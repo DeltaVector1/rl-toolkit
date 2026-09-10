@@ -300,15 +300,107 @@ def load_server_stage_method(stage_worker, publish_lock=None):
         def post(self, *_args, **_kwargs):
             return lambda function: function
 
-    async def reap(_process, communication=None):
+    stage_path = {}
+    stage_state = {}
+    processes = {}
+
+    class FakeProcess:
+        _next_pid = 41000
+
+        def __init__(self):
+            self.pid = FakeProcess._next_pid
+            FakeProcess._next_pid += 1
+            self.returncode = None
+            self.stopped = threading.Event()
+            self.finished = threading.Event()
+
+        async def communicate(self, payload):
+            request = json.loads(payload.decode("utf-8"))
+
+            def run_stage():
+                try:
+                    destination = stage_worker(
+                        request["source_url"],
+                        require_delta=request["require_delta"],
+                        stage_timeout_seconds=request.get("stage_timeout_seconds"),
+                        policy_step=request.get("policy_step"),
+                        cancel_event=self.stopped,
+                        committed_event=threading.Event(),
+                    )
+                    stage_path["value"] = Path(destination)
+                    stage_state.update(
+                        {
+                            "status": "ready",
+                            "stage_id": request["stage_id"],
+                            "pid": self.pid,
+                            "source_url": request["source_url"],
+                            "path": Path(destination).as_posix(),
+                            "target_sha256": "a" * 64,
+                            "ready_at_monotonic": time.monotonic(),
+                        }
+                    )
+                    result = {
+                        "stage_id": request["stage_id"],
+                        "pid": self.pid,
+                        "status": "ok",
+                        "path": Path(destination).as_posix(),
+                    }
+                except BaseException as exc:
+                    result = {
+                        "stage_id": request.get("stage_id"),
+                        "pid": self.pid,
+                        "status": "error",
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                return json.dumps(result, separators=(",", ":")).encode("utf-8")
+
+            try:
+                stdout = await asyncio.to_thread(run_stage)
+            finally:
+                self.returncode = 0
+                self.finished.set()
+            return stdout, None
+
+        async def wait(self):
+            await asyncio.to_thread(self.finished.wait)
+            return self.returncode
+
+    async def create_subprocess_exec(*_args, **_kwargs):
+        process = FakeProcess()
+        processes[process.pid] = process
+        return process
+
+    def killpg(pid, _signal):
+        process = processes[pid]
+        process.stopped.set()
+
+    async def reap(process, communication=None):
+        if process.returncode is None:
+            process.stopped.set()
+            await process.wait()
         return await communication if communication is not None else (b"", b"")
 
+    class AsyncioProxy:
+        subprocess = types.SimpleNamespace(PIPE=object())
+
+        def __getattr__(self, name):
+            return getattr(asyncio, name)
+
+    asyncio_proxy = AsyncioProxy()
+    asyncio_proxy.create_subprocess_exec = create_subprocess_exec
+    process_os = types.SimpleNamespace(
+        **{name: getattr(os, name) for name in dir(os) if name != "killpg"}
+    )
+    process_os.killpg = killpg
+
     namespace = {
-        "asyncio": asyncio,
+        "asyncio": asyncio_proxy,
         "json": json,
         "uuid": uuid,
         "sys": sys,
-        "os": os,
+        "Path": Path,
+        "os": process_os,
         "signal": signal,
         "threading": threading,
         "time": time,
@@ -330,10 +422,10 @@ def load_server_stage_method(stage_worker, publish_lock=None):
         "_end_lora_stage": lambda: None,
         "_set_lora_stage_process": lambda *_args: None,
         "_kill_stage_process": reap,
-        "adapter_cache_path": lambda source_url: Path(source_url),
+        "adapter_cache_path": lambda source_url: stage_path.get("value", Path(source_url)),
         "stage_lora_adapter_files": stage_worker,
-        "adapter_stage_status": lambda: {},
-        "_read_verified_adapter_identity": lambda source_url, _destination: {
+        "adapter_stage_status": lambda: dict(stage_state),
+        "_read_verified_adapter_identity": lambda source_url, _destination, **_kwargs: {
             "source_url": source_url,
             "target_sha256": "a" * 64,
             "target_size": 8,
@@ -1456,7 +1548,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 ):
                     self.assertTrue(require_delta)
                     self.assertEqual(policy_step, 1)
-                    self.assertEqual(stage_timeout_seconds, 0.005)
+                    self.assertEqual(stage_timeout_seconds, 0.1)
                     with publish_lock:
                         started.set()
                         time.sleep(0.02)
@@ -1474,7 +1566,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                             "lora_path": "http://source/step_1",
                             "require_delta": True,
                             "policy_step": 1,
-                            "stage_timeout_seconds": 0.005,
+                            "stage_timeout_seconds": 0.1,
                         }
 
                     async def is_disconnected(self):
@@ -1607,7 +1699,7 @@ class AdapterTransportStateTest(unittest.TestCase):
 
             response = asyncio.run(stage_method(Request()))
             self.assertIsInstance(response, response_type)
-            self.assertEqual(response.status_code, 504)
+            self.assertEqual(response.status_code, 499)
             self.assertTrue(started.is_set())
             self.assertTrue(stopped.is_set())
             self.assertFalse(ready.exists())

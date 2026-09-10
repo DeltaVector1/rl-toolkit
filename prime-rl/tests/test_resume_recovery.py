@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -90,15 +91,59 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
         def model_dump(self):
             return {"error": "backend load failed"}
 
+    def read_text_nofollow(path, *, encoding, dir_fd=None, max_bytes=None):
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd), "rb") as source:
+            value = source.read((max_bytes + 1) if max_bytes is not None else -1)
+        if max_bytes is not None and len(value) > max_bytes:
+            raise OSError("fixture metadata is too large")
+        return value.decode(encoding)
+
+    def open_directory_nofollow(path, *, create, label):
+        return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+    def stat_regular_entry(parent_fd, name, label):
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(entry.st_mode):
+            raise OSError(f"fixture {label} is not regular")
+        return entry
+
+    def adapter_stage_status():
+        manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+        return {
+            "status": "ready",
+            "source_url": manifest["source_url"],
+            "path": destination.as_posix(),
+            "stage_id": "fixture-stage",
+            "pid": os.getpid(),
+            "target_sha256": manifest["files"]["adapter_model.safetensors"]["sha256"],
+            "verified_files": manifest["files"],
+            "file_stats": {
+                name: {
+                    "dev": (destination / name).stat().st_dev,
+                    "ino": (destination / name).stat().st_ino,
+                    "size": (destination / name).stat().st_size,
+                    "mtime_ns": (destination / name).stat().st_mtime_ns,
+                }
+                for name in ("adapter_config.json", "adapter_model.safetensors")
+            },
+        }
+
     namespace = {
         "Any": Any,
         "OpenAIServingModels": object,
         "Path": Path,
+        "os": os,
+        "stat": __import__("stat"),
+        "_ADAPTER_MARKER_MAX_BYTES": 4 * 1024,
+        "_ADAPTER_METADATA_MAX_BYTES": 2 * 1024 * 1024,
+        "_open_directory_nofollow": open_directory_nofollow,
+        "_read_text_nofollow": read_text_nofollow,
+        "_stat_regular_entry": stat_regular_entry,
         "LoadLoRAAdapterRequest": object,
         "Request": object,
         "adapter_cache_path": lambda _source_url: destination,
         "adapter_reader_lock": reader_lock or contextlib.nullcontext,
-        "adapter_stage_status": lambda: {"status": "idle"},
+        "adapter_stage_status": adapter_stage_status,
         "_adapter_step_from_source_url": lambda source_url: int(
             re.fullmatch(r"step_(\d+)", Path(source_url.rstrip("/")).name).group(1)
         ),
