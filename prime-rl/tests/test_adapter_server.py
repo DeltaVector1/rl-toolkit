@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -80,6 +81,8 @@ class AdapterServerTest(unittest.TestCase):
 
             def counted_sha256(path):
                 calls.append(path.name)
+                if path.name == "adapter_model.safetensors":
+                    time.sleep(0.05)
                 return original_sha256(path)
 
             adapter_server._identity_cache.clear()
@@ -101,9 +104,22 @@ class AdapterServerTest(unittest.TestCase):
                     timeout=5,
                 ) as response:
                     self.assertEqual(response.read(), b"ordinary static content")
-                for _ in range(2):
-                    with urllib.request.urlopen(url, timeout=5) as response:
-                        self.assertEqual(response.read(), chunk)
+                errors = []
+
+                def fetch_chunk():
+                    try:
+                        with urllib.request.urlopen(url, timeout=5) as response:
+                            self.assertEqual(response.read(), chunk)
+                    except Exception as exc:
+                        errors.append(exc)
+
+                requests = [threading.Thread(target=fetch_chunk) for _ in range(16)]
+                for request in requests:
+                    request.start()
+                for request in requests:
+                    request.join(timeout=5)
+                self.assertFalse(errors)
+                self.assertTrue(all(not request.is_alive() for request in requests))
                 self.assertEqual(calls.count("adapter_model.safetensors"), 1)
 
                 original_identity = adapter_server._identity_from_published_directory

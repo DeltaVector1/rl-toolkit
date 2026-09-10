@@ -9,6 +9,7 @@ import time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
+from threading import Lock
 from urllib.parse import unquote, urlsplit
 
 
@@ -29,6 +30,7 @@ class UpgradeError(RuntimeError):
 
 
 _identity_cache: dict[tuple[Path, bool, tuple[tuple[int, int, int, int, int], ...]], dict[str, object]] = {}
+_identity_lock = Lock()
 
 
 def _json_object(path: Path, description: str) -> dict[str, object]:
@@ -190,31 +192,32 @@ def _identity_from_published_directory(
     )
     if opened_weight_stat is not None and opened_weight_stat != cache_key[2][1]:
         raise UpgradeError(f"{description} weights changed before validation")
-    cached = _identity_cache.get(cache_key)
-    if cached is not None:
-        return cached.copy()
+    with _identity_lock:
+        cached = _identity_cache.get(cache_key)
+        if cached is not None:
+            return cached.copy()
 
-    actual_config_digest = _sha256(directory / adapter_config_name)
-    if actual_config_digest != records[adapter_config_name]["sha256"]:
-        raise UpgradeError(f"{description} configuration checksum differs")
-    actual_weights_digest = (
-        _sha256_fd(weight_fd, adapter_weights_name)
-        if weight_fd is not None
-        else _sha256(directory / adapter_weights_name)
-    )
-    if actual_weights_digest != records[adapter_weights_name]["sha256"]:
-        raise UpgradeError(f"{description} weight checksum differs")
-    if weight_fd is not None and _fd_stat_identity(weight_fd) != opened_weight_stat:
-        raise UpgradeError(f"{description} weights changed during validation")
-    validated_identity = {
-        "step": step,
-        "config_size": records[adapter_config_name]["size"],
-        "config_sha256": records[adapter_config_name]["sha256"],
-        "weights_size": records[adapter_weights_name]["size"],
-        "weights_sha256": records[adapter_weights_name]["sha256"],
-    }
-    _identity_cache[cache_key] = validated_identity
-    return validated_identity.copy()
+        actual_config_digest = _sha256(directory / adapter_config_name)
+        if actual_config_digest != records[adapter_config_name]["sha256"]:
+            raise UpgradeError(f"{description} configuration checksum differs")
+        actual_weights_digest = (
+            _sha256_fd(weight_fd, adapter_weights_name)
+            if weight_fd is not None
+            else _sha256(directory / adapter_weights_name)
+        )
+        if actual_weights_digest != records[adapter_weights_name]["sha256"]:
+            raise UpgradeError(f"{description} weight checksum differs")
+        if weight_fd is not None and _fd_stat_identity(weight_fd) != opened_weight_stat:
+            raise UpgradeError(f"{description} weights changed during validation")
+        validated_identity = {
+            "step": step,
+            "config_size": records[adapter_config_name]["size"],
+            "config_sha256": records[adapter_config_name]["sha256"],
+            "weights_size": records[adapter_weights_name]["size"],
+            "weights_sha256": records[adapter_weights_name]["sha256"],
+        }
+        _identity_cache[cache_key] = validated_identity
+        return validated_identity.copy()
 
 
 def _cache_directory(active_run: Path, step: int) -> Path:
