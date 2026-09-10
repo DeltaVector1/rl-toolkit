@@ -762,6 +762,10 @@ policy_target_size=
 policy_config_sha256=
 policy_config_size=
 policy_marker=
+if [ -z "__POLICY_LORA_NAME__" ]; then
+  policy_state=ready
+  policy_slot="__MODEL__"
+fi
 if [ -n "__POLICY_BROADCAST_DIR__" ] && [ -d "__POLICY_BROADCAST_DIR__" ]; then
   policy_marker=$(find "__POLICY_BROADCAST_DIR__" -mindepth 2 -maxdepth 2 \
     -type f -name receivers-ready.json -printf '%p\n' 2>/dev/null | sort -V | tail -1)
@@ -788,7 +792,11 @@ for port in __PORTS__; do
   elif [ "$policy_state" != ready ]; then
     code=POLICY_UNKNOWN
   else
-    active_model=$(printf '%s' "$stage_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); slot=sys.argv[1]; expected={"target_step":int(sys.argv[2]),"target_sha256":sys.argv[3],"target_size":int(sys.argv[4]),"config_sha256":sys.argv[5],"config_size":int(sys.argv[6])}; receipts=d.get("loaded_receipts", {}); receipt=receipts.get(slot) if isinstance(receipts, dict) else None; print(slot if isinstance(receipt, dict) and all(receipt.get(k)==v for k,v in expected.items()) else "")' "$policy_slot" "$policy_step" "$policy_target_sha256" "$policy_target_size" "$policy_config_sha256" "$policy_config_size" 2>/dev/null || true)
+    if [ -z "__POLICY_LORA_NAME__" ]; then
+      active_model="__MODEL__"
+    else
+      active_model=$(printf '%s' "$stage_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); slot=sys.argv[1]; expected={"target_step":int(sys.argv[2]),"target_sha256":sys.argv[3],"target_size":int(sys.argv[4]),"config_sha256":sys.argv[5],"config_size":int(sys.argv[6])}; receipts=d.get("loaded_receipts", {}); receipt=receipts.get(slot) if isinstance(receipt, dict) else None; print(slot if isinstance(receipt, dict) and all(receipt.get(k)==v for k,v in expected.items()) else "")' "$policy_slot" "$policy_step" "$policy_target_sha256" "$policy_target_size" "$policy_config_sha256" "$policy_config_size" 2>/dev/null || true)
+    fi
     if [ -z "$active_model" ]; then
       code=POLICY_MISMATCH
     else
@@ -2080,6 +2088,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
         "FAILS5M",
         "ORCH_LOGAGE",
         "JUDGE",
+        "ZMQ_TUNNEL",
     )
     for key in edge_keys:
         h.pop(key, None)

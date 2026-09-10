@@ -680,14 +680,18 @@ async def _resume_engines(
             )
             if remaining <= 0:
                 return None, False, False
-            response = await client.get(
-                "/resume_status",
-                timeout=httpx.Timeout(
-                    connect=10.0,
-                    read=min(RESUME_PROBE_TIMEOUT_S, remaining),
-                    write=min(10.0, remaining),
-                    pool=min(10.0, remaining),
+            request_timeout = min(RESUME_PROBE_TIMEOUT_S, remaining)
+            response = await asyncio.wait_for(
+                client.get(
+                    "/resume_status",
+                    timeout=httpx.Timeout(
+                        connect=min(10.0, request_timeout),
+                        read=request_timeout,
+                        write=min(10.0, request_timeout),
+                        pool=min(10.0, request_timeout),
+                    ),
                 ),
+                timeout=request_timeout,
             )
         except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
             return None, False, False
@@ -708,14 +712,18 @@ async def _resume_engines(
             )
             if remaining <= 0:
                 return False
-            response = await client.get(
-                "/liveness",
-                timeout=httpx.Timeout(
-                    connect=10.0,
-                    read=min(RESUME_PROBE_TIMEOUT_S, remaining),
-                    write=min(10.0, remaining),
-                    pool=min(10.0, remaining),
+            request_timeout = min(RESUME_PROBE_TIMEOUT_S, remaining)
+            response = await asyncio.wait_for(
+                client.get(
+                    "/liveness",
+                    timeout=httpx.Timeout(
+                        connect=min(10.0, request_timeout),
+                        read=request_timeout,
+                        write=min(10.0, request_timeout),
+                        pool=min(10.0, request_timeout),
+                    ),
                 ),
+                timeout=request_timeout,
             )
         except (TimeoutError, httpx.TimeoutException, httpx.TransportError):
             return False
@@ -1241,9 +1249,15 @@ async def update_weights(
                 expected_identity=expected_adapter_identity,
                 deadline=load_deadline,
             )
-        finally:
+        except BaseException as load_error:
             resume_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
-            await _resume_engines(admin_clients, deadline=resume_deadline)
+            try:
+                await _resume_engines(admin_clients, deadline=resume_deadline)
+            except BaseException as resume_error:
+                raise load_error from resume_error
+            raise
+        resume_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
+        await _resume_engines(admin_clients, deadline=resume_deadline)
         return receipts
     else:
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
@@ -1384,14 +1398,18 @@ async def load_lora_adapter(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("LoRA load phase exceeded its 600-second deadline")
-        response = await admin_client.get(
-            "/staging_status",
-            timeout=httpx.Timeout(
-                connect=min(10.0, remaining),
-                read=min(30.0, remaining),
-                write=min(30.0, remaining),
-                pool=min(30.0, remaining),
+        request_timeout = min(30.0, remaining)
+        response = await asyncio.wait_for(
+            admin_client.get(
+                "/staging_status",
+                timeout=httpx.Timeout(
+                    connect=min(10.0, request_timeout),
+                    read=request_timeout,
+                    write=request_timeout,
+                    pool=min(10.0, request_timeout),
+                ),
             ),
+            timeout=request_timeout,
         )
         response.raise_for_status()
         payload = response.json()
