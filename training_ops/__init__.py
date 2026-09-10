@@ -117,7 +117,12 @@ def _inference_config(host: str) -> dict:
     return settings
 
 
-def _config_dir(config_dir: str = default_config_dir, *, require_orchestrator: bool = False) -> dict:
+def _config_dir(
+    config_dir: str = default_config_dir,
+    *,
+    require_orchestrator: bool = False,
+    require_inference: bool = False,
+) -> dict:
     """Resolve one explicit run directory without a profile registry."""
     if not isinstance(config_dir, str) or not config_dir:
         raise Refused("run config directory must be a non-empty path")
@@ -133,11 +138,23 @@ def _config_dir(config_dir: str = default_config_dir, *, require_orchestrator: b
     if not (repo_root / trainer).is_file():
         raise Refused(f"run config directory has no trainer.toml: {config_dir}")
     selected = {"kind": "glm52", "trainer": trainer.as_posix()}
+    inference = path / "inference.toml"
+    if (repo_root / inference).is_file():
+        selected["inference"] = inference.as_posix()
+    elif require_inference:
+        raise Refused(f"run config directory has no inference.toml: {config_dir}")
     if (repo_root / orchestrator).is_file():
         selected["orchestrator"] = orchestrator.as_posix()
     elif require_orchestrator:
         raise Refused(f"run config directory has no orchestrator.toml: {config_dir}")
     return selected
+
+
+def _selected_inference_config(selected: dict) -> str:
+    inference = selected.get("inference")
+    if not isinstance(inference, str) or not (repo_root / inference).is_file():
+        raise Refused("selected run config directory has no inference.toml")
+    return inference
 
 
 def _config_for_run(
@@ -4298,6 +4315,7 @@ def _engine_watchdog_identity_script(
     startup_grace: int,
     *,
     ensure_running: bool,
+    inference_config: str | None = None,
 ) -> str:
     """Stop stale watchdogs for one configured engine identity."""
     values = {
@@ -4353,6 +4371,14 @@ def _engine_watchdog_identity_script(
             f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'START={start_script}')} || return 1",
             f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'MODEL={model}')} || return 1",
             f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'STARTUP_GRACE={startup_grace}')} || return 1",
+        ]
+    )
+    if inference_config is not None:
+        lines.append(
+            f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'inference_config={inference_config}')} || return 1"
+        )
+    lines.extend(
+        [
             "  return 0",
             "}",
             "stop_watchdog() {",
@@ -4402,6 +4428,8 @@ def _engine_watchdog_identity_script(
             "MODEL": model,
             "START": start_script,
         }
+        if inference_config is not None:
+            canonical_environment["inference_config"] = inference_config
         environment = " ".join(
             f"{key}={shlex.quote(value)}"
             for key, value in canonical_environment.items()
@@ -4436,6 +4464,8 @@ def _repair_engine(host: str) -> str:
     _check_host(host)
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
+    selected = _config_for_run(current_run())
+    inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     engine_container = glm_inference_container
     engine_model = glm_model
     start_script = f"{runtime_root}/h200/start_inference.sh"
@@ -4454,6 +4484,7 @@ def _repair_engine(host: str) -> str:
             engine_model,
             startup_grace,
             ensure_running=False,
+            inference_config=inference_config,
         ),
     )
     if stop_code:
@@ -4461,7 +4492,8 @@ def _repair_engine(host: str) -> str:
     rc, out = _ssh(
         host,
         f"sudo docker rm -f {engine_container} >/dev/null 2>&1; "
-        f"nohup setsid env ENGINE_HOST={shlex.quote(host)} bash {start_script} "
+        f"nohup setsid env ENGINE_HOST={shlex.quote(host)} "
+        f"inference_config={shlex.quote(inference_config)} bash {start_script} "
         ">/root/start_inference.log 2>&1 </dev/null & "
         "sleep 3; echo issued",
         timeout=180,
@@ -4478,6 +4510,7 @@ def _repair_engine(host: str) -> str:
             engine_model,
             startup_grace,
             ensure_running=True,
+            inference_config=inference_config,
         ),
     )
     if watchdog_code:
@@ -4514,6 +4547,8 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
     for index, spec in enumerate(specs):
         lines.append(f"  if [ \"${{watchdog_identity:-}}\" = {index!r} ]; then")
         for key, value in spec["environment"].items():
+            if key == "inference_config":
+                continue
             lines.append(
                 f"    printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'{key}={value}')} || return 1"
             )
@@ -4544,7 +4579,7 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
             f"    if printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote('PORT=' + port)}; then"
         )
         for key, value in spec["environment"].items():
-            if key != "WATCHDOG_IDENTITY":
+            if key not in {"WATCHDOG_IDENTITY", "inference_config"}:
                 lines.append(
                     f"      printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'{key}={value}')} || return 1"
                 )
@@ -4627,7 +4662,8 @@ def _repair_engine_watchdog(host: str) -> str:
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
     run = current_run()
-    _config_for_run(run)
+    selected = _config_for_run(run)
+    inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     settings = _inference_config(host)
     configured_ports = settings.get("ports")
     if not isinstance(configured_ports, list) or not configured_ports:
@@ -4646,6 +4682,7 @@ def _repair_engine_watchdog(host: str) -> str:
             "MODEL": model,
             "START": start_script,
             "ENGINE_CONTAINER": container,
+            "inference_config": inference_config,
             "PORT": str(port),
             "WATCHDOG_IDENTITY": f"engine-watchdog:{host}:{run}:{port}",
         }
@@ -4673,9 +4710,14 @@ def _repair_engine_watchdog(host: str) -> str:
 def _repair_supervisors(config_dir: str | None = None) -> str:
     out = []
     if config_dir is None:
-        _config_for_run(current_run())
+        selected = _config_for_run(current_run())
     else:
-        _config_dir(config_dir, require_orchestrator=True)
+        selected = _config_dir(
+            config_dir,
+            require_orchestrator=True,
+            require_inference=True,
+        )
+    inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     for h in inference_hosts:
         start_script = f"{runtime_root}/h200/start_inference.sh"
         code, output = _ssh(
@@ -4688,6 +4730,7 @@ def _repair_supervisors(config_dir: str | None = None) -> str:
                 glm_model,
                 600,
                 ensure_running=True,
+                inference_config=inference_config,
             ),
         )
         if code:
@@ -4790,7 +4833,7 @@ def deploy(
             ]
         elif path.startswith(("environments/", "evals/")):
             nodes = [orchestrator_host]
-        elif path.startswith("training_ops/runtime/h200/") or path == "configs/general-agent/inference.toml":
+        elif path.startswith("training_ops/runtime/h200/") or path.endswith("/inference.toml"):
             nodes = inference_hosts
         elif path.startswith("training_ops/runtime/china/"):
             nodes = trainer_hosts
@@ -5461,7 +5504,7 @@ def _start_dependency_inventory(
 
     configured_hosts = list(dict.fromkeys([*trainer_hosts, *inference_hosts]))
     add("configs/nodes.toml", configured_hosts)
-    add("configs/general-agent/inference.toml", inference_hosts)
+    add(_selected_inference_config(selected), inference_hosts)
     for path in mounted_files():
         if not path.startswith("prime-rl/"):
             continue
@@ -6026,7 +6069,11 @@ def start(
     _runs_path, _run_parent, service_run_dir = _cold_run_paths(run)
     if (resume_adapter is None) != (resume_step is None):
         raise Refused("resume_adapter and resume_step must be set together")
-    selected = _config_dir(config_dir, require_orchestrator=True)
+    selected = _config_dir(
+        config_dir,
+        require_orchestrator=True,
+        require_inference=True,
+    )
     if resume_adapter is not None:
         if not resume_adapter.startswith(f"{run_root}/"):
             raise Refused(f"resume adapter must be below {run_root}")

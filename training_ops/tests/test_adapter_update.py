@@ -26,8 +26,9 @@ adapter_server_spec.loader.exec_module(adapter_server)
 class AdapterUpdateTest(unittest.TestCase):
     def test_start_inventory_deploys_nodes_config_to_participants(self):
         selected = {
-            "trainer": "configs/general-agent/trainer.toml",
-            "orchestrator": "configs/general-agent/orchestrator.toml",
+            "trainer": "configs/decensor/trainer.toml",
+            "orchestrator": "configs/decensor/orchestrator.toml",
+            "inference": "configs/decensor/inference.toml",
         }
         with mock.patch.object(training_ops, "_check_host", side_effect=lambda host: host), mock.patch.object(
             training_ops, "mounted_files", return_value=[]
@@ -38,6 +39,10 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertEqual(
             set(inventory["configs/nodes.toml"]),
             set(training_ops.trainer_hosts + training_ops.inference_hosts),
+        )
+        self.assertEqual(
+            set(inventory["configs/decensor/inference.toml"]),
+            set(training_ops.inference_hosts),
         )
 
     def test_inference_launcher_forwards_mtp_settings_before_docker(self):
@@ -93,6 +98,12 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertEqual(a_extra["max_num_batched_tokens"], 32768)
         self.assertEqual(a_extra["compilation_config"], {"max_cudagraph_capture_size": 256})
         self.assertIn("runtime_output=$(python3", launcher)
+        self.assertIn(
+            "inference_config=${inference_config:?set inference_config to the selected run config}",
+            launcher,
+        )
+        self.assertNotIn("configs/general-agent/inference.toml", launcher)
+        self.assertIn('@ "$inference_config"', launcher)
         self.assertIn("-e PRIME_LORA_DOWNLOAD_STREAMS=48", launcher)
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("install -d"))
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))
@@ -774,6 +785,13 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertTrue(any("glm52-decensor-h200" in call for call in calls))
         self.assertTrue(any("start_inference.sh" in call for call in calls))
         self.assertTrue(any("ENGINE_CONTAINER=glm52-decensor-h200" in call for call in calls))
+        self.assertTrue(
+            any(
+                "inference_config=/data/glm52-rl/deployment/configs/general-agent/inference.toml"
+                in call
+                for call in calls
+            )
+        )
 
     def test_watchdog_cleanup_uses_engine_identity_not_script_path(self):
         script = training_ops._engine_watchdog_identity_script(
@@ -810,7 +828,9 @@ class AdapterUpdateTest(unittest.TestCase):
             return 0, "reconciled one canonical engine watchdog\n"
 
         with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
-            training_ops, "_config_for_run"
+            training_ops,
+            "_config_for_run",
+            return_value={"inference": "configs/general-agent/inference.toml"},
         ), mock.patch.object(training_ops, "_ssh", side_effect=ssh):
             result = training_ops._repair_supervisors()
 
@@ -821,6 +841,15 @@ class AdapterUpdateTest(unittest.TestCase):
             self.assertIn(f"grep -Fxq ENGINE_HOST={host}", script)
             self.assertIn("grep -Fxq ENGINE_CONTAINER=glm52-decensor-h200", script)
             self.assertIn("STARTUP_GRACE=600", script)
+            self.assertIn(
+                "inference_config=/data/glm52-rl/deployment/configs/general-agent/inference.toml",
+                script,
+            )
+            self.assertIn(
+                "inference_config=/data/glm52-rl/deployment/configs/general-agent/inference.toml "
+                "nohup setsid bash",
+                script,
+            )
             self.assertNotIn("pkill", script)
             self.assertNotIn("pgrep", script)
 

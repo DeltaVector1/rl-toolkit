@@ -10,6 +10,25 @@ import training_ops
 
 
 class MicrobatchAddressTest(unittest.TestCase):
+    def test_run_config_selects_matching_inference_config(self):
+        selected = training_ops._config_dir(
+            "configs/decensor",
+            require_orchestrator=True,
+            require_inference=True,
+        )
+        self.assertEqual(selected["inference"], "configs/decensor/inference.toml")
+
+    def test_run_config_requires_inference_config_for_start(self):
+        with self.assertRaisesRegex(
+            training_ops.Refused,
+            "run config directory has no inference.toml",
+        ):
+            training_ops._config_dir(
+                "configs/current",
+                require_orchestrator=True,
+                require_inference=True,
+            )
+
     def test_run_config_is_selected_from_active_run_output(self):
         selected = training_ops._config_for_run("glm-perf-3")
         self.assertEqual(
