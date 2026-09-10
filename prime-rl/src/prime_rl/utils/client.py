@@ -661,6 +661,12 @@ async def stage_lora_adapter(
     if not lora_path_posix.startswith(("http://", "https://")):
         return {
             "wire_stage_seconds": 0.0,
+            "transfer_wall_seconds": 0.0,
+            "reconstruction_wall_seconds": 0.0,
+            "reconstruction_worker_seconds": 0.0,
+            "final_verification_wall_seconds": 0.0,
+            "total_stage_wall_seconds": 0.0,
+            "cache_hit": False,
             "host_count": 0,
             "adapter_identity": None,
         }
@@ -744,17 +750,29 @@ async def stage_lora_adapter(
         adapter_identity = _validate_adapter_identity(
             payload.get("adapter_identity"), lora_path_posix
         )
-        stage_seconds = payload.get("stage_seconds")
-        if not isinstance(stage_seconds, (int, float)) or stage_seconds < 0:
-            stage_seconds = time.perf_counter() - started
-        reconstruct_seconds = payload.get("reconstruct_seconds")
-        if not isinstance(reconstruct_seconds, (int, float)) or reconstruct_seconds < 0:
-            reconstruct_seconds = None
+        def metric(name: str, fallback: float | None = None) -> float | None:
+            value = payload.get(name, fallback)
+            return float(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+        total_stage_seconds = metric("total_stage_wall_seconds", metric("stage_seconds"))
+        if total_stage_seconds is None:
+            total_stage_seconds = time.perf_counter() - started
+        transfer_seconds = metric("transfer_wall_seconds")
+        legacy_wire_seconds = metric("wire_stage_seconds", metric("stage_seconds", transfer_seconds))
+        reconstruction_seconds = metric("reconstruction_wall_seconds", metric("reconstruct_seconds"))
+        worker_seconds = metric("reconstruction_worker_seconds")
+        verification_seconds = metric("final_verification_wall_seconds")
         return {
-            "wire_stage_seconds": float(stage_seconds),
-            "reconstruct_seconds": float(reconstruct_seconds)
-            if reconstruct_seconds is not None
-            else None,
+            "wire_stage_seconds": legacy_wire_seconds,
+            "transfer_wall_seconds": transfer_seconds,
+            "reconstruction_wall_seconds": reconstruction_seconds,
+            "reconstruct_seconds": reconstruction_seconds,
+            "reconstruction_worker_seconds": worker_seconds,
+            "final_verification_wall_seconds": verification_seconds,
+            "total_stage_wall_seconds": total_stage_seconds,
+            "cache_hit": bool(payload.get("cache_hit", False)),
+            "bytes_done": int(payload.get("bytes_done", 0) or 0),
+            "bytes_total": int(payload.get("bytes_total", 0) or 0),
             "request_seconds": time.perf_counter() - started,
             "adapter_identity": adapter_identity,
         }
@@ -926,11 +944,30 @@ async def stage_lora_adapter(
             group_seconds.append(time.perf_counter() - group_started)
     origin_stage_seconds = group_seconds[0] if group_seconds else 0.0
     peer_stage_seconds = sum(group_seconds[1:])
-    wire_stage_seconds = time.perf_counter() - started
-    reconstruct_values = [
-        float(result["reconstruct_seconds"])
+    transfer_values = [
+        float(result["transfer_wall_seconds"])
         for result in results
-        if result["reconstruct_seconds"] is not None
+        if result["transfer_wall_seconds"] is not None
+    ]
+    legacy_wire_values = [
+        float(result["wire_stage_seconds"])
+        for result in results
+        if result["wire_stage_seconds"] is not None
+    ]
+    reconstruct_values = [
+        float(result["reconstruction_wall_seconds"])
+        for result in results
+        if result["reconstruction_wall_seconds"] is not None
+    ]
+    worker_values = [
+        float(result["reconstruction_worker_seconds"])
+        for result in results
+        if result["reconstruction_worker_seconds"] is not None
+    ]
+    verification_values = [
+        float(result["final_verification_wall_seconds"])
+        for result in results
+        if result["final_verification_wall_seconds"] is not None
     ]
     identities = [result["adapter_identity"] for result in results]
     if not identities or any(identity != identities[0] for identity in identities[1:]):
@@ -938,10 +975,18 @@ async def stage_lora_adapter(
     adapter_identity = identities[0]
     assert isinstance(adapter_identity, dict)
     return {
-        "wire_stage_seconds": wire_stage_seconds,
+        "wire_stage_seconds": max(legacy_wire_values) if legacy_wire_values else None,
+        "transfer_wall_seconds": max(transfer_values) if transfer_values else None,
         "origin_stage_seconds": origin_stage_seconds,
         "peer_stage_seconds": peer_stage_seconds,
+        "reconstruction_wall_seconds": max(reconstruct_values) if reconstruct_values else None,
         "reconstruct_seconds": max(reconstruct_values) if reconstruct_values else None,
+        "reconstruction_worker_seconds": max(worker_values) if worker_values else None,
+        "final_verification_wall_seconds": max(verification_values) if verification_values else None,
+        "total_stage_wall_seconds": time.perf_counter() - started,
+        "cache_hit": bool(results) and all(bool(result["cache_hit"]) for result in results),
+        "bytes_done": sum(int(result["bytes_done"]) for result in results),
+        "bytes_total": sum(int(result["bytes_total"]) for result in results),
         "host_count": len(hosts),
         "origin_host_count": origin_count,
         "peer_host_count": len(hosts) - origin_count,

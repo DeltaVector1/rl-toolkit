@@ -1851,6 +1851,38 @@ def adapter_stage_status() -> dict[str, object]:
     return value
 
 
+def _stage_timing_fields(
+    started: float,
+    *,
+    transfer_started: float | None = None,
+    transfer_finished: float | None = None,
+    reconstruction_started: float | None = None,
+    reconstruction_finished: float | None = None,
+    reconstruction_worker_seconds: float = 0.0,
+    verification_started: float | None = None,
+    verification_finished: float | None = None,
+    cache_hit: bool = False,
+) -> dict[str, object]:
+    def elapsed(begin: float | None, end: float | None) -> float:
+        if begin is None or end is None:
+            return 0.0
+        return max(0.0, end - begin)
+
+    now = time.monotonic()
+    reconstruction_wall_seconds = elapsed(reconstruction_started, reconstruction_finished)
+    return {
+        "transfer_wall_seconds": round(elapsed(transfer_started, transfer_finished), 3),
+        "reconstruction_wall_seconds": round(reconstruction_wall_seconds, 3),
+        "reconstruct_seconds": round(reconstruction_wall_seconds, 3),
+        "reconstruction_worker_seconds": round(max(0.0, reconstruction_worker_seconds), 3),
+        "final_verification_wall_seconds": round(
+            elapsed(verification_started, verification_finished), 3
+        ),
+        "total_stage_wall_seconds": round(max(0.0, now - started), 3),
+        "cache_hit": cache_hit,
+    }
+
+
 def _adapter_reader_lock(path: Path) -> Path:
     return path.parent / f".{path.name}.readers.lock"
 
@@ -2600,11 +2632,33 @@ def _stage_chunked_linear_adapter(
             progress_bytes += int(item["wire_size"])
     reconstruct_lock = threading.Lock()
     reconstruct_semaphore = threading.BoundedSemaphore(_PREDICTIVE_RECONSTRUCT_WORKERS)
-    reconstruct_seconds = 0.0
+    reconstruct_worker_seconds = 0.0
+    reconstruction_started = None
+    reconstruction_finished = None
+    transfer_started = None
+    transfer_finished = None
+    verification_started = None
+    verification_finished = None
     last_status = 0.0
 
     def write_stage_status(value: dict[str, object]) -> None:
-        _write_stage_status(destination.parent, {**value, **(status_metadata or {})})
+        _write_stage_status(
+            destination.parent,
+            {
+                **value,
+                **_stage_timing_fields(
+                    started,
+                    transfer_started=transfer_started,
+                    transfer_finished=transfer_finished,
+                    reconstruction_started=reconstruction_started,
+                    reconstruction_finished=reconstruction_finished,
+                    reconstruction_worker_seconds=reconstruct_worker_seconds,
+                    verification_started=verification_started,
+                    verification_finished=verification_finished,
+                ),
+                **(status_metadata or {}),
+            },
+        )
 
     def report(lane: int, amount: int) -> None:
         nonlocal progress_bytes, last_status
@@ -2615,8 +2669,6 @@ def _stage_chunked_linear_adapter(
             if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
                 return
             last_status = now
-            with reconstruct_lock:
-                reconstructed_time = reconstruct_seconds
             write_stage_status(
                 {
                     "status": "staging",
@@ -2626,7 +2678,6 @@ def _stage_chunked_linear_adapter(
                     "bytes_done": progress_bytes,
                     "bytes_total": total_wire_bytes,
                     "lane": lane,
-                    "reconstruct_seconds": round(reconstructed_time, 3),
                     "updated_at": time.time(),
                     "elapsed_seconds": round(now - started, 3),
                 },
@@ -2640,7 +2691,6 @@ def _stage_chunked_linear_adapter(
             "transport": _ADAPTER_LINEAR_TRANSPORT,
             "bytes_done": progress_bytes,
             "bytes_total": total_wire_bytes,
-            "reconstruct_seconds": 0.0,
             "updated_at": time.time(),
             "elapsed_seconds": 0.0,
         },
@@ -2657,6 +2707,8 @@ def _stage_chunked_linear_adapter(
     config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
     _reject_symlink_path(config_path, "adapter configuration file")
     _reject_symlink_path(config_incoming_path, "adapter configuration incoming file")
+    with reconstruct_lock:
+        transfer_started = time.monotonic()
     download(
         f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
         config_incoming_path,
@@ -2667,6 +2719,8 @@ def _stage_chunked_linear_adapter(
         cancel_event=cancel_event,
         retry_http_statuses={404, 503},
     )
+    with reconstruct_lock:
+        transfer_finished = time.monotonic()
     _reject_symlink_path(config_path, "adapter configuration file")
     _replace_paths(config_incoming_path, config_path, "adapter configuration")
 
@@ -2695,7 +2749,8 @@ def _stage_chunked_linear_adapter(
     _write_marker(temporary / _RELAYING_MARKER, "relaying\n")
 
     def fetch(index: int, item: dict[str, object]) -> None:
-        nonlocal reconstruct_seconds
+        nonlocal reconstruct_worker_seconds, reconstruction_started, reconstruction_finished
+        nonlocal transfer_started, transfer_finished
         _check_cancelled(cancel_event)
         name = item["file"]
         if not isinstance(name, str):
@@ -2750,6 +2805,10 @@ def _stage_chunked_linear_adapter(
             chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
             chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
             incoming_path = chunk_path.with_name(f".{chunk_path.name}.incoming")
+            transfer_started_at = time.monotonic()
+            with reconstruct_lock:
+                if transfer_started is None or transfer_started_at < transfer_started:
+                    transfer_started = transfer_started_at
             download(
                 chunk_urls[0],
                 incoming_path,
@@ -2763,6 +2822,10 @@ def _stage_chunked_linear_adapter(
                 per_request_timeout_seconds=_configured_chunk_timeout(),
                 retry_http_statuses={404, 503},
             )
+            transfer_finished_at = time.monotonic()
+            with reconstruct_lock:
+                if transfer_finished is None or transfer_finished_at > transfer_finished:
+                    transfer_finished = transfer_finished_at
             _check_deadline(deadline, cancel_event)
             _reject_symlink_path(incoming_path, "adapter chunk incoming file")
             _replace_paths(incoming_path, chunk_path, "adapter transport chunk")
@@ -2787,7 +2850,10 @@ def _stage_chunked_linear_adapter(
                 },
             )
         with reconstruct_semaphore:
-            reconstruction_started = time.monotonic()
+            reconstruction_started_at = time.monotonic()
+            with reconstruct_lock:
+                if reconstruction_started is None or reconstruction_started_at < reconstruction_started:
+                    reconstruction_started = reconstruction_started_at
             try:
                 base_fd2 = _open_nofollow(base2_model, os.O_RDONLY)
                 base_fd1 = _open_nofollow(base1_model, os.O_RDONLY)
@@ -2818,8 +2884,11 @@ def _stage_chunked_linear_adapter(
                     os.close(base_fd1)
                 if "base_fd2" in locals():
                     os.close(base_fd2)
+            reconstruction_finished_at = time.monotonic()
             with reconstruct_lock:
-                reconstruct_seconds += time.monotonic() - reconstruction_started
+                reconstruct_worker_seconds += reconstruction_finished_at - reconstruction_started_at
+                if reconstruction_finished is None or reconstruction_finished_at > reconstruction_finished:
+                    reconstruction_finished = reconstruction_finished_at
         _check_deadline(deadline, cancel_event)
         _write_json(
             completed_path,
@@ -2849,13 +2918,12 @@ def _stage_chunked_linear_adapter(
         os.fsync(output_fd)
     finally:
         os.close(output_fd)
-    target_hash_started = time.monotonic()
+    verification_started = time.monotonic()
     try:
         if _sha256(output_path, deadline, cancel_event) != target_sha256:
             raise OSError("reconstructed version-two adapter checksum mismatch")
     finally:
-        with reconstruct_lock:
-            reconstruct_seconds += time.monotonic() - target_hash_started
+        verification_finished = time.monotonic()
     if _path_regular_size(output_path, "adapter output") != target_size:
         raise OSError("reconstructed version-two adapter size mismatch")
 
@@ -2907,8 +2975,6 @@ def _stage_chunked_linear_adapter(
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
     _cleanup_retired_adapters(destination.parent, destination.name)
     _cleanup_previous_adapter_caches(destination.parent, destination)
-    with reconstruct_lock:
-        total_reconstruct_seconds = reconstruct_seconds
     write_stage_status(
         {
             "status": "ready",
@@ -2917,7 +2983,6 @@ def _stage_chunked_linear_adapter(
             "transport": _ADAPTER_LINEAR_TRANSPORT,
             "bytes_done": total_wire_bytes,
             "bytes_total": total_wire_bytes,
-            "reconstruct_seconds": round(total_reconstruct_seconds, 3),
             "updated_at": time.time(),
             "elapsed_seconds": round(time.monotonic() - started, 3),
         },
@@ -3099,6 +3164,14 @@ def _stage_chunked_xor_adapter(
         total_wire_bytes += config_size
     progress_lock = threading.Lock()
     progress_bytes = 0
+    timing_lock = threading.Lock()
+    transfer_started = None
+    transfer_finished = None
+    reconstruction_started = None
+    reconstruction_finished = None
+    reconstruction_worker_seconds = 0.0
+    verification_started = None
+    verification_finished = None
     for item in chunks:
         if not isinstance(item, dict) or not isinstance(item.get("file"), str):
             continue
@@ -3109,7 +3182,23 @@ def _stage_chunked_xor_adapter(
     last_status = 0.0
 
     def write_stage_status(value: dict[str, object]) -> None:
-        _write_stage_status(destination.parent, {**value, **(status_metadata or {})})
+        _write_stage_status(
+            destination.parent,
+            {
+                **value,
+                **_stage_timing_fields(
+                    started,
+                    transfer_started=transfer_started,
+                    transfer_finished=transfer_finished,
+                    reconstruction_started=reconstruction_started,
+                    reconstruction_finished=reconstruction_finished,
+                    reconstruction_worker_seconds=reconstruction_worker_seconds,
+                    verification_started=verification_started,
+                    verification_finished=verification_finished,
+                ),
+                **(status_metadata or {}),
+            },
+        )
 
     def report(lane: int, amount: int) -> None:
         nonlocal progress_bytes, last_status
@@ -3154,6 +3243,9 @@ def _stage_chunked_xor_adapter(
         _preallocate(output_path, target_size)
 
     def fetch(index: int, item: dict[str, object]) -> None:
+        nonlocal transfer_started, transfer_finished
+        nonlocal reconstruction_started, reconstruction_finished
+        nonlocal reconstruction_worker_seconds
         _check_cancelled(cancel_event)
         name = item["file"]
         assert isinstance(name, str)
@@ -3197,6 +3289,10 @@ def _stage_chunked_xor_adapter(
 
         chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
         chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
+        transfer_started_at = time.monotonic()
+        with timing_lock:
+            if transfer_started is None or transfer_started_at < transfer_started:
+                transfer_started = transfer_started_at
         download(
             chunk_urls[0],
             chunk_path,
@@ -3209,6 +3305,10 @@ def _stage_chunked_xor_adapter(
             cancel_event=cancel_event,
             per_request_timeout_seconds=_configured_chunk_timeout(),
         )
+        transfer_finished_at = time.monotonic()
+        with timing_lock:
+            if transfer_finished is None or transfer_finished_at > transfer_finished:
+                transfer_finished = transfer_finished_at
 
         _check_deadline(deadline, cancel_event)
         encoded = _read_bytes_nofollow(chunk_path)
@@ -3231,6 +3331,10 @@ def _stage_chunked_xor_adapter(
                 _unlink_path(chunk_path, "corrupt adapter transport chunk")
             raise OSError("adapter transport decoded chunk checksum mismatch")
         _check_cancelled(cancel_event)
+        reconstruction_started_at = time.monotonic()
+        with timing_lock:
+            if reconstruction_started is None or reconstruction_started_at < reconstruction_started:
+                reconstruction_started = reconstruction_started_at
         output_fd = _open_nofollow(output_path, os.O_RDWR)
         try:
             if full_zstd:
@@ -3251,6 +3355,11 @@ def _stage_chunked_xor_adapter(
             os.fsync(output_fd)
         finally:
             os.close(output_fd)
+        reconstruction_finished_at = time.monotonic()
+        with timing_lock:
+            reconstruction_worker_seconds += reconstruction_finished_at - reconstruction_started_at
+            if reconstruction_finished is None or reconstruction_finished_at > reconstruction_finished:
+                reconstruction_finished = reconstruction_finished_at
         _check_deadline(deadline, cancel_event)
         _write_json(
             completed_path,
@@ -3271,13 +3380,19 @@ def _stage_chunked_xor_adapter(
     _wait_for_futures(executor, futures, deadline, cancel_event)
 
     _reject_symlink_path(output_path, "adapter output")
+    verification_started = time.monotonic()
     if _sha256(output_path, deadline, cancel_event) != target_sha256:
         raise OSError("reconstructed adapter checksum mismatch")
     if _path_regular_size(output_path, "adapter output") != target_size:
         raise OSError("reconstructed adapter size mismatch")
+    verification_finished = time.monotonic()
 
     config_path = temporary / _ADAPTER_FILES[0]
     _reject_symlink_path(config_path, "adapter configuration file")
+    config_transfer_started = time.monotonic()
+    with timing_lock:
+        if transfer_started is None or config_transfer_started < transfer_started:
+            transfer_started = config_transfer_started
     download(
         f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
         config_path,
@@ -3287,6 +3402,10 @@ def _stage_chunked_xor_adapter(
         deadline=deadline,
         cancel_event=cancel_event,
     )
+    config_transfer_finished = time.monotonic()
+    with timing_lock:
+        if transfer_finished is None or config_transfer_finished > transfer_finished:
+            transfer_finished = config_transfer_finished
     if _sha256(config_path, deadline, cancel_event) != config_sha256:
         raise OSError("adapter configuration checksum mismatch")
     source_transport_manifest = transport.get("source_manifest")
@@ -3789,9 +3908,28 @@ def stage_lora_adapter_files(
     # intentional: per-URL writers caused old policies to queue behind one
     # another and made it possible to publish a stale policy after a newer one.
     host_lock_path = destination.parent / "adapter-staging.lock"
+    transfer_started = None
+    transfer_finished = None
+    verification_started = None
+    verification_finished = None
+    cache_hit = False
 
     def write_stage_status(value: dict[str, object]) -> None:
-        _write_stage_status(destination.parent, {**value, **status_metadata})
+        _write_stage_status(
+            destination.parent,
+            {
+                **value,
+                **_stage_timing_fields(
+                    started,
+                    transfer_started=transfer_started,
+                    transfer_finished=transfer_finished,
+                    verification_started=verification_started,
+                    verification_finished=verification_finished,
+                    cache_hit=cache_hit,
+                ),
+                **status_metadata,
+            },
+        )
 
     with os.fdopen(
         _open_nofollow(host_lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC),
@@ -3909,6 +4047,7 @@ def stage_lora_adapter_files(
                         )
                         == transport["config_sha256"]
                     ):
+                        cache_hit = True
                         write_stage_status(
                             {
                                 "status": "ready",
@@ -3966,13 +4105,14 @@ def stage_lora_adapter_files(
                     and isinstance(transport, dict)
                     and _relay_manifest_matches(destination, source_url, transport)
                 ):
+                    cache_hit = True
                     write_stage_status(
                         {
                             "status": "ready",
                             "source_url": source_url,
                             "path": destination.as_posix(),
-                            "bytes_done": sum(int(item["size"]) for item in files.values()),
-                            "bytes_total": sum(int(item["size"]) for item in files.values()),
+                            "bytes_done": 0,
+                            "bytes_total": 0,
                             "updated_at": time.time(),
                             "elapsed_seconds": round(time.monotonic() - started, 3),
                         },
@@ -4011,14 +4151,15 @@ def stage_lora_adapter_files(
                     total_bytes = sum(int(item["size"]) for item in files.values())
                     _cleanup_retired_adapters(destination.parent, destination.name)
                     _cleanup_previous_adapter_caches(destination.parent, destination)
+                    cache_hit = True
                     write_stage_status(
                         {
                             "status": "ready",
                             "source_url": source_url,
                             "path": destination.as_posix(),
                             "transport": "full",
-                            "bytes_done": total_bytes,
-                            "bytes_total": total_bytes,
+                            "bytes_done": 0,
+                            "bytes_total": 0,
                             "reuse": "local-cache",
                             "updated_at": time.time(),
                             "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -4073,6 +4214,7 @@ def stage_lora_adapter_files(
                 create=False,
                 label="adapter partial directory",
             )
+            transfer_started = time.monotonic()
             try:
                 for filename in _ADAPTER_FILES:
                     item = files[filename]
@@ -4103,6 +4245,8 @@ def stage_lora_adapter_files(
                             progress_bytes += int(files[name]["size"])
             finally:
                 os.close(temporary_fd)
+            transfer_finished = time.monotonic()
+            verification_started = transfer_finished
             _write_json(temporary / "manifest.json", manifest)
             source_transport_manifest = transport.get("source_manifest") if isinstance(transport, dict) else None
             if not isinstance(source_transport_manifest, dict):
@@ -4123,6 +4267,7 @@ def stage_lora_adapter_files(
                 f"{model_digest}\n",
                 encoding="ascii",
             )
+            verification_finished = time.monotonic()
             with _adapter_stage_publish_lock:
                 ready = temporary / "READY"
                 _check_cancelled(cancel_event)

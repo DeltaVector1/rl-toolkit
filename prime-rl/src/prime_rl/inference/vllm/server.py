@@ -529,10 +529,15 @@ async def stage_lora_adapter(raw_request: Request):
     disconnect_task = asyncio.create_task(monitor_disconnect())
 
     def success_payload(destination):
+        stage_state = adapter_stage_status()
+        total_stage_seconds = stage_state.get("total_stage_wall_seconds")
+        if not isinstance(total_stage_seconds, (int, float)) or total_stage_seconds < 0:
+            total_stage_seconds = time.perf_counter() - started
         payload = {
             "status": "ok",
             "path": destination.as_posix(),
-            "stage_seconds": time.perf_counter() - started,
+            "stage_seconds": float(total_stage_seconds),
+            "total_stage_wall_seconds": float(total_stage_seconds),
         }
         if policy_step is not None:
             payload.update(
@@ -543,9 +548,18 @@ async def stage_lora_adapter(raw_request: Request):
                 }
             )
         payload["adapter_identity"] = _read_verified_adapter_identity(source_url, destination)
-        stage_state = adapter_stage_status()
-        if isinstance(stage_state.get("reconstruct_seconds"), (int, float)):
-            payload["reconstruct_seconds"] = float(stage_state["reconstruct_seconds"])
+        for name in (
+            "transfer_wall_seconds",
+            "reconstruction_wall_seconds",
+            "reconstruction_worker_seconds",
+            "final_verification_wall_seconds",
+        ):
+            value = stage_state.get(name)
+            if isinstance(value, (int, float)) and value >= 0:
+                payload[name] = float(value)
+        payload["cache_hit"] = bool(stage_state.get("cache_hit", False))
+        payload["bytes_done"] = int(stage_state.get("bytes_done", 0) or 0)
+        payload["bytes_total"] = int(stage_state.get("bytes_total", 0) or 0)
         return payload
 
     try:
