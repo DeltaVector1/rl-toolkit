@@ -4695,7 +4695,8 @@ def _engine_watchdog_identity_script(
             '  for _ in $(seq 1 50); do watchdog_matches "$pid" || break; sleep 0.1; done',
             '  if watchdog_matches "$pid"; then kill -KILL -- "-$pid" 2>/dev/null || true; fi',
             '  for _ in $(seq 1 20); do watchdog_matches "$pid" || break; sleep 0.1; done',
-            '  watchdog_matches "$pid" && { echo "watchdog did not exit: pid=$pid" >&2; return 1; }',
+            '  if watchdog_matches "$pid"; then echo "watchdog did not exit: pid=$pid" >&2; return 1; fi',
+            "  return 0",
             "}",
             "matches=()",
             "canonical_matches=()",
@@ -4843,6 +4844,7 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
         "  [ \"$pid\" -gt 1 ] || return 1",
         "  [ -r \"/proc/$pid/cmdline\" ] && [ -r \"/proc/$pid/environ\" ] || return 1",
         "  command_line=$(cat \"/proc/$pid/cmdline\" 2>/dev/null | tr '\\0' ' ' || true)",
+        "  command_line=${command_line% }",
         "  case \"$command_line\" in",
         "    \"bash $watchdog_script\"|\"/bin/bash $watchdog_script\"|\"/usr/bin/bash $watchdog_script\") ;;",
         "    *) return 1;;",
@@ -4867,6 +4869,7 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
         "  case \"$pid\" in ''|*[!0-9]*) return 1;; esac",
         "  [ -r \"/proc/$pid/cmdline\" ] || return 1",
         "  command_line=$(cat \"/proc/$pid/cmdline\" 2>/dev/null | tr '\\0' ' ' || true)",
+        "  command_line=${command_line% }",
         "  case \"$command_line\" in \"bash $watchdog_script\"|\"/bin/bash $watchdog_script\"|\"/usr/bin/bash $watchdog_script\") return 0;; esac",
         "  return 1",
         "}",
@@ -4907,7 +4910,8 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
             "  for _ in $(seq 1 50); do (watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\") || break; sleep 0.1; done",
             "  if (watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\"); then kill -KILL -- \"-$pid\" 2>/dev/null || true; fi",
             "  for _ in $(seq 1 20); do (watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\") || break; sleep 0.1; done",
-            "  (watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\") && { echo \"watchdog did not exit: pid=$pid\" >&2; return 1; }",
+            "  if watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\"; then echo \"watchdog did not exit: pid=$pid\" >&2; return 1; fi",
+            "  return 0",
             "}",
         ]
     )
@@ -5000,6 +5004,22 @@ def _repair_engine_watchdog(host: str) -> str:
     watchdog_path = f"{runtime_root}/h200/engine_watchdog.sh"
     if not deploy("training_ops/runtime/h200/engine_watchdog.sh", [host]):
         raise RuntimeError(f"watchdog deployment failed on {host}")
+    stop_code, stop_output = _ssh(
+        host,
+        _engine_watchdog_identity_script(
+            host,
+            container,
+            watchdog_path,
+            start_script,
+            model,
+            startup_grace,
+            ensure_running=False,
+            inference_config=inference_config,
+        ),
+        timeout=180,
+    )
+    if stop_code:
+        raise RuntimeError(f"watchdog cleanup failed on {host}: {stop_output.strip()}")
     code, output = _ssh(
         host,
         _engine_watchdog_repair_script(watchdog_path, specs),
