@@ -20,7 +20,7 @@ trainer_failures() {
     "failures=''; for host in $TRAINER_ADDRESSES; do
        id=\${host##*.}
        state=\$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=20 \"\$host\" \\
-         \"sudo docker ps --filter name=${TRAINER_CT} --format up 2>/dev/null | head -1\" \\
+         \"sudo docker ps --filter name=^${TRAINER_CT}$ --format up 2>/dev/null | head -1\" \\
          2>/dev/null || true)
        [ \"\$state\" = up ] || failures=\"\$failures n\$id\"
      done

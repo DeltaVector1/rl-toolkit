@@ -224,16 +224,81 @@ if [ "$tunnels_only" = 0 ] && grep -q 'refusals-classifier-eval-v1' "$config_fil
   bash "$deployment/training_ops/runtime/h200/start_refusals_classifier.sh"
 fi
 
+generic_tunnel_ssh_match() {
+  local command_line=$1 via=$2 forward=$3 comp=$4 index
+  local -a command_args expected_args
+  expected_args=(
+    -NT
+    -o BatchMode=yes
+    -o ConnectTimeout=30
+    -o ExitOnForwardFailure=yes
+    -o ServerAliveInterval=10
+    -o ServerAliveCountMax=3
+    -o TCPKeepAlive=yes
+    -o IPQoS=none
+    -o Compression=$comp
+    -L "$forward"
+  )
+  read -r -a command_args <<<"$command_line"
+  case "${command_args[0]:-}" in ssh|/usr/bin/ssh) ;; *) return 1 ;; esac
+  [ "${#command_args[@]}" -eq "$(( ${#expected_args[@]} + 2 ))" ] || return 1
+  for index in "${!expected_args[@]}"; do
+    [ "${command_args[index + 1]}" = "${expected_args[index]}" ] || return 1
+  done
+  [ "${command_args[-1]}" = "$via" ]
+}
+
+generic_tunnel_supervisor_match() {
+  local command_line=$1 marker=$2 via=$3 forward=$4 comp=$5
+  case "$command_line" in *"while true; do"*"done # $marker") ;; *) return 1 ;; esac
+  [ "$(grep -o -- '-L ' <<<"$command_line" | wc -l)" -eq 1 ] || return 1
+  tunnel_command_has "$command_line" "$via" || return 1
+  tunnel_command_has "$command_line" "$forward" || return 1
+  [[ "$command_line" == *"-o Compression=$comp"* ]] || return 1
+}
+
+generic_tunnel_listener_ready() {
+  local lp=$1 marker=$2 via=$3 forward=$4 comp=$5
+  local listener pid ppid owner_command supervisor_command
+  listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":$lp" '$4 ~ port "$" {print; exit}')
+  [ -n "$listener" ] || return 1
+  pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  owner_command=$(ps -o args= -p "$pid" 2>/dev/null || true)
+  generic_tunnel_ssh_match "$owner_command" "$via" "$forward" "$comp" || return 1
+  ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  [ "$ppid" != 1 ] || return 1
+  supervisor_command=$(ps -o args= -p "$ppid" 2>/dev/null || true)
+  generic_tunnel_supervisor_match "$supervisor_command" "$marker" "$via" "$forward" "$comp" || return 1
+  timeout --signal=TERM --kill-after=1s 5 bash -c ":</dev/tcp/127.0.0.1/$lp" 2>/dev/null
+}
+
 tunnel() { # local_port  target_host:port  ssh_target  [compress]
   local lp=$1 tgt=$2 via=$3 comp=${4:-no}
-  pgrep -f -- "-L 127.0.0.1:$lp:" >/dev/null && return 0
+  local marker="zmq-tunnel-$lp" forward="127.0.0.1:$lp:$tgt"
+  local pid command_line
+  for pid in $(pgrep -f -- "$marker" || true); do
+    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    if generic_tunnel_supervisor_match "$command_line" "$marker" "$via" "$forward" "$comp" \
+      && generic_tunnel_listener_ready "$lp" "$marker" "$via" "$forward" "$comp"; then
+      return 0
+    fi
+  done
   setsid nohup bash -c "while true; do
       ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes \
           -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
           -o IPQoS=none -o Compression=$comp \
           -L 127.0.0.1:$lp:$tgt $via
       sleep 3
-    done" >/dev/null 2>&1 < /dev/null &
+    done # $marker" >/dev/null 2>&1 < /dev/null &
+  for _ in $(seq 1 30); do
+    if generic_tunnel_listener_ready "$lp" "$marker" "$via" "$forward" "$comp"; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "generic tunnel :$lp is not owned by the configured supervisor or is not usable" >&2
+  return 1
 }
 
 peer_tunnel_connection() {

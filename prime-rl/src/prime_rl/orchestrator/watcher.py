@@ -739,7 +739,7 @@ class WeightWatcher:
             if self.lora_name is not None:
                 self.last_adapter_load_time = self.last_update_weights_time
             self.update_count += 1
-            get_logger().debug(f"Updated weights to step {next_step} in {format_time(self.last_update_weights_time)}")
+            get_logger().info(f"Updated weights to step {next_step} in {format_time(self.last_update_weights_time)}")
             self.ckpt_step = next_step
             self.policy.version = next_step
             self.current_weights_path = weights_path
