@@ -235,6 +235,47 @@ class DownloadSchedulerTest(unittest.TestCase):
         ])
         self.assertTrue(all(call[1] <= filesystem._configured_chunk_timeout() for call in calls))
 
+    def test_source_check_removes_stalled_connections(self):
+        filesystem = load_filesystem_module()
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        def fake_urlopen(request, **_kwargs):
+            if "lane-2" in request.full_url:
+                raise TimeoutError("stalled")
+            return Response()
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_lanes = filesystem._adapter_source_urls
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_source_urls = lambda _source: [
+            "http://lane-1/adapter",
+            "http://lane-2/adapter",
+            "http://lane-3/adapter",
+        ]
+        try:
+            responsive, total = filesystem._responsive_adapter_source_urls(
+                "http://lane-1/adapter",
+                filesystem.time.monotonic() + 5,
+                None,
+            )
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_source_urls = old_lanes
+
+        self.assertEqual(total, 3)
+        self.assertEqual(responsive, [
+            "http://lane-1/adapter",
+            "http://lane-3/adapter",
+        ])
+
     def test_parallel_ranges_use_configured_stream_cap(self):
         filesystem = load_filesystem_module()
         payload = b"x" * (20 * 1024 * 1024)

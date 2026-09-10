@@ -1080,6 +1080,44 @@ def _metadata_source_urls(source_url: str) -> list[str]:
     return source_urls[: min(len(source_urls), _ADAPTER_LANE_RETRIES)]
 
 
+def _responsive_adapter_source_urls(
+    source_url: str,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+) -> tuple[list[str], int]:
+    """Remove source lanes that cannot reach the adapter server."""
+    source_urls = _adapter_source_urls(source_url)
+    if len(source_urls) == 1:
+        return source_urls, 1
+
+    def probe(candidate: str) -> bool:
+        parsed = urlsplit(candidate)
+        root_url = urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(root_url, method="HEAD"),
+                timeout=_request_timeout(
+                    deadline,
+                    cancel_event,
+                    maximum=_configured_chunk_timeout(),
+                ),
+            ) as response:
+                return 200 <= int(response.status) < 400
+        except OSError:
+            return False
+
+    executor = ThreadPoolExecutor(max_workers=len(source_urls))
+    try:
+        results = list(executor.map(probe, source_urls))
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    _check_deadline(deadline, cancel_event)
+    responsive = [url for url, ready in zip(source_urls, results, strict=True) if ready]
+    if not responsive:
+        raise OSError(f"none of {len(source_urls)} adapter source lanes responded")
+    return responsive, len(source_urls)
+
+
 def _read_v1_transport_chunks(
     value: dict[str, object],
     target_size: int,
@@ -3296,7 +3334,16 @@ def _stage_chunked_linear_adapter(
             "elapsed_seconds": 0.0,
         },
     )
-    lane_urls = _adapter_source_urls(source_url)
+    lane_urls, source_connection_count = _responsive_adapter_source_urls(
+        source_url,
+        deadline,
+        cancel_event,
+    )
+    status_metadata = {
+        **(status_metadata or {}),
+        "source_connections": source_connection_count,
+        "responsive_source_connections": len(lane_urls),
+    }
     output_path = temporary / _ADAPTER_FILES[1]
     config_path = temporary / _ADAPTER_FILES[0]
     config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
@@ -3894,7 +3941,16 @@ def _stage_chunked_xor_adapter(
         },
     )
 
-    lane_urls = _adapter_source_urls(source_url)
+    lane_urls, source_connection_count = _responsive_adapter_source_urls(
+        source_url,
+        deadline,
+        cancel_event,
+    )
+    status_metadata = {
+        **(status_metadata or {}),
+        "source_connections": source_connection_count,
+        "responsive_source_connections": len(lane_urls),
+    }
     output_path = temporary / _ADAPTER_FILES[1]
     config_path = temporary / _ADAPTER_FILES[0]
     _reject_symlink_path(output_path, "adapter output")
