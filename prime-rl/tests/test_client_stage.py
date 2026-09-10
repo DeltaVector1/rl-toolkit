@@ -161,6 +161,12 @@ def _load_adapter_load_function():
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names
     ]
+
+    async def cancel_and_reap(tasks):
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     namespace = {
         "AdapterIdentity": dict[str, object],
         "AsyncClient": object,
@@ -177,6 +183,7 @@ def _load_adapter_load_function():
         "wait_exponential": lambda *_args, **_kwargs: None,
         "LORA_LOAD_READ_TIMEOUT_S": 0.1,
         "LORA_LOAD_TOTAL_TIMEOUT_S": 0.1,
+        "_cancel_and_reap": cancel_and_reap,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(CLIENT_PATH), "exec"), namespace)
     return namespace["load_lora_adapter"]

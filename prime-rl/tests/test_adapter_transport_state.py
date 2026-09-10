@@ -357,8 +357,6 @@ def load_server_stage_method(stage_worker, publish_lock=None):
 
             try:
                 stdout = await asyncio.to_thread(run_stage)
-            except asyncio.CancelledError:
-                raise
             finally:
                 self.returncode = 0
                 self.finished.set()

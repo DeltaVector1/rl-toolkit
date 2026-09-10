@@ -347,6 +347,44 @@ def _sha256_entry(parent_fd: int, name: str, label: str) -> str:
     return digest.hexdigest()
 
 
+def _copy_entry_nofollow(
+    source_directory: Path,
+    source_name: str,
+    destination_directory: Path,
+    destination_name: str,
+) -> None:
+    """Copy one regular entry through held no-follow directory descriptors."""
+    source_fd = _open_directory_nofollow(
+        source_directory,
+        create=False,
+        label="cached adapter directory",
+    )
+    destination_fd = _open_directory_nofollow(
+        destination_directory,
+        create=False,
+        label="adapter partial directory",
+    )
+    input_fd = output_fd = -1
+    try:
+        input_fd = _open_nofollow(source_name, os.O_RDONLY, dir_fd=source_fd, label="cached adapter file")
+        output_fd = _open_nofollow(
+            destination_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            dir_fd=destination_fd,
+            label="adapter file",
+        )
+        with os.fdopen(input_fd, "rb") as source, os.fdopen(output_fd, "wb") as destination:
+            input_fd = output_fd = -1
+            shutil.copyfileobj(source, destination, length=16 * 1024 * 1024)
+    finally:
+        if input_fd >= 0:
+            os.close(input_fd)
+        if output_fd >= 0:
+            os.close(output_fd)
+        os.close(destination_fd)
+        os.close(source_fd)
+
+
 def _open_directory_entry_nofollow(parent_fd: int, name: str, label: str) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
@@ -574,6 +612,7 @@ def _reset_staging_directory_identity(
                     identity_name,
                     encoding="utf-8",
                     dir_fd=directory_fd,
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
                 )
             except (FileNotFoundError, OSError):
                 existing = None
@@ -1905,12 +1944,6 @@ def _relay_manifest_matches(
                 return False
         if entry_stat is None or entry_stat.st_size != size:
             return False
-        if filename in _ADAPTER_FILES and _sha256_entry(
-            directory_fd,
-            filename,
-            "adapter relay file",
-        ) != digest:
-            return False
     return True
 
 
@@ -2193,7 +2226,13 @@ def reconcile_retired_adapter(
                             or type(record.get("size")) is not int
                             or entry.st_size != record["size"]
                             or not isinstance(record.get("sha256"), str)
-                            or _sha256(Path(name), deadline, parent_fd=directory_fd) != record["sha256"]
+                            or _sha256(
+                                Path(name),
+                                deadline,
+                                cancel_event,
+                                parent_fd=directory_fd,
+                            )
+                            != record["sha256"]
                         ):
                             return False
                     if metadata(_ADAPTER_DIGEST, "ascii").strip() != files[_ADAPTER_FILES[1]]["sha256"]:
@@ -2213,16 +2252,13 @@ def reconcile_retired_adapter(
             except FileNotFoundError:
                 current_fd = None
             if current_fd is not None:
-                try:
-                    if valid(current_fd):
-                        _cleanup_retired_adapters(
-                            destination.parent,
-                            destination.name,
-                            deadline=deadline,
-                            cancel_event=cancel_event,
-                        )
-                finally:
-                    os.close(current_fd)
+                os.close(current_fd)
+                _cleanup_retired_adapters(
+                    destination.parent,
+                    destination.name,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                )
                 return
             restored = False
             prefix = f"{destination.name}.retired-"
@@ -2245,8 +2281,20 @@ def reconcile_retired_adapter(
                     continue
                 try:
                     _check_deadline(deadline, cancel_event)
-                    if valid(candidate_fd):
-                        os.replace(name, destination.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                    candidate_stat = os.fstat(candidate_fd)
+                    current_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    if (
+                        stat.S_ISDIR(candidate_stat.st_mode)
+                        and (candidate_stat.st_dev, candidate_stat.st_ino)
+                        == (current_stat.st_dev, current_stat.st_ino)
+                        and valid(candidate_fd)
+                    ):
+                        os.replace(
+                            name,
+                            destination.name,
+                            src_dir_fd=parent_fd,
+                            dst_dir_fd=parent_fd,
+                        )
                         restored = True
                         break
                 finally:
@@ -2374,9 +2422,32 @@ def _cleanup_previous_adapter_caches(
         os.close(cache_fd)
 
 
+def _cleanup_adapter_caches(
+    cache_root: Path,
+    active: Path,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    _cleanup_retired_adapters(
+        cache_root,
+        active.name,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+    _cleanup_previous_adapter_caches(
+        cache_root,
+        active,
+        deadline=deadline,
+        cancel_event=cancel_event,
+    )
+
+
 def _full_cache_matches_manifest(
     candidate: Path,
     files: dict[str, object],
+    *,
+    verify_files: bool = True,
 ) -> bool:
     """Check a READY full cache using its already-published file proof."""
     _reject_symlink_path(candidate, "cached adapter path")
@@ -2433,7 +2504,11 @@ def _full_cache_matches_manifest(
             entry = _stat_regular_entry(directory_fd, filename, "cached adapter file")
             if entry is None or entry.st_size != spec["size"]:
                 return False
-            if _sha256_entry(directory_fd, filename, "cached adapter file") != spec.get("sha256"):
+            if verify_files and _sha256_entry(
+                directory_fd,
+                filename,
+                "cached adapter file",
+            ) != spec.get("sha256"):
                 return False
         return True
     finally:
@@ -2495,8 +2570,10 @@ def _reuse_full_adapter_cache(
             if not stat.S_ISDIR(candidate_stat.st_mode):
                 raise OSError(f"cached adapter path is not a directory: {candidate}")
             with adapter_reader_lock(candidate, deadline=deadline):
-                if not _full_cache_matches_manifest(candidate, files):
+                if not _full_cache_matches_manifest(candidate, files, verify_files=False):
                     continue
+                if not _full_cache_matches_manifest(candidate, files):
+                    return False
                 _check_cancelled(cancel_event)
                 temporary = destination.with_name(f"{destination.name}.partial")
                 _reject_symlink_path(temporary, "adapter partial directory")
@@ -2528,9 +2605,7 @@ def _reuse_full_adapter_cache(
                     _write_json(temporary / "manifest.json", manifest)
                     for filename in _ADAPTER_FILES:
                         _check_cancelled(cancel_event)
-                        _reject_symlink_path(candidate / filename, "cached adapter file")
-                        _reject_symlink_path(temporary / filename, "adapter file")
-                        shutil.copyfile(candidate / filename, temporary / filename)
+                        _copy_entry_nofollow(candidate, filename, temporary, filename)
                     _publish_relay_manifest(
                         temporary,
                         source_url,
@@ -2877,12 +2952,6 @@ def _verified_adapter_base(
             "cached base adapter configuration",
         ) != config_spec["sha256"]:
             raise OSError("cached base adapter configuration bytes differ")
-        if _sha256_entry(
-            base_fd,
-            _ADAPTER_FILES[1],
-            "cached base adapter model",
-        ) != model_spec["sha256"]:
-            raise OSError("cached base adapter model bytes differ")
     finally:
         os.close(base_fd)
     _check_deadline(deadline, cancel_event)
@@ -2925,18 +2994,13 @@ def _allocated_bytes(path: Path, label: str) -> int:
 def _preflight_adapter_space(
     root: Path,
     allocations: list[tuple[Path, int]],
-    *,
-    extra_bytes: int = 0,
 ) -> None:
     """Check only bytes this stage must allocate; cached bases need no reserve."""
-    if type(extra_bytes) is not int or extra_bytes < 0:
-        raise OSError("adapter extra allocation size is invalid")
     required = 0
     for path, size in allocations:
         if type(size) is not int or size < 0:
             raise OSError(f"adapter allocation size is invalid: {path}")
         required += max(0, size - _allocated_bytes(path, "adapter staging file"))
-    required += extra_bytes
     try:
         available = shutil.disk_usage(root).free
     except OSError as exc:
@@ -3512,13 +3576,7 @@ def _stage_chunked_linear_adapter(
             if committed_event is not None:
                 committed_event.set()
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
-    _cleanup_retired_adapters(
-        destination.parent,
-        destination.name,
-        deadline=deadline,
-        cancel_event=cancel_event,
-    )
-    _cleanup_previous_adapter_caches(
+    _cleanup_adapter_caches(
         destination.parent,
         destination,
         deadline=deadline,
@@ -4021,13 +4079,7 @@ def _stage_chunked_xor_adapter(
             if committed_event is not None:
                 committed_event.set()
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
-    _cleanup_retired_adapters(
-        destination.parent,
-        destination.name,
-        deadline=deadline,
-        cancel_event=cancel_event,
-    )
-    _cleanup_previous_adapter_caches(
+    _cleanup_adapter_caches(
         destination.parent,
         destination,
         deadline=deadline,
@@ -4657,13 +4709,7 @@ def stage_lora_adapter_files(
                                 "elapsed_seconds": round(time.monotonic() - started, 3),
                             },
                         )
-                        _cleanup_retired_adapters(
-                            destination.parent,
-                            destination.name,
-                            deadline=operation_deadline,
-                            cancel_event=cancel_event,
-                        )
-                        _cleanup_previous_adapter_caches(
+                        _cleanup_adapter_caches(
                             destination.parent,
                             destination,
                             deadline=operation_deadline,
@@ -4712,6 +4758,7 @@ def stage_lora_adapter_files(
                     local_manifest == manifest
                     and isinstance(transport, dict)
                     and _relay_manifest_matches(destination, source_url, transport)
+                    and _full_cache_matches_manifest(destination, files)
                 ):
                     cache_hit = True
                     write_stage_status(
@@ -4726,13 +4773,7 @@ def stage_lora_adapter_files(
                             "verified_files": files,
                         },
                     )
-                    _cleanup_retired_adapters(
-                        destination.parent,
-                        destination.name,
-                        deadline=operation_deadline,
-                        cancel_event=cancel_event,
-                    )
-                    _cleanup_previous_adapter_caches(
+                    _cleanup_adapter_caches(
                         destination.parent,
                         destination,
                         deadline=operation_deadline,
@@ -4758,8 +4799,10 @@ def stage_lora_adapter_files(
                     status_metadata=status_metadata,
                 )
 
-            if isinstance(transport, dict) and transport.get("mode") == "full":
-                if _reuse_full_adapter_cache(
+            if (
+                isinstance(transport, dict)
+                and transport.get("mode") == "full"
+                and _reuse_full_adapter_cache(
                     source_url,
                     destination,
                     manifest,
@@ -4767,15 +4810,10 @@ def stage_lora_adapter_files(
                     cancel_event=cancel_event,
                     committed_event=committed_event,
                     deadline=operation_deadline,
-                ):
+                )
+            ):
                     total_bytes = sum(int(item["size"]) for item in files.values())
-                    _cleanup_retired_adapters(
-                        destination.parent,
-                        destination.name,
-                        deadline=operation_deadline,
-                        cancel_event=cancel_event,
-                    )
-                    _cleanup_previous_adapter_caches(
+                    _cleanup_adapter_caches(
                         destination.parent,
                         destination,
                         deadline=operation_deadline,
@@ -4929,13 +4967,7 @@ def stage_lora_adapter_files(
                     if committed_event is not None:
                         committed_event.set()
                     fcntl.flock(reader_lock, fcntl.LOCK_UN)
-            _cleanup_retired_adapters(
-                destination.parent,
-                destination.name,
-                deadline=operation_deadline,
-                cancel_event=cancel_event,
-            )
-            _cleanup_previous_adapter_caches(
+            _cleanup_adapter_caches(
                 destination.parent,
                 destination,
                 deadline=operation_deadline,
@@ -5018,7 +5050,14 @@ def _full_checkpoint_cache_is_valid(
         "full checkpoint cache entry",
     )
     try:
-        if _read_bytes_nofollow("READY", dir_fd=directory_fd) != b"ready\n":
+        if (
+            _read_bytes_nofollow(
+                "READY",
+                dir_fd=directory_fd,
+                max_bytes=_ADAPTER_MARKER_MAX_BYTES,
+            )
+            != b"ready\n"
+        ):
             return False
         try:
             cache_manifest = json.loads(
@@ -5026,6 +5065,7 @@ def _full_checkpoint_cache_is_valid(
                     _FULL_CHECKPOINT_CACHE_MANIFEST,
                     encoding="utf-8",
                     dir_fd=directory_fd,
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
                 )
             )
             index = json.loads(
@@ -5033,6 +5073,7 @@ def _full_checkpoint_cache_is_valid(
                     "model.safetensors.index.json",
                     encoding="utf-8",
                     dir_fd=directory_fd,
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
                 )
             )
         except FileNotFoundError:
@@ -5107,6 +5148,7 @@ def prune_full_checkpoint_cache(
     keep: Path,
     *,
     _cache_fd: int | None = None,
+    deadline: float | None = None,
 ) -> list[Path]:
     """Remove checkpoint directories that are older than the policy being staged."""
     removed: list[Path] = []
@@ -5125,7 +5167,17 @@ def prune_full_checkpoint_cache(
         cache_fd = _cache_fd
     keep_names = {keep.name, f"{keep.name}.partial"}
     try:
-        for name in os.listdir(cache_fd):
+        entry_count = 0
+        with os.scandir(cache_fd) as entries:
+            names = []
+            for entry in entries:
+                _check_deadline(deadline)
+                entry_count += 1
+                if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                    raise OSError("full checkpoint cache has too many entries")
+                names.append(entry.name)
+        for name in names:
+            _check_deadline(deadline)
             if name in keep_names:
                 continue
             try:
@@ -5136,7 +5188,12 @@ def prune_full_checkpoint_cache(
                 raise OSError(f"full checkpoint cache entry is a symbolic link: {name}")
             if not stat.S_ISDIR(entry_stat.st_mode):
                 continue
-            _remove_directory_entry(cache_fd, name, "full checkpoint cache entry")
+            _remove_directory_entry(
+                cache_fd,
+                name,
+                "full checkpoint cache entry",
+                deadline=deadline,
+            )
             removed.append(cache_root / name)
     finally:
         if owns_cache_fd:
@@ -5181,10 +5238,12 @@ def stage_full_checkpoint_files(source_url: str, *, download_fn=None) -> Path:
             index_name = "model.safetensors.index.json"
             used_delta = False
             try:
-                with urllib.request.urlopen(
-                    f"{source_url.rstrip('/')}/{DELTA_MANIFEST}", timeout=60
-                ) as response:
-                    delta_manifest = json.load(response)
+                delta_manifest = json.loads(
+                    _read_source_text(
+                        f"{source_url.rstrip('/')}/{DELTA_MANIFEST}",
+                        max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                    )
+                )
             except HTTPError as exc:
                 if exc.code != 404:
                     raise
@@ -5272,17 +5331,14 @@ def stage_full_checkpoint_files(source_url: str, *, download_fn=None) -> Path:
                     parent_fd=temporary_fd,
                     download_fn=download_fn,
                 )
-            with os.fdopen(
-                _open_nofollow(
+            index = json.loads(
+                _read_text_nofollow(
                     index_name,
-                    os.O_RDONLY,
+                    encoding="utf-8",
                     dir_fd=temporary_fd,
-                    label="full checkpoint index",
-                ),
-                "r",
-                encoding="utf-8",
-            ) as source:
-                index = json.load(source)
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
+            )
             if not isinstance(index, dict) or not isinstance(index.get("weight_map"), dict):
                 raise OSError("full checkpoint index has no weight map")
             raw_shard_names = list(index["weight_map"].values())
@@ -5383,6 +5439,7 @@ def stage_full_checkpoint_files(source_url: str, *, download_fn=None) -> Path:
                 destination.parent,
                 destination,
                 _cache_fd=cache_fd,
+                deadline=time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S,
             )
     finally:
         if temporary_fd >= 0:
