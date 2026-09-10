@@ -2,7 +2,10 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
+import signal
+import sys
 import threading
 import time
 import uuid
@@ -27,13 +30,11 @@ from prime_rl.configs.inference import InferenceConfig
 from prime_rl.inference.vllm.worker.filesystem import (
     _delta_stage_timeout_s,
     _adapter_step_from_source_url,
-    _adapter_stage_publish_lock,
     adapter_stage_limit_seconds,
     adapter_cache_path,
     adapter_reader_lock,
     adapter_stage_status,
     stage_full_checkpoint_files,
-    stage_lora_adapter_files,
 )
 from prime_rl.inference.patches import (
     monkey_patch_dp_coordinator_startup_timeout,
@@ -76,6 +77,7 @@ _server_instance_id = uuid.uuid4().hex
 _lora_stage_lock = threading.Lock()
 _lora_stage_count = 0
 _lora_stage_started_at: float | None = None
+_lora_stage_process: tuple[str, int] | None = None
 _engine_state_lock = threading.Lock()
 _engine_state = "running"
 
@@ -111,10 +113,45 @@ def _lora_stage_status() -> dict[str, Any]:
     with _lora_stage_lock:
         if _lora_stage_count == 0 or _lora_stage_started_at is None:
             return {"status": "idle", "age_seconds": 0.0}
-        return {
+        state = {
             "status": "staging",
             "age_seconds": round(max(0.0, time.monotonic() - _lora_stage_started_at), 3),
         }
+        if _lora_stage_process is not None:
+            state["stage_id"], state["pid"] = _lora_stage_process
+        return state
+
+
+def _set_lora_stage_process(stage_id: str, pid: int | None) -> None:
+    global _lora_stage_process
+    with _lora_stage_lock:
+        _lora_stage_process = (stage_id, pid) if pid is not None else None
+
+
+async def _kill_stage_process(process, communication=None) -> tuple[bytes, bytes]:
+    if process.returncode is None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(asyncio.shield(process.wait()), timeout=5.0)
+        except asyncio.TimeoutError:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await asyncio.wait_for(asyncio.shield(process.wait()), timeout=5.0)
+    if communication is None:
+        return b"", b""
+    if not communication.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(communication), timeout=5.0)
+        except asyncio.TimeoutError:
+            communication.cancel()
+            await asyncio.gather(communication, return_exceptions=True)
+            return b"", b""
+    return communication.result()
 
 
 def _combined_lora_stage_status(
@@ -129,6 +166,9 @@ def _combined_lora_stage_status(
         state["status"] = "staging"
         if "age_seconds" in active:
             state["age_seconds"] = active["age_seconds"]
+        for key in ("stage_id", "pid"):
+            if key in active:
+                state[key] = active[key]
         return state
     if durable_status in {"failed", "ready"}:
         state.update(durable)
@@ -377,20 +417,44 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
                     except OSError as exc:
                         return JSONResponse({"error": str(exc)}, status_code=400)
                 if not prefetched:
-                    await asyncio.to_thread(
-                        stage_lora_adapter_files,
-                        source_url,
-                        require_delta=require_delta,
-                        policy_step=policy_step,
-                        stage_timeout_seconds=(
-                            adapter_stage_limit_seconds(policy_step)
-                            if policy_step is not None
-                            else None
-                        ),
-                    )
+                    class StageRequest:
+                        async def json(self):
+                            return {
+                                "lora_path": source_url,
+                                "require_delta": require_delta,
+                                "policy_step": policy_step,
+                            }
+
+                        async def is_disconnected(self):
+                            probe = getattr(raw_request, "is_disconnected", None)
+                            return await probe() if probe is not None else False
+
+                    staged = await stage_lora_adapter(StageRequest())
+                    if not isinstance(staged, dict) or staged.get("status") != "ok":
+                        return staged
                 destination = adapter_cache_path(source_url)
                 lora_request.lora_path = destination.as_posix()
             lora_request.load_inplace = True
+            async def load_engine_adapter():
+                task = asyncio.create_task(handler.load_lora_adapter(lora_request))
+                try:
+                    done, _ = await asyncio.wait({task}, timeout=600.0)
+                    if task in done:
+                        return task.result()
+                    task.cancel()
+                    done, _ = await asyncio.wait({task}, timeout=5.0)
+                    if task in done:
+                        raise asyncio.TimeoutError
+                    _set_engine_state("unknown")
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    raise asyncio.TimeoutError
+                except asyncio.CancelledError:
+                    task.cancel()
+                    done, _ = await asyncio.wait({task}, timeout=5.0)
+                    if task not in done:
+                        _set_engine_state("unknown")
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    raise
             if remote_adapter:
                 with adapter_reader_lock(destination):
                     adapter_identity = _read_verified_adapter_identity(source_url, destination)
@@ -398,14 +462,20 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
                         _validate_adapter_target_compatibility(destination, handler)
                     except ValueError as exc:
                         return JSONResponse({"error": str(exc)}, status_code=400)
-                    response = await handler.load_lora_adapter(lora_request)
+                    try:
+                        response = await load_engine_adapter()
+                    except asyncio.TimeoutError:
+                        return JSONResponse({"error": "LoRA load timed out; server restart required"}, status_code=504)
             else:
                 _loaded_lora_receipts.pop(lora_request.lora_name, None)
                 try:
                     _validate_adapter_target_compatibility(lora_request.lora_path, handler)
                 except ValueError as exc:
                     return JSONResponse({"error": str(exc)}, status_code=400)
-                response = await handler.load_lora_adapter(lora_request)
+                try:
+                    response = await load_engine_adapter()
+                except asyncio.TimeoutError:
+                    return JSONResponse({"error": "LoRA load timed out; server restart required"}, status_code=504)
             stored = handler.lora_requests.get(lora_request.lora_name)
             if stored is not None:
                 stored.load_inplace = False
@@ -502,42 +572,44 @@ async def stage_lora_adapter(raw_request: Request):
             status_code=500,
         )
     _begin_lora_stage()
-    started = time.perf_counter()
-    cancel_event = threading.Event()
-    committed_event = threading.Event()
-    stage_task = asyncio.create_task(
-        asyncio.to_thread(
-            stage_lora_adapter_files,
-            source_url,
-            require_delta=require_delta,
-            stage_timeout_seconds=stage_timeout,
-            policy_step=policy_step,
-            cancel_event=cancel_event,
-            committed_event=committed_event,
-        )
-    )
-
-    async def monitor_disconnect() -> None:
-        while not stage_task.done():
-            if await raw_request.is_disconnected():
-                with _adapter_stage_publish_lock:
-                    if not committed_event.is_set():
-                        cancel_event.set()
-                return
-            await asyncio.sleep(0.25)
-
-    disconnect_task = asyncio.create_task(monitor_disconnect())
+    started = time.monotonic()
+    operation_timeout = stage_timeout if stage_timeout is not None else 600.0
+    deadline = started + operation_timeout
+    stage_id = uuid.uuid4().hex
+    process = None
+    communication = None
 
     def success_payload(destination):
+        if time.monotonic() > deadline:
+            state = adapter_stage_status()
+            ready_at = state.get("ready_at_monotonic")
+            if state.get("status") != "ready" or not isinstance(ready_at, (int, float)) or ready_at > deadline:
+                raise TimeoutError("adapter staging completed after its deadline")
+        if destination != adapter_cache_path(source_url):
+            raise RuntimeError("adapter stage returned an unexpected destination")
+        identity = _read_verified_adapter_identity(source_url, destination)
         stage_state = adapter_stage_status()
-        total_stage_seconds = stage_state.get("total_stage_wall_seconds")
-        if not isinstance(total_stage_seconds, (int, float)) or total_stage_seconds < 0:
-            total_stage_seconds = time.perf_counter() - started
+        if (
+            stage_state.get("status") != "ready"
+            or stage_state.get("stage_id") != stage_id
+            or stage_state.get("pid") != process.pid
+            or stage_state.get("source_url") != source_url
+            or stage_state.get("path") != destination.as_posix()
+            or stage_state.get("target_sha256") != identity.get("target_sha256")
+        ):
+            raise RuntimeError("adapter stage status identity does not match the worker")
+        if time.monotonic() > deadline:
+            ready_at = stage_state.get("ready_at_monotonic")
+            if stage_state.get("status") != "ready" or not isinstance(ready_at, (int, float)) or ready_at > deadline:
+                raise TimeoutError("adapter staging identity verification exceeded its deadline")
         payload = {
             "status": "ok",
             "path": destination.as_posix(),
-            "stage_seconds": float(total_stage_seconds),
-            "total_stage_wall_seconds": float(total_stage_seconds),
+            "stage_seconds": time.monotonic() - started,
+            "total_stage_wall_seconds": time.monotonic() - started,
+            "adapter_identity": identity,
+            "stage_id": stage_id,
+            "pid": process.pid,
         }
         if policy_step is not None:
             payload.update(
@@ -547,7 +619,6 @@ async def stage_lora_adapter(raw_request: Request):
                     "acceptance_target_seconds": 300.0,
                 }
             )
-        payload["adapter_identity"] = _read_verified_adapter_identity(source_url, destination)
         for name in (
             "transfer_wall_seconds",
             "reconstruction_wall_seconds",
@@ -562,47 +633,127 @@ async def stage_lora_adapter(raw_request: Request):
         payload["bytes_total"] = int(stage_state.get("bytes_total", 0) or 0)
         return payload
 
+    def current_commit(destination) -> bool:
+        try:
+            identity = _read_verified_adapter_identity(source_url, destination)
+            state = adapter_stage_status()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return (
+            state.get("status") == "ready"
+            and state.get("stage_id") == stage_id
+            and state.get("pid") == process.pid
+            and state.get("source_url") == source_url
+            and state.get("path") == destination.as_posix()
+            and state.get("target_sha256") == identity.get("target_sha256")
+            and isinstance(state.get("ready_at_monotonic"), (int, float))
+            and state["ready_at_monotonic"] <= deadline
+        )
+
+    async def monitor_disconnect() -> bool:
+        while process is not None and process.returncode is None:
+            if await raw_request.is_disconnected():
+                return True
+            await asyncio.sleep(0.25)
+        return False
+
+    def parse_result(stdout: bytes) -> dict[str, object]:
+        if len(stdout) > 1_000_000:
+            raise RuntimeError("adapter stage worker output is too large")
+        try:
+            text = stdout.decode("utf-8")
+            result, end = json.JSONDecoder().raw_decode(text)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("adapter stage worker returned invalid JSON") from exc
+        if text[end:].strip():
+            raise RuntimeError("adapter stage worker returned multiple JSON frames")
+        if (
+            not isinstance(result, dict)
+            or result.get("stage_id") != stage_id
+            or result.get("pid") != process.pid
+        ):
+            raise RuntimeError("adapter stage worker identity does not match the request")
+        return result
+
     try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "prime_rl.inference.vllm.adapter_stage_worker",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        )
+        _set_lora_stage_process(stage_id, process.pid)
+        request = {
+            "source_url": source_url,
+            "require_delta": require_delta,
+            "policy_step": policy_step,
+            "stage_timeout_seconds": stage_timeout if require_delta else None,
+            "stage_id": stage_id,
+        }
+        communication = asyncio.create_task(
+            process.communicate(json.dumps(request, separators=(",", ":")).encode("utf-8"))
+        )
+        disconnect_task = asyncio.create_task(monitor_disconnect())
         try:
-            destination = await asyncio.wait_for(
-                asyncio.shield(stage_task),
-                timeout=stage_timeout,
+            remaining = max(0.0, deadline - time.monotonic())
+            done, _ = await asyncio.wait(
+                (communication, disconnect_task),
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-        except asyncio.TimeoutError:
-            with _adapter_stage_publish_lock:
-                if not committed_event.is_set():
-                    cancel_event.set()
-            try:
-                destination = await stage_task
-            except BaseException:
-                destination = None
-            if committed_event.is_set() and destination is not None:
+            disconnected = disconnect_task in done and disconnect_task.result()
+            timed_out = communication not in done and not disconnected
+            if timed_out:
+                stdout, _stderr = await _kill_stage_process(process, communication)
+            elif disconnected:
+                stdout, _stderr = await _kill_stage_process(process, communication)
+                return JSONResponse({"error": "adapter stage request disconnected"}, status_code=499)
+            else:
+                stdout, _stderr = communication.result()
+            if len(_stderr) > 1_000_000:
+                raise RuntimeError("adapter stage worker stderr is too large")
+            if not stdout.strip():
+                destination = adapter_cache_path(source_url)
+                if current_commit(destination):
+                    return success_payload(destination)
+                raise TimeoutError("adapter staging worker stopped before returning a result")
+            result = parse_result(stdout)
+        finally:
+            disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
+        if result.get("status") != "ok":
+            error_type = result.get("error_type")
+            status = 504 if error_type == "TimeoutError" else 500
+            return JSONResponse({"error": result.get("error", "adapter staging failed")}, status_code=status)
+        destination = Path(str(result.get("path", "")))
+        try:
+            return success_payload(destination)
+        except TimeoutError:
+            if current_commit(destination):
                 return success_payload(destination)
-            return JSONResponse(
-                {
-                    "error": "adapter delta staging exceeded its time limit",
-                    "policy_step": policy_step,
-                    "stage_limit_seconds": stage_limit,
-                    "acceptance_target_seconds": 300.0,
-                },
-                status_code=504,
-            )
-        except asyncio.CancelledError:
-            with _adapter_stage_publish_lock:
-                if not committed_event.is_set():
-                    cancel_event.set()
-            try:
-                await stage_task
-            except BaseException:
-                pass
             raise
-        return success_payload(destination)
+    except asyncio.CancelledError:
+        if process is not None and communication is not None:
+            await _kill_stage_process(process, communication)
+        raise
+    except (TimeoutError, asyncio.TimeoutError):
+        return JSONResponse(
+            {
+                "error": "adapter delta staging exceeded its time limit",
+                "policy_step": policy_step,
+                "stage_limit_seconds": stage_limit,
+                "acceptance_target_seconds": 300.0,
+            },
+            status_code=504,
+        )
     finally:
-        disconnect_task.cancel()
-        try:
-            await disconnect_task
-        except asyncio.CancelledError:
-            pass
+        if process is not None and communication is not None and process.returncode is None:
+            await _kill_stage_process(process, communication)
+        _set_lora_stage_process(stage_id, None)
         _end_lora_stage()
 
 

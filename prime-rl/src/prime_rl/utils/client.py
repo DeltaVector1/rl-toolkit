@@ -29,6 +29,12 @@ ClientIdentity = tuple[str, str | None]
 AdapterIdentity = dict[str, object]
 
 
+async def _cancel_and_reap(tasks) -> None:
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def client_identity(client: vf.ClientConfig) -> ClientIdentity:
     """Stable identity for load balancing across inference clients."""
     return (client.base_url, client.headers.get("X-data-parallel-rank"))
@@ -472,7 +478,7 @@ ADMIN_TIMEOUT_S = 300.0
 # `/update_weights` runs a collective NCCL receive across all DP workers, which
 # can take longer than the other admin ops.
 UPDATE_WEIGHTS_TIMEOUT_S = 720.0
-FULL_CHECKPOINT_STAGE_TIMEOUT_S = 7200.0
+FULL_CHECKPOINT_STAGE_TIMEOUT_S = 600.0
 # A TP8 LoRA load can leave the engine busy after the load request has completed.
 # Keep resume separate from the shorter pause and update budgets.
 RESUME_ATTEMPT_TIMEOUT_S = 900.0
@@ -789,10 +795,13 @@ async def stage_lora_adapter(
                 if remaining <= 0:
                     raise TimeoutError("adapter delta staging exceeded its time limit")
             try:
-                return await _stage_one(
+                result = await _stage_one(
                     client,
-                    remaining_delta_seconds=remaining,
+                    remaining_delta_seconds=remaining if require_delta else None,
                 )
+                if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
+                    raise TimeoutError("adapter delta staging exceeded its time limit")
+                return result
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -816,6 +825,8 @@ async def stage_lora_adapter(
 
     started = time.perf_counter()
     configured_delta_timeout = _delta_stage_timeout_s() if require_delta else None
+    if not require_delta and delta_deadline is None:
+        delta_deadline = time.monotonic() + LORA_STAGE_TOTAL_TIMEOUT_S
     stage_limit = None
     predictive_transport = False
     if require_delta:
@@ -901,10 +912,10 @@ async def stage_lora_adapter(
         try:
             staged = await asyncio.wait_for(asyncio.gather(*tasks), timeout=remaining)
         except BaseException:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await _cancel_and_reap(tasks)
             raise
+        if time.monotonic() >= delta_deadline:
+            raise TimeoutError("adapter delta staging exceeded its time limit")
         results.extend(staged)
         position = 0
         for group in groups:
@@ -919,29 +930,39 @@ async def stage_lora_adapter(
     else:
         for group in groups:
             group_started = time.perf_counter()
+            stage_tasks = [
+                asyncio.create_task(
+                    _stage_one_with_retries(
+                        client,
+                        absolute_deadline=delta_deadline,
+                    )
+                )
+                for client in group
+            ]
             if delta_deadline is None:
-                results.extend(await asyncio.gather(*(_stage_one_with_retries(client) for client in group)))
+                try:
+                    staged = await asyncio.gather(*stage_tasks)
+                except BaseException:
+                    await _cancel_and_reap(stage_tasks)
+                    raise
             else:
                 remaining = delta_deadline - time.monotonic()
                 if remaining <= 0:
+                    await _cancel_and_reap(stage_tasks)
                     raise TimeoutError("adapter delta staging exceeded its time limit")
                 try:
-                    staged = await asyncio.wait_for(
-                        asyncio.gather(
-                            *(
-                                _stage_one_with_retries(
-                                    client,
-                                    absolute_deadline=delta_deadline,
-                                )
-                                for client in group
-                            )
-                        ),
-                        timeout=remaining,
-                    )
-                except asyncio.TimeoutError as exc:
-                    raise TimeoutError("adapter delta staging exceeded its time limit") from exc
-                results.extend(staged)
+                    staged = await asyncio.wait_for(asyncio.gather(*stage_tasks), timeout=remaining)
+                except BaseException as exc:
+                    await _cancel_and_reap(stage_tasks)
+                    if isinstance(exc, asyncio.TimeoutError):
+                        raise TimeoutError("adapter delta staging exceeded its time limit") from exc
+                    raise
+                if time.monotonic() >= delta_deadline:
+                    raise TimeoutError("adapter delta staging exceeded its time limit")
+            results.extend(staged)
             group_seconds.append(time.perf_counter() - group_started)
+    if delta_deadline is not None and time.monotonic() >= delta_deadline:
+        raise TimeoutError("adapter delta staging exceeded its time limit")
     origin_stage_seconds = group_seconds[0] if group_seconds else 0.0
     peer_stage_seconds = sum(group_seconds[1:])
     transfer_values = [
@@ -1018,7 +1039,12 @@ async def stage_full_checkpoint(admin_clients: list[AsyncClient], checkpoint_url
                 timeout_s=FULL_CHECKPOINT_STAGE_TIMEOUT_S,
             )
 
-    await asyncio.gather(*[_stage(client) for client in admin_clients])
+    tasks = [asyncio.create_task(_stage(client)) for client in admin_clients]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        await _cancel_and_reap(tasks)
+        raise
 
 
 async def update_weights(
@@ -1113,11 +1139,11 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
 # Adapter files cross the control tunnel before vLLM loads them. A rank-32 GLM
 # adapter is about 28.5 GiB, so staging needs a longer transport budget than
 # the local adapter load.
-LORA_LOAD_READ_TIMEOUT_S = 900.0
-LORA_LOAD_TOTAL_TIMEOUT_S = 1200.0
-LORA_STAGE_ATTEMPT_TIMEOUT_S = 3600.0
-LORA_STAGE_TOTAL_TIMEOUT_S = 7200.0
-default_delta_stage_timeout_s = 900.0
+LORA_LOAD_READ_TIMEOUT_S = 600.0
+LORA_LOAD_TOTAL_TIMEOUT_S = 600.0
+LORA_STAGE_ATTEMPT_TIMEOUT_S = 600.0
+LORA_STAGE_TOTAL_TIMEOUT_S = 600.0
+default_delta_stage_timeout_s = 600.0
 
 
 def adapter_stage_limit_seconds(policy_step: int) -> float:
@@ -1125,7 +1151,7 @@ def adapter_stage_limit_seconds(policy_step: int) -> float:
     if type(policy_step) is not int or policy_step <= 0:
         raise RuntimeError("adapter policy step must be a positive integer")
     if policy_step == 1:
-        return 900.0
+        return 600.0
     if policy_step == 2:
         return 600.0
     return 300.0
@@ -1265,7 +1291,12 @@ async def load_lora_adapter(
                     return receipt
             raise
 
-    results = await asyncio.gather(*[_load_lora_adapter(admin_client) for admin_client in admin_clients])
+    tasks = [asyncio.create_task(_load_lora_adapter(admin_client)) for admin_client in admin_clients]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        await _cancel_and_reap(tasks)
+        raise
     return [result for result in results if result is not None]
 
 

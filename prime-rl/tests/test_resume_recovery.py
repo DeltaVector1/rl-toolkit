@@ -42,7 +42,7 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
         ),
         "_delta_stage_timeout_s": lambda: 30.0,
         "adapter_stage_limit_seconds": lambda step: {
-            1: 900.0,
+            1: 600.0,
             2: 600.0,
         }.get(step, 300.0),
         "validate_adapter_manifest": validate_manifest,
@@ -103,7 +103,7 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
             re.fullmatch(r"step_(\d+)", Path(source_url.rstrip("/")).name).group(1)
         ),
         "adapter_stage_limit_seconds": lambda step: {
-            1: 900.0,
+            1: 600.0,
             2: 600.0,
         }.get(step, 300.0),
         "asyncio": asyncio,
@@ -123,6 +123,20 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
         "_server_instance_id": "server-a",
         "lora_load_lock": asyncio.Lock(),
     }
+    async def stage_lora_adapter(request):
+        data = await request.json()
+        destination = namespace["stage_lora_adapter_files"](
+            data["lora_path"],
+            require_delta=data.get("require_delta", False),
+            policy_step=data.get("policy_step"),
+            stage_timeout_seconds=(
+                namespace["adapter_stage_limit_seconds"](data["policy_step"])
+                if data.get("policy_step") is not None
+                else None
+            ),
+        )
+        return {"status": "ok", "path": str(destination)}
+    namespace["stage_lora_adapter"] = stage_lora_adapter
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SERVER_PATH), "exec"), namespace)
     return (
         namespace["load_lora_adapter"],
@@ -568,7 +582,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertEqual(calls, [(target_url + "/adapter_manifest.json", 300.0)])
 
     def test_resume_manifest_probe_uses_exact_policy_step_limit(self):
-        for step, expected_limit in ((1, 900.0), (2, 600.0), (3, 300.0)):
+        for step, expected_limit in ((1, 600.0), (2, 600.0), (3, 300.0)):
             with self.subTest(step=step):
                 calls = []
 
@@ -707,8 +721,8 @@ class ResumeRecoveryTest(unittest.TestCase):
                 if isinstance(node, ast.AsyncFunctionDef) and node.name == "load_lora_adapter"
             ),
         )
-        self.assertIn("await asyncio.to_thread(", load)
-        self.assertIn("stage_lora_adapter_files", load)
+        self.assertIn("await stage_lora_adapter", load)
+        self.assertNotIn("asyncio.to_thread", load)
         self.assertNotIn('collective_rpc("stage_lora_adapter"', load)
 
 

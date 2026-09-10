@@ -35,7 +35,7 @@ _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
 _MAX_DOWNLOAD_STREAMS = 128
 full_download_streams = 48
-default_delta_stage_timeout_s = 900.0
+default_delta_stage_timeout_s = 600.0
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
 _ADAPTER_DIGEST = "adapter_model.safetensors.sha256"
@@ -67,7 +67,7 @@ def adapter_stage_limit_seconds(policy_step: int) -> float:
     if type(policy_step) is not int or policy_step <= 0:
         raise OSError("adapter policy step must be a positive integer")
     if policy_step == 1:
-        return 900.0
+        return 600.0
     if policy_step == 2:
         return 600.0
     return 300.0
@@ -1806,6 +1806,20 @@ def _write_stage_status(
 ) -> None:
     # Calls can come from the range workers. The global staging flock prevents
     # cross-process stages; this lock keeps status writes ordered within one.
+    stage_id = os.environ.get("PRIME_LORA_STAGE_ID")
+    if stage_id:
+        value = {**value, "stage_id": stage_id, "pid": os.getpid()}
+    if value.get("status") == "ready":
+        value = {**value, "ready_at_monotonic": time.monotonic()}
+        try:
+            manifest = json.loads(
+                (Path(str(value["path"])) / "manifest.json").read_text(encoding="utf-8")
+            )
+            target = manifest["files"]["adapter_model.safetensors"]
+            if isinstance(target, dict) and isinstance(target.get("sha256"), str):
+                value = {**value, "target_sha256": target["sha256"]}
+        except (KeyError, OSError, TypeError, ValueError):
+            pass
     with _JSON_LOCK:
         _write_json(cache_root / _ADAPTER_STATUS, value, parent_fd=cache_fd)
 
@@ -1962,6 +1976,93 @@ def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
                 continue
     finally:
         os.close(cache_fd)
+
+
+def reconcile_retired_adapter(destination: Path, source_url: str | None = None) -> None:
+    """Restore a complete retired cache if a stage died between renames."""
+    deadline = time.monotonic() + 5.0
+    with adapter_reader_lock(destination, deadline=deadline):
+        parent_fd = _open_directory_nofollow(destination.parent, create=False, label="adapter cache")
+        try:
+            def valid(directory_fd: int) -> bool:
+                try:
+                    def metadata(name: str, encoding: str) -> str:
+                        entry = _stat_regular_entry(directory_fd, name, "adapter metadata")
+                        if entry is None or entry.st_size > 1_048_576:
+                            raise ValueError("adapter metadata is too large")
+                        return _read_text_nofollow(name, encoding=encoding, dir_fd=directory_fd)
+
+                    if metadata("READY", "ascii") != "ready\n":
+                        return False
+                    manifest = json.loads(metadata("manifest.json", "utf-8"))
+                    if not isinstance(manifest, dict) or manifest.get("version") != 1:
+                        return False
+                    if source_url is not None and manifest.get("source_url") != source_url:
+                        return False
+                    files = manifest.get("files")
+                    if not isinstance(files, dict) or set(files) != set(_ADAPTER_FILES):
+                        return False
+                    for name in _ADAPTER_FILES:
+                        record = files.get(name)
+                        entry = _stat_regular_entry(directory_fd, name, "adapter file")
+                        if (
+                            not isinstance(record, dict)
+                            or entry is None
+                            or type(record.get("size")) is not int
+                            or entry.st_size != record["size"]
+                            or not isinstance(record.get("sha256"), str)
+                            or _sha256(Path(name), deadline, parent_fd=directory_fd) != record["sha256"]
+                        ):
+                            return False
+                    if metadata(_ADAPTER_DIGEST, "ascii").strip() != files[_ADAPTER_FILES[1]]["sha256"]:
+                        return False
+                    transport = metadata("transport.json", "utf-8")
+                    transport_value = json.loads(transport)
+                    return (
+                        isinstance(transport_value, dict)
+                        and (source_url is None or transport_value.get("source_url") == source_url)
+                        and transport_value.get("target_sha256") == files[_ADAPTER_FILES[1]]["sha256"]
+                    )
+                except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+                    return False
+
+            try:
+                current_fd = _open_directory_entry_nofollow(parent_fd, destination.name, "adapter destination")
+            except FileNotFoundError:
+                current_fd = None
+            if current_fd is not None:
+                try:
+                    if valid(current_fd):
+                        _cleanup_retired_adapters(destination.parent, destination.name)
+                finally:
+                    os.close(current_fd)
+                return
+            restored = False
+            prefix = f"{destination.name}.retired-"
+            names = []
+            with os.scandir(parent_fd) as entries:
+                for entry in entries:
+                    _check_deadline(deadline)
+                    if entry.name.startswith(prefix):
+                        names.append(entry.name)
+                        if len(names) > 64:
+                            raise OSError("too many retired adapter candidates")
+            for name in sorted(names, reverse=True):
+                try:
+                    candidate_fd = _open_directory_entry_nofollow(parent_fd, name, "retired adapter")
+                except (FileNotFoundError, OSError):
+                    continue
+                try:
+                    if valid(candidate_fd):
+                        os.replace(name, destination.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                        restored = True
+                        break
+                finally:
+                    os.close(candidate_fd)
+            if restored:
+                _cleanup_retired_adapters(destination.parent, destination.name)
+        finally:
+            os.close(parent_fd)
 
 
 def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
@@ -3963,6 +4064,7 @@ def stage_lora_adapter_files(
     _check_cancelled(cancel_event)
     destination = adapter_cache_path(source_url)
     _ensure_directory(destination.parent, "adapter cache directory")
+    reconcile_retired_adapter(destination, source_url)
     _reject_symlink_path(destination, "adapter destination")
     _reject_symlink_path(
         destination.with_name(f"{destination.name}.partial"),

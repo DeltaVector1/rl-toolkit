@@ -57,8 +57,9 @@ def load_filesystem_module():
 class DownloadSchedulerTest(unittest.TestCase):
     def test_download_keeps_public_signature(self):
         filesystem = load_filesystem_module()
+        signature = str(inspect.signature(filesystem.download)).replace("pathlib._local.Path", "pathlib.Path")
         self.assertEqual(
-            str(inspect.signature(filesystem.download)),
+            signature,
             "(source_url: str, destination: pathlib.Path, *, expected_size: int | None = None, expected_sha256: str | None = None, progress=None, source_urls: list[str] | None = None, parallel_ranges: bool = True, deadline: float | None = None, cancel_event: threading.Event | None = None, per_request_timeout_seconds: float | None = None, retry_http_statuses: set[int] | None = None) -> None",
         )
         self.assertFalse(hasattr(filesystem.download, "__wrapped__"))

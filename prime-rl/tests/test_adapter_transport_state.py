@@ -10,6 +10,7 @@ import math
 import os
 import re
 import socketserver
+import signal
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ import time
 import types
 import tomllib
 import unittest
+import uuid
 from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,7 +59,7 @@ def load_watcher_delta_method(urlopen):
         "urlopen": urlopen,
         "_delta_stage_timeout_s": lambda: 30,
         "adapter_stage_limit_seconds": lambda step: {
-            1: 900.0,
+            1: 600.0,
             2: 600.0,
         }.get(step, 300.0),
         "get_broadcast_dir": lambda output_dir: output_dir,
@@ -298,18 +300,26 @@ def load_server_stage_method(stage_worker, publish_lock=None):
         def post(self, *_args, **_kwargs):
             return lambda function: function
 
+    async def reap(_process, communication=None):
+        return await communication if communication is not None else (b"", b"")
+
     namespace = {
         "asyncio": asyncio,
+        "json": json,
+        "uuid": uuid,
+        "sys": sys,
+        "os": os,
+        "signal": signal,
         "threading": threading,
         "time": time,
         "router": FakeRouter(),
         "Request": object,
         "JSONResponse": FakeJSONResponse,
-        "_delta_stage_timeout_s": lambda: 900.0,
+        "_delta_stage_timeout_s": lambda: 600.0,
         "_adapter_step_from_source_url": lambda source_url: int(
             re.fullmatch(r"step_(\d+)", Path(source_url.rstrip("/")).name).group(1)
         ),
-        "adapter_stage_limit_seconds": lambda _step: 900.0,
+        "adapter_stage_limit_seconds": lambda _step: 600.0,
         "_adapter_stage_publish_lock": publish_lock or threading.Lock(),
         "_is_finite_number": lambda value: (
             isinstance(value, (int, float))
@@ -318,6 +328,9 @@ def load_server_stage_method(stage_worker, publish_lock=None):
         ),
         "_begin_lora_stage": lambda: None,
         "_end_lora_stage": lambda: None,
+        "_set_lora_stage_process": lambda *_args: None,
+        "_kill_stage_process": reap,
+        "adapter_cache_path": lambda source_url: Path(source_url),
         "stage_lora_adapter_files": stage_worker,
         "adapter_stage_status": lambda: {},
         "_read_verified_adapter_identity": lambda source_url, _destination: {
@@ -731,10 +744,10 @@ class AdapterTransportStateTest(unittest.TestCase):
 
             self.assertEqual(result, f"{target_url}/adapter_manifest.json")
             self.assertEqual(watcher.last_adapter_delta_build_time, 2.5)
-            self.assertEqual(calls, [(f"{target_url}/adapter_manifest.json", 900.0)])
+            self.assertEqual(calls, [(f"{target_url}/adapter_manifest.json", 600.0)])
 
     def test_watcher_manifest_probe_uses_exact_policy_step_limit(self):
-        for target_step, expected_limit in ((1, 900.0), (2, 600.0), (3, 300.0)):
+        for target_step, expected_limit in ((1, 600.0), (2, 600.0), (3, 300.0)):
             with self.subTest(target_step=target_step), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 for step in range(target_step + 1):
@@ -1294,7 +1307,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         old_operations = os.environ.get("PRIME_RL_OPERATIONS_CONFIG")
         try:
             os.environ["PRIME_RL_OPERATIONS_CONFIG"] = "/missing/operations.toml"
-            self.assertEqual(filesystem._delta_stage_timeout_s(), 900.0)
+            self.assertEqual(filesystem._delta_stage_timeout_s(), 600.0)
         finally:
             if old_timeout is not None:
                 os.environ["PRIME_LORA_DELTA_STAGE_TIMEOUT_S"] = old_timeout
