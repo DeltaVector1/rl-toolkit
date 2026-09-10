@@ -838,16 +838,31 @@ def _content_length(
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> int:
-    _check_deadline(deadline, cancel_event)
-    with urllib.request.urlopen(
-        urllib.request.Request(source_url, method="HEAD"),
-        timeout=_request_timeout(deadline, cancel_event),
-    ) as response:
+    last_error: OSError | None = None
+    for candidate in _metadata_source_urls(source_url):
         _check_deadline(deadline, cancel_event)
         try:
-            return int(response.headers["Content-Length"])
-        except (TypeError, ValueError) as exc:
-            raise OSError(f"adapter source has no valid Content-Length: {source_url}") from exc
+            with urllib.request.urlopen(
+                urllib.request.Request(candidate, method="HEAD"),
+                timeout=_request_timeout(
+                    deadline,
+                    cancel_event,
+                    maximum=_configured_chunk_timeout(),
+                ),
+            ) as response:
+                _check_deadline(deadline, cancel_event)
+                try:
+                    return int(response.headers["Content-Length"])
+                except (TypeError, ValueError) as exc:
+                    raise OSError(
+                        f"adapter source has no valid Content-Length: {source_url}"
+                    ) from exc
+        except HTTPError:
+            raise
+        except OSError as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
 
 
 def _read_source_text(
@@ -874,40 +889,59 @@ def _read_source_bytes(
 ) -> bytes:
     if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
         raise ValueError("maximum read size must be non-negative")
-    _check_deadline(deadline, cancel_event)
-    with urllib.request.urlopen(
-        source_url,
-        timeout=_request_timeout(deadline, cancel_event),
-    ) as response:
-        headers = getattr(response, "headers", {})
-        content_length = headers.get("Content-Length") if hasattr(headers, "get") else None
-        if content_length is not None:
-            try:
-                content_length_value = int(content_length)
-            except (TypeError, ValueError) as exc:
-                raise OSError(f"source has an invalid Content-Length: {source_url}") from exc
-            if content_length_value < 0:
-                raise OSError(f"source has a negative Content-Length: {source_url}")
-            if max_bytes is not None and content_length_value > max_bytes:
-                raise OSError(
-                    f"source exceeds the {max_bytes}-byte read limit: {source_url}"
-                )
-        chunks = []
-        total = 0
-        while True:
-            _check_deadline(deadline, cancel_event)
-            read_size = 16 * 1024 * 1024
-            if max_bytes is not None:
-                read_size = min(read_size, max_bytes - total + 1)
-            chunk = response.read(read_size)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if max_bytes is not None and total > max_bytes:
-                raise OSError(f"source exceeds the {max_bytes}-byte read limit: {source_url}")
+    last_error: OSError | None = None
+    for candidate in _metadata_source_urls(source_url):
         _check_deadline(deadline, cancel_event)
-        return b"".join(chunks)
+        try:
+            with urllib.request.urlopen(
+                candidate,
+                timeout=_request_timeout(
+                    deadline,
+                    cancel_event,
+                    maximum=_configured_chunk_timeout(),
+                ),
+            ) as response:
+                headers = getattr(response, "headers", {})
+                content_length = (
+                    headers.get("Content-Length") if hasattr(headers, "get") else None
+                )
+                if content_length is not None:
+                    try:
+                        content_length_value = int(content_length)
+                    except (TypeError, ValueError) as exc:
+                        raise OSError(
+                            f"source has an invalid Content-Length: {source_url}"
+                        ) from exc
+                    if content_length_value < 0:
+                        raise OSError(f"source has a negative Content-Length: {source_url}")
+                    if max_bytes is not None and content_length_value > max_bytes:
+                        raise OSError(
+                            f"source exceeds the {max_bytes}-byte read limit: {source_url}"
+                        )
+                chunks = []
+                total = 0
+                while True:
+                    _check_deadline(deadline, cancel_event)
+                    read_size = 16 * 1024 * 1024
+                    if max_bytes is not None:
+                        read_size = min(read_size, max_bytes - total + 1)
+                    chunk = response.read(read_size)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if max_bytes is not None and total > max_bytes:
+                        raise OSError(
+                            f"source exceeds the {max_bytes}-byte read limit: {source_url}"
+                        )
+                _check_deadline(deadline, cancel_event)
+                return b"".join(chunks)
+        except HTTPError:
+            raise
+        except OSError as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
 
 
 def _source_manifest(
@@ -1035,6 +1069,15 @@ def _adapter_source_urls(source_url: str) -> list[str]:
             )
         )
     return source_urls
+
+
+def _metadata_source_urls(source_url: str) -> list[str]:
+    """Return a bounded set of lanes for one small adapter request."""
+    source_urls = _adapter_source_urls(source_url)
+    if source_url in source_urls:
+        start = source_urls.index(source_url)
+        source_urls = source_urls[start:] + source_urls[:start]
+    return source_urls[: min(len(source_urls), _ADAPTER_LANE_RETRIES)]
 
 
 def _read_v1_transport_chunks(

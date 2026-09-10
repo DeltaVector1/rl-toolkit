@@ -190,6 +190,51 @@ class DownloadSchedulerTest(unittest.TestCase):
         finally:
             filesystem.time.monotonic = old_monotonic
 
+    def test_metadata_read_moves_past_a_stalled_lane(self):
+        filesystem = load_filesystem_module()
+        calls = []
+
+        class Response(io.BytesIO):
+            headers = {"Content-Length": "4"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            url = request.full_url if hasattr(request, "full_url") else request
+            calls.append((url, timeout))
+            if url.startswith("http://lane-1/"):
+                raise TimeoutError("stalled")
+            return Response(b"safe")
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_lanes = filesystem._adapter_source_urls
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_source_urls = lambda _source: [
+            "http://lane-1/manifest",
+            "http://lane-2/manifest",
+        ]
+        try:
+            self.assertEqual(
+                filesystem._read_source_bytes(
+                    "http://lane-1/manifest",
+                    max_bytes=16,
+                ),
+                b"safe",
+            )
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_source_urls = old_lanes
+
+        self.assertEqual([call[0] for call in calls], [
+            "http://lane-1/manifest",
+            "http://lane-2/manifest",
+        ])
+        self.assertTrue(all(call[1] <= filesystem._configured_chunk_timeout() for call in calls))
+
     def test_parallel_ranges_use_configured_stream_cap(self):
         filesystem = load_filesystem_module()
         payload = b"x" * (20 * 1024 * 1024)
