@@ -5,9 +5,11 @@
 set -uo pipefail
 
 tunnels_only=0
+restart_tunnels=0
 for argument in "$@"; do
   case "$argument" in
     --tunnels-only) tunnels_only=1 ;;
+    --restart-tunnels) restart_tunnels=1 ;;
     *) echo "unknown launcher argument: $argument" >&2; exit 2 ;;
   esac
 done
@@ -328,7 +330,9 @@ peer_tunnel_connection() {
   [ "$connection_name" = api ] && expected_shape=api
   for pid in $(pgrep -f -- "$signature" || true); do
     command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
-    peer_tunnel_supervisor_forwards_match "$command_line" "$expected_shape" "$marker" "${forwards[@]}" && return 0
+    if peer_tunnel_supervisor_forwards_match "$command_line" "$expected_shape" "$marker" "${forwards[@]}"; then
+      [ "${restart_tunnels:-0}" = 0 ] && return 0
+    fi
     peer_kill_owned "$pid" "$command_line"
   done
   setsid nohup bash -c "while true; do
@@ -825,7 +829,9 @@ china_tunnel_connection() {
   marker="china-tunnel-$connection_name"
   for pid in $(pgrep -f -- "$marker" || true); do
     command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
-    china_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${forwards[@]}" && return 0
+    if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${forwards[@]}"; then
+      [ "${restart_tunnels:-0}" = 0 ] && return 0
+    fi
   done
   china_tunnel_remove_legacy "$marker" "${forwards[@]}"
   setsid nohup bash -c "while true; do

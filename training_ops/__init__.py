@@ -4601,7 +4601,7 @@ def _repair_adapter_tunnels(config_dir: str | None = None) -> str:
         f"ORCH_CONFIG={shlex.quote(f'{remote_repo}/{orchestrator_config}')} "
         f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
         f"TRAINER_CT={shlex.quote(trainer_container)} ORCH_CT={shlex.quote(orchestrator_container)} "
-        f"bash {shlex.quote(orchestrator_launcher)} --tunnels-only"
+        f"bash {shlex.quote(orchestrator_launcher)} --restart-tunnels --tunnels-only"
     )
     code, output = _ssh(orchestrator_host, command, timeout=180)
     if code:
