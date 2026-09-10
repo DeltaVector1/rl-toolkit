@@ -6,7 +6,9 @@ import hashlib
 import json
 import mimetypes
 import re
+import socket
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -52,6 +54,8 @@ class RelayIndex:
 _relay_index_cache_lock = threading.Lock()
 _relay_index_cache: dict[str, tuple[tuple[object, ...], RelayIndex]] = {}
 _MAX_RELAY_INDEX_CACHE_ENTRIES = 8
+relay_socket_idle_timeout_seconds = 30.0
+relay_reader_lock_timeout_seconds = 5.0
 
 
 class RelayConfig:
@@ -139,7 +143,16 @@ def reader_lock(cache_path: Path):
     except OSError as exc:
         raise RelayRequestError(404, "adapter reader lock is unavailable") from exc
     with lock:
-        fcntl.flock(lock, fcntl.LOCK_SH)
+        deadline = time.monotonic() + relay_reader_lock_timeout_seconds
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RelayRequestError(503, "adapter reader lock is busy") from exc
+                time.sleep(min(0.05, remaining))
         try:
             yield
         finally:
@@ -482,6 +495,10 @@ def _byte_range(value: str | None, size: int) -> tuple[int, int, int]:
 class RelayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(relay_socket_idle_timeout_seconds)
+
     def _error(self, error: RelayRequestError) -> None:
         body = f"{error.message}\n".encode("utf-8")
         self.send_response(error.status)
@@ -533,6 +550,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._serve()
         except RelayRequestError as error:
             self._error(error)
+        except socket.timeout:
+            self.close_connection = True
         except (BrokenPipeError, ConnectionResetError):
             return
 
@@ -541,6 +560,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._serve()
         except RelayRequestError as error:
             self._error(error)
+        except socket.timeout:
+            self.close_connection = True
 
     def log_message(self, _format: str, *_args: object) -> None:
         return

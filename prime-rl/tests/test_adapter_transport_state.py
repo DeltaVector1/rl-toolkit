@@ -1170,7 +1170,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertIn("executor.shutdown(wait=True, cancel_futures=True)", worker_source)
         self.assertIn("_cleanup_delta_stage_artifacts(", worker_source)
         self.assertIn("preserve_partial=_preserve_adapter_stage_partial(exc)", worker_source)
-        self.assertIn("deadline=delta_deadline", worker_source)
+        self.assertIn("deadline=operation_deadline", worker_source)
         self.assertIn("asyncio.wait_for(", server.read_text(encoding="utf-8"))
         watcher_source = watcher.read_text(encoding="utf-8")
         self.assertIn('manifest.get("version") != 1', watcher_source)
@@ -1238,6 +1238,36 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertFalse(cleanup.is_alive())
             self.assertEqual(result, [True])
             self.assertFalse(partial.exists())
+
+    def test_reader_lock_deadline_does_not_wait_behind_writer(self):
+        filesystem = load_filesystem_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "adapter"
+            lock_path = filesystem._adapter_reader_lock(destination)
+            lock_path.touch()
+            with lock_path.open("a+") as writer:
+                filesystem.fcntl.flock(writer, filesystem.fcntl.LOCK_EX)
+                with self.assertRaisesRegex(TimeoutError, "exceeded its time limit"):
+                    with filesystem.adapter_reader_lock(
+                        destination,
+                        deadline=time.monotonic() + 0.01,
+                    ):
+                        pass
+                filesystem.fcntl.flock(writer, filesystem.fcntl.LOCK_UN)
+
+    def test_publish_lock_deadline_does_not_wait_behind_reader(self):
+        filesystem = load_filesystem_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = Path(temporary) / "adapter.lock"
+            with lock_path.open("a+") as reader:
+                filesystem.fcntl.flock(reader, filesystem.fcntl.LOCK_SH)
+                with lock_path.open("a+") as writer:
+                    with self.assertRaisesRegex(TimeoutError, "exceeded its time limit"):
+                        filesystem._acquire_stage_lock(
+                            writer,
+                            time.monotonic() + 0.01,
+                        )
+                filesystem.fcntl.flock(reader, filesystem.fcntl.LOCK_UN)
 
     def test_download_stream_count_is_required_and_bounded(self):
         filesystem = load_filesystem_module()
@@ -1316,7 +1346,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temporary:
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
                 filesystem._delta_stage_timeout_s = lambda: 900.0
-                filesystem._cleanup_delta_stage_artifacts = lambda *_args, **_kwargs: None
+                filesystem._cleanup_delta_stage_artifacts = lambda *_args, **_kwargs: True
                 for step, limit in ((2, 600.0), (3, 300.0)):
                     deadlines = []
 

@@ -1856,8 +1856,9 @@ def _adapter_reader_lock(path: Path) -> Path:
 
 
 @contextmanager
-def adapter_reader_lock(path: Path):
+def adapter_reader_lock(path: Path, *, deadline: float | None = None):
     """Hold a shared lease while vLLM reads an adapter from the cache."""
+    deadline = deadline or (time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S)
     lock_path = _adapter_reader_lock(path)
     parent_fd = _open_directory_nofollow(
         lock_path.parent,
@@ -1874,7 +1875,16 @@ def adapter_reader_lock(path: Path):
             ),
             "a+",
         ) as lock:
-            fcntl.flock(lock, fcntl.LOCK_SH)
+            while True:
+                _check_deadline(deadline)
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("adapter reader lock acquisition exceeded its time limit")
+                    time.sleep(min(0.1, remaining))
             try:
                 yield path
             finally:
@@ -2064,8 +2074,10 @@ def _reuse_full_adapter_cache(
     *,
     cancel_event: threading.Event | None = None,
     committed_event: threading.Event | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """Publish a new URL entry from one verified local full cache."""
+    deadline = deadline or (time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S)
     if transport.get("mode") != "full":
         return False
     source_manifest = transport.get("source_manifest")
@@ -2089,7 +2101,7 @@ def _reuse_full_adapter_cache(
             continue
         if not stat.S_ISDIR(candidate_stat.st_mode):
             raise OSError(f"cached adapter path is not a directory: {candidate}")
-        with adapter_reader_lock(candidate):
+        with adapter_reader_lock(candidate, deadline=deadline):
             if not _full_cache_matches_manifest(candidate, files):
                 continue
             _check_cancelled(cancel_event)
@@ -2123,6 +2135,7 @@ def _reuse_full_adapter_cache(
                     source_manifest,
                     transport,
                     files,
+                    deadline=deadline,
                     cancel_event=cancel_event,
                 )
                 model_sha256 = files[_ADAPTER_FILES[1]]["sha256"]
@@ -2141,7 +2154,7 @@ def _reuse_full_adapter_cache(
                         ),
                         "a+",
                     ) as reader_lock:
-                        _acquire_stage_lock(reader_lock, None, cancel_event)
+                        _acquire_stage_lock(reader_lock, deadline, cancel_event)
                         if _path_stat(destination, "adapter destination") is not None:
                             retired = destination.with_name(
                                 f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}"
@@ -2235,9 +2248,10 @@ def _download_range(
             if entry_stat is None or entry_stat.st_size != size:
                 raise OSError(f"incomplete adapter range: {destination.name}")
             return
-        except TimeoutError:
-            raise
         except OSError:
+            # socket.timeout is retryable; only the absolute stage deadline
+            # remains terminal.
+            _check_deadline(deadline, cancel_event)
             if attempt + 1 == _ADAPTER_LANE_RETRIES:
                 raise
             sleep_for = min(2**attempt, 10)
@@ -2473,6 +2487,37 @@ def _preallocate(path: Path, size: int) -> None:
         os.close(parent_fd)
 
 
+def _allocated_bytes(path: Path, label: str) -> int:
+    entry_stat = _path_stat(path, label)
+    if entry_stat is None:
+        return 0
+    blocks = getattr(entry_stat, "st_blocks", None)
+    if blocks is None:
+        return entry_stat.st_size
+    return max(0, int(blocks)) * 512
+
+
+def _preflight_adapter_space(
+    root: Path,
+    allocations: list[tuple[Path, int]],
+) -> None:
+    """Check only bytes this stage must allocate; cached bases need no reserve."""
+    required = 0
+    for path, size in allocations:
+        if type(size) is not int or size < 0:
+            raise OSError(f"adapter allocation size is invalid: {path}")
+        required += max(0, size - _allocated_bytes(path, "adapter staging file"))
+    try:
+        available = shutil.disk_usage(root).free
+    except OSError as exc:
+        raise OSError(f"adapter staging free-space check failed: {root}") from exc
+    if available < required:
+        raise OSError(
+            f"insufficient adapter staging space: need {required} bytes, "
+            f"have {available} bytes free"
+        )
+
+
 def _pwrite_all(file_descriptor: int, value: bytes, offset: int) -> None:
     written = 0
     while written < len(value):
@@ -2647,16 +2692,52 @@ def _stage_chunked_linear_adapter(
     )
     lane_urls = _adapter_source_urls(source_url)
     output_path = temporary / _ADAPTER_FILES[1]
+    config_path = temporary / _ADAPTER_FILES[0]
+    config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
     _reject_symlink_path(output_path, "adapter output")
+    _reject_symlink_path(config_path, "adapter configuration file")
+    _reject_symlink_path(config_incoming_path, "adapter configuration incoming file")
+    chunk_allocations: list[tuple[Path, int]] = []
+    for item in chunks:
+        chunk_path = chunk_root / Path(str(item["file"])).name
+        incoming_path = chunk_path.with_name(f".{chunk_path.name}.incoming")
+        _reject_symlink_path(chunk_path, "adapter transport chunk")
+        _reject_symlink_path(incoming_path, "adapter chunk incoming file")
+        wire_size = int(item["wire_size"])
+        reusable = False
+        for proof_path, completed in (
+            (_proof_path(chunk_path, _COMPLETED_SUFFIX), True),
+            (_proof_path(chunk_path, _WIRE_READY_SUFFIX), False),
+        ):
+            proof_valid, _ = _proof_identity_matches(
+                proof_path, item, completed=completed
+            )
+            if not proof_valid:
+                continue
+            try:
+                reusable = (
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event)
+                    == str(item["wire_sha256"])
+                )
+            except (FileNotFoundError, OSError):
+                reusable = False
+            if reusable:
+                break
+        if not reusable:
+            # The old final wire file remains until incoming is atomically
+            # renamed over it, so reserve the incoming allocation as peak use.
+            chunk_allocations.append((incoming_path, wire_size))
+    _preflight_adapter_space(
+        temporary,
+        [(output_path, target_size), (config_incoming_path, config_size)]
+        + chunk_allocations,
+    )
     if _path_regular_size(output_path, "adapter output") != target_size:
         _preallocate(output_path, target_size)
 
     # Publish configuration atomically before the relay index. The peer must
     # never observe a relay index that points at an unfinished config file.
-    config_path = temporary / _ADAPTER_FILES[0]
-    config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
-    _reject_symlink_path(config_path, "adapter configuration file")
-    _reject_symlink_path(config_incoming_path, "adapter configuration incoming file")
     download(
         f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
         config_incoming_path,
@@ -2716,9 +2797,18 @@ def _stage_chunked_linear_adapter(
             completed_path, item, completed=True
         )
         if completed_valid:
-            # The final file checksum validates all resumed regions together.
-            _discard_proof(wire_ready_path)
-            return
+            try:
+                completed_valid = (
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                )
+            except (FileNotFoundError, OSError):
+                completed_valid = False
+            if completed_valid:
+                # The final file checksum validates all resumed regions together.
+                _discard_proof(wire_ready_path)
+                return
+            _discard_proof(completed_path)
         if _path_stat(completed_path, "adapter completed proof") is not None:
             _discard_proof(completed_path)
 
@@ -3149,7 +3239,16 @@ def _stage_chunked_xor_adapter(
 
     lane_urls = _adapter_source_urls(source_url)
     output_path = temporary / _ADAPTER_FILES[1]
+    config_path = temporary / _ADAPTER_FILES[0]
     _reject_symlink_path(output_path, "adapter output")
+    _reject_symlink_path(config_path, "adapter configuration file")
+    allocations = [(output_path, target_size)] + [
+        (chunk_root / Path(str(item["file"])).name, int(item["wire_size"]))
+        for item in chunks
+    ]
+    if isinstance(config_size, int):
+        allocations.append((config_path, config_size))
+    _preflight_adapter_space(temporary, allocations)
     if _path_regular_size(output_path, "adapter output") != target_size:
         _preallocate(output_path, target_size)
 
@@ -3276,8 +3375,6 @@ def _stage_chunked_xor_adapter(
     if _path_regular_size(output_path, "adapter output") != target_size:
         raise OSError("reconstructed adapter size mismatch")
 
-    config_path = temporary / _ADAPTER_FILES[0]
-    _reject_symlink_path(config_path, "adapter configuration file")
     download(
         f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
         config_path,
@@ -3785,6 +3882,7 @@ def stage_lora_adapter_files(
         if configured_delta_timeout is not None
         else None
     )
+    operation_deadline = delta_deadline or (started + default_delta_stage_timeout_s)
     # The cache is shared by all replicas on this host. One global writer is
     # intentional: per-URL writers caused old policies to queue behind one
     # another and made it possible to publish a stale policy after a newer one.
@@ -3797,19 +3895,19 @@ def stage_lora_adapter_files(
         _open_nofollow(host_lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC),
         "w",
     ) as host_lock:
-        _acquire_stage_lock(host_lock, delta_deadline, cancel_event)
+        _acquire_stage_lock(host_lock, operation_deadline, cancel_event)
         transport: dict[str, object] | None = None
         try:
             if require_delta:
                 transport = _read_delta_manifest_with_visibility_wait(
                     source_url,
-                    deadline=delta_deadline,
+                    deadline=operation_deadline,
                     cancel_event=cancel_event,
                 )
             else:
                 transport = _read_chunked_xor_manifest(
                     source_url,
-                    deadline=delta_deadline,
+                    deadline=operation_deadline,
                     cancel_event=cancel_event,
                 )
             if require_delta:
@@ -3825,12 +3923,10 @@ def stage_lora_adapter_files(
                 and transport.get("mode") == "delta"
             ):
                 delta_deadline = time.monotonic() + _delta_stage_timeout_s()
+                operation_deadline = delta_deadline
             manifest = _source_manifest(
                 source_url,
-                deadline=delta_deadline
-                if require_delta
-                or (transport is not None and transport.get("mode") == "delta")
-                else None,
+                deadline=operation_deadline,
                 cancel_event=cancel_event,
             )
             files = manifest["files"]
@@ -3894,7 +3990,7 @@ def stage_lora_adapter_files(
                         ) is not None
                         and _sha256(
                             destination / _ADAPTER_FILES[1],
-                            delta_deadline,
+                            operation_deadline,
                             cancel_event,
                         )
                         == transport["target_sha256"]
@@ -3904,7 +4000,7 @@ def stage_lora_adapter_files(
                         ) is not None
                         and _sha256(
                             destination / _ADAPTER_FILES[0],
-                            delta_deadline,
+                            operation_deadline,
                             cancel_event,
                         )
                         == transport["config_sha256"]
@@ -3927,13 +4023,13 @@ def stage_lora_adapter_files(
                             with _adapter_stage_publish_lock:
                                 committed_event.set()
                         return destination
-                _check_deadline(delta_deadline, cancel_event)
+                _check_deadline(operation_deadline, cancel_event)
                 if transport.get("transport") == _ADAPTER_LINEAR_TRANSPORT:
                     return _stage_chunked_linear_adapter(
                         source_url,
                         transport,
                         manifest,
-                        deadline=delta_deadline,
+                        deadline=operation_deadline,
                         cancel_event=cancel_event,
                         committed_event=committed_event,
                         status_metadata=status_metadata,
@@ -3943,7 +4039,7 @@ def stage_lora_adapter_files(
                         source_url,
                         transport,
                         manifest,
-                        deadline=delta_deadline,
+                        deadline=operation_deadline,
                         cancel_event=cancel_event,
                         committed_event=committed_event,
                         status_metadata=status_metadata,
@@ -3993,7 +4089,7 @@ def stage_lora_adapter_files(
                     source_url,
                     transport,
                     manifest,
-                    deadline=delta_deadline,
+                    deadline=operation_deadline,
                     cancel_event=cancel_event,
                     committed_event=committed_event,
                     status_metadata=status_metadata,
@@ -4007,6 +4103,7 @@ def stage_lora_adapter_files(
                     transport,
                     cancel_event=cancel_event,
                     committed_event=committed_event,
+                    deadline=operation_deadline,
                 ):
                     total_bytes = sum(int(item["size"]) for item in files.values())
                     _cleanup_retired_adapters(destination.parent, destination.name)
@@ -4087,6 +4184,7 @@ def stage_lora_adapter_files(
                         expected_sha256=expected_sha256 if isinstance(expected_sha256, str) else None,
                         progress=report,
                         cancel_event=cancel_event,
+                        deadline=operation_deadline,
                         stream_cap=full_download_streams,
                         parent_fd=temporary_fd,
                     )
@@ -4113,6 +4211,7 @@ def stage_lora_adapter_files(
                 source_transport_manifest,
                 transport,
                 files,
+                deadline=operation_deadline,
                 cancel_event=cancel_event,
             )
             model_digest = files[_ADAPTER_FILES[1]].get("sha256")
@@ -4135,7 +4234,7 @@ def stage_lora_adapter_files(
                     _open_nofollow(_adapter_reader_lock(destination), os.O_RDWR | os.O_CREAT),
                     "a+",
                 ) as reader_lock:
-                    _acquire_stage_lock(reader_lock, None, cancel_event)
+                    _acquire_stage_lock(reader_lock, operation_deadline, cancel_event)
                     _check_cancelled(cancel_event)
                     if _path_stat(destination, "adapter destination") is not None:
                         retired = destination.with_name(
@@ -4164,12 +4263,35 @@ def stage_lora_adapter_files(
             if require_delta or (
                 isinstance(transport, dict) and transport.get("mode") in {"delta", "full"}
             ):
-                _cleanup_delta_stage_artifacts(
-                    destination,
-                    preserve_partial=_preserve_adapter_stage_partial(exc),
-                    deadline=time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S,
-                    cancel_event=threading.Event(),
-                )
+                cleanup_failure: BaseException | None = None
+                try:
+                    cleaned = _cleanup_delta_stage_artifacts(
+                        destination,
+                        preserve_partial=_preserve_adapter_stage_partial(exc),
+                        deadline=time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S,
+                        cancel_event=threading.Event(),
+                    )
+                    if not cleaned:
+                        cleanup_failure = OSError("adapter staging cleanup timed out")
+                except BaseException as cleanup_exc:
+                    cleanup_failure = cleanup_exc
+                if cleanup_failure is not None:
+                    write_stage_status(
+                        {
+                            "status": "failed",
+                            "source_url": source_url,
+                            "path": destination.as_posix(),
+                            "error": (
+                                f"{type(exc).__name__}: {exc}; cleanup failed: "
+                                f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+                            ),
+                            "updated_at": time.time(),
+                            "elapsed_seconds": round(time.monotonic() - started, 3),
+                        },
+                    )
+                    raise OSError(
+                        f"adapter staging cleanup failed: {cleanup_failure}"
+                    ) from exc
             write_stage_status(
                 {
                     "status": "failed",
