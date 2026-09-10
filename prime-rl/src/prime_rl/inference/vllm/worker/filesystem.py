@@ -608,6 +608,29 @@ def _check_deadline(
         raise TimeoutError("adapter delta staging exceeded its time limit")
 
 
+def _check_stage_cleanup(
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+    committed_event: threading.Event | None,
+) -> None:
+    if committed_event is not None and committed_event.is_set():
+        _check_deadline(_stage_cleanup_deadline(None, committed_event), cancel_event)
+    else:
+        _check_deadline(deadline, cancel_event)
+
+
+def _stage_cleanup_deadline(
+    deadline: float | None,
+    committed_event: threading.Event | None,
+) -> float | None:
+    if committed_event is not None and committed_event.is_set():
+        committed_at = getattr(committed_event, "committed_at", None)
+        if isinstance(committed_at, (int, float)):
+            return committed_at + _ADAPTER_CLEANUP_TIMEOUT_S
+        return time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S
+    return deadline
+
+
 def _acquire_stage_lock(
     lock,
     deadline: float | None,
@@ -1883,7 +1906,13 @@ def adapter_reader_lock(path: Path):
         os.close(parent_fd)
 
 
-def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
+def _cleanup_retired_adapters(
+    cache_root: Path,
+    active_name: str,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
     prefix = f"{active_name}.retired-"
     try:
         cache_fd = _open_directory_nofollow(
@@ -1895,6 +1924,7 @@ def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
         return
     try:
         for name in os.listdir(cache_fd):
+            _check_deadline(deadline, cancel_event)
             if not name.startswith(prefix):
                 continue
             try:
@@ -1907,6 +1937,7 @@ def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
                 continue
             lock_name = f".{active_name}.readers.lock"
             try:
+                _check_deadline(deadline, cancel_event)
                 lock_fd = _open_nofollow(
                     lock_name,
                     os.O_RDWR | os.O_CREAT,
@@ -1914,6 +1945,7 @@ def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
                 )
                 with os.fdopen(lock_fd, "a+") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _check_deadline(deadline, cancel_event)
                     _remove_directory_entry(cache_fd, name, "retired adapter path")
                     fcntl.flock(lock, fcntl.LOCK_UN)
             except (BlockingIOError, FileNotFoundError):
@@ -1922,7 +1954,13 @@ def _cleanup_retired_adapters(cache_root: Path, active_name: str) -> None:
         os.close(cache_fd)
 
 
-def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
+def _cleanup_previous_adapter_caches(
+    cache_root: Path,
+    active: Path,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
     """Remove old adapters while retaining the active predecessor."""
     try:
         cache_fd = _open_directory_nofollow(
@@ -1937,6 +1975,7 @@ def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
         active_name = active.name
         ready_candidates: list[str] = []
         for name in os.listdir(cache_fd):
+            _check_deadline(deadline, cancel_event)
             if name == active_name or re.fullmatch(r"[0-9a-f]{64}", name) is None:
                 continue
             try:
@@ -1986,6 +2025,7 @@ def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
                     keep.add(predecessor_name)
 
         for name in ready_candidates:
+            _check_deadline(deadline, cancel_event)
             if name in keep:
                 continue
             try:
@@ -1997,6 +2037,7 @@ def _cleanup_previous_adapter_caches(cache_root: Path, active: Path) -> None:
                 )
                 with os.fdopen(lock_fd, "a+") as reader_lock:
                     fcntl.flock(reader_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _check_deadline(deadline, cancel_event)
                     _remove_directory_entry(cache_fd, name, "cached adapter path")
                     fcntl.flock(reader_lock, fcntl.LOCK_UN)
             except (BlockingIOError, FileNotFoundError):
@@ -2604,7 +2645,9 @@ def _stage_chunked_linear_adapter(
     last_status = 0.0
 
     def write_stage_status(value: dict[str, object]) -> None:
+        _check_stage_cleanup(deadline, cancel_event, committed_event)
         _write_stage_status(destination.parent, {**value, **(status_metadata or {})})
+        _check_stage_cleanup(deadline, cancel_event, committed_event)
 
     def report(lane: int, amount: int) -> None:
         nonlocal progress_bytes, last_status
@@ -2905,8 +2948,18 @@ def _stage_chunked_linear_adapter(
             if committed_event is not None:
                 committed_event.set()
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
-    _cleanup_retired_adapters(destination.parent, destination.name)
-    _cleanup_previous_adapter_caches(destination.parent, destination)
+    _cleanup_retired_adapters(
+        destination.parent,
+        destination.name,
+        deadline=_stage_cleanup_deadline(deadline, committed_event),
+        cancel_event=cancel_event,
+    )
+    _cleanup_previous_adapter_caches(
+        destination.parent,
+        destination,
+        deadline=_stage_cleanup_deadline(deadline, committed_event),
+        cancel_event=cancel_event,
+    )
     with reconstruct_lock:
         total_reconstruct_seconds = reconstruct_seconds
     write_stage_status(
@@ -2979,6 +3032,7 @@ def _cleanup_delta_stage_artifacts(
                 return False
             try:
                 for name, is_directory in existing_entries:
+                    _check_deadline(deadline, cancel_event)
                     if is_directory:
                         _remove_directory_entry(cache_fd, name, "adapter staging path")
                     else:
@@ -3109,7 +3163,9 @@ def _stage_chunked_xor_adapter(
     last_status = 0.0
 
     def write_stage_status(value: dict[str, object]) -> None:
+        _check_stage_cleanup(deadline, cancel_event, committed_event)
         _write_stage_status(destination.parent, {**value, **(status_metadata or {})})
+        _check_stage_cleanup(deadline, cancel_event, committed_event)
 
     def report(lane: int, amount: int) -> None:
         nonlocal progress_bytes, last_status
@@ -3332,8 +3388,18 @@ def _stage_chunked_xor_adapter(
             if committed_event is not None:
                 committed_event.set()
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
-    _cleanup_retired_adapters(destination.parent, destination.name)
-    _cleanup_previous_adapter_caches(destination.parent, destination)
+    _cleanup_retired_adapters(
+        destination.parent,
+        destination.name,
+        deadline=_stage_cleanup_deadline(deadline, committed_event),
+        cancel_event=cancel_event,
+    )
+    _cleanup_previous_adapter_caches(
+        destination.parent,
+        destination,
+        deadline=_stage_cleanup_deadline(deadline, committed_event),
+        cancel_event=cancel_event,
+    )
     write_stage_status(
         {
             "status": "ready",
@@ -3791,7 +3857,9 @@ def stage_lora_adapter_files(
     host_lock_path = destination.parent / "adapter-staging.lock"
 
     def write_stage_status(value: dict[str, object]) -> None:
+        _check_stage_cleanup(delta_deadline, cancel_event, committed_event)
         _write_stage_status(destination.parent, {**value, **status_metadata})
+        _check_stage_cleanup(delta_deadline, cancel_event, committed_event)
 
     with os.fdopen(
         _open_nofollow(host_lock_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC),
@@ -3921,8 +3989,18 @@ def stage_lora_adapter_files(
                                 "elapsed_seconds": round(time.monotonic() - started, 3),
                             },
                         )
-                        _cleanup_retired_adapters(destination.parent, destination.name)
-                        _cleanup_previous_adapter_caches(destination.parent, destination)
+                        _cleanup_retired_adapters(
+                            destination.parent,
+                            destination.name,
+                            deadline=_stage_cleanup_deadline(delta_deadline, committed_event),
+                            cancel_event=cancel_event,
+                        )
+                        _cleanup_previous_adapter_caches(
+                            destination.parent,
+                            destination,
+                            deadline=_stage_cleanup_deadline(delta_deadline, committed_event),
+                            cancel_event=cancel_event,
+                        )
                         if committed_event is not None:
                             with _adapter_stage_publish_lock:
                                 committed_event.set()
@@ -3977,8 +4055,18 @@ def stage_lora_adapter_files(
                             "elapsed_seconds": round(time.monotonic() - started, 3),
                         },
                     )
-                    _cleanup_retired_adapters(destination.parent, destination.name)
-                    _cleanup_previous_adapter_caches(destination.parent, destination)
+                    _cleanup_retired_adapters(
+                        destination.parent,
+                        destination.name,
+                        deadline=_stage_cleanup_deadline(delta_deadline, committed_event),
+                        cancel_event=cancel_event,
+                    )
+                    _cleanup_previous_adapter_caches(
+                        destination.parent,
+                        destination,
+                        deadline=_stage_cleanup_deadline(delta_deadline, committed_event),
+                        cancel_event=cancel_event,
+                    )
                     if committed_event is not None:
                         with _adapter_stage_publish_lock:
                             committed_event.set()
@@ -4009,8 +4097,18 @@ def stage_lora_adapter_files(
                     committed_event=committed_event,
                 ):
                     total_bytes = sum(int(item["size"]) for item in files.values())
-                    _cleanup_retired_adapters(destination.parent, destination.name)
-                    _cleanup_previous_adapter_caches(destination.parent, destination)
+                    _cleanup_retired_adapters(
+                        destination.parent,
+                        destination.name,
+                        deadline=_stage_cleanup_deadline(delta_deadline, committed_event),
+                        cancel_event=cancel_event,
+                    )
+                    _cleanup_previous_adapter_caches(
+                        destination.parent,
+                        destination,
+                        deadline=_stage_cleanup_deadline(delta_deadline, committed_event),
+                        cancel_event=cancel_event,
+                    )
                     write_stage_status(
                         {
                             "status": "ready",
@@ -4146,8 +4244,18 @@ def stage_lora_adapter_files(
                     if committed_event is not None:
                         committed_event.set()
                     fcntl.flock(reader_lock, fcntl.LOCK_UN)
-            _cleanup_retired_adapters(destination.parent, destination.name)
-            _cleanup_previous_adapter_caches(destination.parent, destination)
+            _cleanup_retired_adapters(
+                destination.parent,
+                destination.name,
+                deadline=_stage_cleanup_deadline(delta_deadline, committed_event),
+                cancel_event=cancel_event,
+            )
+            _cleanup_previous_adapter_caches(
+                destination.parent,
+                destination,
+                deadline=_stage_cleanup_deadline(delta_deadline, committed_event),
+                cancel_event=cancel_event,
+            )
             write_stage_status(
                 {
                     "status": "ready",
@@ -4164,22 +4272,31 @@ def stage_lora_adapter_files(
             if require_delta or (
                 isinstance(transport, dict) and transport.get("mode") in {"delta", "full"}
             ):
+                cleanup_deadline = _stage_cleanup_deadline(delta_deadline, committed_event)
+                if cleanup_deadline is None:
+                    cleanup_deadline = time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S
+                cleanup_event = cancel_event or threading.Event()
                 _cleanup_delta_stage_artifacts(
                     destination,
                     preserve_partial=_preserve_adapter_stage_partial(exc),
-                    deadline=time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S,
-                    cancel_event=threading.Event(),
+                    deadline=cleanup_deadline,
+                    cancel_event=cleanup_event,
                 )
-            write_stage_status(
-                {
-                    "status": "failed",
-                    "source_url": source_url,
-                    "path": destination.as_posix(),
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "updated_at": time.time(),
-                    "elapsed_seconds": round(time.monotonic() - started, 3),
-                },
-            )
+            try:
+                _write_stage_status(
+                    destination.parent,
+                    {
+                        "status": "failed",
+                        "source_url": source_url,
+                        "path": destination.as_posix(),
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "updated_at": time.time(),
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        **status_metadata,
+                    },
+                )
+            except BaseException:
+                pass
             raise
 
 

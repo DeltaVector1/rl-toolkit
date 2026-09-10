@@ -771,10 +771,13 @@ async def stage_lora_adapter(
                 if remaining <= 0:
                     raise TimeoutError("adapter delta staging exceeded its time limit")
             try:
-                return await _stage_one(
+                result = await _stage_one(
                     client,
                     remaining_delta_seconds=remaining,
                 )
+                if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
+                    raise TimeoutError("adapter delta staging exceeded its time limit")
+                return result
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -887,6 +890,8 @@ async def stage_lora_adapter(
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
+        if time.monotonic() >= delta_deadline:
+            raise TimeoutError("adapter delta staging exceeded its time limit")
         results.extend(staged)
         position = 0
         for group in groups:
@@ -901,29 +906,45 @@ async def stage_lora_adapter(
     else:
         for group in groups:
             group_started = time.perf_counter()
+            stage_tasks = [
+                asyncio.create_task(
+                    _stage_one_with_retries(
+                        client,
+                        absolute_deadline=delta_deadline,
+                    )
+                )
+                for client in group
+            ]
             if delta_deadline is None:
-                results.extend(await asyncio.gather(*(_stage_one_with_retries(client) for client in group)))
+                try:
+                    staged = await asyncio.gather(*stage_tasks)
+                except BaseException:
+                    for task in stage_tasks:
+                        task.cancel()
+                    await asyncio.gather(*stage_tasks, return_exceptions=True)
+                    raise
             else:
                 remaining = delta_deadline - time.monotonic()
                 if remaining <= 0:
+                    for task in stage_tasks:
+                        task.cancel()
+                    await asyncio.gather(*stage_tasks, return_exceptions=True)
                     raise TimeoutError("adapter delta staging exceeded its time limit")
                 try:
-                    staged = await asyncio.wait_for(
-                        asyncio.gather(
-                            *(
-                                _stage_one_with_retries(
-                                    client,
-                                    absolute_deadline=delta_deadline,
-                                )
-                                for client in group
-                            )
-                        ),
-                        timeout=remaining,
-                    )
-                except asyncio.TimeoutError as exc:
-                    raise TimeoutError("adapter delta staging exceeded its time limit") from exc
-                results.extend(staged)
+                    staged = await asyncio.wait_for(asyncio.gather(*stage_tasks), timeout=remaining)
+                except BaseException as exc:
+                    for task in stage_tasks:
+                        task.cancel()
+                    await asyncio.gather(*stage_tasks, return_exceptions=True)
+                    if isinstance(exc, asyncio.TimeoutError):
+                        raise TimeoutError("adapter delta staging exceeded its time limit") from exc
+                    raise
+                if time.monotonic() >= delta_deadline:
+                    raise TimeoutError("adapter delta staging exceeded its time limit")
+            results.extend(staged)
             group_seconds.append(time.perf_counter() - group_started)
+    if delta_deadline is not None and time.monotonic() >= delta_deadline:
+        raise TimeoutError("adapter delta staging exceeded its time limit")
     origin_stage_seconds = group_seconds[0] if group_seconds else 0.0
     peer_stage_seconds = sum(group_seconds[1:])
     wire_stage_seconds = time.perf_counter() - started
@@ -973,7 +994,14 @@ async def stage_full_checkpoint(admin_clients: list[AsyncClient], checkpoint_url
                 timeout_s=FULL_CHECKPOINT_STAGE_TIMEOUT_S,
             )
 
-    await asyncio.gather(*[_stage(client) for client in admin_clients])
+    tasks = [asyncio.create_task(_stage(client)) for client in admin_clients]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def update_weights(
@@ -1220,7 +1248,14 @@ async def load_lora_adapter(
                     return receipt
             raise
 
-    results = await asyncio.gather(*[_load_lora_adapter(admin_client) for admin_client in admin_clients])
+    tasks = [asyncio.create_task(_load_lora_adapter(admin_client)) for admin_client in admin_clients]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     return [result for result in results if result is not None]
 
 

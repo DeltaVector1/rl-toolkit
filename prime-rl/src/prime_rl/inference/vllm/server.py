@@ -503,8 +503,18 @@ async def stage_lora_adapter(raw_request: Request):
         )
     _begin_lora_stage()
     started = time.perf_counter()
+    stage_deadline = time.monotonic() + stage_timeout if stage_timeout is not None else None
     cancel_event = threading.Event()
-    committed_event = threading.Event()
+
+    class CommitEvent(threading.Event):
+        committed_at: float | None = None
+
+        def set(self):
+            if self.committed_at is None:
+                self.committed_at = time.monotonic()
+            super().set()
+
+    committed_event = CommitEvent()
     stage_task = asyncio.create_task(
         asyncio.to_thread(
             stage_lora_adapter_files,
@@ -548,6 +558,32 @@ async def stage_lora_adapter(raw_request: Request):
             payload["reconstruct_seconds"] = float(stage_state["reconstruct_seconds"])
         return payload
 
+    def timeout_response(*, cleanup_pending: bool = False):
+        payload = {
+            "error": "adapter delta staging exceeded its time limit",
+            "policy_step": policy_step,
+            "stage_limit_seconds": stage_limit,
+            "acceptance_target_seconds": 300.0,
+        }
+        if committed_event.is_set():
+            payload["committed"] = True
+        if cleanup_pending:
+            payload["cleanup_pending"] = True
+        return JSONResponse(
+            payload,
+            status_code=504,
+        )
+
+    post_commit_cleanup_timeout_s = (
+        min(30.0, max(1.0, stage_timeout)) if stage_timeout is not None else 30.0
+    )
+
+    def committed_within_deadline() -> bool:
+        if stage_deadline is None:
+            return True
+        committed_at = committed_event.committed_at
+        return committed_at is not None and committed_at < stage_deadline
+
     try:
         try:
             destination = await asyncio.wait_for(
@@ -555,33 +591,66 @@ async def stage_lora_adapter(raw_request: Request):
                 timeout=stage_timeout,
             )
         except asyncio.TimeoutError:
+            if stage_task.done():
+                try:
+                    destination = stage_task.result()
+                except asyncio.TimeoutError:
+                    return timeout_response()
+                except BaseException:
+                    raise
+                if (
+                    committed_event.is_set()
+                    and committed_within_deadline()
+                ):
+                    return success_payload(destination)
+                return timeout_response()
             with _adapter_stage_publish_lock:
                 if not committed_event.is_set():
                     cancel_event.set()
+            cleanup_pending = False
             try:
-                destination = await stage_task
+                destination = await asyncio.wait_for(
+                    asyncio.shield(stage_task),
+                    timeout=post_commit_cleanup_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                cleanup_pending = True
+                cancel_event.set()
+                try:
+                    destination = await stage_task
+                except BaseException:
+                    destination = None
             except BaseException:
                 destination = None
-            if committed_event.is_set() and destination is not None:
+            if (
+                committed_event.is_set()
+                and destination is not None
+                and committed_within_deadline()
+            ):
                 return success_payload(destination)
-            return JSONResponse(
-                {
-                    "error": "adapter delta staging exceeded its time limit",
-                    "policy_step": policy_step,
-                    "stage_limit_seconds": stage_limit,
-                    "acceptance_target_seconds": 300.0,
-                },
-                status_code=504,
-            )
+            if cleanup_pending:
+                return timeout_response(cleanup_pending=True)
+            return timeout_response()
         except asyncio.CancelledError:
             with _adapter_stage_publish_lock:
                 if not committed_event.is_set():
                     cancel_event.set()
             try:
-                await stage_task
+                await asyncio.wait_for(
+                    asyncio.shield(stage_task),
+                    timeout=post_commit_cleanup_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                cancel_event.set()
+                try:
+                    await stage_task
+                except BaseException:
+                    pass
             except BaseException:
                 pass
             raise
+        if not committed_within_deadline():
+            return timeout_response()
         return success_payload(destination)
     finally:
         disconnect_task.cancel()
