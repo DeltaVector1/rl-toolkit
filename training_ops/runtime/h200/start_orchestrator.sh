@@ -1008,10 +1008,9 @@ if [ "$tunnels_only" = 1 ]; then
   readiness_port=""
   for _ in $(seq 1 30); do
     tunnels_ready=1
-    for port in "${lora_source_ports[@]}"; do
-      port_index=$((port - lora_source_ports[0]))
-      lane_number=$((port_index / china_lane_size))
-      lane_start=$((lane_number * china_lane_size))
+    lane_start=0
+    while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
+      lane_number=$((lane_start / china_lane_size))
       lane_ports=("${lora_source_ports[@]:lane_start:china_lane_size}")
       lane_forwards=()
       for lane_port in "${lane_ports[@]}"; do
@@ -1020,13 +1019,14 @@ if [ "$tunnels_only" = 1 ]; then
         )
       done
       listener_status=0
-      tunnel_listener_ready "$port" "china-tunnel-lora-$lane_number" \
+      tunnel_listener_ready "${lane_ports[0]}" "china-tunnel-lora-$lane_number" \
         "$trainer_ssh_target" "${#lane_ports[@]}" "${lane_forwards[@]}" || listener_status=$?
       if [ "$listener_status" -ne 0 ]; then
         tunnels_ready=0
-        readiness_port=$port
+        readiness_port=${lane_ports[0]}
         break
       fi
+      lane_start=$((lane_start + china_lane_size))
     done
     if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ]; then
       listener_status=0
