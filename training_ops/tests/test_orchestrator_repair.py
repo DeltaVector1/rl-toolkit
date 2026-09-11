@@ -88,6 +88,8 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('china_tunnel_remove_orphan_children "${forwards[@]}"', source)
         self.assertIn('old adapter tunnel ports did not clear for $marker', source)
         self.assertIn('china_tunnel_remove_orphan_children "${china_legacy_cleanup_ports[@]}"', source)
+        self.assertIn('china_tunnel_remove_all_owned', source)
+        self.assertIn('done < <(ps -eo pid=,args=)', source)
         self.assertLess(mode_start, docker_start)
 
     def test_orchestrator_prepares_broadcast_steps_for_appuser(self):

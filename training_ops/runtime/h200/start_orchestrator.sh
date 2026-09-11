@@ -328,13 +328,15 @@ peer_tunnel_connection() {
   peer_target=$(printf '%q' "$peer_ssh_user@$peer_host")
   marker="peer-tunnel-$connection_name"
   [ "$connection_name" = api ] && expected_shape=api
-  for pid in $(pgrep -f -- "$signature" || true); do
-    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
-    if peer_tunnel_supervisor_forwards_match "$command_line" "$expected_shape" "$marker" "${forwards[@]}"; then
-      [ "${restart_tunnels:-0}" = 0 ] && return 0
-    fi
-    peer_kill_owned "$pid" "$command_line"
-  done
+  if [ "${restart_tunnels:-0}" = 0 ]; then
+    for pid in $(pgrep -f -- "$signature" || true); do
+      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      if peer_tunnel_supervisor_forwards_match "$command_line" "$expected_shape" "$marker" "${forwards[@]}"; then
+        return 0
+      fi
+      peer_kill_owned "$pid" "$command_line"
+    done
+  fi
   setsid nohup bash -c "while true; do
       ssh$ssh_text$forward_text $peer_target
       sleep 3
@@ -458,28 +460,17 @@ peer_tunnel_group_safe() {
 
 peer_tunnel_remove_legacy() {
   local keep_current=${1:-0}
-  local api_signature="-L 127.0.0.1:$peer_api_port:127.0.0.1:8000"
-  local reverse_signature pid command_line lora_source_port
-  for pid in $(pgrep -f -- "$api_signature" || true); do
-    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+  local pid command_line
+  while read -r pid command_line; do
     peer_tunnel_supervisor_match "$command_line" cleanup || continue
-    case "$command_line" in *"$api_signature"*) ;; *) continue ;; esac
-    [ "$keep_current" = 1 ] && continue
-    peer_kill_owned "$pid" "$command_line"
-    sleep 1
-  done
-  for lora_source_port in "${lora_source_ports[@]}"; do
-    reverse_signature="-R 127.0.0.1:${lora_source_port}:"
-    for pid in $(pgrep -f -- "$reverse_signature" || true); do
-      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
-      peer_tunnel_supervisor_match "$command_line" cleanup || continue
-      case "$command_line" in *"$reverse_signature"*) ;; *) continue ;; esac
-      if [ "$keep_current" = 1 ]; then
-        peer_tunnel_supervisor_match "$command_line" current && continue
+    if [ "$keep_current" = 1 ]; then
+      if peer_tunnel_supervisor_match "$command_line" api \
+          || peer_tunnel_supervisor_match "$command_line" current; then
+        continue
       fi
-      peer_kill_owned "$pid" "$command_line"
-    done
-  done
+    fi
+    peer_kill_owned "$pid" "$command_line"
+  done < <(ps -eo pid=,args=)
 }
 
 peer_kill_owned() {
@@ -727,8 +718,9 @@ china_tunnel_ssh_child_match() {
 }
 
 china_tunnel_remove_orphan_children() {
-  local requested source_port listener pid ppid seen_pid
+  local requested source_port listener state receive_queue send_queue local_address remote_address details pid ppid seen_pid
   local -a requested_ports=() listener_pids=()
+  local -A requested_port=()
   for requested in "$@"; do
     case "$requested" in
       127.0.0.1:*:127.0.0.1:*)
@@ -740,28 +732,33 @@ china_tunnel_remove_orphan_children() {
   done
   [ "${#requested_ports[@]}" -gt 0 ] || requested_ports=("${lora_source_ports[@]}")
   for source_port in "${requested_ports[@]}"; do
-    while IFS= read -r listener; do
-      pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
-      case "$pid" in ''|*[!0-9]*) continue ;; esac
-      seen_pid=0
-      for listener_pid in "${listener_pids[@]}"; do
-        [ "$listener_pid" = "$pid" ] && seen_pid=1
-      done
-      [ "$seen_pid" = 0 ] || continue
-      ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-      [ "$ppid" = 1 ] || continue
-      china_tunnel_ssh_child_match "$pid" || continue
-      listener_pids+=("$pid")
-      china_legacy_cleanup_required=1
-      china_legacy_cleanup_pids+=("$pid")
-      china_legacy_cleanup_orphan_pids+=("$pid")
-      case " ${china_legacy_cleanup_ports[*]} " in
-        *" $source_port "*) ;;
-        *) china_legacy_cleanup_ports+=("$source_port") ;;
-      esac
-      kill "$pid" 2>/dev/null || true
-    done < <(ss -H -ltnp 2>/dev/null | awk -v local_port="127.0.0.1:$source_port" '$4 == local_port')
+    requested_port[$source_port]=1
   done
+  while IFS= read -r listener; do
+    read -r state receive_queue send_queue local_address remote_address details <<<"$listener"
+    [ "${local_address%:*}" = "127.0.0.1" ] || continue
+    source_port=${local_address##*:}
+    [ -n "${requested_port[$source_port]+set}" ] || continue
+    pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    seen_pid=0
+    for listener_pid in "${listener_pids[@]}"; do
+      [ "$listener_pid" = "$pid" ] && seen_pid=1
+    done
+    [ "$seen_pid" = 0 ] || continue
+    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ "$ppid" = 1 ] || continue
+    china_tunnel_ssh_child_match "$pid" || continue
+    listener_pids+=("$pid")
+    china_legacy_cleanup_required=1
+    china_legacy_cleanup_pids+=("$pid")
+    china_legacy_cleanup_orphan_pids+=("$pid")
+    case " ${china_legacy_cleanup_ports[*]} " in
+      *" $source_port "*) ;;
+      *) china_legacy_cleanup_ports+=("$source_port") ;;
+    esac
+    kill "$pid" 2>/dev/null || true
+  done < <(ss -H -ltnp 2>/dev/null)
 }
 
 china_tunnel_ports_clear() {
@@ -783,9 +780,49 @@ china_tunnel_ports_clear() {
   done
 }
 
+china_tunnel_stop_supervisor() {
+  local pid=$1 command_line=$2 expected_marker=${3:-} pgid forward source_port
+  local -a owned_forwards=()
+  mapfile -t owned_forwards < <(grep -oE -- '-L 127\.0\.0\.1:[0-9]+:127\.0\.0\.1:[0-9]+' <<<"$command_line")
+  [ "${#owned_forwards[@]}" -gt 0 ] || return 1
+  china_legacy_cleanup_required=1
+  china_legacy_cleanup_pids+=("$pid")
+  for forward in "${owned_forwards[@]}"; do
+    source_port=${forward#-L 127.0.0.1:}
+    source_port=${source_port%%:*}
+    case " ${china_legacy_cleanup_ports[*]} " in
+      *" $source_port "*) ;;
+      *) china_legacy_cleanup_ports+=("$source_port") ;;
+    esac
+  done
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  case "$pgid" in
+    ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
+    *)
+      case " ${china_legacy_cleanup_pgids[*]} " in
+        *" $pgid "*) ;;
+        *) china_legacy_cleanup_pgids+=("$pgid") ;;
+      esac
+      if china_tunnel_group_safe "$pgid" "$expected_marker"; then
+        kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+      else
+        kill "$pid" 2>/dev/null || true
+      fi
+      ;;
+  esac
+}
+
+china_tunnel_remove_all_owned() {
+  local pid command_line
+  while read -r pid command_line; do
+    china_tunnel_supervisor_match "$command_line" cleanup || continue
+    china_tunnel_stop_supervisor "$pid" "$command_line"
+  done < <(ps -eo pid=,args=)
+}
+
 china_tunnel_remove_legacy() {
   local only_marker=${1:-}
-  local lora_source_port pattern pid command_line pgid cleanup_port
+  local lora_source_port pattern pid command_line cleanup_port
   local grouped_legacy
   local -a cleanup_ports=()
   for cleanup_port in "${@:2}"; do
@@ -810,34 +847,9 @@ china_tunnel_remove_legacy() {
         china_tunnel_grouped_legacy_match "$command_line" || continue
         grouped_legacy=1
       fi
-      pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
       if [ "$grouped_legacy" = 1 ]; then
-        china_legacy_cleanup_required=1
-        china_legacy_cleanup_pids+=("$pid")
-        case " ${china_legacy_cleanup_ports[*]} " in
-          *" $lora_source_port "*) ;;
-          *) china_legacy_cleanup_ports+=("$lora_source_port") ;;
-        esac
-        case "$pgid" in
-          ''|*[!0-9]*|0|1) ;;
-          *)
-            case " ${china_legacy_cleanup_pgids[*]} " in
-              *" $pgid "*) ;;
-              *) china_legacy_cleanup_pgids+=("$pgid") ;;
-            esac
-            ;;
-        esac
+        china_tunnel_stop_supervisor "$pid" "$command_line" "$only_marker"
       fi
-      case "$pgid" in
-        ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
-        *)
-          if china_tunnel_group_safe "$pgid" "$only_marker"; then
-            kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-          else
-            kill "$pid" 2>/dev/null || true
-          fi
-          ;;
-      esac
     done
   done
 }
@@ -895,25 +907,27 @@ china_tunnel_connection() {
   ssh_text=$(printf ' %q' "${ssh_args[@]}")
   target=$(printf '%q' "$trainer_ssh_target")
   marker="china-tunnel-$connection_name"
-  for pid in $(pgrep -f -- "$marker" || true); do
-    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
-    if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${forwards[@]}"; then
-      [ "${restart_tunnels:-0}" = 0 ] && return 0
+  if [ "${restart_tunnels:-0}" = 0 ]; then
+    for pid in $(pgrep -f -- "$marker" || true); do
+      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${forwards[@]}"; then
+        return 0
+      fi
+    done
+    china_tunnel_remove_legacy "$marker" "${forwards[@]}"
+    ports_clear=0
+    for _ in $(seq 1 10); do
+      china_tunnel_remove_orphan_children "${forwards[@]}"
+      if china_tunnel_ports_clear "${forwards[@]}"; then
+        ports_clear=1
+        break
+      fi
+      sleep 1
+    done
+    if [ "$ports_clear" != 1 ]; then
+      echo "old adapter tunnel ports did not clear for $marker" >&2
+      return 1
     fi
-  done
-  china_tunnel_remove_legacy "$marker" "${forwards[@]}"
-  ports_clear=0
-  for _ in $(seq 1 10); do
-    china_tunnel_remove_orphan_children "${forwards[@]}"
-    if china_tunnel_ports_clear "${forwards[@]}"; then
-      ports_clear=1
-      break
-    fi
-    sleep 1
-  done
-  if [ "$ports_clear" != 1 ]; then
-    echo "old adapter tunnel ports did not clear for $marker" >&2
-    return 1
   fi
   setsid nohup bash -c "while true; do
       ssh$ssh_text$forward_text $target
@@ -922,7 +936,10 @@ china_tunnel_connection() {
 }
 
 peer_tunnel() {
-  peer_tunnel_remove_legacy "$peer_enabled"
+  local peer_keep_current
+  peer_keep_current=$peer_enabled
+  [ "$restart_tunnels" = 1 ] && peer_keep_current=0
+  peer_tunnel_remove_legacy "$peer_keep_current"
   [ "$peer_enabled" = 1 ] || return 0
   peer_tunnel_connection "api" \
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
@@ -957,7 +974,11 @@ china_legacy_cleanup_pids=()
 china_legacy_cleanup_pgids=()
 china_legacy_cleanup_orphan_pids=()
 china_legacy_cleanup_ports=()
-china_tunnel_remove_legacy
+if [ "$restart_tunnels" = 1 ]; then
+  china_tunnel_remove_all_owned
+else
+  china_tunnel_remove_legacy
+fi
 china_tunnel_remove_orphan_children
 if [ "$china_legacy_cleanup_required" = 1 ] && ! china_tunnel_wait_legacy_clear; then
   exit 1
