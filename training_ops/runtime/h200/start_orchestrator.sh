@@ -843,8 +843,9 @@ china_tunnel_remove_legacy() {
 }
 
 china_tunnel_wait_legacy_clear() {
-  local pid pgid group_processes source_port listener_remaining
+  local pid pgid group_processes listener_remaining
   for wait_cycle in $(seq 1 30); do
+    china_tunnel_remove_orphan_children "${china_legacy_cleanup_ports[@]}"
     if [ "$wait_cycle" -eq 15 ]; then
       for pid in "${china_legacy_cleanup_orphan_pids[@]}"; do
         china_tunnel_ssh_child_match "$pid" && kill -KILL "$pid" 2>/dev/null || true
@@ -864,14 +865,6 @@ china_tunnel_wait_legacy_clear() {
           listener_remaining=1
           break
         }
-      done
-    fi
-    if [ "$listener_remaining" = 0 ]; then
-      for source_port in "${china_legacy_cleanup_ports[@]}"; do
-        if ss -H -ltn 2>/dev/null | awk -v port=":$source_port" '$4 ~ port "$" {found=1} END {exit !found}'; then
-          listener_remaining=1
-          break
-        fi
       done
     fi
     [ "$listener_remaining" = 0 ] && return 0
