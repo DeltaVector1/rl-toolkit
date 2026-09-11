@@ -237,6 +237,7 @@ class DownloadSchedulerTest(unittest.TestCase):
 
     def test_source_check_removes_stalled_connections(self):
         filesystem = load_filesystem_module()
+        requests = []
 
         class Response:
             status = 200
@@ -248,6 +249,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 return None
 
         def fake_urlopen(request, **_kwargs):
+            requests.append(request)
             if "lane-2" in request.full_url:
                 raise TimeoutError("stalled")
             return Response()
@@ -275,6 +277,9 @@ class DownloadSchedulerTest(unittest.TestCase):
             "http://lane-1/adapter",
             "http://lane-3/adapter",
         ])
+        self.assertTrue(
+            all(request.full_url.endswith("/adapter_config.json") for request in requests)
+        )
 
     def test_parallel_ranges_use_configured_stream_cap(self):
         filesystem = load_filesystem_module()

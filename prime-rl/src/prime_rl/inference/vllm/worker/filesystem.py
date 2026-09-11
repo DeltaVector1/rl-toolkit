@@ -1092,11 +1092,10 @@ def _responsive_adapter_source_urls(
         return source_urls, 1
 
     def probe(candidate: str) -> bool:
-        parsed = urlsplit(candidate)
-        root_url = urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+        config_url = f"{candidate.rstrip('/')}/{_ADAPTER_FILES[0]}"
         try:
             with urllib.request.urlopen(
-                urllib.request.Request(root_url, method="HEAD"),
+                urllib.request.Request(config_url, method="HEAD"),
                 timeout=_request_timeout(
                     deadline,
                     cancel_event,
