@@ -167,6 +167,11 @@ def _combined_lora_stage_status(
     active_status = active.get("status")
     durable_status = durable.get("status")
     if active_status == "staging":
+        if (
+            active.get("stage_id") != durable.get("stage_id")
+            or active.get("pid") != durable.get("pid")
+        ):
+            return state
         state.update(durable)
         state["status"] = "staging"
         if "age_seconds" in active:

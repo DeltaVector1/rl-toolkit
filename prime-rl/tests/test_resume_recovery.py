@@ -717,12 +717,17 @@ class ResumeRecoveryTest(unittest.TestCase):
         combine = namespace["_combined_lora_stage_status"]
 
         active = combine(
-            {"status": "staging", "age_seconds": 3.5},
-            {"status": "failed", "error": "old transfer"},
+            {"status": "staging", "age_seconds": 3.5, "stage_id": "new", "pid": 20},
+            {"status": "failed", "stage_id": "new", "pid": 20, "error": "current transfer"},
         )
         self.assertEqual(active["status"], "staging")
         self.assertEqual(active["age_seconds"], 3.5)
-        self.assertEqual(active["error"], "old transfer")
+        self.assertEqual(active["error"], "current transfer")
+        stale = combine(
+            {"status": "staging", "age_seconds": 1.0, "stage_id": "new", "pid": 20},
+            {"status": "failed", "stage_id": "old", "pid": 10, "error": "old transfer"},
+        )
+        self.assertEqual(stale, {"status": "staging", "age_seconds": 1.0, "stage_id": "new", "pid": 20})
         self.assertEqual(
             combine({"status": "idle", "age_seconds": 0.0}, {"status": "ready"})["status"],
             "ready",
