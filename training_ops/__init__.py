@@ -5927,9 +5927,14 @@ copy_one() {{
   done
   return 1
 }}
-fail=0
+pids=()
 for target in {target_addresses}; do
-  copy_one "$target" || fail=1
+  copy_one "$target" &
+  pids+=("$!")
+done
+fail=0
+for pid in "${{pids[@]}}"; do
+  wait "$pid" || fail=1
 done
 exit "$fail"
 """
@@ -6662,6 +6667,10 @@ exit 1
         _cold_adapter_cache_cleanup(initial_adapter_identity)
     launch_adapter()
     if mode == "cold":
+        launch_orch()
+        wait_for_orchestrator_control()
+        launch_trainer()
+    elif resume_adapter is not None:
         launch_orch()
         wait_for_orchestrator_control()
         launch_trainer()
