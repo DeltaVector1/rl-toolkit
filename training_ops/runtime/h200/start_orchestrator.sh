@@ -343,7 +343,7 @@ peer_tunnel_connection() {
 
 peer_tunnel_forward_shape() {
   local command_line=$1 shape=$2
-  local forward_total spec source_port
+  local forward_total spec source_port destination_port
   local -a specs seen=()
   forward_total=$(grep -o -- '-[LR] ' <<<"$command_line" | wc -l)
   case "$shape:$forward_total" in
@@ -354,9 +354,17 @@ peer_tunnel_forward_shape() {
   [ "${#specs[@]}" -eq "$forward_total" ] || return 1
   for spec in "${specs[@]}"; do
     case "$spec" in
-      -R\ 127.0.0.1:*:127.0.0.1:"$relay_port")
+      -R\ 127.0.0.1:*:127.0.0.1:*)
         source_port=${spec#-R 127.0.0.1:}
         source_port=${source_port%%:*}
+        destination_port=${spec##*:}
+        case "$destination_port" in
+          ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$destination_port" -ge 1 ] && [ "$destination_port" -le 65535 ] || return 1
+        if [ "$shape" != cleanup ] && [ "$destination_port" != "$relay_port" ]; then
+          return 1
+        fi
         case " ${lora_source_ports[*]} " in
           *" $source_port "*) ;;
           *) return 1 ;;
@@ -491,18 +499,48 @@ peer_kill_owned() {
 }
 
 peer_remote_ports_ready() {
-  local probe_seconds=${1:-5} peer_target remote_ports port
+  local probe_seconds=${1:-10} peer_target verified_ports
   peer_target=$(printf '%q' "$peer_ssh_user@$peer_host")
-  if ! remote_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
+  if ! verified_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
       ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout="$probe_seconds" \
       -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
       -o IPQoS=none -i "$peer_ssh_identity" -p "$peer_ssh_port" \
-      "$peer_target" "ss -H -ltn | awk '{print \$4}'" 2>/dev/null); then
+      "$peer_target" "python3 - ${lora_source_ports[0]} ${lora_source_ports[-1]}" 2>/dev/null <<'PY'
+import http.client
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+first = int(sys.argv[1])
+last = int(sys.argv[2])
+
+
+def is_relay(port):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    try:
+        connection.request("GET", "/adapter-relay-status")
+        response = connection.getresponse()
+        body = response.read()
+        if response.status != 404 or body != b"source URL is not configured\n":
+            return port
+    except OSError:
+        return port
+    finally:
+        connection.close()
+    return None
+
+
+ports = list(range(first, last + 1))
+with ThreadPoolExecutor(max_workers=min(32, len(ports))) as executor:
+    failed = [port for port in executor.map(is_relay, ports) if port is not None]
+if failed:
+    print("wrong adapter relay ports: " + ",".join(map(str, failed)), file=sys.stderr)
+    raise SystemExit(1)
+print(len(ports))
+PY
+  ); then
     return 1
   fi
-  for port in "${lora_source_ports[@]}"; do
-    printf '%s\n' "$remote_ports" | grep -Eq "([.:])$port$" || return 1
-  done
+  [ "$verified_ports" = "${#lora_source_ports[@]}" ]
 }
 
 tunnel_command_has() {
@@ -950,7 +988,7 @@ if [ "$tunnels_only" = 1 ]; then
   if [ "$peer_enabled" = 1 ]; then
     remote_ready=0
     for _ in $(seq 1 10); do
-      if peer_remote_ports_ready 5; then
+      if peer_remote_ports_ready 10; then
         remote_ready=1
         break
       fi

@@ -83,6 +83,8 @@ class OrchestratorRepairTest(unittest.TestCase):
         docker_start = source.index("sudo docker", mode_start)
         self.assertIn("unknown launcher argument", source)
         self.assertIn("adapter tunnel reconciliation did not establish", source)
+        self.assertIn('if [ "$shape" != cleanup ] && [ "$destination_port" != "$relay_port" ]', source)
+        self.assertIn('body != b"source URL is not configured\\n"', source)
         self.assertLess(mode_start, docker_start)
 
     def test_orchestrator_prepares_broadcast_steps_for_appuser(self):
