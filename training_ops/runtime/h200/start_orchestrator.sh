@@ -727,9 +727,19 @@ china_tunnel_ssh_child_match() {
 }
 
 china_tunnel_remove_orphan_children() {
-  local source_port listener pid ppid seen_pid
-  local -a listener_pids=()
-  for source_port in "${lora_source_ports[@]}"; do
+  local requested source_port listener pid ppid seen_pid
+  local -a requested_ports=() listener_pids=()
+  for requested in "$@"; do
+    case "$requested" in
+      127.0.0.1:*:127.0.0.1:*)
+        requested=${requested#127.0.0.1:}
+        requested_ports+=("${requested%%:*}")
+        ;;
+      [0-9]*) requested_ports+=("$requested") ;;
+    esac
+  done
+  [ "${#requested_ports[@]}" -gt 0 ] || requested_ports=("${lora_source_ports[@]}")
+  for source_port in "${requested_ports[@]}"; do
     while IFS= read -r listener; do
       pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
       case "$pid" in ''|*[!0-9]*) continue ;; esac
@@ -747,6 +757,25 @@ china_tunnel_remove_orphan_children() {
       china_legacy_cleanup_orphan_pids+=("$pid")
       kill "$pid" 2>/dev/null || true
     done < <(ss -H -ltnp 2>/dev/null | awk -v local_port="127.0.0.1:$source_port" '$4 == local_port')
+  done
+}
+
+china_tunnel_ports_clear() {
+  local requested source_port
+  local -a requested_ports=()
+  for requested in "$@"; do
+    case "$requested" in
+      127.0.0.1:*:127.0.0.1:*)
+        requested=${requested#127.0.0.1:}
+        requested_ports+=("${requested%%:*}")
+        ;;
+    esac
+  done
+  [ "${#requested_ports[@]}" -gt 0 ] || return 1
+  for source_port in "${requested_ports[@]}"; do
+    if ss -H -ltn 2>/dev/null | awk -v local_port="127.0.0.1:$source_port" '$4 == local_port {found=1} END {exit !found}'; then
+      return 1
+    fi
   done
 }
 
@@ -860,7 +889,7 @@ china_tunnel_connection() {
     -o IPQoS=none
     -o Compression=no
   )
-  local forward_text ssh_text target marker pid command_line process_matches forward forward_count
+  local forward_text ssh_text target marker pid command_line ports_clear
   forward_text=$(printf ' %q' "${forwards[@]}")
   ssh_text=$(printf ' %q' "${ssh_args[@]}")
   target=$(printf '%q' "$trainer_ssh_target")
@@ -872,6 +901,19 @@ china_tunnel_connection() {
     fi
   done
   china_tunnel_remove_legacy "$marker" "${forwards[@]}"
+  ports_clear=0
+  for _ in $(seq 1 10); do
+    china_tunnel_remove_orphan_children "${forwards[@]}"
+    if china_tunnel_ports_clear "${forwards[@]}"; then
+      ports_clear=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$ports_clear" != 1 ]; then
+    echo "old adapter tunnel ports did not clear for $marker" >&2
+    return 1
+  fi
   setsid nohup bash -c "while true; do
       ssh$ssh_text$forward_text $target
       sleep 3
