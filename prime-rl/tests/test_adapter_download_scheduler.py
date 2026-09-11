@@ -524,6 +524,7 @@ class DownloadSchedulerTest(unittest.TestCase):
         filesystem = load_filesystem_module()
         payload = b"chunk"
         calls = []
+        sleeps = []
 
         class Response(io.BytesIO):
             status = 200
@@ -543,7 +544,7 @@ class DownloadSchedulerTest(unittest.TestCase):
         old_urlopen = filesystem.urllib.request.urlopen
         old_sleep = filesystem.time.sleep
         filesystem.urllib.request.urlopen = fake_urlopen
-        filesystem.time.sleep = lambda _seconds: None
+        filesystem.time.sleep = sleeps.append
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 destination = Path(temporary) / "chunk"
@@ -567,6 +568,7 @@ class DownloadSchedulerTest(unittest.TestCase):
             "http://lane-2/chunk",
         ])
         self.assertTrue(all(0 < call[1] <= 15 for call in calls))
+        self.assertEqual(sleeps, [filesystem.lane_rotation_delay_seconds])
 
     def test_chunk_retry_can_try_every_lane_before_deadline(self):
         filesystem = load_filesystem_module()

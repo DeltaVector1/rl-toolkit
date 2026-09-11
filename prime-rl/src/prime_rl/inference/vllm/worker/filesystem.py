@@ -62,6 +62,7 @@ _ADAPTER_METADATA_MAX_BYTES = 2 * 1024 * 1024
 _ADAPTER_MARKER_MAX_BYTES = 4 * 1024
 _ADAPTER_CLEANUP_ENTRY_LIMIT = 256
 _ADAPTER_CLEANUP_CANDIDATE_LIMIT = 64
+lane_rotation_delay_seconds = 0.1
 _JSON_LOCK = threading.Lock()
 _adapter_stage_publish_lock = threading.Lock()
 
@@ -2821,7 +2822,11 @@ def _download_range(
             _check_deadline(deadline, cancel_event)
             if attempt + 1 == attempt_limit:
                 raise
-            sleep_for = min(2**attempt, 10)
+            sleep_for = (
+                lane_rotation_delay_seconds
+                if len(source_urls) > 1
+                else min(2**attempt, 10)
+            )
             _check_cancelled(cancel_event)
             if deadline is not None:
                 remaining = deadline - time.monotonic()
@@ -4397,7 +4402,11 @@ def _download_with_parent(
                 _check_deadline(deadline, cancel_event)
                 if attempt + 1 == attempt_limit:
                     raise
-                sleep_for = min(2**attempt, 10)
+                sleep_for = (
+                    lane_rotation_delay_seconds
+                    if len(source_urls) > 1
+                    else min(2**attempt, 10)
+                )
                 _check_cancelled(cancel_event)
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -4413,7 +4422,11 @@ def _download_with_parent(
                 _check_deadline(deadline, cancel_event)
                 if attempt + 1 == attempt_limit:
                     raise
-                sleep_for = min(2**attempt, 10)
+                sleep_for = (
+                    lane_rotation_delay_seconds
+                    if len(source_urls) > 1
+                    else min(2**attempt, 10)
+                )
                 _check_cancelled(cancel_event)
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
