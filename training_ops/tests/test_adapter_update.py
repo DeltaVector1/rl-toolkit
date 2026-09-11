@@ -1,4 +1,5 @@
 import hashlib
+import io
 import importlib.util
 import json
 import subprocess
@@ -24,6 +25,23 @@ adapter_server_spec.loader.exec_module(adapter_server)
 
 
 class AdapterUpdateTest(unittest.TestCase):
+    def test_adapter_server_uses_short_bounded_writes(self):
+        payload = b"x" * (adapter_server.transfer_write_bytes * 3 + 17)
+        writes = []
+
+        class Output:
+            def write(self, value):
+                if len(value) > adapter_server.transfer_write_bytes:
+                    raise AssertionError("adapter server write exceeded its bound")
+                writes.append(value)
+
+        handler = adapter_server.RangeHandler.__new__(adapter_server.RangeHandler)
+        handler.remaining = len(payload)
+        handler.copyfile(io.BytesIO(payload), Output())
+
+        self.assertEqual(b"".join(writes), payload)
+        self.assertEqual(handler.remaining, 0)
+
     def test_start_inventory_deploys_nodes_config_to_participants(self):
         selected = {
             "trainer": "configs/decensor/trainer.toml",

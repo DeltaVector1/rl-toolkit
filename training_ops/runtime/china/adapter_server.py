@@ -23,6 +23,7 @@ lock_name = ".adapter-predictive-upgrade.lock"
 digest_pattern = re.compile(r"[0-9a-f]{64}\Z")
 step_pattern = re.compile(r"step_(\d+)\Z")
 run_pattern = re.compile(r"[A-Za-z0-9_-]+\Z")
+transfer_write_bytes = 256 * 1024
 
 
 class UpgradeError(RuntimeError):
@@ -584,7 +585,7 @@ class RangeHandler(SimpleHTTPRequestHandler):
             return super().copyfile(source, output)
         try:
             while self.remaining:
-                chunk = source.read(min(self.remaining, 16 * 1024 * 1024))
+                chunk = source.read(min(self.remaining, transfer_write_bytes))
                 if not chunk:
                     break
                 output.write(chunk)
