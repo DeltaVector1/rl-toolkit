@@ -724,11 +724,15 @@ else
 fi
 echo "BATCH_SYNC $batch_sync_ok"
 trainer_fail_wd=0
+watchdog_script="__TRAINER_WATCHDOG_SCRIPT__"
 for proc_dir in /proc/[0-9]*; do
   pid=${proc_dir##*/}
   [ -r "/proc/$pid/cmdline" ] && [ -r "/proc/$pid/environ" ] || continue
   command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//' || true)
-  case "$command_line" in *"__TRAINER_WATCHDOG_SCRIPT__"*) ;; *) continue ;; esac
+  case "$command_line" in
+    "bash $watchdog_script"|"/bin/bash $watchdog_script"|"/usr/bin/bash $watchdog_script") ;;
+    *) continue ;;
+  esac
   environment=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' || true)
   grep -Fxq "RUN=__RUN__" <<<"$environment" || continue
   grep -Fxq "RUN_NAME=__RUN_NAME__" <<<"$environment" || continue

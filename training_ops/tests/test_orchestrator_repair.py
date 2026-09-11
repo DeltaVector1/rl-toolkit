@@ -267,6 +267,108 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("if name=$(sudo docker inspect", script)
         self.assertIn("echo absent", script)
 
+    def test_trainer_failure_watchdog_probe_requires_exact_identity(self):
+        probe = training_ops.orchestrator_probe
+        start = probe.index("trainer_fail_wd=0")
+        end = probe.index('echo "ORCH_LAST', start)
+        block = probe[start:end]
+        expected = {
+            "RUN": "run",
+            "RUN_NAME": "run_run",
+            "TRAINER_ADDRESSES": "10.92.20.76 10.92.20.77",
+            "TRAINER_CT": "trainer",
+            "ORCH_CT": "orchestrator",
+        }
+
+        def run_probe(entries):
+            with tempfile.TemporaryDirectory() as temporary:
+                proc_root = Path(temporary) / "proc"
+                script_path = "/data/deployment/trainer_failure_watchdog.sh"
+                script = block.replace("/proc/", f"{proc_root}/")
+                script = script.replace(
+                    "__TRAINER_WATCHDOG_SCRIPT__", script_path
+                )
+                for key, value in expected.items():
+                    placeholder = "__ORCH__" if key == "ORCH_CT" else f"__{key}__"
+                    script = script.replace(placeholder, value)
+                for pid, argv, environment in entries:
+                    process = proc_root / str(pid)
+                    process.mkdir(parents=True)
+                    (process / "cmdline").write_bytes(
+                        b"\0".join(value.encode() for value in argv) + b"\0"
+                    )
+                    (process / "environ").write_bytes(
+                        b"\0".join(value.encode() for value in environment) + b"\0"
+                    )
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                line = next(
+                    line
+                    for line in result.stdout.splitlines()
+                    if line.startswith("TRAINER_FAIL_WD ")
+                )
+                return int(line.rsplit(" ", 1)[1])
+
+        def valid_environment():
+            return [f"{key}={value}" for key, value in expected.items()]
+
+        def valid_process(pid, command=("bash",), environment=None):
+            return (
+                pid,
+                (*command, "/data/deployment/trainer_failure_watchdog.sh"),
+                valid_environment() if environment is None else environment,
+            )
+
+        self.assertEqual(
+            run_probe(
+                [
+                    valid_process(100, ("bash",)),
+                    valid_process(101, ("/bin/bash",)),
+                    valid_process(102, ("/usr/bin/bash",)),
+                ]
+            ),
+            3,
+        )
+        self.assertEqual(
+            run_probe(
+                [
+                    (
+                        103,
+                        ("bash", "/data/deployment/trainer_failure_watchdog.sh", "extra"),
+                        valid_environment(),
+                    ),
+                    (
+                        104,
+                        ("bash", "-c", "echo /data/deployment/trainer_failure_watchdog.sh"),
+                        valid_environment(),
+                    ),
+                    (105, ("sleep", "1"), valid_environment()),
+                ]
+            ),
+            0,
+        )
+        for key in expected:
+            mismatched = valid_environment()
+            mismatched[list(expected).index(key)] = f"{key}=wrong"
+            self.assertEqual(
+                run_probe([valid_process(200, ("bash",), mismatched)]),
+                0,
+                key,
+            )
+        for valid_count in (0, 1, 2):
+            entries = [
+                valid_process(300 + index, ("bash",))
+                for index in range(valid_count)
+            ]
+            count = run_probe(entries)
+            self.assertEqual(count, valid_count)
+            self.assertEqual(count == 1, valid_count == 1)
+
     def test_absent_orchestrator_recreation_checks_that_it_stays_absent(self):
         with mock.patch.object(
             training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
