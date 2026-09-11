@@ -24,6 +24,7 @@ digest_pattern = re.compile(r"[0-9a-f]{64}\Z")
 step_pattern = re.compile(r"step_(\d+)\Z")
 run_pattern = re.compile(r"[A-Za-z0-9_-]+\Z")
 transfer_write_bytes = 256 * 1024
+connection_timeout_seconds = 60
 
 
 class UpgradeError(RuntimeError):
@@ -487,7 +488,7 @@ class RangeHandler(SimpleHTTPRequestHandler):
 
     def setup(self):
         super().setup()
-        self.connection.settimeout(30)
+        self.connection.settimeout(connection_timeout_seconds)
 
     def _maybe_upgrade(self):
         path, pieces = _safe_request_path(self)
