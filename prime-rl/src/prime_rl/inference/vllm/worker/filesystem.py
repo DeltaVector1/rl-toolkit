@@ -2765,7 +2765,12 @@ def _download_range(
     """Download one inclusive byte range and resume its local part file."""
     destination_name = destination.name
     size = end - start + 1
-    for attempt in range(_ADAPTER_LANE_RETRIES):
+    attempt_limit = (
+        max(_ADAPTER_LANE_RETRIES, len(source_urls))
+        if deadline is not None
+        else _ADAPTER_LANE_RETRIES
+    )
+    for attempt in range(attempt_limit):
         _check_deadline(deadline, cancel_event)
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
@@ -2814,7 +2819,7 @@ def _download_range(
             # socket.timeout is retryable; only the absolute stage deadline
             # remains terminal.
             _check_deadline(deadline, cancel_event)
-            if attempt + 1 == _ADAPTER_LANE_RETRIES:
+            if attempt + 1 == attempt_limit:
                 raise
             sleep_for = min(2**attempt, 10)
             _check_cancelled(cancel_event)
@@ -4313,6 +4318,8 @@ def _download_with_parent(
             if retry_http_statuses
             else _ADAPTER_LANE_RETRIES
         )
+        if deadline is not None:
+            attempt_limit = max(attempt_limit, len(source_urls))
         for attempt in range(attempt_limit):
             _check_deadline(deadline, cancel_event)
             try:

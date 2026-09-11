@@ -568,6 +568,51 @@ class DownloadSchedulerTest(unittest.TestCase):
         ])
         self.assertTrue(all(0 < call[1] <= 15 for call in calls))
 
+    def test_chunk_retry_can_try_every_lane_before_deadline(self):
+        filesystem = load_filesystem_module()
+        payload = b"chunk"
+        source_urls = [f"http://lane-{index}/chunk" for index in range(8)]
+        calls = []
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, timeout))
+            if len(calls) < len(source_urls):
+                raise TimeoutError("lane read timed out")
+            return Response(payload)
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_sleep = filesystem.time.sleep
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "chunk"
+                filesystem.download(
+                    source_urls[0],
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    source_urls=source_urls,
+                    parallel_ranges=False,
+                    deadline=filesystem.time.monotonic() + 100,
+                    per_request_timeout_seconds=15,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.sleep = old_sleep
+
+        self.assertEqual([call[0] for call in calls], source_urls)
+
     def test_range_retry_rotates_to_a_distinct_tunnel_supervisor(self):
         filesystem = load_filesystem_module()
         payload = b"chunk"
