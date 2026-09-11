@@ -33,7 +33,7 @@ from decensor_v1.text import (
     extract_all_assistant_texts,
     word_band,
 )
-from decensor_v1.user import DecensorUserConfig
+from decensor_v1.user import DecensorUser, DecensorUserConfig
 
 
 _review_slots = asyncio.Semaphore(2)
@@ -420,6 +420,10 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             "decensor_user_sim_failed", float(trace.state.user_sim_failed)
         )
         return reward
+
+
+if hasattr(vf, "User"):
+    DecensorTask.user = DecensorUser
 
 
 class DecensorTaskset(vf.Taskset[DecensorTask, DecensorTasksetConfig]):
