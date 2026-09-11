@@ -120,7 +120,10 @@ async def review_follow_up_message(
     return FollowUpReview.model_validate_json(arguments), arguments
 
 
-class DecensorUserConfig(BaseConfig):
+_DecensorUserConfigBase = vf.UserConfig if hasattr(vf, "User") else BaseConfig
+
+
+class DecensorUserConfig(_DecensorUserConfigBase):
     in_process: bool = True
     model: str = "google/gemma-4-26B-A4B-it"
     base_url: str = "http://198.13.252.41:40002/v1"
@@ -133,7 +136,12 @@ class DecensorUserConfig(BaseConfig):
     max_concurrent_requests: int = Field(default=24, ge=1)
 
 
-class DecensorUser:
+_DecensorUserBase = (
+    vf.User[DecensorUserConfig, DecensorState] if hasattr(vf, "User") else object
+)
+
+
+class DecensorUser(_DecensorUserBase):
     config: DecensorUserConfig
     state: DecensorState
 
