@@ -1124,6 +1124,7 @@ class Orchestrator:
             )
             for name, count in self.train_sink.pre_filter_dropped_by_name.items():
                 metrics[f"pre_filters/all/{name}/rate"] = count / self.train_sink.pre_filter_seen
+        metrics["groups/all_refusal/skipped"] = self.train_sink.all_refusal_groups_skipped
         self.monitor.log(metrics, step=step)
         self.wait_for_policy_time = 0.0
         self.monitor.log_samples(effective.rollouts, step=step)

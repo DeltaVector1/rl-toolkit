@@ -525,6 +525,10 @@ class OrchestratorConfig(BaseConfig):
     """Filters applied *after* a batch has been assembled. Each filter annotates each rollout;
     rollouts flagged by an enforcing filter are still recorded but not shipped to the trainer."""
 
+    skip_all_refusal_groups: bool = False
+    """When True, skip a complete group only when every rollout has refusal_score=9.
+    Mixed or unscored groups are unchanged."""
+
     log: LogConfig = LogConfig()
 
     env_vars: EnvVars = {}

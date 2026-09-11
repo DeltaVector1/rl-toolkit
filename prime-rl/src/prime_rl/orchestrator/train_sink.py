@@ -53,6 +53,38 @@ def payload_tokens(rollout: Rollout) -> int:
     return sum(len(sample.token_ids) for sample in rollout.samples) or rollout.num_total_tokens
 
 
+def _refusal_score(rollout: Rollout) -> int | float | None:
+    """Read the decensor refusal score without changing the rollout record."""
+    info = getattr(rollout, "info", None)
+    if not isinstance(info, dict):
+        return None
+    decensor = info.get("decensor")
+    if not isinstance(decensor, dict):
+        return None
+    score = decensor.get("refusal_score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        return None
+    return score
+
+
+def should_skip_all_refusal_group(group: list[Rollout], enabled: bool) -> bool:
+    """Return True only for an enabled, fully scored, all-refusal group."""
+    return (
+        enabled
+        and bool(group)
+        and not any(getattr(rollout, "has_error", False) for rollout in group)
+        and all(_refusal_score(rollout) == 9 for rollout in group)
+    )
+
+
+def _skip_refusal_group(group: list[Rollout]) -> None:
+    """Remove training samples while retaining rollout observations."""
+    for rollout in group:
+        rollout.samples = []
+        rollout.is_filtered = True
+        rollout.filter_results = {"all_refusal_group": True}
+
+
 class TrainSink:
     """Three-level train sink. Constructed once, fed via ``add(rollout)``."""
 
@@ -107,6 +139,7 @@ class TrainSink:
         self.pre_filter_seen = 0
         self.pre_filter_dropped = 0
         self.pre_filter_dropped_by_name: dict[str, int] = {}
+        self.all_refusal_groups_skipped = 0
 
     def _is_stale(self, rollout: Rollout) -> bool:
         sampler = self.train_envs.get(rollout.env_name).sampler
@@ -251,7 +284,7 @@ class TrainSink:
         await self.train_envs.get(rollout.env_name).algorithm.finalize_rollout(rollout)
 
     async def process_group(self, group_id: uuid.UUID) -> None:
-        """Finalize one complete GRPO group: reject the complete group when
+        """Finalize one complete GRPO group: skip the complete group when
         any member failed, is oversized, or is untrainable; assign advantages;
         run pre-batch filters; append clean survivors to ``pending_batch``."""
         group = self.pending_groups.pop(group_id, [])
@@ -335,6 +368,16 @@ class TrainSink:
             get_logger().debug(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} | dropped complete group: untrainable member"
+            )
+            return
+
+        # Keep the group in pending_rollouts, but send no optimizer samples.
+        if should_skip_all_refusal_group(group, self.config.skip_all_refusal_groups):
+            self.all_refusal_groups_skipped += 1
+            _skip_refusal_group(group)
+            get_logger().debug(
+                f"Finished group | env={env_name} task_idx={task_idx} | "
+                f"rollouts={len(group)} | skipped all-refusal group"
             )
             return
 
@@ -450,3 +493,4 @@ class TrainSink:
         self.pre_filter_seen = 0
         self.pre_filter_dropped = 0
         self.pre_filter_dropped_by_name.clear()
+        self.all_refusal_groups_skipped = 0

@@ -5,6 +5,7 @@ import os
 import socket
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 class _FakeTensor:
@@ -110,6 +111,92 @@ class PipelineBatchIdentityTest(unittest.TestCase):
             object(),
             compare_all_ranks=False,
         )
+
+
+def _load_refusal_group_function():
+    source_path = (
+        Path(__file__).resolve().parents[1]
+        / "src/prime_rl/orchestrator/train_sink.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    wanted = {"_refusal_score", "should_skip_all_refusal_group", "_skip_refusal_group"}
+    body = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    namespace = {"Rollout": object}
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(source_path), "exec"), namespace)
+    return namespace["should_skip_all_refusal_group"], namespace["_skip_refusal_group"]
+
+
+class RefusalGroupSkipTest(unittest.TestCase):
+    _missing = object()
+
+    @staticmethod
+    def _rollout(score=_missing):
+        details = {} if score is RefusalGroupSkipTest._missing else {"refusal_score": score}
+        return SimpleNamespace(
+            info={"decensor": details},
+            samples=[object()],
+            reward=0.25,
+            has_error=False,
+        )
+
+    def test_all_refusal_group_is_skipped_when_enabled(self):
+        skip, _ = _load_refusal_group_function()
+        self.assertTrue(skip([self._rollout(9), self._rollout(9)], enabled=True))
+
+    def test_mixed_refusal_group_is_unchanged(self):
+        skip, _ = _load_refusal_group_function()
+        self.assertFalse(skip([self._rollout(9), self._rollout(8)], enabled=True))
+
+    def test_invalid_refusal_scores_are_unchanged(self):
+        skip, _ = _load_refusal_group_function()
+        for value in (self._rollout(), self._rollout(None), self._rollout(True), self._rollout("9"), self._rollout(float("nan"))):
+            with self.subTest(value=value):
+                self.assertFalse(skip([self._rollout(9), value], enabled=True))
+
+    def test_default_off_is_unchanged(self):
+        skip, _ = _load_refusal_group_function()
+        self.assertFalse(skip([self._rollout(9), self._rollout(9)], enabled=False))
+
+    def test_service_error_is_not_reclassified_as_refusal_skip(self):
+        skip, _ = _load_refusal_group_function()
+        errored = self._rollout(9)
+        errored.has_error = True
+        self.assertFalse(skip([errored, self._rollout(9)], enabled=True))
+
+    def test_skip_removes_effective_samples_but_keeps_observation(self):
+        _, mark_skip = _load_refusal_group_function()
+        group = [self._rollout(9), self._rollout(9)]
+        infos = [rollout.info for rollout in group]
+        rewards = [rollout.reward for rollout in group]
+        mark_skip(group)
+        self.assertEqual([rollout.samples for rollout in group], [[], []])
+        self.assertTrue(all(rollout.is_filtered for rollout in group))
+        self.assertEqual([rollout.info for rollout in group], infos)
+        self.assertEqual([rollout.reward for rollout in group], rewards)
+
+    def test_config_default_is_off(self):
+        source_path = (
+            Path(__file__).resolve().parents[1]
+            / "packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py"
+        )
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        field = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "skip_all_refusal_groups"
+        )
+        self.assertIsInstance(field.value, ast.Constant)
+        self.assertFalse(field.value.value)
+
+    def test_opt_in_enables_all_refusal_skip(self):
+        skip, _ = _load_refusal_group_function()
+        self.assertTrue(skip([self._rollout(9), self._rollout(9)], enabled=True))
 
 
 if __name__ == "__main__":
