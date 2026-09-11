@@ -418,6 +418,7 @@ def load_server_stage_method(stage_worker, publish_lock=None):
         "Request": object,
         "JSONResponse": FakeJSONResponse,
         "_delta_stage_timeout_s": lambda: 600.0,
+        "full_adapter_stage_timeout_s": 1800.0,
         "_adapter_step_from_source_url": lambda source_url: int(
             re.fullmatch(r"step_(\d+)", Path(source_url.rstrip("/")).name).group(1)
         ),
@@ -1125,8 +1126,37 @@ class AdapterTransportStateTest(unittest.TestCase):
         filesystem = load_filesystem_module()
         self.assertTrue(filesystem._preserve_adapter_stage_partial(OSError("connection reset")))
         self.assertTrue(filesystem._preserve_adapter_stage_partial(TimeoutError("request timed out")))
+        self.assertTrue(
+            filesystem._preserve_adapter_stage_partial(
+                OSError("adapter manifest is missing; transfer mode is unknown")
+            )
+        )
+        self.assertTrue(
+            filesystem._preserve_adapter_stage_partial(
+                filesystem.HTTPError("http://relay", 404, "not ready", None, None)
+            )
+        )
         self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("checksum mismatch")))
         self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("path is a symbolic link")))
+
+    def test_relay_unavailable_is_temporary_for_both_delta_versions(self):
+        filesystem = load_filesystem_module()
+        old_reader = filesystem._read_source_text
+
+        def unavailable(*_args, **_kwargs):
+            raise filesystem.HTTPError("http://relay", 503, "starting", None, None)
+
+        filesystem._read_source_text = unavailable
+        try:
+            for reader in (
+                filesystem._read_chunked_v1_manifest,
+                filesystem._read_chunked_linear_manifest,
+            ):
+                with self.subTest(reader=reader.__name__):
+                    with self.assertRaisesRegex(OSError, "manifest is missing"):
+                        reader("http://relay/step_2")
+        finally:
+            filesystem._read_source_text = old_reader
 
     def test_full_cache_reuse_rebinds_url_without_model_download(self):
         filesystem = load_filesystem_module()
@@ -1290,7 +1320,9 @@ class AdapterTransportStateTest(unittest.TestCase):
         watcher_source = watcher.read_text(encoding="utf-8")
         self.assertIn('manifest.get("version") != 1', watcher_source)
         policy_update = watcher_source[watcher_source.index('f"Policy update'):]
-        self.assertIn("attempts=1", policy_update[:250])
+        self.assertIn("attempts=update_attempts", policy_update[:300])
+        self.assertIn("2 * adapter_stage_limit_seconds", watcher_source)
+        self.assertIn("delta_deadline = min(delta_deadline, update_deadline)", watcher_source)
         self.assertIn("for attempt in range(1, attempts + 1)", watcher_source)
         self.assertIn("failed on attempt {attempt}/{attempts}", watcher_source)
         self.assertIn("delta_deadline = time.monotonic()", watcher_source)
@@ -1741,7 +1773,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
         runtime = REPOSITORY / "training_ops/runtime/h200"
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
-        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=96", glm_source)
+        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=128", glm_source)
         self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
         source_generator = glm_source.split(
             'runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<\'PY\'\n',

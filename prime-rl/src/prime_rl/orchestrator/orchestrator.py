@@ -85,6 +85,7 @@ from prime_rl.transport import TrainingBatch, setup_training_batch_sender
 from prime_rl.utils.async_utils import EventLoopLagMonitor, EventLoopLagStats, safe_cancel
 from prime_rl.utils.client import (
     adapter_stage_limit_seconds,
+    common_loaded_lora_receipt,
     init_nccl_broadcast,
     init_nixl_broadcast,
     stage_lora_adapter,
@@ -560,96 +561,224 @@ class Orchestrator:
         # Sync inference to the incoming policy before the first step when resuming or when using
         # an in-memory transport, which rendezvouses with the trainer's startup broadcast.
         if self.resume_policy_step is not None or config.weight_broadcast.type in ("nccl", "nixl"):
-            sync_version = self.resume_policy_step if self.resume_policy_step is not None else 0
-            require_delta = self.lora_name is not None and sync_version > 0
-            startup_delta_deadline = None
-            if config.weight_broadcast.type == "nixl":
-                weights_path = None
-                local_weights_path = None
-                if require_delta:
-                    startup_delta_deadline = (
-                        time.monotonic() + adapter_stage_limit_seconds(sync_version)
+            final_sync_version = self.resume_policy_step if self.resume_policy_step is not None else 0
+            sync_versions = (final_sync_version,)
+            if (
+                self.lora_name is not None
+                and config.weight_broadcast.type == "filesystem"
+                and final_sync_version > 0
+            ):
+                broadcast_dir = get_broadcast_dir(config.output_dir)
+                sync_versions = tuple(
+                    step
+                    for step in get_all_ckpt_steps(broadcast_dir)
+                    if step <= final_sync_version
+                    and (get_step_path(broadcast_dir, step) / "STABLE").is_file()
+                )
+                if not sync_versions or sync_versions[-1] != final_sync_version:
+                    raise RuntimeError(
+                        f"cannot resume policy v{final_sync_version}: saved adapter chain is incomplete"
                     )
-            else:
-                check_exists = config.weight_broadcast.type == "filesystem"
-                # Without a ckpt block, fall back to a default timeout instead of not waiting at all.
-                wait_timeout = config.ckpt.wait_for_weights_timeout if config.ckpt else STARTUP_WEIGHT_WAIT_TIMEOUT_S
-                weights_path = get_weight_dir(
-                    config.output_dir, sync_version, check_exists=check_exists, wait_timeout=wait_timeout
+                loaded_receipt = await common_loaded_lora_receipt(
+                    self.policy_inference.admin_clients, self.lora_name
                 )
-                local_weights_path = weights_path
-                source_weights_path = inference_weight_path(config, weights_path, self.lora_name)
-                if require_delta:
-                    startup_delta_deadline = (
-                        time.monotonic() + adapter_stage_limit_seconds(sync_version)
+                if loaded_receipt is None:
+                    if sync_versions[0] > 0:
+                        raise RuntimeError(
+                            "cannot resume adapter transfer: inference has no common loaded "
+                            "policy and the initial policy is no longer saved"
+                        )
+                else:
+                    loaded_source_url = loaded_receipt["source_url"]
+                    matching_steps = tuple(
+                        step
+                        for step in sync_versions
+                        if inference_weight_path(
+                            config,
+                            get_step_path(broadcast_dir, step),
+                            self.lora_name,
+                        )
+                        == loaded_source_url
                     )
-                _verify_startup_adapter_delta(
-                    config,
-                    self.lora_name,
-                    sync_version,
-                    weights_path,
-                    source_weights_path if isinstance(source_weights_path, str) else None,
-                    deadline=startup_delta_deadline,
-                )
-                weights_path = source_weights_path
-            if self.model_express is not None:
-                await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY)
-            prefetched = False
-            adapter_identity = None
-            if self.lora_name is not None and isinstance(weights_path, str):
-                stage_result = await stage_lora_adapter(
-                    self.policy_inference.admin_clients,
-                    weights_path,
-                    require_delta=require_delta,
-                    policy_step=sync_version if require_delta else None,
-                    delta_deadline=startup_delta_deadline,
-                    origin_base_urls=self.policy_inference.adapter_origin_base_urls,
-                )
-                adapter_identity = stage_result["adapter_identity"]
-                prefetched = True
-                if require_delta:
+                    if len(matching_steps) != 1:
+                        raise RuntimeError(
+                            "cannot resume adapter transfer: the common loaded policy is not "
+                            "one saved policy in this run"
+                        )
+                    loaded_step = matching_steps[0]
+                    try:
+                        with urlopen(
+                            f"{loaded_source_url.rstrip('/')}/adapter_manifest.json",
+                            timeout=30,
+                        ) as source:
+                            loaded_manifest = json.load(source)
+                        loaded_files = _adapter_file_records(loaded_manifest)
+                    except (OSError, ValueError, RuntimeError) as exc:
+                        raise RuntimeError(
+                            f"cannot resume adapter transfer: saved policy v{loaded_step} is invalid"
+                        ) from exc
+                    loaded_weights = loaded_files["adapter_model.safetensors"]
+                    loaded_config = loaded_files["adapter_config.json"]
+                    expected_identity = {
+                        "target_sha256": loaded_weights["sha256"],
+                        "target_size": loaded_weights["size"],
+                        "config_sha256": loaded_config["sha256"],
+                        "config_size": loaded_config["size"],
+                    }
+                    if any(
+                        loaded_receipt.get(name) != value
+                        for name, value in expected_identity.items()
+                    ):
+                        raise RuntimeError(
+                            "cannot resume adapter transfer: loaded and saved policy identities differ"
+                        )
+                    sync_versions = tuple(step for step in sync_versions if step >= loaded_step)
                     get_logger().info(
-                        f"Adapter v{sync_version} staging limit "
-                        f"{float(stage_result.get('stage_limit_seconds', adapter_stage_limit_seconds(sync_version))):g}s "
-                        "(300s acceptance target)"
+                        f"All inference endpoints have policy v{loaded_step}; "
+                        f"resuming adapter transfer there"
                     )
-            receipts = await self.policy_inference.update_weights(
-                weights_path,
-                lora_name=self.lora_name,
-                step=sync_version,
-                require_delta=require_delta,
-                prefetched=prefetched,
-                expected_adapter_identity=adapter_identity,
-            )
-            if self.lora_name is not None and isinstance(weights_path, str):
-                assert local_weights_path is not None
-                _write_receivers_ready(
-                    local_weights_path,
-                    run_name=config.output_dir.name,
+
+            for sync_version in sync_versions:
+                require_delta = self.lora_name is not None and sync_version > 0
+                startup_delta_deadline = None
+                if config.weight_broadcast.type == "nixl":
+                    weights_path = None
+                    local_weights_path = None
+                    if require_delta:
+                        startup_delta_deadline = (
+                            time.monotonic() + adapter_stage_limit_seconds(sync_version)
+                        )
+                else:
+                    check_exists = config.weight_broadcast.type == "filesystem"
+                    wait_timeout = (
+                        config.ckpt.wait_for_weights_timeout
+                        if config.ckpt
+                        else STARTUP_WEIGHT_WAIT_TIMEOUT_S
+                    )
+                    weights_path = get_weight_dir(
+                        config.output_dir,
+                        sync_version,
+                        check_exists=check_exists,
+                        wait_timeout=wait_timeout,
+                    )
+                    local_weights_path = weights_path
+                    source_weights_path = inference_weight_path(
+                        config, weights_path, self.lora_name
+                    )
+                    _verify_startup_adapter_delta(
+                        config,
+                        self.lora_name,
+                        sync_version,
+                        weights_path,
+                        source_weights_path if isinstance(source_weights_path, str) else None,
+                        deadline=startup_delta_deadline,
+                    )
+                    if require_delta:
+                        startup_delta_deadline = (
+                            time.monotonic() + adapter_stage_limit_seconds(sync_version)
+                        )
+                    weights_path = source_weights_path
+                if self.model_express is not None:
+                    await asyncio.to_thread(
+                        self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY
+                    )
+                prefetched = False
+                adapter_identity = None
+                if self.lora_name is not None and isinstance(weights_path, str):
+                    stage_attempts = 2 if require_delta else 1
+                    stage_limit = (
+                        adapter_stage_limit_seconds(sync_version)
+                        if require_delta
+                        else None
+                    )
+                    stage_total_deadline = (
+                        time.monotonic() + stage_attempts * stage_limit
+                        if stage_limit is not None
+                        else None
+                    )
+                    for stage_attempt in range(1, stage_attempts + 1):
+                        if stage_limit is not None and stage_total_deadline is not None:
+                            remaining_total = stage_total_deadline - time.monotonic()
+                            if remaining_total <= 0:
+                                raise TimeoutError(
+                                    "adapter restart staging exceeded its ten-minute limit"
+                                )
+                            startup_delta_deadline = time.monotonic() + min(
+                                stage_limit, remaining_total
+                            )
+                        try:
+                            stage_result = await stage_lora_adapter(
+                                self.policy_inference.admin_clients,
+                                weights_path,
+                                require_delta=require_delta,
+                                policy_step=sync_version if require_delta else None,
+                                delta_deadline=startup_delta_deadline,
+                                origin_base_urls=self.policy_inference.adapter_origin_base_urls,
+                            )
+                            break
+                        except Exception as exc:
+                            message = str(exc).lower()
+                            retryable = not any(
+                                marker in message
+                                for marker in ("identity", "checksum", "policy step", "manifest")
+                            )
+                            if stage_attempt == stage_attempts or not retryable:
+                                raise
+                            get_logger().warning(
+                                f"Adapter v{sync_version} staging attempt "
+                                f"{stage_attempt}/{stage_attempts} did not finish; "
+                                "resuming its saved partial once"
+                            )
+                    adapter_identity = stage_result["adapter_identity"]
+                    prefetched = True
+                    if require_delta:
+                        get_logger().info(
+                            f"Adapter v{sync_version} staging limit "
+                            f"{float(stage_result.get('stage_limit_seconds', adapter_stage_limit_seconds(sync_version))):g}s "
+                            "(300s acceptance target)"
+                        )
+                if sync_version != final_sync_version:
+                    get_logger().info(
+                        f"Adapter v{sync_version} cache ready for resume"
+                    )
+                    continue
+                receipts = await self.policy_inference.update_weights(
+                    weights_path,
+                    lora_name=self.lora_name,
                     step=sync_version,
-                    source_url=weights_path,
-                    slot=self.lora_name,
-                    adapter_identity=adapter_identity,
-                    admin_clients=self.policy_inference.admin_clients,
-                    receipts=receipts,
+                    require_delta=require_delta,
+                    prefetched=prefetched,
+                    expected_adapter_identity=adapter_identity,
                 )
-            if self.model_express is not None:
-                await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_INITIALIZING)
-                # Complete the startup rendezvous before the watcher begins its next cycle.
-                await asyncio.to_thread(
-                    self.model_express.wait_for,
-                    "trainer",
-                    count=1,
-                    status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
-                    timeout=config.weight_broadcast.timeout,
-                )
-            if self.lora_name is not None:
-                self.policy_inference.update_model_name(self.lora_name)
-                self.policy.model_name = self.lora_name
-            self.policy.version = sync_version
-            # Do not start rollout scheduling until every inference endpoint
-            # exposes the exact policy that was loaded.
-            await self.policy_inference.wait_for_ready(self.policy.model_name)
+                if self.lora_name is not None and isinstance(weights_path, str):
+                    assert local_weights_path is not None
+                    _write_receivers_ready(
+                        local_weights_path,
+                        run_name=config.output_dir.name,
+                        step=sync_version,
+                        source_url=weights_path,
+                        slot=self.lora_name,
+                        adapter_identity=adapter_identity,
+                        admin_clients=self.policy_inference.admin_clients,
+                        receipts=receipts,
+                    )
+                if self.model_express is not None:
+                    await asyncio.to_thread(
+                        self.model_express.set_status,
+                        p2p_pb2.SOURCE_STATUS_INITIALIZING,
+                    )
+                    await asyncio.to_thread(
+                        self.model_express.wait_for,
+                        "trainer",
+                        count=1,
+                        status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+                        timeout=config.weight_broadcast.timeout,
+                    )
+                if self.lora_name is not None:
+                    self.policy_inference.update_model_name(self.lora_name)
+                    self.policy.model_name = self.lora_name
+                self.policy.version = sync_version
+                await self.policy_inference.wait_for_ready(self.policy.model_name)
 
         self.train_source = TrainSource(self.train_envs, seed=42)
         self.eval_source: EvalSource | None = (

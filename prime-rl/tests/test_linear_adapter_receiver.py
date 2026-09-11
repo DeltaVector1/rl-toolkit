@@ -739,6 +739,47 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     cache_root / "active",
                 )
 
+    def test_cache_cleanup_keeps_a_newer_adapter_during_recovery(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                base_url = "http://source/run/broadcasts/step_0"
+                active_url = "http://source/run/broadcasts/step_1"
+                future_url = "http://source/run/broadcasts/step_3"
+                stale_url = "http://source/old/broadcasts/step_0"
+
+                paths = {
+                    url: filesystem.adapter_cache_path(url)
+                    for url in (base_url, active_url, future_url, stale_url)
+                }
+                for url, path in paths.items():
+                    path.mkdir(parents=True)
+                    (path / "READY").write_text("ready\n", encoding="ascii")
+                    transport = {"source_url": url}
+                    if url == active_url:
+                        transport["base_url"] = base_url
+                    (path / "transport.json").write_text(
+                        json.dumps(transport),
+                        encoding="utf-8",
+                    )
+
+                filesystem._cleanup_previous_adapter_caches(
+                    Path(temporary),
+                    paths[active_url],
+                )
+
+                self.assertTrue(paths[base_url].is_dir())
+                self.assertTrue(paths[active_url].is_dir())
+                self.assertTrue(paths[future_url].is_dir())
+                self.assertFalse(paths[stale_url].exists())
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
     def test_delta_cleanup_rejects_a_symlinked_candidate(self):
         filesystem = load_filesystem()
         old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")

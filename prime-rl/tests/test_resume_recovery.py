@@ -702,7 +702,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertIn('state["status"] = "staging"', source)
         self.assertIn('durable_status in {"failed", "ready"}', source)
         self.assertIn('elif durable_status == "staging":', source)
-        self.assertIn('state["status"] = "unknown"', source)
+        self.assertIn('state["status"] = "failed"', source)
 
     def test_active_stage_wins_over_terminal_transfer_record(self):
         source = SERVER_PATH.read_text(encoding="utf-8")
@@ -738,7 +738,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         )
         self.assertEqual(
             combine({"status": "idle", "age_seconds": 0.0}, {"status": "staging"})["status"],
-            "unknown",
+            "failed",
         )
         self.assertEqual(
             combine({"status": "idle", "age_seconds": 0.0}, {"status": "corrupt"})["status"],
@@ -759,6 +759,26 @@ class ResumeRecoveryTest(unittest.TestCase):
         update_at = setup.index("await self.policy_inference.update_weights(", stage_at)
         self.assertLess(stage_at, update_at)
         self.assertIn("prefetched=prefetched", setup[update_at:])
+
+    def test_filesystem_lora_resume_stages_saved_policies_and_loads_only_the_last(self):
+        source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+        setup = ast.get_source_segment(
+            source,
+            next(
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
+            ),
+        )
+        self.assertIn("for step in get_all_ckpt_steps(broadcast_dir)", setup)
+        self.assertIn('get_step_path(broadcast_dir, step) / "STABLE"', setup)
+        self.assertIn("saved adapter chain is incomplete", setup)
+        self.assertIn("for sync_version in sync_versions", setup)
+        self.assertIn("if sync_version != final_sync_version", setup)
+        self.assertLess(
+            setup.index("if sync_version != final_sync_version"),
+            setup.index("await self.policy_inference.update_weights("),
+        )
 
     def test_server_fallback_stages_in_the_host_process(self):
         source = SERVER_PATH.read_text(encoding="utf-8")

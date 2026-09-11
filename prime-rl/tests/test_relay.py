@@ -146,6 +146,39 @@ class RelayTest(unittest.TestCase):
         selected = relay._load_file(self.cache, self.source_url, "adapter_model.safetensors")
         self.assertEqual(selected.path.read_bytes(), b"model-bytes")
 
+    def test_delta_relay_publishes_only_completed_in_progress_chunks(self):
+        partial = self.cache.with_name(f"{self.cache.name}.partial")
+        (self.cache / relay.ready_marker_name).unlink()
+        self.cache.rename(partial)
+        (partial / relay.relaying_marker_name).write_text(
+            "relaying\n", encoding="utf-8"
+        )
+        chunk = partial / "transport-chunks/chunk-0"
+        chunk_sha = hashlib.sha256(chunk.read_bytes()).hexdigest()
+        with self.assertRaises(HTTPError) as error:
+            self.request(
+                "/glm-1/run_glm-1/broadcasts/step_1/adapter_model.safetensors"
+            )
+        self.assertEqual(error.exception.code, 404)
+        with self.assertRaises(HTTPError) as error:
+            self.request("/glm-1/run_glm-1/broadcasts/step_1/chunk-0")
+        self.assertEqual(error.exception.code, 503)
+        (chunk.with_name("chunk-0.done")).write_text(
+            json.dumps(
+                {
+                    "file": "chunk-0",
+                    "wire_size": chunk.stat().st_size,
+                    "wire_sha256": chunk_sha,
+                    "output_sha256": "0" * 64,
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.request(
+            "/glm-1/run_glm-1/broadcasts/step_1/chunk-0"
+        ) as response:
+            self.assertEqual(response.read(), b"compressed-delta")
+
     def test_predictive_relay_publishes_only_verified_in_progress_chunks(self):
         source_url = "http://127.0.0.1:18100/glm-1/run_glm-1/broadcasts/step_2"
         cache = self.root / hashlib.sha256(source_url.encode()).hexdigest()

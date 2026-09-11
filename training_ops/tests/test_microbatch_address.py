@@ -1,5 +1,6 @@
 import sys
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -19,15 +20,22 @@ class MicrobatchAddressTest(unittest.TestCase):
         self.assertEqual(selected["inference"], "configs/decensor/inference.toml")
 
     def test_run_config_requires_inference_config_for_start(self):
-        with self.assertRaisesRegex(
-            training_ops.Refused,
-            "run config directory has no inference.toml",
-        ):
-            training_ops._config_dir(
-                "configs/current",
-                require_orchestrator=True,
-                require_inference=True,
-            )
+        with tempfile.TemporaryDirectory(
+            dir=training_ops.repo_root / "configs"
+        ) as directory:
+            path = Path(directory)
+            (path / "trainer.toml").write_text('output_dir = "/tmp/test"\n')
+            (path / "orchestrator.toml").write_text('output_dir = "/tmp/test"\n')
+            relative = path.relative_to(training_ops.repo_root).as_posix()
+            with self.assertRaisesRegex(
+                training_ops.Refused,
+                "run config directory has no inference.toml",
+            ):
+                training_ops._config_dir(
+                    relative,
+                    require_orchestrator=True,
+                    require_inference=True,
+                )
 
     def test_run_config_is_selected_from_active_run_output(self):
         selected = training_ops._config_for_run("glm-perf-3")

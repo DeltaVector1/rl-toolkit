@@ -394,7 +394,12 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
     )
     transport = index.transport
     files = index.files
-    if relaying and transport == predictive_transport and requested_name == "adapter_model.safetensors":
+    streaming_transports = {relay_transport, predictive_transport}
+    if (
+        relaying
+        and transport in streaming_transports
+        and requested_name == "adapter_model.safetensors"
+    ):
         raise RelayRequestError(404, "adapter model is not published until staging is complete")
     raw_spec = files.get(requested_name)
     if not isinstance(raw_spec, dict):
@@ -417,16 +422,16 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
         raise RelayRequestError(500, "relay manifest escapes the adapter cache") from exc
     if not candidate.is_file() or candidate.stat().st_size != size:
         raise RelayRequestError(503, "relay file is incomplete")
-    if relaying and transport == predictive_transport and requested_name not in {
+    if relaying and transport in streaming_transports and requested_name not in {
         "adapter_manifest.json",
         "adapter_config.json",
     }:
-        # A chunk is visible only after the writer has validated its wire
-        # checksum and atomically published a wire or completed proof.
-        proofs = (
-            ("wire-ready", candidate.with_name(f"{candidate.name}.wire-ready")),
-            ("completed", candidate.with_name(f"{candidate.name}.done")),
-        )
+        proofs = [("completed", candidate.with_name(f"{candidate.name}.done"))]
+        if transport == predictive_transport:
+            proofs.insert(
+                0,
+                ("wire-ready", candidate.with_name(f"{candidate.name}.wire-ready")),
+            )
         proof_valid = False
         for proof_type, proof_path in proofs:
             if proof_path.is_symlink() or not proof_path.is_file():

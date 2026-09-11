@@ -217,6 +217,39 @@ def _active_policy_probe_config(run: str) -> tuple[str, str] | None:
     return f"{output_dir.rstrip('/')}/broadcasts", lora_name
 
 
+def _active_policy_identity(broadcast_dir: str) -> dict | None:
+    """Read the newest policy identity from the orchestrator host."""
+    script = f"""
+marker=$(find {shlex.quote(broadcast_dir)} -mindepth 2 -maxdepth 2 \\
+  -type f -name receivers-ready.json -printf '%p\\n' 2>/dev/null | sort -V | tail -1)
+[ -n "$marker" ] || exit 3
+cat "$marker"
+"""
+    code, output = _ssh(orchestrator_host, script, timeout=30)
+    if code == 3:
+        return None
+    if code:
+        raise RuntimeError("cannot read the active policy receipt")
+    try:
+        value = json.loads(output)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("the active policy receipt is invalid") from error
+    required = {
+        "step": int,
+        "slot": str,
+        "target_sha256": str,
+        "target_size": int,
+        "config_sha256": str,
+        "config_size": int,
+        "source_url": str,
+    }
+    if not isinstance(value, dict) or any(
+        not isinstance(value.get(name), expected) for name, expected in required.items()
+    ):
+        raise RuntimeError("the active policy receipt is incomplete")
+    return value
+
+
 def _status_runtime_identity(run: str) -> tuple[str, str, str, int, str]:
     """Return exact run, transport, and tunnel identity expected by status."""
     profile = _config_for_run(run, required=False)
@@ -761,23 +794,30 @@ policy_target_sha256=
 policy_target_size=
 policy_config_sha256=
 policy_config_size=
+policy_source_url=
+policy_values=__POLICY_VALUES__
 policy_marker=
 if [ -z "__POLICY_LORA_NAME__" ]; then
   policy_state=ready
   policy_slot="__MODEL__"
 fi
-if [ -n "__POLICY_BROADCAST_DIR__" ] && [ -d "__POLICY_BROADCAST_DIR__" ]; then
+if [ -z "$policy_values" ] && [ -n "__POLICY_BROADCAST_DIR__" ] && [ -d "__POLICY_BROADCAST_DIR__" ]; then
   policy_marker=$(find "__POLICY_BROADCAST_DIR__" -mindepth 2 -maxdepth 2 \
     -type f -name receivers-ready.json -printf '%p\n' 2>/dev/null | sort -V | tail -1)
 fi
-if [ -n "$policy_marker" ]; then
-  policy_values=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("\t".join(str(value.get(name, "")) for name in ("step","slot","target_sha256","target_size","config_sha256","config_size")))' "$policy_marker" 2>/dev/null || true)
-  read -r policy_step policy_slot policy_target_sha256 policy_target_size policy_config_sha256 policy_config_size <<<"$policy_values"
+if [ -z "$policy_values" ] && [ -n "$policy_marker" ]; then
+  policy_values=$(python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("\t".join(str(value.get(name, "")) for name in ("step","slot","target_sha256","target_size","config_sha256","config_size","source_url")))' "$policy_marker" 2>/dev/null || true)
+fi
+if [ -n "$policy_values" ]; then
+  read -r policy_step policy_slot policy_target_sha256 policy_target_size policy_config_sha256 policy_config_size policy_source_url <<<"$policy_values"
   case "$policy_step" in ''|*[!0-9]*) policy_step= ;; esac
   expected_slot="__POLICY_LORA_NAME__"
-  [ "$policy_step" -gt 0 ] 2>/dev/null && expected_slot="__POLICY_LORA_NAME__-slot$((policy_step % 2))"
+  if [ -n "$policy_step" ] && [ "$policy_step" -gt 0 ] 2>/dev/null \
+    && [ "$policy_slot" = "__POLICY_LORA_NAME__-slot$((policy_step % 2))" ]; then
+    expected_slot="$policy_slot"
+  fi
   if [ -n "$policy_step" ] && [ -n "$policy_slot" ] && [ "$policy_slot" = "$expected_slot" ] && [ -n "$policy_target_sha256" ] \
-    && [ -n "$policy_target_size" ] && [ -n "$policy_config_sha256" ] && [ -n "$policy_config_size" ]; then
+    && [ -n "$policy_target_size" ] && [ -n "$policy_config_sha256" ] && [ -n "$policy_config_size" ] && [ -n "$policy_source_url" ]; then
     policy_state=ready
   fi
 fi
@@ -795,7 +835,7 @@ for port in __PORTS__; do
     if [ -z "__POLICY_LORA_NAME__" ]; then
       active_model="__MODEL__"
     else
-      active_model=$(printf '%s' "$stage_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); slot=sys.argv[1]; expected={"target_step":int(sys.argv[2]),"target_sha256":sys.argv[3],"target_size":int(sys.argv[4]),"config_sha256":sys.argv[5],"config_size":int(sys.argv[6])}; receipts=d.get("loaded_receipts", {}); receipt=receipts.get(slot) if isinstance(receipt, dict) else None; print(slot if isinstance(receipt, dict) and all(receipt.get(k)==v for k,v in expected.items()) else "")' "$policy_slot" "$policy_step" "$policy_target_sha256" "$policy_target_size" "$policy_config_sha256" "$policy_config_size" 2>/dev/null || true)
+      active_model=$(printf '%s' "$stage_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); slot=sys.argv[1]; expected={"source_url":sys.argv[2],"target_sha256":sys.argv[3],"target_size":int(sys.argv[4]),"config_sha256":sys.argv[5],"config_size":int(sys.argv[6])}; receipts=d.get("loaded_receipts", {}); receipt=receipts.get(slot) if isinstance(receipts, dict) else None; print(slot if isinstance(receipt, dict) and all(receipt.get(k)==v for k,v in expected.items()) else "")' "$policy_slot" "$policy_source_url" "$policy_target_sha256" "$policy_target_size" "$policy_config_sha256" "$policy_config_size" 2>/dev/null || true)
     fi
     if [ -z "$active_model" ]; then
       code=POLICY_MISMATCH
@@ -860,6 +900,7 @@ def _inference_script(
     policy_broadcast_dir: str = "",
     policy_lora_name: str = "",
     run: str = "",
+    policy_identity: dict | None = None,
 ) -> str:
     settings = _inference_config(host)
     gpu_count = settings.get("gpu_count")
@@ -882,12 +923,27 @@ def _inference_script(
         raise RuntimeError(f"inference ports for {host} are invalid")
     if len(ports) != gpu_count // (tensor_parallel_size * data_parallel_size):
         raise RuntimeError(f"inference replica count for {host} is inconsistent")
+    policy_values = ""
+    if policy_identity is not None:
+        policy_values = "\t".join(
+            str(policy_identity[name])
+            for name in (
+                "step",
+                "slot",
+                "target_sha256",
+                "target_size",
+                "config_sha256",
+                "config_size",
+                "source_url",
+            )
+        )
     return (
         inference_probe.replace("__MODEL__", model)
         .replace("__ENGINE__", container)
         .replace("__PORTS__", " ".join(map(str, ports)))
         .replace("__POLICY_BROADCAST_DIR__", policy_broadcast_dir)
         .replace("__POLICY_LORA_NAME__", policy_lora_name)
+        .replace("__POLICY_VALUES__", shlex.quote(policy_values))
         .replace("__ENGINE_HOST__", host)
         .replace("__RUN__", run)
         .replace("__API_PORT__", str(ports[0]))
@@ -2010,6 +2066,9 @@ def status(run: str = "", quiet: bool = False) -> Status:
     policy_probe = None if trainer_only else _active_policy_probe_config(run)
     policy_broadcast_dir = policy_probe[0] if policy_probe is not None else ""
     policy_lora_name = policy_probe[1] if policy_probe is not None else ""
+    policy_identity = (
+        _active_policy_identity(policy_broadcast_dir) if policy_broadcast_dir else None
+    )
     run_name, rollout_transport, run_dir, zmq_port, zmq_target = _status_runtime_identity(run)
 
     def node(h):
@@ -2025,6 +2084,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
                 policy_broadcast_dir,
                 policy_lora_name,
                 run,
+                policy_identity,
             ),
             timeout=90,
         )
@@ -2233,7 +2293,12 @@ def _warnings(s: Status) -> list[str]:
             w.append(f"{e.host} API listener PID/command does not match the configured container")
         if e.reachable and e.policy_state != "ready":
             w.append(f"{e.host} active LoRA name/slot or policy identity is not exact ({e.policy_state})")
-        if e.reachable and not e.healthy:
+        if e.reachable and e.gen_code not in {
+            "200",
+            "STAGING",
+            "POLICY_UNKNOWN",
+            "POLICY_MISMATCH",
+        }:
             if e.watchdog:
                 w.append(
                     f"{e.host} failed a real completion probe (code {e.gen_code}), but its watchdog is active. "
@@ -2316,6 +2381,9 @@ def engines(run: str = "") -> dict[str, EngineState]:
     policy_probe = _active_policy_probe_config(run)
     policy_broadcast_dir = policy_probe[0] if policy_probe is not None else ""
     policy_lora_name = policy_probe[1] if policy_probe is not None else ""
+    policy_identity = (
+        _active_policy_identity(policy_broadcast_dir) if policy_broadcast_dir else None
+    )
     states = []
     for host, (rc, out) in _fan(
         inference_hosts,
@@ -2328,6 +2396,7 @@ def engines(run: str = "") -> dict[str, EngineState]:
                 policy_broadcast_dir,
                 policy_lora_name,
                 run,
+                policy_identity,
             ),
             timeout=90,
         ),

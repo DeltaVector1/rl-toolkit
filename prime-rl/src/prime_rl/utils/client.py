@@ -96,6 +96,61 @@ def _validate_loaded_receipt(
     return receipt
 
 
+async def common_loaded_lora_receipt(
+    admin_clients: list[AsyncClient], lora_name: str
+) -> AdapterIdentity | None:
+    """Return the adapter identity that every inference host has loaded."""
+    if not admin_clients:
+        raise RuntimeError("cannot read loaded adapter receipts without an inference endpoint")
+
+    async def read_receipt(admin_client: AsyncClient) -> AdapterIdentity | None:
+        response = await asyncio.wait_for(
+            admin_client.get(
+                "/staging_status",
+                timeout=httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0),
+            ),
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        receipts = payload.get("loaded_receipts") if isinstance(payload, dict) else None
+        receipt = receipts.get(lora_name) if isinstance(receipts, dict) else None
+        if receipt is None:
+            return None
+        source_url = receipt.get("source_url") if isinstance(receipt, dict) else None
+        parsed = urlsplit(source_url) if isinstance(source_url, str) else None
+        if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise RuntimeError("loaded adapter receipt has an invalid source URL")
+        return _validate_loaded_receipt(
+            receipt,
+            source_url=source_url,
+            lora_name=lora_name,
+            expected=None,
+        )
+
+    tasks = [asyncio.create_task(read_receipt(client)) for client in admin_clients]
+    try:
+        receipts = await asyncio.gather(*tasks)
+    except BaseException:
+        await _cancel_and_reap(tasks)
+        raise
+    present = [receipt for receipt in receipts if receipt is not None]
+    if not present:
+        return None
+    if len(present) != len(receipts):
+        raise RuntimeError(
+            f"loaded adapter receipt exists on only {len(present)}/{len(receipts)} inference endpoints"
+        )
+    common = dict(present[0])
+    common.pop("server_instance", None)
+    for receipt in present[1:]:
+        identity = dict(receipt)
+        identity.pop("server_instance", None)
+        if identity != common:
+            raise RuntimeError("inference endpoints have different loaded adapter receipts")
+    return common
+
+
 @runtime_checkable
 class InferencePool(Protocol):
     """Protocol for inference pools (static or elastic)."""
@@ -879,18 +934,25 @@ async def stage_lora_adapter(
         origin_count = len(origin_hosts)
         peer_groups = [peer_hosts] if peer_hosts else []
 
+    stage_response_grace_seconds = 30.0
+
     async def _stage_one(
         client: AsyncClient,
         *,
         remaining_delta_seconds: float | None = None,
     ) -> dict[str, object]:
         started = time.perf_counter()
-        stage_timeout_s = (
+        operation_timeout_s = (
             remaining_delta_seconds
             if remaining_delta_seconds is not None
             else LORA_STAGE_ATTEMPT_TIMEOUT_S
         )
-        stage_total_timeout_s = stage_timeout_s if require_delta else LORA_STAGE_TOTAL_TIMEOUT_S
+        request_timeout_s = operation_timeout_s
+        if remaining_delta_seconds is not None:
+            request_timeout_s += stage_response_grace_seconds
+        stage_total_timeout_s = (
+            request_timeout_s if require_delta else LORA_STAGE_TOTAL_TIMEOUT_S
+        )
         payload = {
             "lora_path": lora_path_posix,
             "require_delta": require_delta,
@@ -903,7 +965,7 @@ async def stage_lora_adapter(
             client,
             "/stage_lora_adapter",
             json=payload,
-            timeout_s=stage_timeout_s,
+            timeout_s=request_timeout_s,
             total_timeout_s=stage_total_timeout_s,
             max_attempts=1,
         )
@@ -923,6 +985,11 @@ async def stage_lora_adapter(
         total_stage_seconds = metric("total_stage_wall_seconds", metric("stage_seconds"))
         if total_stage_seconds is None:
             total_stage_seconds = time.perf_counter() - started
+        if (
+            remaining_delta_seconds is not None
+            and total_stage_seconds > remaining_delta_seconds
+        ):
+            raise TimeoutError("adapter delta staging exceeded its time limit")
         transfer_seconds = metric("transfer_wall_seconds")
         legacy_wire_seconds = metric("wire_stage_seconds", metric("stage_seconds", transfer_seconds))
         reconstruction_seconds = metric("reconstruction_wall_seconds", metric("reconstruct_seconds"))
@@ -959,8 +1026,6 @@ async def stage_lora_adapter(
                     client,
                     remaining_delta_seconds=remaining if require_delta else None,
                 )
-                if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
-                    raise TimeoutError("adapter delta staging exceeded its time limit")
                 return result
             except asyncio.CancelledError:
                 raise
@@ -989,73 +1054,23 @@ async def stage_lora_adapter(
         delta_deadline = time.monotonic() + LORA_STAGE_TOTAL_TIMEOUT_S
     stage_limit = None
     if require_delta:
-        # The caller has already supplied the policy step. Select its
-        # operational limit before probing the manifest so a later step
-        # cannot spend the full server maximum in this request.
         if policy_step is None:
             raise RuntimeError("adapter policy step is required for delta staging")
         stage_limit = adapter_stage_limit_seconds(policy_step)
-        # A policy adapter stage has one absolute phase deadline. Keep any
-        # caller-provided deadline as the stricter bound, and never reset it
-        # while probing the manifest or retrying a host.
+        source_name = Path(urlsplit(lora_path_posix).path.rstrip("/")).name
+        match = re.fullmatch(r"step_(\d+)", source_name)
+        if match is None or int(match.group(1)) != policy_step:
+            raise RuntimeError("adapter source URL differs from its policy step")
         selected_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
         selected_deadline = min(selected_deadline, time.monotonic() + min(stage_limit, configured_delta_timeout))
         if delta_deadline is None:
             delta_deadline = selected_deadline
         else:
             delta_deadline = min(delta_deadline, selected_deadline)
-        remaining = delta_deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("adapter delta staging exceeded its time limit")
-        try:
-            async with httpx.AsyncClient(follow_redirects=False) as probe:
-                response = await asyncio.wait_for(
-                    probe.get(
-                        f"{lora_path_posix.rstrip('/')}/adapter_manifest.json",
-                        timeout=httpx.Timeout(
-                            connect=remaining,
-                            read=remaining,
-                            write=remaining,
-                            pool=remaining,
-                        ),
-                    ),
-                    timeout=remaining,
-                )
-                response.raise_for_status()
-                manifest = response.json()
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError("adapter delta staging exceeded its time limit") from exc
-        except (httpx.HTTPError, ValueError) as exc:
-            raise RuntimeError("cannot determine adapter transport before staging") from exc
-        if not isinstance(manifest, dict):
-            raise RuntimeError("adapter transport manifest is not an object")
-        source_name = Path(urlsplit(lora_path_posix).path.rstrip("/")).name
-        match = re.fullmatch(r"step_(\d+)", source_name)
-        target_step = manifest.get("target_step")
-        if (
-            match is None
-            or type(target_step) is not int
-            or target_step <= 0
-            or int(match.group(1)) != target_step
-        ):
-            raise RuntimeError("cannot determine adapter policy step from validated manifest")
-        if manifest.get("version") == 1:
-            if manifest.get("base_step") != target_step - 1:
-                raise RuntimeError("adapter manifest steps are not consecutive")
-        elif manifest.get("version") == 2:
-            if (
-                manifest.get("base_step") != target_step - 1
-                or manifest.get("base2_step") != target_step - 2
-            ):
-                raise RuntimeError("adapter manifest steps are not consecutive")
-        else:
-            raise RuntimeError("adapter manifest version is unsupported")
-        if policy_step != target_step:
-            raise RuntimeError("requested adapter policy step differs from its manifest")
-    results = []
-    group_seconds: list[float] = []
-    groups = [ordered_hosts, *peer_groups]
-    for group in groups:
+
+    async def _stage_group(
+        group: list[AsyncClient],
+    ) -> tuple[list[dict[str, object]], float]:
         group_started = time.perf_counter()
         stage_tasks = [
             asyncio.create_task(
@@ -1078,20 +1093,33 @@ async def stage_lora_adapter(
                 await _cancel_and_reap(stage_tasks)
                 raise TimeoutError("adapter delta staging exceeded its time limit")
             try:
-                staged = await asyncio.wait_for(asyncio.gather(*stage_tasks), timeout=remaining)
+                staged = await asyncio.wait_for(
+                    asyncio.gather(*stage_tasks),
+                    timeout=remaining + stage_response_grace_seconds,
+                )
             except BaseException as exc:
                 await _cancel_and_reap(stage_tasks)
                 if isinstance(exc, asyncio.TimeoutError):
                     raise TimeoutError("adapter delta staging exceeded its time limit") from exc
                 raise
-            if time.monotonic() >= delta_deadline:
-                raise TimeoutError("adapter delta staging exceeded its time limit")
-        results.extend(staged)
-        group_seconds.append(time.perf_counter() - group_started)
-    if delta_deadline is not None and time.monotonic() >= delta_deadline:
-        raise TimeoutError("adapter delta staging exceeded its time limit")
+        return staged, time.perf_counter() - group_started
+
+    groups = [ordered_hosts, *peer_groups]
+    if require_delta and len(groups) > 1:
+        group_tasks = [asyncio.create_task(_stage_group(group)) for group in groups]
+        completed_groups = await asyncio.gather(*group_tasks, return_exceptions=True)
+        failures = [
+            result for result in completed_groups if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise failures[0]
+        grouped_results = completed_groups
+    else:
+        grouped_results = [await _stage_group(group) for group in groups]
+    results = [result for staged, _seconds in grouped_results for result in staged]
+    group_seconds = [seconds for _staged, seconds in grouped_results]
     origin_stage_seconds = group_seconds[0] if group_seconds else 0.0
-    peer_stage_seconds = sum(group_seconds[1:])
+    peer_stage_seconds = max(group_seconds[1:], default=0.0)
     transfer_values = [
         float(result["transfer_wall_seconds"])
         for result in results
@@ -1283,8 +1311,8 @@ def _is_retryable_lora_error(exception: BaseException) -> bool:
 # the local adapter load.
 LORA_LOAD_READ_TIMEOUT_S = 600.0
 LORA_LOAD_TOTAL_TIMEOUT_S = 600.0
-LORA_STAGE_ATTEMPT_TIMEOUT_S = 600.0
-LORA_STAGE_TOTAL_TIMEOUT_S = 600.0
+LORA_STAGE_ATTEMPT_TIMEOUT_S = 1800.0
+LORA_STAGE_TOTAL_TIMEOUT_S = 1800.0
 default_delta_stage_timeout_s = 600.0
 
 

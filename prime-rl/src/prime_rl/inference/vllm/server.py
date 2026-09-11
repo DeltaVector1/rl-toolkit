@@ -38,6 +38,7 @@ from prime_rl.inference.vllm.worker.filesystem import (
     adapter_cache_path,
     adapter_reader_lock,
     adapter_stage_status,
+    full_adapter_stage_timeout_s,
     stage_full_checkpoint_files,
 )
 from prime_rl.inference.patches import (
@@ -184,7 +185,8 @@ def _combined_lora_stage_status(
         state.update(durable)
     elif durable_status == "staging":
         state.update(durable)
-        state["status"] = "unknown"
+        state["status"] = "failed"
+        state["error"] = "RuntimeError: previous adapter stage did not finish"
     elif durable_status not in {None, "idle"}:
         state.update(durable)
         state["status"] = "unknown"
@@ -659,7 +661,11 @@ async def stage_lora_adapter(raw_request: Request):
         )
     _begin_lora_stage()
     started = time.monotonic()
-    operation_timeout = stage_timeout if stage_timeout is not None else 600.0
+    operation_timeout = (
+        stage_timeout
+        if stage_timeout is not None
+        else full_adapter_stage_timeout_s
+    )
     deadline = started + operation_timeout
     stage_id = uuid.uuid4().hex
     process = None

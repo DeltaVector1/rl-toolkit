@@ -665,18 +665,49 @@ class StageLoraAdapterTest(unittest.TestCase):
         origin = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
         peer = httpx.AsyncClient(base_url="http://127.0.0.1:18049")
 
-        with self.assertRaisesRegex(TimeoutError, "exceeded its time limit"):
-            asyncio.run(
-                stage_lora_adapter(
-                    [origin, peer],
-                    "http://adapter/step_1",
-                    require_delta=True,
-                    policy_step=1,
-                    origin_base_urls=["http://127.0.0.1:8000"],
-                )
+        result = asyncio.run(
+            stage_lora_adapter(
+                [origin, peer],
+                "http://adapter/step_1",
+                require_delta=True,
+                policy_step=1,
+                origin_base_urls=["http://127.0.0.1:8000"],
             )
+        )
+        self.assertEqual(result["host_count"], 2)
+        self.assertLess(result["total_stage_wall_seconds"], 0.05)
 
-    def test_delta_peer_receives_only_remaining_time(self):
+    def test_delta_accepts_a_late_response_for_work_finished_in_time(self):
+        stage_lora_adapter, namespace = _load_stage_function()
+
+        class Response:
+            def json(self):
+                return {
+                    "status": "ok",
+                    "stage_seconds": 0.01,
+                    "adapter_identity": _adapter_identity(),
+                }
+
+        async def fake_admin_post_response(_client, _path, **_kwargs):
+            await asyncio.sleep(0.06)
+            return Response()
+
+        namespace["_admin_post_response"] = fake_admin_post_response
+        namespace["_delta_stage_timeout_s"] = lambda: 0.05
+        client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
+
+        result = asyncio.run(
+            stage_lora_adapter(
+                [client],
+                "http://adapter/step_1",
+                require_delta=True,
+                policy_step=1,
+            )
+        )
+
+        self.assertEqual(result["host_count"], 1)
+
+    def test_delta_origin_and_peer_receive_one_shared_deadline(self):
         stage_lora_adapter, namespace = _load_stage_function()
         calls = []
 
@@ -710,19 +741,27 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(result["peer_host_count"], 1)
         origin_request = calls[0][1]
         peer_request = calls[1][1]
-        self.assertEqual(
-            origin_request["json"]["stage_timeout_seconds"], origin_request["timeout_s"]
+        self.assertLess(
+            origin_request["json"]["stage_timeout_seconds"],
+            origin_request["timeout_s"],
         )
-        self.assertEqual(
-            peer_request["json"]["stage_timeout_seconds"], peer_request["timeout_s"]
+        self.assertLess(
+            peer_request["json"]["stage_timeout_seconds"],
+            peer_request["timeout_s"],
         )
         self.assertEqual(origin_request["total_timeout_s"], origin_request["timeout_s"])
         self.assertEqual(peer_request["total_timeout_s"], peer_request["timeout_s"])
-        self.assertLess(peer_request["timeout_s"], origin_request["timeout_s"])
-        self.assertLessEqual(origin_request["timeout_s"], 0.15)
-        self.assertLessEqual(peer_request["timeout_s"], 0.15)
+        self.assertAlmostEqual(
+            peer_request["json"]["stage_timeout_seconds"],
+            origin_request["json"]["stage_timeout_seconds"],
+            delta=0.01,
+        )
+        self.assertLessEqual(
+            origin_request["json"]["stage_timeout_seconds"], 0.15
+        )
+        self.assertLessEqual(peer_request["json"]["stage_timeout_seconds"], 0.15)
 
-    def test_predictive_origin_finishes_before_peer(self):
+    def test_predictive_origin_and_peer_start_together(self):
         _ManifestProbeClient.requests.clear()
         stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
         calls = []
@@ -750,15 +789,49 @@ class StageLoraAdapterTest(unittest.TestCase):
         )
 
         self.assertEqual([client for client, _ in calls], [origin, peer])
-        self.assertGreaterEqual(calls[1][1] - calls[0][1], 0.025)
+        self.assertLess(abs(calls[1][1] - calls[0][1]), 0.01)
         self.assertEqual(result["origin_host_count"], 1)
         self.assertEqual(result["peer_host_count"], 1)
         self.assertLess(result["wire_stage_seconds"], 0.10)
-        self.assertEqual(len(_ManifestProbeClient.requests), 1)
-        self.assertGreater(_ManifestProbeClient.requests[0].read, 10.0)
-        self.assertLessEqual(_ManifestProbeClient.requests[0].read, 30.0)
+        self.assertEqual(_ManifestProbeClient.requests, [])
 
-    def test_manifest_probe_uses_selected_policy_step_limit(self):
+    def test_peer_failure_does_not_cancel_origin_progress(self):
+        stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
+        finished = []
+
+        class Response:
+            def json(self):
+                return {
+                    "status": "ok",
+                    "stage_seconds": 0.05,
+                    "adapter_identity": _adapter_identity(2),
+                }
+
+        origin = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
+        peer = httpx.AsyncClient(base_url="http://127.0.0.1:18049")
+
+        async def fake_admin_post_response(client, _path, **_kwargs):
+            if client is peer:
+                await asyncio.sleep(0.01)
+                raise RuntimeError("adapter identity mismatch")
+            await asyncio.sleep(0.05)
+            finished.append(client)
+            return Response()
+
+        namespace["_admin_post_response"] = fake_admin_post_response
+        with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+            asyncio.run(
+                stage_lora_adapter(
+                    [peer, origin],
+                    "http://adapter/step_2",
+                    require_delta=True,
+                    policy_step=2,
+                    origin_base_urls=["http://127.0.0.1:8000"],
+                )
+            )
+        self.assertEqual(finished, [origin])
+
+    def test_server_receives_selected_policy_step_limit_without_client_probe(self):
         for policy_step, expected_limit in ((2, 600.0), (3, 300.0)):
             with self.subTest(policy_step=policy_step):
                 _ManifestProbeClient.requests.clear()
@@ -775,7 +848,10 @@ class StageLoraAdapterTest(unittest.TestCase):
                             "adapter_identity": _adapter_identity(policy_step),
                         }
 
-                async def fake_admin_post_response(_client, _path, **_kwargs):
+                calls = []
+
+                async def fake_admin_post_response(_client, _path, **kwargs):
+                    calls.append(kwargs)
                     return Response()
 
                 namespace["_admin_post_response"] = fake_admin_post_response
@@ -788,9 +864,14 @@ class StageLoraAdapterTest(unittest.TestCase):
                         policy_step=policy_step,
                     )
                 )
-                self.assertEqual(len(_ManifestProbeClient.requests), 1)
-                self.assertGreater(_ManifestProbeClient.requests[0].read, expected_limit - 0.01)
-                self.assertLessEqual(_ManifestProbeClient.requests[0].read, expected_limit)
+                self.assertEqual(_ManifestProbeClient.requests, [])
+                self.assertGreater(
+                    calls[0]["json"]["stage_timeout_seconds"],
+                    expected_limit - 0.01,
+                )
+                self.assertLessEqual(
+                    calls[0]["json"]["stage_timeout_seconds"], expected_limit
+                )
 
     def test_external_delta_deadline_is_not_reset_after_probe_setup(self):
         _ManifestProbeClient.requests.clear()
@@ -805,7 +886,10 @@ class StageLoraAdapterTest(unittest.TestCase):
                     "adapter_identity": _adapter_identity(3),
                 }
 
-        async def fake_admin_post_response(_client, _path, **_kwargs):
+        calls = []
+
+        async def fake_admin_post_response(_client, _path, **kwargs):
+            calls.append(kwargs)
             return Response()
 
         namespace["_admin_post_response"] = fake_admin_post_response
@@ -818,26 +902,21 @@ class StageLoraAdapterTest(unittest.TestCase):
                 delta_deadline=time.perf_counter() + 0.2,
             )
         )
-        self.assertLessEqual(_ManifestProbeClient.requests[0].read, 0.2)
+        self.assertEqual(_ManifestProbeClient.requests, [])
+        self.assertLessEqual(calls[0]["json"]["stage_timeout_seconds"], 0.2)
 
-    def test_slow_manifest_probe_cannot_outlive_delta_deadline(self):
-        _ManifestProbeClient.delay = 1.0
-        try:
-            stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
-            namespace["_delta_stage_timeout_s"] = lambda: 0.05
-            client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
-
-            with self.assertRaisesRegex(TimeoutError, "exceeded its time limit"):
-                asyncio.run(
-                    stage_lora_adapter(
-                        [client],
-                        "http://adapter/step_2",
-                        require_delta=True,
-                        policy_step=2,
-                    )
+    def test_delta_rejects_a_source_url_for_another_step(self):
+        stage_lora_adapter, _namespace = _load_stage_function()
+        client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
+        with self.assertRaisesRegex(RuntimeError, "source URL differs"):
+            asyncio.run(
+                stage_lora_adapter(
+                    [client],
+                    "http://adapter/step_1",
+                    require_delta=True,
+                    policy_step=2,
                 )
-        finally:
-            _ManifestProbeClient.delay = 0.0
+            )
 
 
 if __name__ == "__main__":

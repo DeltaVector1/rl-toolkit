@@ -372,10 +372,17 @@ class WeightWatcher:
                         continue
                 next_step = self.compute_next_ckpt_step()
                 if next_step > self.ckpt_step:
+                    update_deadline = None
+                    update_attempts = 1
+                    if self.lora_name is not None and next_step > 0:
+                        update_deadline = time.monotonic() + 2 * adapter_stage_limit_seconds(
+                            next_step
+                        )
+                        update_attempts = 2
                     await _run_with_retries(
                         f"Policy update {next_step}",
-                        lambda: self.apply_policy_update(next_step),
-                        attempts=1,
+                        lambda: self.apply_policy_update(next_step, update_deadline),
+                        attempts=update_attempts,
                     )
                 elif time.monotonic() - self.last_reconcile_check_at >= self.reconcile_interval:
                     self.last_reconcile_check_at = time.monotonic()
@@ -577,7 +584,11 @@ class WeightWatcher:
             deadline,
         )
 
-    async def apply_policy_update(self, next_step: int) -> None:
+    async def apply_policy_update(
+        self,
+        next_step: int,
+        update_deadline: float | None = None,
+    ) -> None:
         async with self.update_lock:
             if next_step <= self.ckpt_step:
                 # Another caller raced us — bail without re-applying
@@ -620,6 +631,12 @@ class WeightWatcher:
                     if local_weights_path is None:
                         raise RuntimeError("adapter delta target path is not local")
                     delta_deadline = time.monotonic() + adapter_stage_limit_seconds(next_step)
+                    if update_deadline is not None:
+                        delta_deadline = min(delta_deadline, update_deadline)
+                    if delta_deadline <= time.monotonic():
+                        raise TimeoutError(
+                            f"cannot apply adapter policy v{next_step}: update time limit expired"
+                        )
                     manifest_path = await self._prewarm_adapter_manifest(
                         next_step,
                         local_weights_path,

@@ -112,7 +112,7 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_LORA_CACHE_DIR="$adapter_cache_dir" \
-  -e PRIME_LORA_DOWNLOAD_STREAMS=96 \
+  -e PRIME_LORA_DOWNLOAD_STREAMS=128 \
   -e PRIME_LORA_SOURCE_PORTS="$lora_source_port_list" \
   --entrypoint /bin/bash \
   prime-rl:glm52-v080-glm52-h200-router \

@@ -31,7 +31,10 @@ class UpgradeError(RuntimeError):
     pass
 
 
-_identity_cache: dict[tuple[Path, bool, tuple[tuple[int, int, int, int, int], ...]], dict[str, object]] = {}
+_identity_cache: dict[
+    tuple[Path, bool, bool, tuple[tuple[int, int, int, int, int], ...]],
+    dict[str, object],
+] = {}
 _identity_lock = Lock()
 
 
@@ -122,6 +125,7 @@ def _identity_from_published_directory(
     *,
     cache: bool,
     weight_fd: int | None = None,
+    verify_weights: bool = True,
 ) -> dict[str, object]:
     if directory.is_symlink() or not directory.is_dir():
         raise UpgradeError(f"adapter step {step} directory is missing")
@@ -190,9 +194,10 @@ def _identity_from_published_directory(
     cache_key = (
         directory.resolve(),
         cache,
+        verify_weights,
         tuple(_stat_identity(path) for path in stat_paths),
     )
-    if opened_weight_stat is not None and opened_weight_stat != cache_key[2][1]:
+    if opened_weight_stat is not None and opened_weight_stat != cache_key[3][1]:
         raise UpgradeError(f"{description} weights changed before validation")
     with _identity_lock:
         cached = _identity_cache.get(cache_key)
@@ -202,13 +207,14 @@ def _identity_from_published_directory(
         actual_config_digest = _sha256(directory / adapter_config_name)
         if actual_config_digest != records[adapter_config_name]["sha256"]:
             raise UpgradeError(f"{description} configuration checksum differs")
-        actual_weights_digest = (
-            _sha256_fd(weight_fd, adapter_weights_name)
-            if weight_fd is not None
-            else _sha256(directory / adapter_weights_name)
-        )
-        if actual_weights_digest != records[adapter_weights_name]["sha256"]:
-            raise UpgradeError(f"{description} weight checksum differs")
+        if verify_weights:
+            actual_weights_digest = (
+                _sha256_fd(weight_fd, adapter_weights_name)
+                if weight_fd is not None
+                else _sha256(directory / adapter_weights_name)
+            )
+            if actual_weights_digest != records[adapter_weights_name]["sha256"]:
+                raise UpgradeError(f"{description} weight checksum differs")
         if weight_fd is not None and _fd_stat_identity(weight_fd) != opened_weight_stat:
             raise UpgradeError(f"{description} weights changed during validation")
         validated_identity = {
@@ -548,6 +554,7 @@ class RangeHandler(SimpleHTTPRequestHandler):
                     step,
                     cache=False,
                     weight_fd=weight_fd,
+                    verify_weights=weight_fd is not None,
                 )
         except UpgradeError as exc:
             if source is not None:

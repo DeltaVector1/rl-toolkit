@@ -575,6 +575,133 @@ class DownloadSchedulerTest(unittest.TestCase):
         self.assertTrue(all(0 < call[1] <= 15 for call in calls))
         self.assertEqual(sleeps, [filesystem.lane_rotation_delay_seconds])
 
+    def test_active_chunk_can_run_longer_than_idle_timeout(self):
+        filesystem = load_filesystem_module()
+        payload = b"six-bytes"
+        calls = []
+        clock = [0.0]
+
+        class SlowResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read1(self, _size):
+                clock[0] += 6
+                return payload[int(clock[0] // 6) - 1 : int(clock[0] // 6)]
+
+        class FastResponse(io.BytesIO):
+            status = 206
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, request.headers.get("Range"), timeout))
+            if len(calls) == 1:
+                return SlowResponse()
+            return FastResponse(payload[3:])
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_monotonic = filesystem.time.monotonic
+        old_sleep = filesystem.time.sleep
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.monotonic = lambda: clock[0]
+        filesystem.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "chunk"
+                filesystem.download(
+                    "http://slow/chunk",
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    source_urls=["http://slow/chunk", "http://fast/chunk"],
+                    parallel_ranges=False,
+                    deadline=100,
+                    per_request_timeout_seconds=60,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.monotonic = old_monotonic
+            filesystem.time.sleep = old_sleep
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "http://slow/chunk")
+        self.assertIsNone(calls[0][1])
+        self.assertLessEqual(calls[0][2], filesystem._ADAPTER_LANE_TIMEOUT_S)
+
+    def test_trickling_chunk_rotates_after_its_total_timeout(self):
+        filesystem = load_filesystem_module()
+        payload = b"six-bytes"
+        calls = []
+        clock = [0.0]
+
+        class SlowResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read1(self, _size):
+                clock[0] += 6
+                return payload[int(clock[0] // 6) - 1 : int(clock[0] // 6)]
+
+        class FastResponse(io.BytesIO):
+            status = 206
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, request.headers.get("Range"), timeout))
+            if len(calls) == 1:
+                return SlowResponse()
+            return FastResponse(payload[3:])
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_monotonic = filesystem.time.monotonic
+        old_sleep = filesystem.time.sleep
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.monotonic = lambda: clock[0]
+        filesystem.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "chunk"
+                filesystem.download(
+                    "http://slow/chunk",
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    source_urls=["http://slow/chunk", "http://fast/chunk"],
+                    parallel_ranges=False,
+                    deadline=100,
+                    per_request_timeout_seconds=15,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.monotonic = old_monotonic
+            filesystem.time.sleep = old_sleep
+
+        self.assertEqual(calls[0][0], "http://slow/chunk")
+        self.assertEqual(calls[1][0], "http://fast/chunk")
+        self.assertEqual(calls[1][1], "bytes=3-")
+
     def test_chunk_retry_can_try_every_lane_before_deadline(self):
         filesystem = load_filesystem_module()
         payload = b"chunk"
@@ -619,6 +746,56 @@ class DownloadSchedulerTest(unittest.TestCase):
             filesystem.time.sleep = old_sleep
 
         self.assertEqual([call[0] for call in calls], source_urls)
+
+    def test_relay_chunk_waits_past_one_lane_cycle(self):
+        filesystem = load_filesystem_module()
+        payload = b"chunk"
+        calls = []
+        clock = [0.0]
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, timeout))
+            if len(calls) <= 70:
+                raise filesystem.HTTPError(request.full_url, 503, "not ready", None, None)
+            return Response(payload)
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_monotonic = filesystem.time.monotonic
+        old_sleep = filesystem.time.sleep
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.monotonic = lambda: clock[0]
+        filesystem.time.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "chunk"
+                filesystem.download(
+                    "http://lane-1/chunk",
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    source_urls=["http://lane-1/chunk", "http://lane-2/chunk"],
+                    parallel_ranges=False,
+                    deadline=100.0,
+                    per_request_timeout_seconds=15.0,
+                    retry_http_statuses={404, 503},
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.monotonic = old_monotonic
+            filesystem.time.sleep = old_sleep
+
+        self.assertEqual(len(calls), 71)
+        self.assertEqual(clock[0], 70.0)
 
     def test_range_retry_rotates_to_a_distinct_tunnel_supervisor(self):
         filesystem = load_filesystem_module()
