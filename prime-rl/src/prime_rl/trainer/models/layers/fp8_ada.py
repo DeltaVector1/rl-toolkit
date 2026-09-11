@@ -2270,9 +2270,9 @@ def _grouped_lora_backward(
     """Compute one grouped LoRA backward without nested autograd."""
     if grad_output.dtype != x.dtype:
         raise TypeError("expert LoRA output gradient must use the activation dtype")
-    if tuple(grad_a.shape) != tuple(lora_a.shape) or tuple(grad_b.shape) != tuple(
-        lora_b.shape
-    ):
+    if grad_a is not None and tuple(grad_a.shape) != tuple(lora_a.shape):
+        raise ValueError("expert LoRA A gradient buffer does not match its factor")
+    if grad_b is not None and tuple(grad_b.shape) != tuple(lora_b.shape):
         raise ValueError("expert LoRA gradient buffers do not match their factors")
     if lora_a.shape[1] != 32:
         raise RuntimeError(
@@ -2301,8 +2301,10 @@ def _grouped_lora_backward(
         lora_a,
         offs=offsets,
     )
-    _grouped_outer_accumulate(low_rank_grad, x, offsets, grad_a)
-    _grouped_outer_accumulate(grad_output, low_rank, offsets, grad_b)
+    if grad_a is not None:
+        _grouped_outer_accumulate(low_rank_grad, x, offsets, grad_a)
+    if grad_b is not None:
+        _grouped_outer_accumulate(grad_output, low_rank, offsets, grad_b)
     return input_grad
 
 
@@ -2607,7 +2609,10 @@ class _InplacePermutedLoRAExperts(torch.autograd.Function):
             raise RuntimeError("native expert row-index device changed before backward")
         grad = grad.contiguous()
         workspace = ctx.received_input.make_workspace(ctx.chunk_rows, grad.device)
-        parameter_grads = [torch.zeros_like(value) for value in lora_parameters]
+        parameter_grads = [
+            torch.zeros_like(value) if needed else None
+            for value, needed in zip(lora_parameters, ctx.needs_input_grad[7:13])
+        ]
         score_grads = (
             torch.empty_like(received_scores)
             if ctx.local_recompute

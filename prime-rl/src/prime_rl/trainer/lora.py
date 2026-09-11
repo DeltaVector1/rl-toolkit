@@ -397,7 +397,9 @@ def freeze_all_except_lora_and_specified(model: nn.Module, config: LoRAConfig) -
         config: LoRA configuration with modules_to_save patterns
     """
     for name, param in model.named_parameters():
-        if any(lora_param in name for lora_param in ["lora_A", "lora_B"]):
+        if "lora_A" in name:
+            param.requires_grad = not config.freeze_a
+        elif "lora_B" in name:
             param.requires_grad = True
         elif _should_keep_trainable(name, config.modules_to_save):
             param.requires_grad = True
@@ -535,10 +537,20 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> None:
             lora_adapter_params += adapter_params
             lora_adapted_params += adapted_params
 
-    fully_trainable = trainable_params - lora_adapter_params
+    trainable_lora_params = sum(
+        param.numel()
+        for name, param in model.named_parameters()
+        if param.requires_grad and ("lora_A" in name or "lora_B" in name)
+    )
+    fully_trainable = trainable_params - trainable_lora_params
     adapted_or_trainable = lora_adapted_params + fully_trainable
 
     logger.info(f"LoRA enabled: {lora_adapter_params:,} adapter params adapting {lora_adapted_params:,} base params")
+    if config.freeze_a:
+        logger.info(
+            f"LoRA input projections fixed: {lora_adapter_params - trainable_lora_params:,} parameters; "
+            f"output projections trainable: {trainable_lora_params:,} parameters"
+        )
     logger.info(f"LoRA: {fully_trainable:,} fully trainable parameters")
     logger.info(f"LoRA: {adapted_or_trainable:,} adapted or fully trainable out of {total_params:,} parameters")
 

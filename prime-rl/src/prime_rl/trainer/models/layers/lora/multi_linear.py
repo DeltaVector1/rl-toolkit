@@ -225,13 +225,22 @@ class _SingleLoRA(torch.autograd.Function):
             # explicit full-size FP32 activation and output-gradient copies.
             grad_a = _lora_mm(grad, lora_B)
             x_grad = _lora_mm(grad_a, lora_A).to(x.dtype)
-            a_grad = _lora_mm(grad_a.T, x).to(lora_A.dtype)
-            b_grad = _lora_mm(grad.T, a_out).to(lora_B.dtype)
+            a_grad = (
+                _lora_mm(grad_a.T, x).to(lora_A.dtype)
+                if ctx.needs_input_grad[1]
+                else None
+            )
+            b_grad = (
+                _lora_mm(grad.T, a_out).to(lora_B.dtype)
+                if ctx.needs_input_grad[2]
+                else None
+            )
             if (
                 os.environ.get("PRIME_FP8_DIAG_LINEAR_BACKWARD", "") == "1"
                 and not all(
                     bool(torch.isfinite(value).all())
                     for value in (grad, grad_a, x_grad, a_grad, b_grad)
+                    if value is not None
                 )
                 and ctx.fqn not in _REPORTED_NONFINITE_LORA
             ):
@@ -256,8 +265,8 @@ class _SingleLoRA(torch.autograd.Function):
         grad_a = grad @ lora_B
         return (
             (grad_a @ lora_A).to(x.dtype),
-            (grad_a.T @ x).to(lora_A.dtype),
-            (grad.T @ a_out).to(lora_B.dtype),
+            (grad_a.T @ x).to(lora_A.dtype) if ctx.needs_input_grad[1] else None,
+            (grad.T @ a_out).to(lora_B.dtype) if ctx.needs_input_grad[2] else None,
             None,
         )
 
