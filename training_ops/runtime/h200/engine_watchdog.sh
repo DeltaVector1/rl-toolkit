@@ -32,6 +32,7 @@ liveness_deferrals=0
 last_generation_tokens=-1
 last_staging_bytes=-1
 last_staging_progress_at=0
+loading_container=
 
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 log "engine watchdog started (port=$PORT interval=${INTERVAL}s timeout=${TIMEOUT}s)"
@@ -41,6 +42,22 @@ if [ "$STARTUP_GRACE" -gt 0 ]; then
 fi
 
 while true; do
+  container_state=$(sudo docker inspect -f '{{.Id}} {{.State.StartedAt}}' "$ENGINE_CONTAINER" 2>/dev/null || true)
+  container_id=${container_state%% *}
+  container_started_at=${container_state#* }
+  container_started_epoch=$(date -u -d "$container_started_at" +%s 2>/dev/null || true)
+  now=$(date +%s)
+  if [ "$STARTUP_GRACE" -gt 0 ] && [ -n "$container_id" ] &&
+     [ -n "$container_started_epoch" ] && [ $((now - container_started_epoch)) -lt "$STARTUP_GRACE" ]; then
+    if [ "$loading_container" != "$container_id" ]; then
+      log "engine container is loading; probe deferred"
+      loading_container=$container_id
+    fi
+    misses=0
+    sleep "$INTERVAL"
+    continue
+  fi
+  loading_container=
   # A tiny real generation. max_tokens=3 keeps it cheap; a hung EngineCore
   # never answers it even though /v1/models still returns 200.
   code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \

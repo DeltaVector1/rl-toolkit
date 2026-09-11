@@ -955,6 +955,16 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertNotIn("pkill", script)
         self.assertNotIn("kill -- -", script)
 
+    def test_engine_watchdog_defers_each_new_container_load(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / "runtime"
+            / "h200"
+            / "engine_watchdog.sh"
+        ).read_text()
+        self.assertIn("{{.Id}} {{.State.StartedAt}}", script)
+        self.assertIn("engine container is loading; probe deferred", script)
+
     def test_repair_refuses_before_any_mutation_when_trainer_is_down(self):
         unhealthy = training_ops.Status(trainer_up=False, orch_up=True)
         with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
