@@ -988,7 +988,6 @@ async def stage_lora_adapter(
     if not require_delta and delta_deadline is None:
         delta_deadline = time.monotonic() + LORA_STAGE_TOTAL_TIMEOUT_S
     stage_limit = None
-    predictive_transport = False
     if require_delta:
         # The caller has already supplied the policy step. Select its
         # operational limit before probing the manifest so a later step
@@ -1053,78 +1052,42 @@ async def stage_lora_adapter(
             raise RuntimeError("adapter manifest version is unsupported")
         if policy_step != target_step:
             raise RuntimeError("requested adapter policy step differs from its manifest")
-        predictive_transport = (
-            manifest.get("version") == 2
-            and manifest.get("transport") == "chunked-bf16-linear-zigzag-sparse-zstd"
-        )
     results = []
     group_seconds: list[float] = []
     groups = [ordered_hosts, *peer_groups]
-    if predictive_transport:
-        # v2 origin and peer transfers share one absolute deadline. If the
-        # origin fails, cancel and await every peer task before returning.
-        remaining = delta_deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("adapter delta staging exceeded its time limit")
-        tasks = [
+    for group in groups:
+        group_started = time.perf_counter()
+        stage_tasks = [
             asyncio.create_task(
-                _stage_one_with_retries(client, absolute_deadline=delta_deadline)
+                _stage_one_with_retries(
+                    client,
+                    absolute_deadline=delta_deadline,
+                )
             )
-            for group in groups
             for client in group
         ]
-        try:
-            staged = await asyncio.wait_for(asyncio.gather(*tasks), timeout=remaining)
-        except BaseException:
-            await _cancel_and_reap(tasks)
-            raise
-        if time.monotonic() >= delta_deadline:
-            raise TimeoutError("adapter delta staging exceeded its time limit")
+        if delta_deadline is None:
+            try:
+                staged = await asyncio.gather(*stage_tasks)
+            except BaseException:
+                await _cancel_and_reap(stage_tasks)
+                raise
+        else:
+            remaining = delta_deadline - time.monotonic()
+            if remaining <= 0:
+                await _cancel_and_reap(stage_tasks)
+                raise TimeoutError("adapter delta staging exceeded its time limit")
+            try:
+                staged = await asyncio.wait_for(asyncio.gather(*stage_tasks), timeout=remaining)
+            except BaseException as exc:
+                await _cancel_and_reap(stage_tasks)
+                if isinstance(exc, asyncio.TimeoutError):
+                    raise TimeoutError("adapter delta staging exceeded its time limit") from exc
+                raise
+            if time.monotonic() >= delta_deadline:
+                raise TimeoutError("adapter delta staging exceeded its time limit")
         results.extend(staged)
-        position = 0
-        for group in groups:
-            group_results = staged[position : position + len(group)]
-            position += len(group)
-            group_seconds.append(
-                max(
-                    (float(item["request_seconds"]) for item in group_results),
-                    default=0.0,
-                )
-            )
-    else:
-        for group in groups:
-            group_started = time.perf_counter()
-            stage_tasks = [
-                asyncio.create_task(
-                    _stage_one_with_retries(
-                        client,
-                        absolute_deadline=delta_deadline,
-                    )
-                )
-                for client in group
-            ]
-            if delta_deadline is None:
-                try:
-                    staged = await asyncio.gather(*stage_tasks)
-                except BaseException:
-                    await _cancel_and_reap(stage_tasks)
-                    raise
-            else:
-                remaining = delta_deadline - time.monotonic()
-                if remaining <= 0:
-                    await _cancel_and_reap(stage_tasks)
-                    raise TimeoutError("adapter delta staging exceeded its time limit")
-                try:
-                    staged = await asyncio.wait_for(asyncio.gather(*stage_tasks), timeout=remaining)
-                except BaseException as exc:
-                    await _cancel_and_reap(stage_tasks)
-                    if isinstance(exc, asyncio.TimeoutError):
-                        raise TimeoutError("adapter delta staging exceeded its time limit") from exc
-                    raise
-                if time.monotonic() >= delta_deadline:
-                    raise TimeoutError("adapter delta staging exceeded its time limit")
-            results.extend(staged)
-            group_seconds.append(time.perf_counter() - group_started)
+        group_seconds.append(time.perf_counter() - group_started)
     if delta_deadline is not None and time.monotonic() >= delta_deadline:
         raise TimeoutError("adapter delta staging exceeded its time limit")
     origin_stage_seconds = group_seconds[0] if group_seconds else 0.0

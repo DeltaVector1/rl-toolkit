@@ -722,7 +722,7 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertLessEqual(origin_request["timeout_s"], 0.15)
         self.assertLessEqual(peer_request["timeout_s"], 0.15)
 
-    def test_predictive_origin_and_peer_stage_concurrently(self):
+    def test_predictive_origin_finishes_before_peer(self):
         _ManifestProbeClient.requests.clear()
         stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
         calls = []
@@ -749,8 +749,8 @@ class StageLoraAdapterTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual({client for client, _ in calls}, {origin, peer})
-        self.assertLess(abs(calls[0][1] - calls[1][1]), 0.02)
+        self.assertEqual([client for client, _ in calls], [origin, peer])
+        self.assertGreaterEqual(calls[1][1] - calls[0][1], 0.025)
         self.assertEqual(result["origin_host_count"], 1)
         self.assertEqual(result["peer_host_count"], 1)
         self.assertLess(result["wire_stage_seconds"], 0.10)
