@@ -534,6 +534,51 @@ PY
   [ "$verified_ports" = "${#lora_source_ports[@]}" ]
 }
 
+china_source_ports_ready() {
+  local probe_seconds=${1:-10} expected_lanes observed_lanes verified_ports
+  expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
+  observed_lanes=$(ps -eo args= | sed -n 's/.*# china-tunnel-lora-\([0-9][0-9]*\)$/\1/p' | sort -n)
+  [ "$observed_lanes" = "$(seq 0 $((expected_lanes - 1)))" ] || return 1
+  if ! verified_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
+      python3 - "${lora_source_ports[0]}" "${lora_source_ports[-1]}" <<'PY'
+import http.client
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+first = int(sys.argv[1])
+last = int(sys.argv[2])
+
+
+def is_adapter_server(port):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    try:
+        connection.request("HEAD", "/")
+        response = connection.getresponse()
+        response.read()
+        server = response.getheader("Server") or ""
+        if response.status != 200 or not server.startswith("SimpleHTTP/"):
+            return port
+    except OSError:
+        return port
+    finally:
+        connection.close()
+    return None
+
+
+ports = list(range(first, last + 1))
+with ThreadPoolExecutor(max_workers=min(32, len(ports))) as executor:
+    failed = [port for port in executor.map(is_adapter_server, ports) if port is not None]
+if failed:
+    print("wrong adapter source ports: " + ",".join(map(str, failed)), file=sys.stderr)
+    raise SystemExit(1)
+print(len(ports))
+PY
+  ); then
+    return 1
+  fi
+  [ "$verified_ports" = "${#lora_source_ports[@]}" ]
+}
+
 tunnel_command_has() {
   local command_line=$1 token=$2
   case " $command_line " in
@@ -1007,27 +1052,8 @@ if [ "$tunnels_only" = 1 ]; then
   tunnels_ready=0
   readiness_port=""
   for _ in $(seq 1 30); do
-    tunnels_ready=1
-    lane_start=0
-    while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
-      lane_number=$((lane_start / china_lane_size))
-      lane_ports=("${lora_source_ports[@]:lane_start:china_lane_size}")
-      lane_forwards=()
-      for lane_port in "${lane_ports[@]}"; do
-        lane_forwards+=(
-          -L "127.0.0.1:$lane_port:127.0.0.1:$adapter_port"
-        )
-      done
-      listener_status=0
-      tunnel_listener_ready "${lane_ports[0]}" "china-tunnel-lora-$lane_number" \
-        "$trainer_ssh_target" "${#lane_ports[@]}" "${lane_forwards[@]}" || listener_status=$?
-      if [ "$listener_status" -ne 0 ]; then
-        tunnels_ready=0
-        readiness_port=${lane_ports[0]}
-        break
-      fi
-      lane_start=$((lane_start + china_lane_size))
-    done
+    tunnels_ready=0
+    china_source_ports_ready 10 && tunnels_ready=1
     if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ]; then
       listener_status=0
       tunnel_listener_ready "$peer_api_port" peer-tunnel-api \
