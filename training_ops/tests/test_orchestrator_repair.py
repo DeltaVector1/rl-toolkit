@@ -87,6 +87,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('body != b"source URL is not configured\\n"', source)
         self.assertIn('china_tunnel_remove_orphan_children "${forwards[@]}"', source)
         self.assertIn('old adapter tunnel ports did not clear for $marker', source)
+        self.assertIn('for source_port in "${china_legacy_cleanup_ports[@]}"', source)
         self.assertLess(mode_start, docker_start)
 
     def test_orchestrator_prepares_broadcast_steps_for_appuser(self):

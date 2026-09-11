@@ -755,6 +755,10 @@ china_tunnel_remove_orphan_children() {
       china_legacy_cleanup_required=1
       china_legacy_cleanup_pids+=("$pid")
       china_legacy_cleanup_orphan_pids+=("$pid")
+      case " ${china_legacy_cleanup_ports[*]} " in
+        *" $source_port "*) ;;
+        *) china_legacy_cleanup_ports+=("$source_port") ;;
+      esac
       kill "$pid" 2>/dev/null || true
     done < <(ss -H -ltnp 2>/dev/null | awk -v local_port="127.0.0.1:$source_port" '$4 == local_port')
   done
@@ -810,6 +814,10 @@ china_tunnel_remove_legacy() {
       if [ "$grouped_legacy" = 1 ]; then
         china_legacy_cleanup_required=1
         china_legacy_cleanup_pids+=("$pid")
+        case " ${china_legacy_cleanup_ports[*]} " in
+          *" $lora_source_port "*) ;;
+          *) china_legacy_cleanup_ports+=("$lora_source_port") ;;
+        esac
         case "$pgid" in
           ''|*[!0-9]*|0|1) ;;
           *)
@@ -859,7 +867,7 @@ china_tunnel_wait_legacy_clear() {
       done
     fi
     if [ "$listener_remaining" = 0 ]; then
-      for source_port in "${lora_source_ports[@]}"; do
+      for source_port in "${china_legacy_cleanup_ports[@]}"; do
         if ss -H -ltn 2>/dev/null | awk -v port=":$source_port" '$4 ~ port "$" {found=1} END {exit !found}'; then
           listener_remaining=1
           break
@@ -955,6 +963,7 @@ china_legacy_cleanup_required=0
 china_legacy_cleanup_pids=()
 china_legacy_cleanup_pgids=()
 china_legacy_cleanup_orphan_pids=()
+china_legacy_cleanup_ports=()
 china_tunnel_remove_legacy
 china_tunnel_remove_orphan_children
 if [ "$china_legacy_cleanup_required" = 1 ] && ! china_tunnel_wait_legacy_clear; then
