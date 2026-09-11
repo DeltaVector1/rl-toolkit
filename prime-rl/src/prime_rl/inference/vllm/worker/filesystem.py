@@ -61,6 +61,7 @@ _ADAPTER_STATUS_INTERVAL_S = float(os.environ.get("PRIME_LORA_STATUS_INTERVAL_S"
 _ADAPTER_METADATA_MAX_BYTES = 2 * 1024 * 1024
 _ADAPTER_MARKER_MAX_BYTES = 4 * 1024
 _ADAPTER_CLEANUP_ENTRY_LIMIT = 256
+_ADAPTER_DIRECTORY_ENTRY_LIMIT = 8192
 _ADAPTER_CLEANUP_CANDIDATE_LIMIT = 64
 lane_rotation_delay_seconds = 0.1
 _JSON_LOCK = threading.Lock()
@@ -483,7 +484,7 @@ def _remove_opened_directory_contents(
         for entry in entries:
             _check_deadline(deadline, cancel_event)
             child_count += 1
-            if child_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+            if child_count > _ADAPTER_DIRECTORY_ENTRY_LIMIT:
                 raise OSError(f"{label} contains too many entries")
             child_names.append(entry.name)
     for child_name in child_names:

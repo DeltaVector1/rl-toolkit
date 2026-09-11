@@ -778,6 +778,25 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
 
+    def test_delta_cleanup_accepts_a_normal_chunk_directory(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path("http://source/step_1")
+                chunk_root = destination.with_name(f"{destination.name}.partial") / "transport-chunks"
+                chunk_root.mkdir(parents=True)
+                for index in range(300):
+                    (chunk_root / f"chunk-{index:04d}").touch()
+                self.assertTrue(filesystem._cleanup_delta_stage_artifacts(destination))
+                self.assertFalse(chunk_root.parent.exists())
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
     def test_full_checkpoint_ready_requires_index_and_shard_hashes(self):
         filesystem = load_filesystem()
         source_url = "http://source/checkpoint"

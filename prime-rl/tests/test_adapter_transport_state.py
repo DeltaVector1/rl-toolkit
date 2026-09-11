@@ -257,6 +257,7 @@ def load_filesystem_module():
         "vllm.model_executor.model_loader": types.ModuleType("vllm.model_executor.model_loader"),
         "prime_rl": types.ModuleType("prime_rl"),
         "prime_rl.utils": types.ModuleType("prime_rl.utils"),
+        "prime_rl.utils.adapter_delta": adapter_delta,
         "prime_rl.utils.checkpoint_delta": types.ModuleType("prime_rl.utils.checkpoint_delta"),
     }
     modules["torch.nn"].Module = object
@@ -273,6 +274,15 @@ def load_filesystem_module():
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+
+        def decode_transport_chunk(payload, *, codec, raw_size):
+            return adapter_delta.decode_adapter_chunk(
+                payload,
+                codec=codec,
+                max_output_size=raw_size,
+            )
+
+        module._decode_transport_chunk = decode_transport_chunk
         return module
     finally:
         for name, previous in saved.items():
@@ -1704,16 +1714,16 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertTrue(stopped.is_set())
             self.assertFalse(ready.exists())
 
-    def test_inventory_defines_bounded_48_stream_transfer(self):
+    def test_inventory_defines_bounded_transfer(self):
         nodes = REPOSITORY / "configs/nodes.toml"
         with nodes.open("rb") as stream:
             config = tomllib.load(stream)
         ports = config["ports"]
         self.assertEqual(ports["lora_source_first"], 18100)
-        self.assertEqual(ports["lora_source_last"], 18195)
-        self.assertEqual(ports["adapter_relay"], 18196)
+        self.assertEqual(ports["lora_source_last"], 18227)
+        self.assertEqual(ports["adapter_relay"], 18228)
         self.assertEqual(ports["refusal_classifier"], 18250)
-        self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 96)
+        self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 128)
         source_ports = set(range(ports["lora_source_first"], ports["lora_source_last"] + 1))
         self.assertNotIn(ports["adapter_relay"], source_ports)
         self.assertNotIn(ports["refusal_classifier"], source_ports)
@@ -1731,7 +1741,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
         runtime = REPOSITORY / "training_ops/runtime/h200"
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
-        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=48", glm_source)
+        self.assertIn("PRIME_LORA_DOWNLOAD_STREAMS=96", glm_source)
         self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
         source_generator = glm_source.split(
             'runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<\'PY\'\n',
@@ -1752,7 +1762,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             [
                 port
                 for offset in range(2)
-                for port in range(18100 + offset, 18196, 2)
+                for port in range(18100 + offset, 18228, 2)
             ],
         )
         orchestrator_source = (
@@ -1890,6 +1900,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         old_source_manifest = filesystem._source_manifest
         old_base = filesystem._verified_adapter_base
         old_lanes = filesystem._adapter_source_urls
+        old_responsive_lanes = filesystem._responsive_adapter_source_urls
         old_streams = filesystem._configured_download_streams
         old_decode = filesystem._decode_transport_chunk
         old_raw_digest = filesystem._transport_raw_sha256
@@ -1924,6 +1935,10 @@ class AdapterTransportStateTest(unittest.TestCase):
         filesystem._source_manifest = lambda *_args, **_kwargs: manifest
         filesystem._verified_adapter_base = lambda *_args, **_kwargs: (base_model, base_model)
         filesystem._adapter_source_urls = lambda _source: ["http://lane-1", "http://lane-2"]
+        filesystem._responsive_adapter_source_urls = lambda *_args: (
+            ["http://lane-1", "http://lane-2"],
+            2,
+        )
         filesystem._configured_download_streams = lambda: 1
         filesystem._decode_transport_chunk = lambda payload, **_kwargs: payload
         filesystem._transport_raw_sha256 = lambda payload, **_kwargs: hashlib.sha256(payload).hexdigest()
@@ -1968,6 +1983,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             filesystem._source_manifest = old_source_manifest
             filesystem._verified_adapter_base = old_base
             filesystem._adapter_source_urls = old_lanes
+            filesystem._responsive_adapter_source_urls = old_responsive_lanes
             filesystem._configured_download_streams = old_streams
             filesystem._decode_transport_chunk = old_decode
             filesystem._transport_raw_sha256 = old_raw_digest
