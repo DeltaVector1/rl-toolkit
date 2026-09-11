@@ -480,13 +480,26 @@ peer_kill_owned() {
   case "$pgid" in
     ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
     *)
-      if peer_tunnel_group_safe "$pgid"; then
+      if [ "$pgid" = "$pid" ] || peer_tunnel_group_safe "$pgid"; then
         kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
       else
         kill "$pid" 2>/dev/null || true
       fi
       ;;
   esac
+}
+
+peer_tunnel_remove_orphan_children() {
+  local pid ppid command_line executable found=0
+  while read -r pid ppid command_line; do
+    [ "$ppid" = 1 ] || continue
+    executable=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    [ "$executable" = /usr/bin/ssh ] || continue
+    peer_tunnel_ssh_args_match "$command_line" cleanup || continue
+    kill "$pid" 2>/dev/null || true
+    found=1
+  done < <(ps -eo pid=,ppid=,args=)
+  [ "$found" = 0 ]
 }
 
 peer_remote_ports_ready() {
@@ -848,7 +861,7 @@ china_tunnel_stop_supervisor() {
         *" $pgid "*) ;;
         *) china_legacy_cleanup_pgids+=("$pgid") ;;
       esac
-      if china_tunnel_group_safe "$pgid" "$expected_marker"; then
+      if [ "$pgid" = "$pid" ] || china_tunnel_group_safe "$pgid" "$expected_marker"; then
         kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
       else
         kill "$pid" 2>/dev/null || true
@@ -981,10 +994,22 @@ china_tunnel_connection() {
 }
 
 peer_tunnel() {
-  local peer_keep_current
+  local peer_keep_current peer_orphans_clear
   peer_keep_current=$peer_enabled
   [ "$restart_tunnels" = 1 ] && peer_keep_current=0
   peer_tunnel_remove_legacy "$peer_keep_current"
+  peer_orphans_clear=0
+  for _ in $(seq 1 10); do
+    if peer_tunnel_remove_orphan_children; then
+      peer_orphans_clear=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$peer_orphans_clear" != 1 ]; then
+    echo "old peer tunnel connections did not stop" >&2
+    return 1
+  fi
   [ "$peer_enabled" = 1 ] || return 0
   peer_tunnel_connection "api" \
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
