@@ -2,21 +2,23 @@
 
 ## Tried
 
-- The equal-ratio run used fixed easy/medium/hard ratios of 1:1:1. It failed to test a curriculum.
-- Reward change from steps 6-36 was +0.0070. The noise threshold was 0.0439, so this is not an improvement.
-- Recent rewards were easy 0.2205, medium 0.0393, and hard 0.0093.
-- 61 of 102 hard groups were all refusal 9. These groups still had reward variation.
-- At step 36, multi-turn was assigned to 512/1024 groups, but none completed. The deployed old Verifiers has `DecensorTask.user=None`.
+- The multi-turn and all-9 group fixes are implemented and independently passed.
+- Steps 1-41 all-9 group rates were easy 1.07%, medium 5.80%, and hard 49.83%.
+- Equal raw sampling with the skip gave an accepted mix of easy 40.00%, medium 38.94%, and hard 21.05%.
+- Approximate raw compensation is easy:medium:hard = 1:1.05:1.97.
+- The steps 6-40 reward fit was -0.0048. The noise threshold was 0.0433.
 
 ## In progress
 
-- Curriculum: change the easy/medium/hard ratios by stage.
-- Multi-turn repair: fix the old Verifiers task user and verify completed traces.
-- Optional all-9 group skip: create no optimizer samples for an all-refusal group.
+- Curriculum: use the compensated stage ratios.
 
-## Not tried
+## Not tried / Next
 
-- No stage-varying run has passed acceptance yet.
+- Run the staged curriculum.
+- Verify that multi-turn traces have more than one actual assistant turn.
+- Measure that skipped all-9 groups create no optimizer samples.
+- Measure the added timing cost.
+- Check reward beyond the measured noise.
 
 ## Acceptance
 
