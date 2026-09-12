@@ -14,12 +14,25 @@ for port in range(ports["lora_source_first"], ports["lora_source_last"] + 1):
     print(port)
 PY
 )
+configured_relay_port=$(python3 - "$nodes_file" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    print(tomllib.load(stream)["ports"]["adapter_relay"])
+PY
+)
 [ "${#configured_lora_ports[@]}" -eq 128 ] || {
   echo "expected 128 configured LoRA source ports" >&2
   exit 1
 }
 test_source_first=${configured_lora_ports[0]}
 test_source_last=${configured_lora_ports[-1]}
+case "$configured_relay_port" in ''|*[!0-9]*)
+  echo "invalid configured adapter relay port" >&2
+  exit 1
+  ;;
+esac
 export TEST_SOURCE_FIRST="$test_source_first" TEST_SOURCE_LAST="$test_source_last" \
   TEST_SOURCE_COUNT="${#configured_lora_ports[@]}"
 relay_block=$(sed -n '/sudo docker run -d --name/,/--canonical-source-url/p' "$script")
@@ -142,7 +155,7 @@ expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
 expected_peer_lines=$((expected_lanes + 1))
 peer_enabled=1
 peer_api_port=18049
-relay_port=18196
+relay_port=$configured_relay_port
 peer_name=h200b
 peer_host=38.255.28.19
 peer_ssh_port=20099
@@ -180,6 +193,14 @@ while IFS= read -r line; do
   test "$reverse_count" -eq 2
   grep -Fq -- '-o ExitOnForwardFailure=yes' <<<"$line"
 done < <(grep -F -- '-R 127.0.0.1:' "$log")
+
+# SSH matching rejects an extra token even when the forwards and target match.
+peer_exact_command="ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19"
+peer_tunnel_ssh_args_match "$peer_exact_command" current
+if peer_tunnel_ssh_args_match "${peer_exact_command/root@38.255.28.19/junk root@38.255.28.19}" current; then
+  echo "peer SSH matcher accepted an extra token" >&2
+  exit 1
+fi
 
 # A second launcher invocation finds the exact API and lane signatures.
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
@@ -286,7 +307,7 @@ write_child_cmdline "$proc_fixtures/20002" \
 write_child_cmdline "$proc_fixtures/20003" \
   -L 127.0.0.1:18114:127.0.0.1:8100 \
   -L 127.0.0.1:18195:127.0.0.1:8100 \
-  -L 127.0.0.1:18196:127.0.0.1:8100 \
+  -L "127.0.0.1:$((test_source_last + 1)):127.0.0.1:8100" \
   -L 127.0.0.1:18116:127.0.0.1:8100 \
   china-trainer
 orphan_ss="$tmp/orphan-ss"
@@ -368,13 +389,13 @@ done
 test "$(wc -l <"$china_log")" -eq "$((expected_lanes * 2))"
 
 # A same-signature process with the wrong peer target is not reused.
-printf '%s\n' 'while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 wrong@peer; sleep 3; done # peer-tunnel-lora-0' >"$log"
+printf '%s\n' "while true; do ssh -R 127.0.0.1:18100:127.0.0.1:$relay_port wrong@peer; sleep 3; done # peer-tunnel-lora-0" >"$log"
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel_connection lora-0 \
-  '-R 127.0.0.1:18100:127.0.0.1:18196' \
-  -R 127.0.0.1:18100:127.0.0.1:18196 \
-  -R 127.0.0.1:18101:127.0.0.1:18196 \
-  -R 127.0.0.1:18102:127.0.0.1:18196 \
-  -R 127.0.0.1:18103:127.0.0.1:18196
+  "-R 127.0.0.1:18100:127.0.0.1:$relay_port" \
+  -R "127.0.0.1:18100:127.0.0.1:$relay_port" \
+  -R "127.0.0.1:18101:127.0.0.1:$relay_port" \
+  -R "127.0.0.1:18102:127.0.0.1:$relay_port" \
+  -R "127.0.0.1:18103:127.0.0.1:$relay_port"
 for _ in $(seq 1 50); do
   [ "$(wc -l <"$log")" -eq 2 ] && break
   sleep 0.1
@@ -383,33 +404,33 @@ test "$(wc -l <"$log")" -eq 2
 grep -Fq -- 'root@38.255.28.19' "$log"
 
 # A process missing a lane forward is not reused.
-printf '%s\n' 'while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 root@38.255.28.19; sleep 3; done # peer-tunnel-lora-0' >"$log"
+printf '%s\n' "while true; do ssh -R 127.0.0.1:18100:127.0.0.1:$relay_port root@38.255.28.19; sleep 3; done # peer-tunnel-lora-0" >"$log"
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel_connection lora-0 \
-  '-R 127.0.0.1:18100:127.0.0.1:18196' \
-  -R 127.0.0.1:18100:127.0.0.1:18196 \
-  -R 127.0.0.1:18101:127.0.0.1:18196 \
-  -R 127.0.0.1:18102:127.0.0.1:18196 \
-  -R 127.0.0.1:18103:127.0.0.1:18196
+  "-R 127.0.0.1:18100:127.0.0.1:$relay_port" \
+  -R "127.0.0.1:18100:127.0.0.1:$relay_port" \
+  -R "127.0.0.1:18101:127.0.0.1:$relay_port" \
+  -R "127.0.0.1:18102:127.0.0.1:$relay_port" \
+  -R "127.0.0.1:18103:127.0.0.1:$relay_port"
 for _ in $(seq 1 50); do
   [ "$(wc -l <"$log")" -eq 2 ] && break
   sleep 0.1
 done
 test "$(wc -l <"$log")" -eq 2
-test "$(grep -F -c -- '-R 127.0.0.1:18103:127.0.0.1:18196' "$log")" -eq 1
+test "$(grep -F -c -- "-R 127.0.0.1:18103:127.0.0.1:$relay_port" "$log")" -eq 1
 
 # A peer marker does not authorize killing an unrelated process in its group.
 group_commands="$tmp/group-commands"
 kill_log="$tmp/kill-log"
 printf '%s\n' \
-  '1234 bash -c while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:18196 -R 127.0.0.1:18101:127.0.0.1:18196 root@38.255.28.19; done # peer-tunnel-lora-0' \
-  '1234 ssh -i /other/key -p 20099 -R 127.0.0.1:18100:127.0.0.1:18196 unrelated@peer' >"$group_commands"
+  "1234 bash -c while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19; done # peer-tunnel-lora-0" \
+  "1234 ssh -i /other/key -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port unrelated@peer" >"$group_commands"
 kill() { printf '%s\n' "$*" >>"$KILL_LOG"; }
 export KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group_commands"
 export PEER_TEST_PGID_PID=1235 PEER_TEST_PGID=1234
 PATH="$tmp/bin:$PATH"
 export PATH
 peer_kill_owned 1235 \
-  'while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:18196 -R 127.0.0.1:18101:127.0.0.1:18196 root@38.255.28.19; done # peer-tunnel-lora-0'
+  "while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19; done # peer-tunnel-lora-0"
 test "$(grep -F -c -- '1235' "$kill_log")" -eq 1
 if grep -Fq -- '-1235' "$kill_log"; then
   echo "unrelated peer group received a group kill" >&2
@@ -418,6 +439,22 @@ fi
 unset -f kill
 unset KILL_LOG PEER_GROUP_COMMANDS
 unset PEER_TEST_PGID_PID PEER_TEST_PGID
+
+# A wrong-target legacy supervisor is owned by its exact peer marker and
+# forward shape, so its complete process group is stopped safely.
+legacy_group_commands="$tmp/legacy-group-commands"
+legacy_kill_log="$tmp/legacy-kill-log"
+printf '%s\n' \
+  "1234 bash -c while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port wrong@peer; done # peer-tunnel-lora-0" \
+  "1234 ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port wrong@peer" \
+  >"$legacy_group_commands"
+kill() { printf '%s\n' "$*" >>"$LEGACY_KILL_LOG"; }
+export LEGACY_KILL_LOG="$legacy_kill_log" PEER_GROUP_COMMANDS="$legacy_group_commands"
+export PEER_TEST_PGID_PID=1234 PEER_TEST_PGID=1234
+PATH="$tmp/bin:$PATH" peer_tunnel_remove_legacy
+test "$(grep -F -c -- '-1234' "$legacy_kill_log")" -eq 1
+unset -f kill
+unset LEGACY_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
 
 # Readiness accepts a listener only when its SSH child and two-port
 # supervisor both match the configured target.

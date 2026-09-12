@@ -561,9 +561,41 @@ peer_tunnel_stale_supervisor_match() {
   done
 }
 
+peer_tunnel_supervisor_ssh_command() {
+  local command_line=$1 ssh_command
+  case "$command_line" in *"ssh "*) ;; *) return 1 ;; esac
+  ssh_command="ssh ${command_line#*ssh }"
+  case "$ssh_command" in
+    *';'*) ssh_command=${ssh_command%%;*} ;;
+    *) ssh_command=${ssh_command%% sleep 3*} ;;
+  esac
+  printf '%s\n' "$ssh_command"
+}
+
+peer_tunnel_stale_group_safe() {
+  local pgid=$1 supervisor_command=$2 shape=$3 marker=$4
+  local group_command expected_ssh group_seen=0
+  expected_ssh=$(peer_tunnel_supervisor_ssh_command "$supervisor_command") || return 1
+  while IFS= read -r group_command; do
+    group_seen=1
+    case "$group_command" in
+      *"while true; do"*)
+        peer_tunnel_stale_supervisor_match "$group_command" "$shape" "$marker" || return 1
+        [ "$(peer_tunnel_supervisor_ssh_command "$group_command")" = "$expected_ssh" ] || return 1
+        ;;
+      ssh\ *|/usr/bin/ssh\ *)
+        [ "$(peer_tunnel_supervisor_ssh_command "$group_command")" = "$expected_ssh" ] || return 1
+        ;;
+      *" sleep 3"|*"sleep 3") ;;
+      *) return 1 ;;
+    esac
+  done < <(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}')
+  [ "$group_seen" = 1 ]
+}
+
 peer_tunnel_ssh_args_match() {
   local command_line=$1 shape=$2
-  local index forward_count
+  local index forward_count forward_start target_index remaining
   local -a command_args expected_args
   expected_args=(
     -NT
@@ -580,12 +612,23 @@ peer_tunnel_ssh_args_match() {
   )
   read -r -a command_args <<<"$command_line"
   case "${command_args[0]:-}" in ssh|/usr/bin/ssh) ;; *) return 1 ;; esac
-  [ "${#command_args[@]}" -ge "$(( ${#expected_args[@]} + 4 ))" ] || return 1
+  target_index=$((${#command_args[@]} - 1))
+  [ "$target_index" -gt "$(( ${#expected_args[@]} + 1 ))" ] || return 1
   for index in "${!expected_args[@]}"; do
     [ "${command_args[index + 1]}" = "${expected_args[index]}" ] || return 1
   done
-  [ "${command_args[-1]}" = "$peer_ssh_user@$peer_host" ] || return 1
-  forward_count=$(( (${#command_args[@]} - ${#expected_args[@]} - 2) / 2 ))
+  [ "${command_args[target_index]}" = "$peer_ssh_user@$peer_host" ] || return 1
+  forward_start=$((1 + ${#expected_args[@]}))
+  remaining=$((target_index - forward_start))
+  [ "$remaining" -gt 0 ] && [ "$((remaining % 2))" -eq 0 ] || return 1
+  forward_count=$((remaining / 2))
+  for ((index = forward_start; index < target_index; index += 2)); do
+    case "${command_args[index]}" in -L|-R) ;; *) return 1 ;; esac
+    case "${command_args[index + 1]}" in
+      127.0.0.1:[0-9]*:127.0.0.1:[0-9]*) ;;
+      *) return 1 ;;
+    esac
+  done
   peer_tunnel_forward_shape "$command_line" "$shape" || return 1
   [ "$forward_count" -eq "$(grep -o -- '-[LR] ' <<<"$command_line" | wc -l)" ]
 }
@@ -606,16 +649,18 @@ peer_tunnel_group_safe() {
 
 peer_tunnel_remove_legacy() {
   local keep_current=${1:-0}
-  local pid command_line
+  local pid command_line marker
   while read -r pid command_line; do
-    peer_tunnel_stale_supervisor_match "$command_line" cleanup "" || continue
+    marker=$(sed -n 's/.*# \(peer-tunnel-lora-[0-9][0-9]*\)$/\1/p' <<<"$command_line")
+    [ -n "$marker" ] || continue
+    peer_tunnel_stale_supervisor_match "$command_line" cleanup "$marker" || continue
     if [ "$keep_current" = 1 ]; then
       if peer_tunnel_supervisor_match "$command_line" api \
           || peer_tunnel_supervisor_match "$command_line" current; then
         continue
       fi
     fi
-    peer_kill_owned "$pid" "$command_line"
+    peer_kill_owned "$pid" "$command_line" cleanup "$marker"
   done < <(ps -eo pid=,args=)
 }
 
@@ -631,7 +676,11 @@ peer_kill_owned() {
     ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
     *)
       if [ -n "$shape" ] && [ -n "$marker" ]; then
-        kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+        if peer_tunnel_stale_group_safe "$pgid" "$command_line" "$shape" "$marker"; then
+          kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+        else
+          kill "$pid" 2>/dev/null || true
+        fi
         return 0
       fi
       if [ "$pgid" = "$pid" ] || peer_tunnel_group_safe "$pgid"; then
