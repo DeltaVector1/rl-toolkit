@@ -222,12 +222,116 @@ if [ "$peer_enabled" = 1 ] && [ "$relay_is_glm" != 1 ]; then
   exit 2
 fi
 
+if ! secondary_settings=$(python3 - "$nodes_file" "$config_file" <<'PY'
+import ipaddress
+import re
+import sys
+import tomllib
+from urllib.parse import urlsplit
+
+
+def port_value(value, name):
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 65535:
+        raise SystemExit(f"judges.secondary.{name} is invalid")
+    return value
+
+
+with open(sys.argv[1], "rb") as stream:
+    nodes = tomllib.load(stream)
+with open(sys.argv[2], "rb") as stream:
+    active_config = tomllib.load(stream)
+
+judges = nodes.get("judges")
+external = judges.get("external") if isinstance(judges, dict) else None
+secondary = judges.get("secondary") if isinstance(judges, dict) else None
+if not isinstance(external, dict) or not isinstance(secondary, dict):
+    raise SystemExit("nodes config has no complete judge inventory")
+
+host = secondary.get("host")
+try:
+    ipaddress.ip_address(host)
+except (TypeError, ValueError) as error:
+    raise SystemExit("judges.secondary.host must be an IP address") from error
+ssh_port = port_value(secondary.get("ssh_port"), "ssh_port")
+local_api_port = port_value(secondary.get("local_api_port"), "local_api_port")
+remote_api_port = port_value(secondary.get("remote_api_port"), "remote_api_port")
+ssh_user = secondary.get("ssh_user")
+if not isinstance(ssh_user, str) or re.fullmatch(r"[A-Za-z0-9_.-]+", ssh_user) is None:
+    raise SystemExit("judges.secondary.ssh_user is invalid")
+identity = secondary.get("ssh_identity_file")
+if (
+    not isinstance(identity, str)
+    or not identity.startswith("/")
+    or re.fullmatch(r"/[A-Za-z0-9_./-]+", identity) is None
+    or any(part in {"", ".", ".."} for part in identity.split("/")[1:])
+):
+    raise SystemExit("judges.secondary.ssh_identity_file is invalid")
+api_url = secondary.get("api_url")
+expected_api_url = f"http://127.0.0.1:{local_api_port}/v1"
+parsed_api_url = urlsplit(api_url) if isinstance(api_url, str) else None
+if (
+    api_url != expected_api_url
+    or parsed_api_url is None
+    or parsed_api_url.query
+    or parsed_api_url.fragment
+):
+    raise SystemExit("judges.secondary.api_url must be the configured local API URL")
+model = secondary.get("model")
+external_model = external.get("model")
+if not isinstance(model, str) or model != external_model:
+    raise SystemExit("judges.secondary.model must match judges.external.model")
+data_parallel_size = secondary.get("data_parallel_size")
+tensor_parallel_size = secondary.get("tensor_parallel_size")
+if (
+    not isinstance(data_parallel_size, int)
+    or isinstance(data_parallel_size, bool)
+    or data_parallel_size != 2
+):
+    raise SystemExit("judges.secondary.data_parallel_size must be 2")
+if (
+    not isinstance(tensor_parallel_size, int)
+    or isinstance(tensor_parallel_size, bool)
+    or tensor_parallel_size != 4
+    or tensor_parallel_size * data_parallel_size != 8
+):
+    raise SystemExit("judges.secondary.tensor_parallel_size must be 4 for eight GPUs")
+
+
+def values(value):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from values(item)
+    else:
+        yield value
+
+
+active = int(any(value == api_url for value in values(active_config)))
+print(host, ssh_port, ssh_user, identity, local_api_port, remote_api_port, api_url, active)
+PY
+); then
+  echo "cannot read the configured secondary judge" >&2
+  exit 2
+fi
+read -r secondary_host secondary_ssh_port secondary_ssh_user secondary_ssh_identity \
+  secondary_local_api_port secondary_remote_api_port secondary_api_url secondary_enabled <<<"$secondary_settings"
+secondary_ssh_target="$secondary_ssh_user@$secondary_host"
+secondary_ssh_options=(
+  -o IdentitiesOnly=yes
+  -i "$secondary_ssh_identity"
+  -p "$secondary_ssh_port"
+)
+
 if [ "$tunnels_only" = 0 ] && grep -q 'refusals-classifier-eval-v1' "$config_file"; then
   bash "$deployment/training_ops/runtime/h200/start_refusals_classifier.sh"
 fi
 
 generic_tunnel_ssh_match() {
   local command_line=$1 via=$2 forward=$3 comp=$4 index
+  shift 4
+  local -a ssh_options=("$@")
   local -a command_args expected_args
   expected_args=(
     -NT
@@ -239,6 +343,7 @@ generic_tunnel_ssh_match() {
     -o TCPKeepAlive=yes
     -o IPQoS=none
     -o Compression=$comp
+    "${ssh_options[@]}"
     -L "$forward"
   )
   read -r -a command_args <<<"$command_line"
@@ -252,49 +357,65 @@ generic_tunnel_ssh_match() {
 
 generic_tunnel_supervisor_match() {
   local command_line=$1 marker=$2 via=$3 forward=$4 comp=$5
+  shift 5
+  local -a ssh_options=("$@")
+  local ssh_option
   case "$command_line" in *"while true; do"*"done # $marker") ;; *) return 1 ;; esac
   [ "$(grep -o -- '-L ' <<<"$command_line" | wc -l)" -eq 1 ] || return 1
   tunnel_command_has "$command_line" "$via" || return 1
   tunnel_command_has "$command_line" "$forward" || return 1
   [[ "$command_line" == *"-o Compression=$comp"* ]] || return 1
+  for ssh_option in "${ssh_options[@]}"; do
+    tunnel_command_has "$command_line" "$ssh_option" || return 1
+  done
 }
 
 generic_tunnel_listener_ready() {
   local lp=$1 marker=$2 via=$3 forward=$4 comp=$5
+  shift 5
+  local -a ssh_options=("$@")
   local listener pid ppid owner_command supervisor_command
   listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":$lp" '$4 ~ port "$" {print; exit}')
   [ -n "$listener" ] || return 1
   pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   owner_command=$(ps -o args= -p "$pid" 2>/dev/null || true)
-  generic_tunnel_ssh_match "$owner_command" "$via" "$forward" "$comp" || return 1
+  generic_tunnel_ssh_match "$owner_command" "$via" "$forward" "$comp" "${ssh_options[@]}" || return 1
   ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
   [ "$ppid" != 1 ] || return 1
   supervisor_command=$(ps -o args= -p "$ppid" 2>/dev/null || true)
-  generic_tunnel_supervisor_match "$supervisor_command" "$marker" "$via" "$forward" "$comp" || return 1
+  generic_tunnel_supervisor_match "$supervisor_command" "$marker" "$via" "$forward" "$comp" \
+    "${ssh_options[@]}" || return 1
   timeout --signal=TERM --kill-after=1s 5 bash -c ":</dev/tcp/127.0.0.1/$lp" 2>/dev/null
 }
 
 tunnel() { # local_port  target_host:port  ssh_target  [compress]
   local lp=$1 tgt=$2 via=$3 comp=${4:-no}
+  shift $(( $# >= 4 ? 4 : $# ))
+  local -a ssh_options=("$@")
+  local ssh_text=""
+  [ "${#ssh_options[@]}" -eq 0 ] || ssh_text=$(printf ' %q' "${ssh_options[@]}")
   local marker="zmq-tunnel-$lp" forward="127.0.0.1:$lp:$tgt"
   local pid command_line
   for pid in $(pgrep -f -- "$marker" || true); do
     command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
     if generic_tunnel_supervisor_match "$command_line" "$marker" "$via" "$forward" "$comp" \
-      && generic_tunnel_listener_ready "$lp" "$marker" "$via" "$forward" "$comp"; then
+      "${ssh_options[@]}" \
+      && generic_tunnel_listener_ready "$lp" "$marker" "$via" "$forward" "$comp" \
+        "${ssh_options[@]}"; then
       return 0
     fi
   done
   setsid nohup bash -c "while true; do
       ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes \
           -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
-          -o IPQoS=none -o Compression=$comp \
+          -o IPQoS=none -o Compression=$comp$ssh_text \
           -L 127.0.0.1:$lp:$tgt $via
       sleep 3
     done # $marker" >/dev/null 2>&1 < /dev/null &
   for _ in $(seq 1 30); do
-    if generic_tunnel_listener_ready "$lp" "$marker" "$via" "$forward" "$comp"; then
+    if generic_tunnel_listener_ready "$lp" "$marker" "$via" "$forward" "$comp" \
+      "${ssh_options[@]}"; then
       return 0
     fi
     sleep 1
@@ -996,7 +1117,7 @@ china_tunnel_connection() {
 peer_tunnel() {
   local peer_keep_current peer_orphans_clear
   peer_keep_current=$peer_enabled
-  [ "$restart_tunnels" = 1 ] && peer_keep_current=0
+  [ "${restart_tunnels:-0}" = 1 ] && peer_keep_current=0
   peer_tunnel_remove_legacy "$peer_keep_current"
   peer_orphans_clear=0
   for _ in $(seq 1 10); do
@@ -1073,6 +1194,16 @@ if [ "$tunnels_only" = 0 ]; then
   echo "China adapter forwards ${lora_source_ports[0]}-${lora_source_ports[-1]} in $china_lane_number SSH lanes"
 fi
 peer_tunnel
+if [ "$secondary_enabled" = 1 ]; then
+  if [ "$tunnels_only" = 1 ]; then
+    tunnel "$secondary_local_api_port" "127.0.0.1:$secondary_remote_api_port" \
+      "$secondary_ssh_target" no "${secondary_ssh_options[@]}"
+  elif ! tunnel "$secondary_local_api_port" "127.0.0.1:$secondary_remote_api_port" \
+      "$secondary_ssh_target" no "${secondary_ssh_options[@]}"; then
+    echo "secondary judge tunnel failed" >&2
+    exit 1
+  fi
+fi
 if [ "$tunnels_only" = 1 ]; then
   tunnels_ready=0
   readiness_port=""
@@ -1087,6 +1218,17 @@ if [ "$tunnels_only" = 1 ]; then
       if [ "$listener_status" -ne 0 ]; then
         tunnels_ready=0
         readiness_port=$peer_api_port
+      fi
+    fi
+    if [ "$tunnels_ready" = 1 ] && [ "$secondary_enabled" = 1 ]; then
+      listener_status=0
+      generic_tunnel_listener_ready "$secondary_local_api_port" "zmq-tunnel-$secondary_local_api_port" \
+        "$secondary_ssh_target" \
+        "127.0.0.1:$secondary_local_api_port:127.0.0.1:$secondary_remote_api_port" \
+        no "${secondary_ssh_options[@]}" || listener_status=$?
+      if [ "$listener_status" -ne 0 ]; then
+        tunnels_ready=0
+        readiness_port=$secondary_local_api_port
       fi
     fi
     [ "$tunnels_ready" = 1 ] && break
@@ -1121,6 +1263,9 @@ fi
 ports=("${lora_source_ports[@]}")
 if [ "$peer_enabled" = 1 ]; then
   ports+=("$peer_api_port")
+fi
+if [ "$secondary_enabled" = 1 ]; then
+  ports+=("$secondary_local_api_port")
 fi
 sudo install -d -o 1000 -g 1000 -m 0755 "$relay_cache_dir"
 if [ "$peer_enabled" = 1 ]; then

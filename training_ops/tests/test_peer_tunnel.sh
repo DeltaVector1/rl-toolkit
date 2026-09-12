@@ -94,7 +94,11 @@ elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "ppid=" ]; then
     printf '%s\n' 1
   fi
 elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "pgid=" ]; then
-  echo "${4:?missing process id}"
+  if [ "${PEER_TEST_PGID_PID:-}" = "${4:?missing process id}" ]; then
+    echo "${PEER_TEST_PGID:?missing test process group id}"
+  else
+    echo "$4"
+  fi
 elif [ "${1:-}" = "-eo" ]; then
   [ -n "${PEER_GROUP_COMMANDS:-}" ] && cat "$PEER_GROUP_COMMANDS"
 fi
@@ -110,7 +114,7 @@ chmod +x "$tmp/bin/cat" "$tmp/bin/pgrep" "$tmp/bin/setsid"
 chmod +x "$tmp/bin/ps" "$tmp/bin/ss"
 export REAL_CAT="$real_cat"
 
-start=$(grep -n '^tunnel() {' "$script" | cut -d: -f1)
+start=$(grep -n '^generic_tunnel_ssh_match() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
 
@@ -292,6 +296,9 @@ for port in $(seq 18100 18195); do
   printf 'LISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\n' "$port" >>"$stale_listener_output"
 done
 export TUNNEL_SS_OUTPUT="$stale_listener_output" PEER_STALE_LISTENERS_ACTIVE=1 PEER_TEARDOWN_POLLS=2
+printf '%s\n' 'ssh -NT stale-listener-owner' >"$tmp/tunnel-owner"
+china_legacy_cleanup_pids=(4242)
+export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_COMMAND="$tmp/tunnel-owner"
 sleep() {
   if [ "${PEER_TEARDOWN_POLLS:-0}" -gt 0 ]; then
     PEER_TEARDOWN_POLLS=$((PEER_TEARDOWN_POLLS - 1))
@@ -299,19 +306,22 @@ sleep() {
     if [ "$PEER_TEARDOWN_POLLS" -eq 0 ]; then
       PEER_STALE_LISTENERS_ACTIVE=0
       export PEER_STALE_LISTENERS_ACTIVE
+      unset TUNNEL_OWNER_PID
     fi
   fi
 }
 PATH="$tmp/bin:$PATH" china_tunnel_wait_legacy_clear
 test "${PEER_TEARDOWN_POLLS:-1}" -eq 0
 PEER_STALE_LISTENERS_ACTIVE=1
-export PEER_STALE_LISTENERS_ACTIVE
+export TUNNEL_OWNER_PID=4242 PEER_STALE_LISTENERS_ACTIVE
 set +e
 PATH="$tmp/bin:$PATH" china_tunnel_wait_legacy_clear
 wait_status=$?
 set -e
 test "$wait_status" -ne 0
-unset PEER_STALE_LISTENERS_ACTIVE PEER_TEARDOWN_POLLS TUNNEL_SS_OUTPUT
+unset PEER_STALE_LISTENERS_ACTIVE PEER_TEARDOWN_POLLS TUNNEL_SS_OUTPUT \
+  TUNNEL_OWNER_PID TUNNEL_OWNER_COMMAND
+china_legacy_cleanup_pids=()
 unset -f sleep kill
 
 # A fresh launch creates forty-eight two-forward lanes.
@@ -377,17 +387,19 @@ printf '%s\n' \
   '1234 ssh -i /other/key -p 20099 -R 127.0.0.1:18100:127.0.0.1:18196 unrelated@peer' >"$group_commands"
 kill() { printf '%s\n' "$*" >>"$KILL_LOG"; }
 export KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group_commands"
+export PEER_TEST_PGID_PID=1235 PEER_TEST_PGID=1234
 PATH="$tmp/bin:$PATH"
 export PATH
-peer_kill_owned 1234 \
+peer_kill_owned 1235 \
   'while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:18196 -R 127.0.0.1:18101:127.0.0.1:18196 root@38.255.28.19; done # peer-tunnel-lora-0'
-test "$(grep -F -c -- '1234' "$kill_log")" -eq 1
-if grep -Fq -- '-1234' "$kill_log"; then
+test "$(grep -F -c -- '1235' "$kill_log")" -eq 1
+if grep -Fq -- '-1235' "$kill_log"; then
   echo "unrelated peer group received a group kill" >&2
   exit 1
 fi
 unset -f kill
 unset KILL_LOG PEER_GROUP_COMMANDS
+unset PEER_TEST_PGID_PID PEER_TEST_PGID
 
 # Readiness accepts a listener only when its SSH child and two-port
 # supervisor both match the configured target.
@@ -435,6 +447,92 @@ unset -f kill
 unset TUNNEL_OWNER_PID TUNNEL_OWNER_PPID TUNNEL_SUPERVISOR_PID \
   TUNNEL_OWNER_COMMAND TUNNEL_SUPERVISOR_COMMAND TUNNEL_SS_OUTPUT
 
+# The secondary judge uses the supervised generic tunnel with a separate SSH
+# identity and port.  Its child, supervisor, and listener checks are exact.
+secondary_target=root@202.214.223.66
+secondary_forward='127.0.0.1:26407:127.0.0.1:8000'
+secondary_options=(-o IdentitiesOnly=yes -i /data/trinity/h200_rollout_ed25519 -p 30599)
+secondary_owner="ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no ${secondary_options[*]} -L $secondary_forward $secondary_target"
+secondary_supervisor="bash -c while true; do $secondary_owner; sleep 3; done # zmq-tunnel-26407"
+generic_tunnel_ssh_match "$secondary_owner" "$secondary_target" "$secondary_forward" no \
+  "${secondary_options[@]}"
+generic_tunnel_supervisor_match "$secondary_supervisor" zmq-tunnel-26407 \
+  "$secondary_target" "$secondary_forward" no "${secondary_options[@]}"
+if generic_tunnel_ssh_match "${secondary_owner/30599/30598}" "$secondary_target" \
+    "$secondary_forward" no "${secondary_options[@]}"; then
+  echo "generic tunnel accepted the wrong SSH port" >&2
+  exit 1
+fi
+printf '%s\n' "$secondary_owner" >"$tmp/tunnel-owner"
+printf '%s\n' "$secondary_supervisor" >"$tmp/tunnel-supervisor"
+printf 'LISTEN 0 128 127.0.0.1:26407 0.0.0.0:* users:(("ssh",pid=4242,fd=5))\n' \
+  >"$tmp/tunnel-ss"
+export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=4241 TUNNEL_SUPERVISOR_PID=4241 \
+  TUNNEL_OWNER_COMMAND="$tmp/tunnel-owner" TUNNEL_SUPERVISOR_COMMAND="$tmp/tunnel-supervisor" \
+  TUNNEL_SS_OUTPUT="$tmp/tunnel-ss" PEER_STALE_LISTENERS_ACTIVE=1
+timeout() { return 0; }
+PATH="$tmp/bin:$PATH" generic_tunnel_listener_ready 26407 zmq-tunnel-26407 \
+  "$secondary_target" "$secondary_forward" no "${secondary_options[@]}"
+unset -f timeout
+unset TUNNEL_OWNER_PID TUNNEL_OWNER_PPID TUNNEL_SUPERVISOR_PID TUNNEL_OWNER_COMMAND \
+  TUNNEL_SUPERVISOR_COMMAND TUNNEL_SS_OUTPUT PEER_STALE_LISTENERS_ACTIVE
+
+# Execute the normal-path launcher block with a failing reconciliation.  The
+# service-start marker must not be reached, while tunnels-only keeps its
+# existing non-fatal handoff to the readiness loop.
+secondary_launch_block=$(awk '
+  /^if \[ "\$secondary_enabled" = 1 \]; then$/ {
+    matches++
+    if (matches == 1) {
+      active=1
+      depth=1
+      print
+      next
+    }
+  }
+  active {
+    print
+    if ($0 ~ /^[[:space:]]*if[[:space:]]/) depth++
+    if ($0 ~ /^[[:space:]]*fi[[:space:]]*$/) {
+      depth--
+      if (depth == 0) exit
+    }
+  }
+' "$script")
+test -n "$secondary_launch_block"
+if output=$(bash -c '
+  set -u
+  secondary_enabled=1
+  tunnels_only=0
+  secondary_local_api_port=26407
+  secondary_remote_api_port=8000
+  secondary_ssh_target=root@202.214.223.66
+  secondary_ssh_options=(-o IdentitiesOnly=yes -i /data/trinity/h200_rollout_ed25519 -p 30599)
+  tunnel() { return 1; }
+'"$secondary_launch_block"'
+  printf "%s\n" service-started
+' 2>&1); then
+  echo "normal secondary tunnel failure was ignored" >&2
+  exit 1
+fi
+if grep -Fq service-started <<<"$output" || ! grep -Fq 'secondary judge tunnel failed' <<<"$output"; then
+  echo "normal secondary tunnel failure reached the service path" >&2
+  exit 1
+fi
+tunnels_only_output=$(bash -c '
+  set -u
+  secondary_enabled=1
+  tunnels_only=1
+  secondary_local_api_port=26407
+  secondary_remote_api_port=8000
+  secondary_ssh_target=root@202.214.223.66
+  secondary_ssh_options=(-o IdentitiesOnly=yes -i /data/trinity/h200_rollout_ed25519 -p 30599)
+  tunnel() { return 1; }
+'"$secondary_launch_block"'
+  printf "%s\n" tunnels-only-continued
+')
+grep -Fq tunnels-only-continued <<<"$tunnels_only_output"
+
 cat >"$tmp/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -445,9 +543,9 @@ if [ "${PEER_REMOTE_FAIL:-0}" = 1 ]; then
   exit 1
 fi
 if [ "${PEER_REMOTE_MISSING:-0}" = 1 ]; then
-  for port in $(seq 18100 18194); do printf '127.0.0.1:%s\n' "$port"; done
+  printf '95\n'
 else
-  for port in $(seq 18100 18195); do printf '127.0.0.1:%s\n' "$port"; done
+  printf '96\n'
 fi
 EOF
 chmod +x "$tmp/bin/ssh"

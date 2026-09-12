@@ -1,5 +1,6 @@
-output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-4/run_glm-decensor-difficulty-4"
+output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-7/run_glm-decensor-difficulty-7"
 max_steps = 50
+skip_all_refusal_groups = true
 seq_len = 32768
 batch_size = 1024
 group_size = 16
@@ -12,9 +13,9 @@ level = "info"
 
 [swanlab]
 project = "glm-runs"
-name = "orchestrator-glm-decensor-difficulty-4"
+name = "orchestrator-glm-decensor-difficulty-7"
 group = "glm-runs"
-tags = ["decensor-diff-4", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
+tags = ["decensor-diff-7", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -70,7 +71,7 @@ api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
 [train.env.env.taskset.task.user]
-base_url = "http://202.214.223.66:26406/v1"
+base_url = "http://127.0.0.1:26407/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
@@ -96,7 +97,7 @@ api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
 [train.env.env.taskset.task.user]
-base_url = "http://202.214.223.66:26406/v1"
+base_url = "http://127.0.0.1:26407/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
@@ -122,15 +123,31 @@ api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
 [train.env.env.taskset.task.user]
-base_url = "http://202.214.223.66:26406/v1"
+base_url = "http://127.0.0.1:26407/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
+[[train.ratio_stages]]
+start_step = 1
+ratios = { "decensor-easy" = 5.4, "decensor-medium" = 2.8, "decensor-hard" = 1.8 }
+
+[[train.ratio_stages]]
+start_step = 11
+ratios = { "decensor-easy" = 3.3, "decensor-medium" = 3.4, "decensor-hard" = 3.3 }
+
+[[train.ratio_stages]]
+start_step = 26
+ratios = { "decensor-easy" = 1.4, "decensor-medium" = 3.0, "decensor-hard" = 5.6 }
+
+[[train.ratio_stages]]
+start_step = 41
+ratios = { "decensor-easy" = 0.6, "decensor-medium" = 1.2, "decensor-hard" = 8.2 }
+
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/glm-decensor-difficulty-4"
-source_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-4"
+source_url = "http://127.0.0.1:18100/glm-decensor-difficulty-7"
+source_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-7"
 
 [rollout_transport]
 type = "filesystem"

@@ -38,6 +38,18 @@ api_url = "http://202.214.223.66:26406/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 data_parallel_size = 8
 
+[judges.secondary]
+host = "202.214.223.66"
+ssh_port = 30599
+ssh_user = "root"
+ssh_identity_file = "/data/trinity/h200_rollout_ed25519"
+local_api_port = 26407
+remote_api_port = 8000
+api_url = "http://127.0.0.1:26407/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+tensor_parallel_size = 4
+data_parallel_size = 2
+
 [containers]
 trainer = "glm52-decensor-trainer"
 orchestrator = "glm52-decensor-orchestrator"
