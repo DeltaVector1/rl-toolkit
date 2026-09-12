@@ -138,7 +138,8 @@ class AdapterUpdateTest(unittest.TestCase):
         )
         self.assertNotIn("configs/general-agent/inference.toml", launcher)
         self.assertIn('@ "$inference_config"', launcher)
-        self.assertIn("-e PRIME_LORA_DOWNLOAD_STREAMS=96", launcher)
+        self.assertIn("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-96}", launcher)
+        self.assertIn('-e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams"', launcher)
         self.assertIn("-e PRIME_LORA_CHUNK_TIMEOUT_S=45", launcher)
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("install -d"))
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))
@@ -152,6 +153,48 @@ class AdapterUpdateTest(unittest.TestCase):
             result = read_settings("h200a", config_text)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("mtp_tokens", result.stderr)
+
+    def test_inference_launcher_validates_download_stream_override(self):
+        launcher = (
+            Path(__file__).resolve().parents[1]
+            / "runtime"
+            / "h200"
+            / "start_inference.sh"
+        ).read_text(encoding="utf-8")
+        start = launcher.index("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-96}")
+        end = launcher.index("runtime_output=$(python3", start)
+        validation = launcher[start:end]
+
+        for value in ("32", "48", "96"):
+            result = subprocess.run(
+                ["bash", "-c", f"PRIME_LORA_DOWNLOAD_STREAMS={value}\n{validation}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        default_result = subprocess.run(
+            ["bash", "-c", f"unset PRIME_LORA_DOWNLOAD_STREAMS\n{validation}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(default_result.returncode, 0, default_result.stderr)
+
+        for value in ("", "0", "129", "999999999999999999999", "not-an-integer"):
+            assignment = (
+                "PRIME_LORA_DOWNLOAD_STREAMS=''\n"
+                if value == ""
+                else f"PRIME_LORA_DOWNLOAD_STREAMS={value}\n"
+            )
+            result = subprocess.run(
+                ["bash", "-c", f"{assignment}{validation}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, value)
 
     def test_config_uses_the_active_glm_run_config(self):
         config = training_ops._adapter_update_config("glm-perf-3")

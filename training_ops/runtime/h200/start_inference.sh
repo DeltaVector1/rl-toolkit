@@ -8,6 +8,21 @@ test -f "$inference_config" || {
   echo "inference config is missing: $inference_config" >&2
   exit 2
 }
+download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-96}
+case "$download_streams" in
+  ''|*[!0-9]*)
+    echo "PRIME_LORA_DOWNLOAD_STREAMS must be an integer" >&2
+    exit 2
+    ;;
+esac
+if [ "${#download_streams}" -gt 3 ]; then
+  echo "PRIME_LORA_DOWNLOAD_STREAMS must be between 1 and 128" >&2
+  exit 2
+fi
+if [ "$download_streams" -lt 1 ] || [ "$download_streams" -gt 128 ]; then
+  echo "PRIME_LORA_DOWNLOAD_STREAMS must be between 1 and 128" >&2
+  exit 2
+fi
 runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<'PY'
 import sys
 import tomllib
@@ -112,7 +127,7 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_LORA_CACHE_DIR="$adapter_cache_dir" \
-  -e PRIME_LORA_DOWNLOAD_STREAMS=96 \
+  -e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams" \
   -e PRIME_LORA_CHUNK_TIMEOUT_S=45 \
   -e PRIME_LORA_SOURCE_PORTS="$lora_source_port_list" \
   --entrypoint /bin/bash \
