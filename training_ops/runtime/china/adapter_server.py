@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import shutil
 import time
 from functools import partial
@@ -24,7 +25,8 @@ digest_pattern = re.compile(r"[0-9a-f]{64}\Z")
 step_pattern = re.compile(r"step_(\d+)\Z")
 run_pattern = re.compile(r"[A-Za-z0-9_-]+\Z")
 transfer_write_bytes = 256 * 1024
-connection_timeout_seconds = 60
+# End idle reads before the worker's 45-second chunk deadline.
+connection_timeout_seconds = 40
 
 
 class UpgradeError(RuntimeError):
@@ -487,6 +489,8 @@ def _safe_request_path(handler: SimpleHTTPRequestHandler) -> tuple[Path, tuple[s
 
 
 class RangeHandler(SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def __init__(self, *args, upgrade_path=None, source_base_url=None, **kwargs):
         self.upgrade_path = upgrade_path
         self.source_base_url = source_base_url
@@ -495,6 +499,12 @@ class RangeHandler(SimpleHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(connection_timeout_seconds)
+
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            self.close_connection = True
 
     def _maybe_upgrade(self):
         path, pieces = _safe_request_path(self)
@@ -564,6 +574,12 @@ class RangeHandler(SimpleHTTPRequestHandler):
         if os.path.isdir(path):
             return super().send_head()
         size = os.fstat(source.fileno()).st_size
+        try:
+            etag = f'"{_sha256_fd(source.fileno(), path.name)}"'
+        except UpgradeError as exc:
+            source.close()
+            self.send_error(500, str(exc))
+            return None
         start, end = 0, size - 1
         if value := self.headers.get("Range"):
             try:
@@ -582,6 +598,8 @@ class RangeHandler(SimpleHTTPRequestHandler):
             self.send_response(200)
         self.send_header("Content-Type", self.guess_type(path))
         self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", etag)
         self.send_header("Last-Modified", self.date_time_string(os.fstat(source.fileno()).st_mtime))
         self.end_headers()
         source.seek(start)
@@ -594,6 +612,8 @@ class RangeHandler(SimpleHTTPRequestHandler):
         while self.remaining:
             chunk = source.read(min(self.remaining, transfer_write_bytes))
             if not chunk:
+                self.close_connection = True
+                source.close()
                 break
             try:
                 output.write(chunk)
@@ -602,6 +622,7 @@ class RangeHandler(SimpleHTTPRequestHandler):
                 source.close()
                 return
             self.remaining -= len(chunk)
+        source.close()
 
 
 class AdapterServer(ThreadingHTTPServer):
