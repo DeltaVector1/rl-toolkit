@@ -876,33 +876,50 @@ class AdapterUpdateTest(unittest.TestCase):
             return 0, "reloaded exact engine watchdog(s) without restarting an engine\n"
 
         with mock.patch.object(
-            training_ops, "current_run", return_value="glm-decensor-difficulty-8"
-        ), mock.patch.object(
+            training_ops,
+            "current_run",
+            side_effect=["glm-decensor-difficulty-8", "glm-decensor-difficulty-6"],
+        ) as current_run, mock.patch.object(
             training_ops,
             "_config_for_run",
             return_value={"inference": "configs/current/inference.toml"},
-        ), mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
+        ) as config_for_run, mock.patch.object(
+            training_ops, "deploy", return_value=True
+        ), mock.patch.object(
             training_ops, "_ssh", side_effect=ssh
-        ):
+        ), mock.patch("builtins.print") as printer:
             result = training_ops._repair_supervisors()
 
+        current_run.assert_called_once_with()
+        config_for_run.assert_called_once_with("glm-decensor-difficulty-8")
+        printer.assert_called_once_with(result)
         self.assertIn("h200a: reloaded exact engine watchdog", result)
         self.assertEqual({host for host, _, _ in calls}, {"h200a", "h200b"})
         self.assertEqual(len(calls), 4)
         for host in ("h200a", "h200b"):
-            host_calls = [(script, timeout) for called_host, script, timeout in calls if called_host == host]
+            host_calls = [
+                (script, timeout)
+                for called_host, script, timeout in calls
+                if called_host == host
+            ]
             self.assertEqual(len(host_calls), 2)
             self.assertTrue(all(timeout == 180 for _, timeout in host_calls))
-            repair_script = next(script for script, _ in host_calls if "WATCHDOG_IDENTITY=" in script)
+            cleanup_script, cleanup_timeout = host_calls[0]
+            repair_script, repair_timeout = host_calls[1]
+            self.assertEqual(cleanup_timeout, 180)
+            self.assertEqual(repair_timeout, 180)
+            self.assertIn(f"grep -Fxq ENGINE_HOST={host}", cleanup_script)
+            self.assertIn("grep -Fxq ENGINE_CONTAINER=glm52-decensor-h200", cleanup_script)
+            self.assertIn('for pid in "${matches[@]}"; do stop_watchdog "$pid"; done', cleanup_script)
+            self.assertNotIn("WATCHDOG_IDENTITY=engine-watchdog:", cleanup_script)
             self.assertIn("PORT=8000", repair_script)
             self.assertIn(
                 f"WATCHDOG_IDENTITY=engine-watchdog:{host}:glm-decensor-difficulty-8:8000",
                 repair_script,
             )
-            self.assertNotIn(
-                f"WATCHDOG_IDENTITY=engine-watchdog:{host}:glm-decensor-difficulty-6:8000",
-                repair_script,
-            )
+            self.assertIn(f"env ENGINE_HOST={host}", repair_script)
+            self.assertIn('nohup setsid bash "$watchdog_script"', repair_script)
+            self.assertIn("stop_watchdog", repair_script)
             self.assertNotIn("docker restart", "\n".join(script for script, _ in host_calls))
             self.assertNotIn("docker rm -f", "\n".join(script for script, _ in host_calls))
 

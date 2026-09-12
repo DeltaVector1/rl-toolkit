@@ -5105,13 +5105,21 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
     return "\n".join(lines) + "\n"
 
 
-def _repair_engine_watchdog(host: str) -> str:
+def _repair_engine_watchdog(
+    host: str,
+    *,
+    run: str | None = None,
+    selected: dict | None = None,
+    print_result: bool = True,
+) -> str:
     """Deploy and reload only the active profile's exact watchdog process."""
     _check_host(host)
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
-    run = current_run()
-    selected = _config_for_run(run)
+    if run is None:
+        run = current_run()
+    if selected is None:
+        selected = _config_for_run(run)
     inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     settings = _inference_config(host)
     configured_ports = settings.get("ports")
@@ -5168,31 +5176,34 @@ def _repair_engine_watchdog(host: str) -> str:
     if code:
         raise RuntimeError(f"watchdog repair failed on {host}: {output.strip()}")
     result = output.strip().splitlines()[-1] if output.strip() else "engine watchdog reloaded"
-    print(f"{host}: {result}")
+    if print_result:
+        print(f"{host}: {result}")
     return result
 
 
 def _repair_supervisors(config_dir: str | None = None) -> str:
     run = current_run()
+    active = _config_for_run(run)
     if config_dir is None:
-        _config_for_run(run)
+        selected = active
     else:
-        selected = _config_dir(
+        configured = _config_dir(
             config_dir,
             require_orchestrator=True,
             require_inference=True,
         )
-        active = _config_for_run(run)
-        if selected != active:
+        if configured != active:
             raise Refused(
                 f"supervisor config {config_dir!r} does not match active run {run!r}"
             )
+        selected = active
     out = []
     for h in inference_hosts:
-        out.append(f"{h}: {_repair_engine_watchdog(h)}")
+        out.append(
+            f"{h}: {_repair_engine_watchdog(h, run=run, selected=selected, print_result=False)}"
+        )
     msg = "; ".join(out)
     print(msg)
-    print("Use start(run, mode='restart') to replace a run supervisor.")
     return msg
 
 
