@@ -54,6 +54,7 @@ metric_hosts = list(hosts["metrics"])
 blocked_hosts = set(hosts["blocked"])
 adapter_port = ports["adapter"]
 judge_api_url = nodes["judges"]["external"]["api_url"].rstrip("/")
+secondary_judge_api_url = nodes["judges"]["secondary"]["api_url"].rstrip("/")
 remote_repo = paths["remote_repository"]
 storage_root = paths["storage_root"]
 run_root = paths["runs"]
@@ -271,6 +272,30 @@ def _status_runtime_identity(run: str) -> tuple[str, str, str, int, str]:
     zmq_port = 29620 if transport == "zmq" else 0
     zmq_target = f"{hosts['trainer_lan'][trainer_head]}:{zmq_port}" if zmq_port else ""
     return run_name, transport, f"{run_root.rstrip('/')}/{run}/{run_name}", zmq_port, zmq_target
+
+
+def _config_uses_url(value: object, target: str) -> bool:
+    if isinstance(value, str):
+        return value.rstrip("/") == target
+    if isinstance(value, dict):
+        return any(_config_uses_url(item, target) for item in value.values())
+    if isinstance(value, list):
+        return any(_config_uses_url(item, target) for item in value)
+    return False
+
+
+def _active_orchestrator_uses_url(run: str, target: str) -> bool:
+    profile = _config_for_run(run, required=False)
+    path_name = profile.get("orchestrator") if profile else None
+    if not isinstance(path_name, str):
+        return False
+    path = repo_root / path_name
+    try:
+        with path.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"cannot read orchestrator config {path}: {error}") from error
+    return _config_uses_url(config, target)
 
 ssh_command = [
     "ssh",
@@ -667,7 +692,9 @@ echo "TRAINER_FINISHED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc '
 echo "TRAINER_FAILED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'prime_rl\.trainer\.rl\.train FAILED|CheckpointException')"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
-echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout failed')"
+recent_rollouts=$(sudo docker logs --since 5m __ORCH__ 2>&1 || true)
+echo "FAILS5M $(printf '%s\n' "$recent_rollouts" | grep -ai 'Rollout failed' | grep -avi 'rollout is unscored' | wc -l)"
+echo "UNSCORED5M $(printf '%s\n' "$recent_rollouts" | grep -ai 'rollout is unscored' | wc -l)"
 echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 | cut -d' ' -f1)"
 echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
 adapter_state=$(sudo docker inspect --type container __ADAPTER_CONTAINER__ --format '{{.Name}} {{.State.Running}} {{.State.Status}} {{.State.Pid}}' 2>/dev/null | head -1)
@@ -754,9 +781,16 @@ done
 echo "TRAINER_FAIL_WD $trainer_fail_wd"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
-echo "FAILS5M $(sudo docker logs --since 5m __ORCH__ 2>&1 | grep -ac 'Rollout failed')"
+recent_rollouts=$(sudo docker logs --since 5m __ORCH__ 2>&1 || true)
+echo "FAILS5M $(printf '%s\n' "$recent_rollouts" | grep -ai 'Rollout failed' | grep -avi 'rollout is unscored' | wc -l)"
+echo "UNSCORED5M $(printf '%s\n' "$recent_rollouts" | grep -ai 'rollout is unscored' | wc -l)"
 echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
 echo "JUDGE $(curl -s -o /dev/null -m 10 -w '%{http_code}' __JUDGE_URL__/models)"
+if [ "__SECONDARY_JUDGE_ENABLED__" = 1 ]; then
+  echo "SECONDARY_JUDGE $(curl -s -o /dev/null -m 10 -w '%{http_code}' __SECONDARY_JUDGE_URL__/models)"
+else
+  echo "SECONDARY_JUDGE unused"
+fi
 zmq_ok=1
 if [ "__ZMQ_PORT__" != 0 ]; then
   zmq_ok=0
@@ -1163,9 +1197,11 @@ class Status:
     orch_last: str = ""
     batch: str = ""
     fails_5m: int = 0
+    unscored_5m: int = 0
     trainer_log_age: float | None = None
     orch_log_age: float | None = None
     judge: str = "000"
+    secondary_judge: str = "unused"
     adapter: str = "000"
     zmq_tunnel: bool = False
     nodes: list[NodeState] = field(default_factory=list)
@@ -1203,10 +1239,12 @@ class Status:
                 f"trainer {trainer_state} | "
                 f"orchestrator "
                 f"{'failed' if self.orch_failed else 'up' if self.orch_up else 'finished' if self.trainer_finished else 'down'} | "
-                f"judge {self.judge} | adapter {self.adapter}"
+                f"scoring judge {self.judge} | "
+                f"follow-up judge {self.secondary_judge} | adapter {self.adapter}"
             )
         L.append(
-            f"run steps {self.trainer_steps} | failures in 5m {self.fails_5m} | {self.batch or 'no batch line'}"
+            f"run steps {self.trainer_steps} | rollout failures in 5m {self.fails_5m} | "
+            f"unscored rollouts in 5m {self.unscored_5m} | {self.batch or 'no batch line'}"
         )
         if self.trainer_compute_state == "unknown":
             compute = "unknown"
@@ -1417,6 +1455,21 @@ def _failure_evidence(
 ) -> dict[str, int]:
     """Count measured failure evidence. Counts are lines or affected metric steps."""
     failures: dict[str, int] = {}
+    log_lines = list(
+        dict.fromkeys(line.strip() for line in logs.splitlines() if line.strip())
+    )
+    has_unscored_rollout = any(
+        re.search(r"rollout is unscored|complete group will be replaced", line, re.I)
+        for line in log_lines
+    )
+    has_fatal_rollout = any(
+        re.search(r"rollout failed", line, re.I)
+        and not re.search(
+            r"rollout is unscored|complete group will be replaced", line, re.I
+        )
+        for line in log_lines
+    )
+    isolated_unscored = has_unscored_rollout and not has_fatal_rollout
 
     rollout_error_steps = sum(
         1
@@ -1437,6 +1490,9 @@ def _failure_evidence(
             for key, value in row.items()
         )
     )
+    if isolated_unscored:
+        rollout_error_steps = 0
+        environment_steps = 0
     if rollout_error_steps:
         failures["transport/rollout"] = rollout_error_steps
     if environment_steps:
@@ -1463,14 +1519,14 @@ def _failure_evidence(
             r"out of memory|\boom\b|\b(?:nan|inf)\b|nonfinite", re.I
         ),
     }
-    lines = list(
-        dict.fromkeys(line.strip() for line in logs.splitlines() if line.strip())
-    )
     for category, pattern in categories.items():
         count = sum(
             1
-            for line in lines
+            for line in log_lines
             if pattern.search(line)
+            and not re.search(
+                r"rollout is unscored|complete group will be replaced", line, re.I
+            )
             and not re.search(
                 r"Out of range float values are not JSON compliant:\s*nan",
                 line,
@@ -2084,6 +2140,10 @@ def status(run: str = "", quiet: bool = False) -> Status:
         _active_policy_identity(policy_broadcast_dir) if policy_broadcast_dir else None
     )
     run_name, rollout_transport, run_dir, zmq_port, zmq_target = _status_runtime_identity(run)
+    secondary_judge_used = (
+        not trainer_only
+        and _active_orchestrator_uses_url(run, secondary_judge_api_url)
+    )
 
     def node(h):
         return _ssh(h, node_probe.replace("__TRAINER__", trainer_container), timeout=60)
@@ -2130,6 +2190,11 @@ def status(run: str = "", quiet: bool = False) -> Status:
                 orchestrator_host,
                 orchestrator_probe.replace("__ORCH__", orchestrator_container)
                 .replace("__JUDGE_URL__", judge_api_url)
+                .replace("__SECONDARY_JUDGE_URL__", secondary_judge_api_url)
+                .replace(
+                    "__SECONDARY_JUDGE_ENABLED__",
+                    "1" if secondary_judge_used else "0",
+                )
                 .replace("__RUN__", run)
                 .replace("__RUN_NAME__", run_name)
                 .replace("__RUN_DIR__", run_dir)
@@ -2160,8 +2225,10 @@ def status(run: str = "", quiet: bool = False) -> Status:
         "ORCH_LAST",
         "BATCH",
         "FAILS5M",
+        "UNSCORED5M",
         "ORCH_LOGAGE",
         "JUDGE",
+        "SECONDARY_JUDGE",
         "ZMQ_TUNNEL",
     )
     for key in edge_keys:
@@ -2195,9 +2262,13 @@ def status(run: str = "", quiet: bool = False) -> Status:
     s.orch_last = h.get("ORCH_LAST", "")
     s.batch = h.get("BATCH", "")
     s.fails_5m = int(h.get("FAILS5M", 0) or 0)
+    s.unscored_5m = int(h.get("UNSCORED5M", 0) or 0)
     s.trainer_log_age = _age(h.get("TRAINER_LOGAGE", ""))
     s.orch_log_age = _age(h.get("ORCH_LOGAGE", ""))
     s.judge = h.get("JUDGE", "000")
+    s.secondary_judge = h.get(
+        "SECONDARY_JUDGE", "000" if secondary_judge_used else "unused"
+    )
     s.adapter = h.get("ADAPTER", "000")
     s.zmq_tunnel = h.get("ZMQ_TUNNEL", "0") == "1"
 
@@ -2326,8 +2397,10 @@ def _warnings(s: Status) -> list[str]:
             w.append(f"{e.host} has no engine watchdog running")
     if not trainer_only and s.judge != "200":
         w.append(
-            f"judge returned {s.judge}; every reward multiplies by the judge score"
+            f"scoring judge returned {s.judge}; every reward multiplies by the judge score"
         )
+    if not trainer_only and s.secondary_judge not in {"200", "unused"}:
+        w.append(f"follow-up judge returned {s.secondary_judge}")
     if not trainer_only and s.adapter != "200":
         w.append(
             f"adapter server returned {s.adapter} on port {adapter_port}. "

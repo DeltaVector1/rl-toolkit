@@ -131,6 +131,50 @@ class TrainerComputeProbeTest(unittest.TestCase):
     def test_status_reports_pending_without_an_explicit_start(self):
         self.assertIn("trainer compute: pending", training_ops.Status().report())
 
+    def test_status_reports_judges_and_split_rollout_counters(self):
+        status = training_ops.Status(
+            judge="200",
+            secondary_judge="unused",
+            fails_5m=2,
+            unscored_5m=1,
+        )
+        report = status.report()
+        self.assertIn("scoring judge 200", report)
+        self.assertIn("follow-up judge unused", report)
+        self.assertIn("rollout failures in 5m 2", report)
+        self.assertIn("unscored rollouts in 5m 1", report)
+
+    def test_follow_up_judge_warns_only_when_used_and_unhealthy(self):
+        healthy = training_ops.Status(
+            trainer_up=True,
+            orch_up=True,
+            judge="200",
+            secondary_judge="200",
+        )
+        self.assertFalse(
+            any("follow-up judge" in warning for warning in training_ops._warnings(healthy))
+        )
+        unused = training_ops.Status(
+            trainer_up=True,
+            orch_up=True,
+            judge="200",
+            secondary_judge="unused",
+            unscored_5m=1,
+        )
+        self.assertFalse(
+            any("follow-up judge" in warning for warning in training_ops._warnings(unused))
+        )
+        unhealthy = training_ops.Status(
+            trainer_up=True,
+            orch_up=True,
+            judge="200",
+            secondary_judge="503",
+        )
+        self.assertIn(
+            "follow-up judge returned 503",
+            training_ops._warnings(unhealthy),
+        )
+
 
 class ActiveRewardRowsTest(unittest.TestCase):
     def test_selects_rows_after_active_container_start(self):
@@ -635,6 +679,15 @@ dequantize_checkpoint_moe = true
 
         self.assertEqual(report.completed_steps, 5)
         self.assertEqual(report.failures, {})
+
+    def test_isolated_unscored_rollout_is_not_failure_evidence(self):
+        rows = [{
+            "step": 1,
+            "train/agg/all/has_error/mean": 1.0,
+            "train/agg/all/user_sim_failed/mean": 1.0,
+        }]
+        logs = "Rollout failed after three attempts: rollout is unscored; its complete group will be replaced"
+        self.assertEqual(training_ops._failure_evidence([], rows, logs), {})
 
 
 if __name__ == "__main__":

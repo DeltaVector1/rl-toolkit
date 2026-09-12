@@ -141,6 +141,80 @@ asyncio.run(main())
     assert result.returncode == 0
 
 
+def test_follow_up_retries_wait_and_leave_rollout_unscored():
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "src")
+    result = subprocess.run(
+        ["uv", "run", "--project", str(ROOT), "--with", "verifiers==0.2.2.dev17", "python", "-c", """
+import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+import httpx
+from verifiers.v1.mcp.server import _call_state
+import decensor_v1.user as user_module
+from decensor_v1.follow_up import FollowUpReview
+from decensor_v1.state import DecensorState
+from decensor_v1.taskset import DecensorData, DecensorTask
+
+active_client = None
+delays = []
+class Completions:
+    def __init__(self, recover): self.calls, self.recover = 0, recover
+    async def create(self, **kwargs):
+        self.calls += 1
+        if self.calls < 3 or not self.recover:
+            raise httpx.TransportError("connection failed token=secret-value")
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content="<user-turn-output>Please explain the specific steps with one concrete example in detail.</user-turn-output>", tool_calls=[]))])
+@asynccontextmanager
+async def fake_openai(_config): yield active_client
+@asynccontextmanager
+async def fake_slot(_config): yield
+async def fake_review(*args, **kwargs):
+    return (FollowUpReview(continues_original_request=True, fits_latest_answer=True,
+        switches_to_assistant_alternative=False, sounds_like_a_real_user=True,
+        reason="valid"), "{}")
+async def fake_sleep(delay): delays.append(delay)
+async def run_user(recover):
+    global active_client
+    active_client = SimpleNamespace(chat=SimpleNamespace(completions=Completions(recover)))
+    task = DecensorTask(DecensorData(prompt="Give the requested steps.", target_turns=2))
+    user, state = task.user_server(), DecensorState(target_turns=2)
+    await user.setup_task(SimpleNamespace(system_prompt=None, prompt=task.data.prompt, idx=0))
+    token = _call_state.set(state)
+    try: messages = await user.respond("I cannot answer that directly.")
+    finally: _call_state.reset(token)
+    return task, state, messages
+async def main():
+    user_module._shared_openai = fake_openai
+    user_module.judge_request_slot = fake_slot
+    user_module.review_follow_up_message = fake_review
+    user_module.asyncio.sleep = fake_sleep
+    task, recovered, messages = await run_user(True)
+    assert len(messages) == 1 and len(recovered.follow_up_attempts) == 3, (messages, recovered.follow_up_attempts, delays)
+    assert delays == [2.0, 4.0] and not recovered.user_sim_failed
+    delays.clear()
+    task, failed, messages = await run_user(False)
+    assert messages == [] and len(failed.follow_up_attempts) == 3
+    assert delays == [2.0, 4.0] and failed.user_sim_failed
+    assert "secret-value" not in failed.user_sim_error
+    class Trace:
+        branches = [SimpleNamespace(messages=[SimpleNamespace(role="user", content="request"),
+            SimpleNamespace(role="assistant", content="answer", reasoning="trace")])]
+        is_truncated, info, state = False, {}, failed
+        record_metrics = lambda self, values: None
+        record_metric = lambda self, name, value: None
+    try: await task.decensor_reward(Trace())
+    except RuntimeError as error: message = str(error)
+    else: raise AssertionError("failed follow-up must remain unscored")
+    assert "connection failed" in message
+    assert "rollout is unscored; its complete group will be replaced" in message
+    assert "secret-value" not in message
+asyncio.run(main())
+"""], cwd=ROOT, env=env, check=False, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+
+
 def test_old_user_module_starts_mcp_server():
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "src")

@@ -400,12 +400,25 @@ class DecensorUser(_DecensorUserBase):
                             ValueError,
                             IndexError,
                         ) as exc:
-                            if isinstance(exc, APIStatusError) and not (
-                                exc.status_code in {408, 409, 429}
-                                or exc.status_code >= 500
-                            ):
+                            retryable_request_error = isinstance(
+                                exc,
+                                (
+                                    APIConnectionError,
+                                    APITimeoutError,
+                                    httpx.TransportError,
+                                    TimeoutError,
+                                ),
+                            ) or (
+                                isinstance(exc, APIStatusError)
+                                and (
+                                    exc.status_code in {408, 409, 429}
+                                    or exc.status_code >= 500
+                                )
+                            )
+                            if isinstance(exc, APIStatusError) and not retryable_request_error:
                                 raise
-                            final_error = type(exc).__name__
+                            error_type = type(exc).__name__
+                            final_error = safe_service_error(exc) or error_type
                             text = ""
                             self.state.follow_up_attempts.append(
                                 {
@@ -415,12 +428,14 @@ class DecensorUser(_DecensorUserBase):
                                     "strategy": strategy_name,
                                     "strategy_selection_seed": strategy_selection_seed,
                                     "generation_seed": generation_seed,
-                                    "error_type": final_error,
+                                    "error_type": error_type,
                                     "error": safe_service_error(exc),
                                     "elapsed_seconds": time.monotonic()
                                     - attempt_started_at,
                                 }
                             )
+                            if retryable_request_error and attempt < 2:
+                                await asyncio.sleep(2.0 if attempt == 0 else 4.0)
                         if text:
                             break
         except TimeoutError:

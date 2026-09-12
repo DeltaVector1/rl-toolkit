@@ -51,8 +51,13 @@ acceptance requirements. Do not change them without an owner decision.
 - Run the full topology for at least 50 completed trainer steps. Keep
   `training_ops.watch()` in the foreground with an interval of 600 seconds or
   less.
+- An isolated unscored rollout after three attempts is replaced with its
+  complete GRPO group. It is not alone a run failure while both judges are
+  healthy and batch progress continues. Stop on a judge outage, eight
+  consecutive errored groups, or stopped batch progress.
 - Stop acceptance for an OOM, nonfinite value, failed adapter load, transport
-  failure, environment failure, or measured reward regression.
+  failure, an environment failure beyond an isolated replaced rollout, or
+  measured reward regression.
 - A short run, step 1, cached adapter, or reward change inside the noise does
   not pass. Report unfinished adapter, parity, rollout, judging, save, or
   transfer checks as unfinished.

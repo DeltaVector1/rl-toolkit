@@ -26,6 +26,7 @@ from decensor_v1.service import (
     format_judge_failure_summary,
     judge_failure_summary,
     request_judge_score,
+    safe_service_error,
 )
 from decensor_v1.state import DecensorState
 from decensor_v1.text import (
@@ -175,13 +176,20 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
             reject_forbidden_tags=scoring_config.enable_structured_markers,
         )
         if trace.state.user_sim_failed:
+            final_cause = trace.state.user_sim_error
+            if trace.state.follow_up_attempts:
+                final_attempt = trace.state.follow_up_attempts[-1]
+                if final_attempt.get("error"):
+                    final_cause = str(final_attempt["error"])
+            final_cause = safe_service_error(final_cause) or "unknown error"
             trace.info["decensor"] = {
                 "evaluation_status": "unscored_service_failure",
                 "service": "follow_up_model",
-                "error": trace.state.user_sim_error,
+                "error": final_cause,
             }
             raise RuntimeError(
-                "follow-up model failed after three attempts; rollout is unscored"
+                "follow-up model failed after three attempts: "
+                f"{final_cause}; rollout is unscored; its complete group will be replaced"
             )
         if response_failure is not None:
             invalid_result = EvaluationResult(
