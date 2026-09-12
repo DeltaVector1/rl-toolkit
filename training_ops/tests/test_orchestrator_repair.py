@@ -291,7 +291,7 @@ class OrchestratorRepairTest(unittest.TestCase):
                 for key, value in expected.items():
                     placeholder = "__ORCH__" if key == "ORCH_CT" else f"__{key}__"
                     script = script.replace(placeholder, value)
-                for pid, argv, environment in entries:
+                for pid, argv, environment, process_group in entries:
                     process = proc_root / str(pid)
                     process.mkdir(parents=True)
                     (process / "cmdline").write_bytes(
@@ -299,6 +299,10 @@ class OrchestratorRepairTest(unittest.TestCase):
                     )
                     (process / "environ").write_bytes(
                         b"\0".join(value.encode() for value in environment) + b"\0"
+                    )
+                    (process / "stat").write_text(
+                        f"{pid} (bash) S 1 {process_group} 1 0 0 0 0 0\n",
+                        encoding="ascii",
                     )
                 result = subprocess.run(
                     ["bash", "-c", script],
@@ -317,22 +321,23 @@ class OrchestratorRepairTest(unittest.TestCase):
         def valid_environment():
             return [f"{key}={value}" for key, value in expected.items()]
 
-        def valid_process(pid, command=("bash",), environment=None):
+        def valid_process(pid, command=("bash",), environment=None, process_group=None):
             return (
                 pid,
                 (*command, "/data/deployment/trainer_failure_watchdog.sh"),
                 valid_environment() if environment is None else environment,
+                pid if process_group is None else process_group,
             )
 
         self.assertEqual(
             run_probe(
                 [
                     valid_process(100, ("bash",)),
-                    valid_process(101, ("/bin/bash",)),
-                    valid_process(102, ("/usr/bin/bash",)),
+                    valid_process(101, ("/bin/bash",), process_group=100),
+                    valid_process(102, ("/usr/bin/bash",), process_group=100),
                 ]
             ),
-            3,
+            1,
         )
         self.assertEqual(
             run_probe(
@@ -341,13 +346,15 @@ class OrchestratorRepairTest(unittest.TestCase):
                         103,
                         ("bash", "/data/deployment/trainer_failure_watchdog.sh", "extra"),
                         valid_environment(),
+                        103,
                     ),
                     (
                         104,
                         ("bash", "-c", "echo /data/deployment/trainer_failure_watchdog.sh"),
                         valid_environment(),
+                        104,
                     ),
-                    (105, ("sleep", "1"), valid_environment()),
+                    (105, ("sleep", "1"), valid_environment(), 105),
                 ]
             ),
             0,

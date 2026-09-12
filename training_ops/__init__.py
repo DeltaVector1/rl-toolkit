@@ -733,6 +733,10 @@ for proc_dir in /proc/[0-9]*; do
     "bash $watchdog_script"|"/bin/bash $watchdog_script"|"/usr/bin/bash $watchdog_script") ;;
     *) continue ;;
   esac
+  # Command substitutions in the watchdog inherit its argv and environment.
+  # Count only the setsid process-group leader, not those transient children.
+  process_group=$(awk '{print $5}' "/proc/$pid/stat" 2>/dev/null || true)
+  [ "$process_group" = "$pid" ] || continue
   environment=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' || true)
   grep -Fxq "RUN=__RUN__" <<<"$environment" || continue
   grep -Fxq "RUN_NAME=__RUN_NAME__" <<<"$environment" || continue
