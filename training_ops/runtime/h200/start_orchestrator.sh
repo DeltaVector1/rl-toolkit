@@ -359,15 +359,14 @@ generic_tunnel_supervisor_match() {
   local command_line=$1 marker=$2 via=$3 forward=$4 comp=$5
   shift 5
   local -a ssh_options=("$@")
-  local ssh_option
+  local ssh_command
   case "$command_line" in *"while true; do"*"done # $marker") ;; *) return 1 ;; esac
-  [ "$(grep -o -- '-L ' <<<"$command_line" | wc -l)" -eq 1 ] || return 1
-  tunnel_command_has "$command_line" "$via" || return 1
-  tunnel_command_has "$command_line" "$forward" || return 1
-  [[ "$command_line" == *"-o Compression=$comp"* ]] || return 1
-  for ssh_option in "${ssh_options[@]}"; do
-    tunnel_command_has "$command_line" "$ssh_option" || return 1
-  done
+  case "$command_line" in *"ssh "*) ;; *) return 1 ;; esac
+  ssh_command="ssh ${command_line#*ssh }"
+  ssh_command=${ssh_command%% $via*}
+  ssh_command+=" $via"
+  generic_tunnel_ssh_match "$ssh_command" "$via" "$forward" "$comp" \
+    "${ssh_options[@]}"
 }
 
 generic_tunnel_listener_ready() {
@@ -405,6 +404,7 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
         "${ssh_options[@]}"; then
       return 0
     fi
+    generic_tunnel_stop_stale "$pid" "$command_line" "$marker" "$forward"
   done
   setsid nohup bash -c "while true; do
       ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes \
@@ -422,6 +422,20 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
   done
   echo "generic tunnel :$lp is not owned by the configured supervisor or is not usable" >&2
   return 1
+}
+
+generic_tunnel_stop_stale() {
+  local pid=$1 command_line=$2 marker=$3 forward=$4 pgid
+  case "$command_line" in
+    *"while true; do"*"done # $marker") ;;
+    *) return 0 ;;
+  esac
+  tunnel_command_has "$command_line" "$forward" || return 0
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  case "$pgid" in
+    ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
+    *) kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true ;;
+  esac
 }
 
 peer_tunnel_connection() {
@@ -455,7 +469,7 @@ peer_tunnel_connection() {
       if peer_tunnel_supervisor_forwards_match "$command_line" "$expected_shape" "$marker" "${forwards[@]}"; then
         return 0
       fi
-      peer_kill_owned "$pid" "$command_line"
+      peer_kill_owned "$pid" "$command_line" "$expected_shape" "$marker" "${forwards[@]}"
     done
   fi
   setsid nohup bash -c "while true; do
@@ -516,21 +530,32 @@ peer_tunnel_marker_match() {
 
 peer_tunnel_supervisor_match() {
   local command_line=$1 shape=$2 marker=${3:-}
-  local peer_target="${peer_ssh_user}@${peer_host}"
+  local ssh_command peer_target
   peer_tunnel_marker_match "$command_line" "$marker" || return 1
   case "$command_line" in *"while true; do"*) ;; *) return 1 ;; esac
-  case "$command_line" in
-    *"ssh -NT "*"-o IdentitiesOnly=yes"*"-o ExitOnForwardFailure=yes"*"-i $peer_ssh_identity"*"-p $peer_ssh_port "*) ;;
-    *) return 1 ;;
-  esac
-  tunnel_command_has "$command_line" "$peer_target" || return 1
-  peer_tunnel_forward_shape "$command_line" "$shape"
+  case "$command_line" in *"ssh "*) ;; *) return 1 ;; esac
+  ssh_command="ssh ${command_line#*ssh }"
+  peer_target="${peer_ssh_user}@${peer_host}"
+  ssh_command=${ssh_command%% $peer_target*}
+  ssh_command+=" $peer_target"
+  peer_tunnel_ssh_args_match "$ssh_command" "$shape"
 }
 
 peer_tunnel_supervisor_forwards_match() {
   local command_line=$1 shape=$2 marker=$3 forward
   shift 3
   peer_tunnel_supervisor_match "$command_line" "$shape" "$marker" || return 1
+  for forward in "$@"; do
+    tunnel_command_has "$command_line" "$forward" || return 1
+  done
+}
+
+peer_tunnel_stale_supervisor_match() {
+  local command_line=$1 shape=$2 marker=$3 forward
+  shift 3
+  peer_tunnel_marker_match "$command_line" "$marker" || return 1
+  case "$command_line" in *"while true; do"*) ;; *) return 1 ;; esac
+  peer_tunnel_forward_shape "$command_line" "$shape" || return 1
   for forward in "$@"; do
     tunnel_command_has "$command_line" "$forward" || return 1
   done
@@ -583,7 +608,7 @@ peer_tunnel_remove_legacy() {
   local keep_current=${1:-0}
   local pid command_line
   while read -r pid command_line; do
-    peer_tunnel_supervisor_match "$command_line" cleanup || continue
+    peer_tunnel_stale_supervisor_match "$command_line" cleanup "" || continue
     if [ "$keep_current" = 1 ]; then
       if peer_tunnel_supervisor_match "$command_line" api \
           || peer_tunnel_supervisor_match "$command_line" current; then
@@ -595,12 +620,20 @@ peer_tunnel_remove_legacy() {
 }
 
 peer_kill_owned() {
-  local pid=$1 command_line=$2 pgid
-  peer_tunnel_supervisor_match "$command_line" cleanup || return 0
+  local pid=$1 command_line=$2 shape=${3:-} marker=${4:-} pgid
+  if [ -n "$shape" ] && [ -n "$marker" ]; then
+    peer_tunnel_stale_supervisor_match "$command_line" "$shape" "$marker" || return 0
+  else
+    peer_tunnel_supervisor_match "$command_line" cleanup || return 0
+  fi
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
   case "$pgid" in
     ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
     *)
+      if [ -n "$shape" ] && [ -n "$marker" ]; then
+        kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+        return 0
+      fi
       if [ "$pgid" = "$pid" ] || peer_tunnel_group_safe "$pgid"; then
         kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
       else
@@ -764,16 +797,31 @@ china_tunnel_marker_match() {
 
 china_tunnel_supervisor_match() {
   local command_line=$1 shape=$2 marker=${3:-}
+  local ssh_command
   china_tunnel_marker_match "$command_line" "$marker" || return 1
   case "$command_line" in *"while true; do"*) ;; *) return 1 ;; esac
-  tunnel_command_has "$command_line" "$trainer_ssh_target" || return 1
-  china_tunnel_forward_shape "$command_line" "$shape"
+  case "$command_line" in *"ssh "*) ;; *) return 1 ;; esac
+  ssh_command="ssh ${command_line#*ssh }"
+  ssh_command=${ssh_command%% $trainer_ssh_target*}
+  ssh_command+=" $trainer_ssh_target"
+  china_tunnel_ssh_args_match "$ssh_command" "$shape"
 }
 
 china_tunnel_supervisor_forwards_match() {
   local command_line=$1 shape=$2 marker=$3 forward
   shift 3
   china_tunnel_supervisor_match "$command_line" "$shape" "$marker" || return 1
+  for forward in "$@"; do
+    tunnel_command_has "$command_line" "$forward" || return 1
+  done
+}
+
+china_tunnel_stale_supervisor_match() {
+  local command_line=$1 shape=$2 marker=$3 forward
+  shift 3
+  china_tunnel_marker_match "$command_line" "$marker" || return 1
+  case "$command_line" in *"while true; do"*) ;; *) return 1 ;; esac
+  china_tunnel_forward_shape "$command_line" "$shape" || return 1
   for forward in "$@"; do
     tunnel_command_has "$command_line" "$forward" || return 1
   done
@@ -876,7 +924,10 @@ tunnel_listener_ready() {
 
 china_tunnel_grouped_legacy_match() {
   local command_line=$1 forward_total
-  china_tunnel_supervisor_match "$command_line" cleanup || return 1
+  china_tunnel_marker_match "$command_line" || return 1
+  case "$command_line" in *"while true; do"*) ;; *) return 1 ;; esac
+  tunnel_command_has "$command_line" "$trainer_ssh_target" || return 1
+  china_tunnel_forward_shape "$command_line" cleanup || return 1
   case "$command_line" in
     *"while true; do"*"$trainer_ssh_target"*"# china-tunnel-lora-"*) ;;
     *) return 1 ;;
@@ -960,7 +1011,7 @@ china_tunnel_ports_clear() {
 }
 
 china_tunnel_stop_supervisor() {
-  local pid=$1 command_line=$2 expected_marker=${3:-} pgid forward source_port
+  local pid=$1 command_line=$2 expected_marker=${3:-} stale=${4:-0} pgid forward source_port
   local -a owned_forwards=()
   mapfile -t owned_forwards < <(grep -oE -- '-L 127\.0\.0\.1:[0-9]+:127\.0\.0\.1:[0-9]+' <<<"$command_line")
   [ "${#owned_forwards[@]}" -gt 0 ] || return 1
@@ -982,7 +1033,9 @@ china_tunnel_stop_supervisor() {
         *" $pgid "*) ;;
         *) china_legacy_cleanup_pgids+=("$pgid") ;;
       esac
-      if [ "$pgid" = "$pid" ] || china_tunnel_group_safe "$pgid" "$expected_marker"; then
+      if [ "$stale" = 1 ]; then
+        kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+      elif [ "$pgid" = "$pid" ] || china_tunnel_group_safe "$pgid" "$expected_marker"; then
         kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
       else
         kill "$pid" 2>/dev/null || true
@@ -1020,7 +1073,11 @@ china_tunnel_remove_legacy() {
       command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
       grouped_legacy=0
       if [ -n "$only_marker" ]; then
-        china_tunnel_supervisor_forwards_match "$command_line" cleanup "$only_marker" "$pattern" || continue
+        china_tunnel_marker_match "$command_line" "$only_marker" || continue
+        case "$command_line" in *"while true; do"*) ;; *) continue ;; esac
+        tunnel_command_has "$command_line" "$trainer_ssh_target" || continue
+        china_tunnel_forward_shape "$command_line" cleanup || continue
+        tunnel_command_has "$command_line" "$pattern" || continue
         grouped_legacy=1
       else
         china_tunnel_grouped_legacy_match "$command_line" || continue
@@ -1092,6 +1149,9 @@ china_tunnel_connection() {
       if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${forwards[@]}"; then
         return 0
       fi
+      if china_tunnel_stale_supervisor_match "$command_line" current "$marker" "${forwards[@]}"; then
+        china_tunnel_stop_supervisor "$pid" "$command_line" "$marker" 1
+      fi
     done
     china_tunnel_remove_legacy "$marker" "${forwards[@]}"
     ports_clear=0
@@ -1136,7 +1196,7 @@ peer_tunnel() {
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
     -L "127.0.0.1:$peer_api_port:127.0.0.1:8000"
 
-  # Keep each SSH connection to two source ports so all 96 source listeners
+  # Keep each SSH connection to two source ports so all configured source listeners
   # have independent bounded workers.
   local peer_lane_size=2
   local lane_start=0 lane_number=0
@@ -1157,6 +1217,114 @@ peer_tunnel() {
   done
   if [ "${tunnels_only:-0}" = 0 ]; then
     echo "peer tunnel :$peer_api_port -> $peer_name:8000; adapter source reverse ports ${lora_source_ports[0]}-${lora_source_ports[-1]} in $lane_number SSH lanes"
+  fi
+}
+
+china_tunnel_supervisors_ready() {
+  local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
+  local marker ready lora_source_port
+  while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
+    lane_ports=("${lora_source_ports[@]:lane_start:2}")
+    lane_forwards=()
+    for lora_source_port in "${lane_ports[@]}"; do
+      lane_forwards+=("-L 127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port")
+    done
+    marker="china-tunnel-lora-$lane_number"
+    ready=0
+    for pid in $(pgrep -f -- "$marker" || true); do
+      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${lane_forwards[@]}"; then
+        ready=1
+        break
+      fi
+    done
+    [ "$ready" = 1 ] || return 1
+    lane_start=$((lane_start + 2))
+    lane_number=$((lane_number + 1))
+  done
+}
+
+peer_tunnel_supervisors_ready() {
+  local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
+  local marker ready lora_source_port
+  [ "$peer_enabled" = 1 ] || return 0
+  while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
+    lane_ports=("${lora_source_ports[@]:lane_start:2}")
+    lane_forwards=()
+    for lora_source_port in "${lane_ports[@]}"; do
+      lane_forwards+=("-R 127.0.0.1:$lora_source_port:127.0.0.1:$relay_port")
+    done
+    marker="peer-tunnel-lora-$lane_number"
+    ready=0
+    for pid in $(pgrep -f -- "$marker" || true); do
+      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      if peer_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${lane_forwards[@]}"; then
+        ready=1
+        break
+      fi
+    done
+    [ "$ready" = 1 ] || return 1
+    lane_start=$((lane_start + 2))
+    lane_number=$((lane_number + 1))
+  done
+}
+
+adapter_tunnel_readiness() {
+  local tunnels_ready=0 readiness_port="" listener_status=0 remote_ready=1
+  for _ in $(seq 1 30); do
+    tunnels_ready=0
+    china_tunnel_supervisors_ready && china_source_ports_ready 10 && tunnels_ready=1
+    if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ]; then
+      peer_tunnel_supervisors_ready || {
+        tunnels_ready=0
+        readiness_port=peer
+      }
+      if [ "$tunnels_ready" = 1 ]; then
+        listener_status=0
+        tunnel_listener_ready "$peer_api_port" peer-tunnel-api \
+          "$peer_ssh_user@$peer_host" 1 \
+          -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" || listener_status=$?
+        if [ "$listener_status" -ne 0 ]; then
+          tunnels_ready=0
+          readiness_port=$peer_api_port
+        fi
+      fi
+    fi
+    if [ "$tunnels_ready" = 1 ] && [ "$secondary_enabled" = 1 ]; then
+      listener_status=0
+      generic_tunnel_listener_ready "$secondary_local_api_port" "zmq-tunnel-$secondary_local_api_port" \
+        "$secondary_ssh_target" \
+        "127.0.0.1:$secondary_local_api_port:127.0.0.1:$secondary_remote_api_port" \
+        no "${secondary_ssh_options[@]}" || listener_status=$?
+      if [ "$listener_status" -ne 0 ]; then
+        tunnels_ready=0
+        readiness_port=$secondary_local_api_port
+      fi
+    fi
+    [ "$tunnels_ready" = 1 ] && break
+    sleep 1
+  done
+  if [ "$tunnels_ready" != 1 ]; then
+    if [ -n "$readiness_port" ]; then
+      echo "adapter tunnel readiness failed for local port $readiness_port: listener owner is not the expected SSH supervisor" >&2
+    else
+      echo "adapter tunnel reconciliation did not establish all configured forwards" >&2
+    fi
+    return 1
+  fi
+  if [ "$peer_enabled" = 1 ]; then
+    remote_ready=0
+    for _ in $(seq 1 10); do
+      if peer_remote_ports_ready 10; then
+        remote_ready=1
+        break
+      fi
+      sleep 1
+    done
+  fi
+  if [ "$remote_ready" != 1 ]; then
+    echo "adapter tunnel reconciliation did not establish all remote reverse forwards" >&2
+    return 1
   fi
 }
 
@@ -1204,59 +1372,10 @@ if [ "$secondary_enabled" = 1 ]; then
     exit 1
   fi
 fi
+if ! adapter_tunnel_readiness; then
+  exit 1
+fi
 if [ "$tunnels_only" = 1 ]; then
-  tunnels_ready=0
-  readiness_port=""
-  for _ in $(seq 1 30); do
-    tunnels_ready=0
-    china_source_ports_ready 10 && tunnels_ready=1
-    if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ]; then
-      listener_status=0
-      tunnel_listener_ready "$peer_api_port" peer-tunnel-api \
-        "$peer_ssh_user@$peer_host" 1 \
-        -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" || listener_status=$?
-      if [ "$listener_status" -ne 0 ]; then
-        tunnels_ready=0
-        readiness_port=$peer_api_port
-      fi
-    fi
-    if [ "$tunnels_ready" = 1 ] && [ "$secondary_enabled" = 1 ]; then
-      listener_status=0
-      generic_tunnel_listener_ready "$secondary_local_api_port" "zmq-tunnel-$secondary_local_api_port" \
-        "$secondary_ssh_target" \
-        "127.0.0.1:$secondary_local_api_port:127.0.0.1:$secondary_remote_api_port" \
-        no "${secondary_ssh_options[@]}" || listener_status=$?
-      if [ "$listener_status" -ne 0 ]; then
-        tunnels_ready=0
-        readiness_port=$secondary_local_api_port
-      fi
-    fi
-    [ "$tunnels_ready" = 1 ] && break
-    sleep 1
-  done
-  if [ "$tunnels_ready" != 1 ]; then
-    if [ -n "$readiness_port" ]; then
-      echo "adapter tunnel readiness failed for local port $readiness_port: listener owner is not the expected SSH supervisor" >&2
-    else
-      echo "adapter tunnel reconciliation did not establish all configured forwards" >&2
-    fi
-    exit 1
-  fi
-  remote_ready=1
-  if [ "$peer_enabled" = 1 ]; then
-    remote_ready=0
-    for _ in $(seq 1 10); do
-      if peer_remote_ports_ready 10; then
-        remote_ready=1
-        break
-      fi
-      sleep 1
-    done
-  fi
-  if [ "$remote_ready" != 1 ]; then
-    echo "adapter tunnel reconciliation did not establish all remote reverse forwards" >&2
-    exit 1
-  fi
   echo "adapter tunnel reconciliation complete"
   exit 0
 fi

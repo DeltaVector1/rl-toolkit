@@ -3,6 +3,25 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 script="$root/training_ops/runtime/h200/start_orchestrator.sh"
+nodes_file="$root/configs/nodes.toml"
+readarray -t configured_lora_ports < <(python3 - "$nodes_file" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    ports = tomllib.load(stream)["ports"]
+for port in range(ports["lora_source_first"], ports["lora_source_last"] + 1):
+    print(port)
+PY
+)
+[ "${#configured_lora_ports[@]}" -eq 128 ] || {
+  echo "expected 128 configured LoRA source ports" >&2
+  exit 1
+}
+test_source_first=${configured_lora_ports[0]}
+test_source_last=${configured_lora_ports[-1]}
+export TEST_SOURCE_FIRST="$test_source_first" TEST_SOURCE_LAST="$test_source_last" \
+  TEST_SOURCE_COUNT="${#configured_lora_ports[@]}"
 relay_block=$(sed -n '/sudo docker run -d --name/,/--canonical-source-url/p' "$script")
 [[ "$relay_block" == *"--user 0:0"* && "$relay_block" == *'-v "$relay_cache_dir":"$relay_cache_dir":ro'* ]] || {
   echo "relay must run as root with a read-only adapter cache" >&2
@@ -44,8 +63,8 @@ if [ -r "${PEER_TEST_LOG:?}" ] && grep -Fq -- "$pattern" "$PEER_TEST_LOG"; then
         echo 10000
         exit 0
       fi
-      if [ "${PEER_CHINA_MODE:-0}" = 1 ] && [ "$port" -ge 18100 ] && [ "$port" -le 18195 ]; then
-        echo $((10000 + (port - 18100)))
+      if [ "${PEER_CHINA_MODE:-0}" = 1 ] && [ "$port" -ge "${TEST_SOURCE_FIRST:?}" ] && [ "$port" -le "${TEST_SOURCE_LAST:?}" ]; then
+        echo $((10000 + (port - TEST_SOURCE_FIRST)))
       else
         echo 1234
       fi
@@ -118,10 +137,9 @@ start=$(grep -n '^generic_tunnel_ssh_match() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
 
-lora_source_ports=()
-for port in $(seq 18100 18195); do
-  lora_source_ports+=("$port")
-done
+lora_source_ports=("${configured_lora_ports[@]}")
+expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
+expected_peer_lines=$((expected_lanes + 1))
 peer_enabled=1
 peer_api_port=18049
 relay_port=18196
@@ -138,14 +156,14 @@ query="$tmp/peer-query"
 
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
 for _ in $(seq 1 50); do
-  [ -f "$log" ] && [ "$(wc -l <"$log")" -eq 49 ] && break
+  [ -f "$log" ] && [ "$(wc -l <"$log")" -eq "$expected_peer_lines" ] && break
   sleep 0.1
 done
-test "$(wc -l <"$log")" -eq 49
+test "$(wc -l <"$log")" -eq "$expected_peer_lines"
 
 api_pattern='-L 127.0.0.1:18049:127.0.0.1:8000'
 test "$(grep -F -c -- "$api_pattern" "$log")" -eq 1
-test "$(grep -F -c -- '-R 127.0.0.1:' "$log")" -eq 48
+test "$(grep -F -c -- '-R 127.0.0.1:' "$log")" -eq "$expected_lanes"
 while IFS= read -r line; do
   case "$line" in
     *"$api_pattern"*"-R 127.0.0.1:"*)
@@ -154,7 +172,7 @@ while IFS= read -r line; do
       ;;
   esac
 done <"$log"
-for port in $(seq 18100 18195); do
+for port in "${lora_source_ports[@]}"; do
   test "$(grep -F -c -- "-R 127.0.0.1:$port:127.0.0.1:$relay_port" "$log")" -eq 1
 done
 while IFS= read -r line; do
@@ -165,7 +183,7 @@ done < <(grep -F -- '-R 127.0.0.1:' "$log")
 
 # A second launcher invocation finds the exact API and lane signatures.
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
-test "$(wc -l <"$log")" -eq 49
+test "$(wc -l <"$log")" -eq "$expected_peer_lines"
 
 china_log="$tmp/china-tunnel.log"
 trainer_ssh_target=china-trainer
@@ -195,7 +213,7 @@ run_china_lanes() {
 }
 
 # A migration launch removes an old four-port China supervisor before
-# creating forty-eight two-forward supervisors.
+# creating sixty-four two-forward supervisors.
 stale_group_command="$tmp/stale-group-command"
 stale_group_kill_log="$tmp/stale-group-kill"
 kill() {
@@ -292,7 +310,7 @@ china_legacy_cleanup_orphan_pids=()
 
 stale_listener_output="$tmp/stale-listeners"
 : >"$stale_listener_output"
-for port in $(seq 18100 18195); do
+for port in "${lora_source_ports[@]}"; do
   printf 'LISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\n' "$port" >>"$stale_listener_output"
 done
 export TUNNEL_SS_OUTPUT="$stale_listener_output" PEER_STALE_LISTENERS_ACTIVE=1 PEER_TEARDOWN_POLLS=2
@@ -324,13 +342,13 @@ unset PEER_STALE_LISTENERS_ACTIVE PEER_TEARDOWN_POLLS TUNNEL_SS_OUTPUT \
 china_legacy_cleanup_pids=()
 unset -f sleep kill
 
-# A fresh launch creates forty-eight two-forward lanes.
+# A fresh launch creates sixty-four two-forward lanes.
 run_china_lanes
 for _ in $(seq 1 50); do
-  [ -f "$china_log" ] && [ "$(wc -l <"$china_log")" -eq 48 ] && break
+  [ -f "$china_log" ] && [ "$(wc -l <"$china_log")" -eq "$expected_lanes" ] && break
   sleep 0.1
 done
-test "$(wc -l <"$china_log")" -eq 48
+test "$(wc -l <"$china_log")" -eq "$expected_lanes"
 test "$(awk '/18104:127.0.0.1:8100/ && /18105:127.0.0.1:8100/ {count++} END {print count + 0}' "$china_log")" -eq 1
 while IFS= read -r line; do
   forward_count=$(grep -o -- '-L 127.0.0.1:' <<<"$line" | wc -l)
@@ -339,15 +357,15 @@ while IFS= read -r line; do
 done <"$china_log"
 # A repeat launch preserves all matching groups without adding processes.
 run_china_lanes
-test "$(wc -l <"$china_log")" -eq 48
+test "$(wc -l <"$china_log")" -eq "$expected_lanes"
 # A target change removes only the owned old groups before regrouping.
 trainer_ssh_target=china-trainer-regrouped
 run_china_lanes
 for _ in $(seq 1 50); do
-  [ "$(wc -l <"$china_log")" -eq 96 ] && break
+  [ "$(wc -l <"$china_log")" -eq "$((expected_lanes * 2))" ] && break
   sleep 0.1
 done
-test "$(wc -l <"$china_log")" -eq 96
+test "$(wc -l <"$china_log")" -eq "$((expected_lanes * 2))"
 
 # A same-signature process with the wrong peer target is not reused.
 printf '%s\n' 'while true; do ssh -R 127.0.0.1:18100:127.0.0.1:18196 wrong@peer; sleep 3; done # peer-tunnel-lora-0' >"$log"
@@ -543,9 +561,9 @@ if [ "${PEER_REMOTE_FAIL:-0}" = 1 ]; then
   exit 1
 fi
 if [ "${PEER_REMOTE_MISSING:-0}" = 1 ]; then
-  printf '95\n'
+  printf '%s\n' "$((TEST_SOURCE_COUNT - 1))"
 else
-  printf '96\n'
+  printf '%s\n' "${TEST_SOURCE_COUNT:?}"
 fi
 EOF
 chmod +x "$tmp/bin/ssh"
@@ -568,4 +586,4 @@ elapsed=$(( $(date +%s) - started ))
 printf 'hung remote probe wall_seconds=%s\n' "$elapsed"
 test "$elapsed" -le 3
 unset PEER_REMOTE_SLEEP
-printf 'peer tunnel uses one API connection and forty-eight bounded two-port lanes\n'
+printf 'peer tunnel uses one API connection and sixty-four bounded two-port lanes\n'

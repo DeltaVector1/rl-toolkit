@@ -90,6 +90,9 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('china_tunnel_remove_orphan_children "${china_legacy_cleanup_ports[@]}"', source)
         self.assertIn('china_tunnel_remove_all_owned', source)
         self.assertIn('done < <(ps -eo pid=,args=)', source)
+        self.assertIn('adapter_tunnel_readiness() {', source)
+        readiness_call = source.index('if ! adapter_tunnel_readiness; then')
+        self.assertLess(readiness_call, docker_start)
         self.assertLess(mode_start, docker_start)
 
     def test_orchestrator_prepares_broadcast_steps_for_appuser(self):
