@@ -873,33 +873,52 @@ class AdapterUpdateTest(unittest.TestCase):
 
         def ssh(host, script, timeout=120):
             calls.append((host, script, timeout))
-            return 0, "reconciled one canonical engine watchdog\n"
+            return 0, "reloaded exact engine watchdog(s) without restarting an engine\n"
 
-        with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
+        with mock.patch.object(
+            training_ops, "current_run", return_value="glm-decensor-difficulty-8"
+        ), mock.patch.object(
             training_ops,
             "_config_for_run",
-            return_value={"inference": "configs/general-agent/inference.toml"},
-        ), mock.patch.object(training_ops, "_ssh", side_effect=ssh):
+            return_value={"inference": "configs/current/inference.toml"},
+        ), mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
+            training_ops, "_ssh", side_effect=ssh
+        ):
             result = training_ops._repair_supervisors()
 
-        self.assertIn("h200a: reconciled one canonical engine watchdog", result)
+        self.assertIn("h200a: reloaded exact engine watchdog", result)
         self.assertEqual({host for host, _, _ in calls}, {"h200a", "h200b"})
-        for host, script, timeout in calls:
-            self.assertEqual(timeout, 120)
-            self.assertIn(f"grep -Fxq ENGINE_HOST={host}", script)
-            self.assertIn("grep -Fxq ENGINE_CONTAINER=glm52-decensor-h200", script)
-            self.assertIn("STARTUP_GRACE=600", script)
+        self.assertEqual(len(calls), 4)
+        for host in ("h200a", "h200b"):
+            host_calls = [(script, timeout) for called_host, script, timeout in calls if called_host == host]
+            self.assertEqual(len(host_calls), 2)
+            self.assertTrue(all(timeout == 180 for _, timeout in host_calls))
+            repair_script = next(script for script, _ in host_calls if "WATCHDOG_IDENTITY=" in script)
+            self.assertIn("PORT=8000", repair_script)
             self.assertIn(
-                "inference_config=/data/glm52-rl/deployment/configs/general-agent/inference.toml",
-                script,
+                f"WATCHDOG_IDENTITY=engine-watchdog:{host}:glm-decensor-difficulty-8:8000",
+                repair_script,
             )
-            self.assertIn(
-                "inference_config=/data/glm52-rl/deployment/configs/general-agent/inference.toml "
-                "nohup setsid bash",
-                script,
+            self.assertNotIn(
+                f"WATCHDOG_IDENTITY=engine-watchdog:{host}:glm-decensor-difficulty-6:8000",
+                repair_script,
             )
-            self.assertNotIn("pkill", script)
-            self.assertNotIn("pgrep", script)
+            self.assertNotIn("docker restart", "\n".join(script for script, _ in host_calls))
+            self.assertNotIn("docker rm -f", "\n".join(script for script, _ in host_calls))
+
+    def test_supervisor_repair_rejects_different_config(self):
+        with mock.patch.object(training_ops, "current_run", return_value="glm-decensor-difficulty-8"), mock.patch.object(
+            training_ops,
+            "_config_dir",
+            return_value={"inference": "configs/general-agent/inference.toml"},
+        ), mock.patch.object(
+            training_ops,
+            "_config_for_run",
+            return_value={"inference": "configs/current/inference.toml"},
+        ), mock.patch.object(training_ops, "_ssh") as ssh:
+            with self.assertRaisesRegex(training_ops.Refused, "does not match active run"):
+                training_ops._repair_supervisors("configs/general-agent")
+        ssh.assert_not_called()
 
     def test_healthy_engines_are_reloaded_to_import_receiver_changes(self):
         before = training_ops.Status(

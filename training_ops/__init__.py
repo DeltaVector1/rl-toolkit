@@ -5173,35 +5173,23 @@ def _repair_engine_watchdog(host: str) -> str:
 
 
 def _repair_supervisors(config_dir: str | None = None) -> str:
-    out = []
+    run = current_run()
     if config_dir is None:
-        selected = _config_for_run(current_run())
+        _config_for_run(run)
     else:
         selected = _config_dir(
             config_dir,
             require_orchestrator=True,
             require_inference=True,
         )
-    inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
+        active = _config_for_run(run)
+        if selected != active:
+            raise Refused(
+                f"supervisor config {config_dir!r} does not match active run {run!r}"
+            )
+    out = []
     for h in inference_hosts:
-        start_script = f"{runtime_root}/h200/start_inference.sh"
-        code, output = _ssh(
-            h,
-            _engine_watchdog_identity_script(
-                h,
-                glm_inference_container,
-                f"{runtime_root}/h200/engine_watchdog.sh",
-                start_script,
-                glm_model,
-                600,
-                ensure_running=True,
-                inference_config=inference_config,
-            ),
-        )
-        if code:
-            raise RuntimeError(f"cannot reconcile watchdogs on {h}: {output.strip()}")
-        result = output.strip().splitlines()[-1] if output.strip() else "reconciled one canonical engine watchdog"
-        out.append(f"{h}: {result}")
+        out.append(f"{h}: {_repair_engine_watchdog(h)}")
     msg = "; ".join(out)
     print(msg)
     print("Use start(run, mode='restart') to replace a run supervisor.")
