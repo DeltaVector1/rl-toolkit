@@ -123,7 +123,8 @@ class AdapterUpdateTest(unittest.TestCase):
         )
         self.assertNotIn("configs/general-agent/inference.toml", launcher)
         self.assertIn('@ "$inference_config"', launcher)
-        self.assertIn("-e PRIME_LORA_DOWNLOAD_STREAMS=128", launcher)
+        self.assertIn("-e PRIME_LORA_DOWNLOAD_STREAMS=96", launcher)
+        self.assertIn("-e PRIME_LORA_CHUNK_TIMEOUT_S=45", launcher)
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("install -d"))
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))
 
