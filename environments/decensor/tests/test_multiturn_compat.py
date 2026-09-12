@@ -1,6 +1,10 @@
 import os
+import json
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 
@@ -135,3 +139,68 @@ asyncio.run(main())
         timeout=60,
     )
     assert result.returncode == 0
+
+
+def test_old_user_module_starts_mcp_server():
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "src")
+    env["VF_CONFIG"] = json.dumps(
+        {
+            "colocated": False,
+            "runtime": {"type": "subprocess"},
+            "in_process": True,
+            "model": "unused",
+            "base_url": "http://unused/v1",
+        }
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        port_file = Path(temporary) / "mcp-port"
+        env["MCP_PORT_FILE"] = str(port_file)
+        process = subprocess.Popen(
+            [
+                "uv",
+                "run",
+                "--with",
+                "verifiers==0.2.2.dev17",
+                "python",
+                "-m",
+                "decensor_v1.user",
+            ],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 30.0
+            while not port_file.exists() and time.monotonic() < deadline:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.05)
+            assert port_file.exists(), process.stderr.read() if process.poll() is not None else ""
+            port = int(port_file.read_text(encoding="ascii"))
+            assert 1 <= port <= 65535
+            assert process.poll() is None
+            connected = False
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and process.poll() is None:
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                        connected = True
+                        break
+                except OSError:
+                    time.sleep(0.05)
+            assert connected
+            time.sleep(0.1)
+            assert process.poll() is None
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10.0)
+            if process.stderr is not None:
+                process.stderr.close()

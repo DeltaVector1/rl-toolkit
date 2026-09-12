@@ -441,3 +441,7 @@ class DecensorUser(_DecensorUserBase):
         self._accepted_follow_ups.append(text)
         self._transcript.append({"role": "user", "content": text})
         return [UserMessage(content=text)]
+
+
+if __name__ == "__main__" and hasattr(vf, "User"):
+    DecensorUser.run()
