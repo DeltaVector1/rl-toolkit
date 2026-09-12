@@ -1099,6 +1099,15 @@ def _metadata_source_urls(source_url: str) -> list[str]:
 
 def _is_retryable_metadata_error(exception: BaseException) -> bool:
     """Identify connection failures and temporary source HTTP responses."""
+    message = str(exception).lower()
+    if re.search(
+        r"\b(?:checksum|sha256|digest|identity|protocol|semantic|disk)\b|"
+        r"content-length|invalid .*manifest|unsupported .*manifest|"
+        r"wrong .*step|policy step|no space|space left|permission denied|"
+        r"read-only filesystem",
+        message,
+    ):
+        return False
     if isinstance(exception, HTTPError):
         return exception.code in {404, 503}
     if isinstance(exception, _AdapterMetadataError):
@@ -1109,16 +1118,8 @@ def _is_retryable_metadata_error(exception: BaseException) -> bool:
         reason = exception.reason
         if isinstance(reason, BaseException):
             return _is_retryable_metadata_error(reason)
-        return True
-    message = str(exception).lower()
-    if re.search(
-        r"\b(?:checksum|sha256|digest|identity|semantic)\b|"
-        r"content-length|invalid .*manifest|unsupported .*manifest|"
-        r"wrong .*step|policy step",
-        message,
-    ):
         return False
-    return isinstance(exception, OSError)
+    return False
 
 
 def _responsive_adapter_source_urls(

@@ -339,6 +339,35 @@ class DownloadSchedulerTest(unittest.TestCase):
 
         self.assertEqual(calls, ["http://lane-1/manifest"])
 
+    def test_metadata_retry_classifier_is_fail_closed(self):
+        filesystem = load_filesystem_module()
+        retryable = (
+            TimeoutError("timed out"),
+            ConnectionResetError("connection reset by peer"),
+            ConnectionRefusedError("connection refused"),
+            filesystem.URLError(ConnectionResetError("connection reset by peer")),
+            filesystem.HTTPError("http://lane/manifest", 404, "missing", None, None),
+            filesystem.HTTPError("http://lane/manifest", 503, "starting", None, None),
+        )
+        terminal = (
+            OSError("generic metadata failure"),
+            OSError("connection reset by peer"),
+            filesystem.URLError("connection reset by peer"),
+            filesystem.HTTPError("http://lane/manifest", 500, "server error", None, None),
+            OSError("adapter checksum mismatch"),
+            OSError("adapter identity differs"),
+            OSError("adapter protocol error"),
+            OSError("disk full"),
+            TimeoutError("checksum verification timed out"),
+            filesystem.HTTPError("http://lane/manifest", 503, "checksum mismatch", None, None),
+        )
+        for exception in retryable:
+            with self.subTest(retryable=repr(exception)):
+                self.assertTrue(filesystem._is_retryable_metadata_error(exception))
+        for exception in terminal:
+            with self.subTest(terminal=repr(exception)):
+                self.assertFalse(filesystem._is_retryable_metadata_error(exception))
+
     def test_source_check_removes_stalled_connections(self):
         filesystem = load_filesystem_module()
         requests = []
