@@ -122,14 +122,42 @@ def load_receiver_ack_reader():
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_read_receivers_ready"
+        and node.name in {"_receiver_id", "_read_receivers_ready", "_valid_digest"}
     ]
+
+    def validate_loaded_receipt(receipt, *, source_url, lora_name, expected):
+        if not isinstance(receipt, dict):
+            raise RuntimeError("loaded receipt is invalid")
+        if receipt.get("source_url") != source_url or receipt.get("lora_name") != lora_name:
+            raise RuntimeError("loaded receipt differs from marker")
+        for name, value in expected.items():
+            actual = receipt.get(name)
+            if name.endswith("_size"):
+                if type(actual) is not int or actual != value:
+                    raise RuntimeError(f"loaded receipt differs in {name}")
+            elif actual != value:
+                raise RuntimeError(f"loaded receipt differs in {name}")
+        return dict(receipt)
+
     namespace = {
         "json": json,
-        "_validate_loaded_receipt": lambda receipt, **_kwargs: dict(receipt),
+        "_validate_loaded_receipt": validate_loaded_receipt,
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return namespace["_read_receivers_ready"]
+
+
+def load_receipt_ack_validator():
+    path = ROOT / "src/prime_rl/orchestrator/watcher.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_validate_receipt_against_ack"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["_validate_receipt_against_ack"]
 
 
 def load_broadcast_cleanup_method():
@@ -788,39 +816,79 @@ class AdapterTransportStateTest(unittest.TestCase):
             ]
             write_receiver_ack(step_path, root, 3)
             source_url = "http://source/broadcasts/step_3"
-            self.assertEqual(
-                read_ack(
+
+            def read_current():
+                return read_ack(
                     step_path,
                     run_name="run_test",
                     step=3,
                     source_url=source_url,
                     slot="adapter-slot1",
                     admin_clients=clients,
-                )["step"],
+                )
+
+            self.assertEqual(
+                read_current()["step"],
                 3,
             )
 
+            marker = step_path / "receivers-ready.json"
+            payload = json.loads(marker.read_text())
+            payload["version"] = True
+            marker.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                read_current()
+
+            for endpoints in (
+                ["http://h200-a", "http://h200-a"],
+                ["http://h200-a", "http://other"],
+                ["http://h200-a"],
+            ):
+                write_receiver_ack(step_path, root, 3, endpoints=endpoints)
+                with self.assertRaisesRegex(RuntimeError, "endpoint|records"):
+                    read_current()
+
+            write_receiver_ack(step_path, root, 3)
+            payload = json.loads(marker.read_text())
+            payload["receivers"][0]["receipt"] = None
+            marker.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(RuntimeError, "receipt"):
+                read_current()
+
+            write_receiver_ack(step_path, root, 3)
+            payload = json.loads(marker.read_text())
+            payload["target_sha256"] = "b" * 64
+            marker.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(RuntimeError, "differs"):
+                read_current()
+
             write_receiver_ack(step_path, root, 3, run_name="old_run")
             with self.assertRaisesRegex(RuntimeError, "stale"):
-                read_ack(
-                    step_path,
-                    run_name="run_test",
-                    step=3,
-                    source_url=source_url,
-                    slot="adapter-slot1",
-                    admin_clients=clients,
-                )
+                read_current()
 
             (step_path / "receivers-ready.json").unlink()
             with self.assertRaisesRegex(RuntimeError, "missing"):
-                read_ack(
-                    step_path,
-                    run_name="run_test",
-                    step=3,
-                    source_url=source_url,
-                    slot="adapter-slot1",
-                    admin_clients=clients,
-                )
+                read_current()
+
+    def test_receipt_ack_validator_rejects_boolean_sizes(self):
+        validate = load_receipt_ack_validator()
+        receipt = {
+            "source_url": "http://source/broadcasts/step_3",
+            "target_sha256": "a" * 64,
+            "target_size": 7,
+            "config_sha256": "b" * 64,
+            "config_size": 2,
+            "lora_name": "adapter-slot1",
+        }
+        ack = dict(receipt)
+        ack["slot"] = ack.pop("lora_name")
+        validate(receipt, ack, step=3)
+        for name in ("target_size", "config_size"):
+            with self.subTest(name=name):
+                invalid = dict(receipt)
+                invalid[name] = True
+                with self.assertRaisesRegex(RuntimeError, name):
+                    validate(invalid, ack, step=3)
 
     def test_exact_adjacent_delta_round_trip(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -176,23 +176,55 @@ def _read_receivers_ready(
     }
     if not isinstance(payload, dict) or set(payload) != required:
         raise RuntimeError(f"receiver ACK fields are invalid for adapter step {step}: {marker}")
-    expected = {
-        "version": 1,
-        "run_name": run_name,
-        "step": step,
-        "source_url": source_url,
-        "slot": slot,
-    }
-    if any(payload.get(name) != value for name, value in expected.items()):
+    if (
+        type(payload["version"]) is not int
+        or payload["version"] != 1
+        or not isinstance(payload["run_name"], str)
+        or payload["run_name"] != run_name
+        or type(payload["step"]) is not int
+        or payload["step"] != step
+        or not isinstance(payload["source_url"], str)
+        or payload["source_url"] != source_url
+        or not _valid_digest(payload["target_sha256"])
+        or type(payload["target_size"]) is not int
+        or payload["target_size"] <= 0
+        or not _valid_digest(payload["config_sha256"])
+        or type(payload["config_size"]) is not int
+        or payload["config_size"] < 0
+        or not isinstance(payload["slot"], str)
+        or payload["slot"] != slot
+    ):
         raise RuntimeError(f"receiver ACK is stale for adapter step {step}: {marker}")
     receivers = payload["receivers"]
-    if not isinstance(receivers, list) or len(receivers) != len(admin_clients):
-        raise RuntimeError(f"receiver ACK records are invalid for adapter step {step}: {marker}")
-    if any(
-        not isinstance(item, dict) or set(item) != {"endpoint", "receipt"}
-        for item in receivers
+    expected_endpoints = sorted(_receiver_id(client) for client in admin_clients)
+    if (
+        len(expected_endpoints) != len(set(expected_endpoints))
+        or not isinstance(receivers, list)
+        or len(receivers) != len(expected_endpoints)
     ):
         raise RuntimeError(f"receiver ACK records are invalid for adapter step {step}: {marker}")
+    identity = {
+        name: payload[name]
+        for name in ("source_url", "target_sha256", "target_size", "config_sha256", "config_size")
+    }
+    actual_endpoints = []
+    for item in receivers:
+        if not isinstance(item, dict) or set(item) != {"endpoint", "receipt"}:
+            raise RuntimeError(f"receiver ACK records are invalid for adapter step {step}: {marker}")
+        endpoint = item["endpoint"]
+        if not isinstance(endpoint, str) or endpoint in actual_endpoints or endpoint not in expected_endpoints:
+            raise RuntimeError(f"receiver ACK endpoint set is invalid for adapter step {step}: {marker}")
+        if not isinstance(item["receipt"], dict):
+            raise RuntimeError(f"receiver ACK receipt is invalid for adapter step {step}: {marker}")
+        _validate_loaded_receipt(
+            item["receipt"],
+            source_url=source_url,
+            lora_name=slot,
+            expected=identity,
+        )
+        actual_endpoints.append(endpoint)
+    if set(actual_endpoints) != set(expected_endpoints):
+        raise RuntimeError(f"receiver ACK endpoint set differs for adapter step {step}: {marker}")
     return payload
 
 
@@ -204,7 +236,11 @@ def _validate_receipt_against_ack(
 ) -> None:
     if receipt is None:
         raise RuntimeError(f"cannot reconcile policy v{step}: no common loaded adapter receipt")
-    if receipt.get("lora_name") != ack["slot"]:
+    if (
+        not isinstance(receipt.get("lora_name"), str)
+        or not isinstance(ack.get("slot"), str)
+        or receipt["lora_name"] != ack["slot"]
+    ):
         raise RuntimeError(f"cannot reconcile policy v{step}: loaded adapter slot differs from receiver ACK")
     for name in (
         "source_url",
@@ -213,7 +249,18 @@ def _validate_receipt_against_ack(
         "config_sha256",
         "config_size",
     ):
-        if receipt.get(name) != ack[name]:
+        actual = receipt.get(name)
+        expected = ack.get(name)
+        if name.endswith("_size"):
+            matches = (
+                type(actual) is int
+                and type(expected) is int
+                and actual == expected
+                and (actual > 0 if name == "target_size" else actual >= 0)
+            )
+        else:
+            matches = isinstance(actual, str) and isinstance(expected, str) and actual == expected
+        if not matches:
             raise RuntimeError(
                 f"cannot reconcile policy v{step}: loaded adapter {name} differs from receiver ACK"
             )
