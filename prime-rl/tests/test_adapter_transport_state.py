@@ -115,6 +115,23 @@ def load_receiver_ack_writer():
     return namespace["_write_receivers_ready"]
 
 
+def load_receiver_ack_reader():
+    path = ROOT / "src/prime_rl/orchestrator/watcher.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    nodes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_read_receivers_ready"
+    ]
+    namespace = {
+        "json": json,
+        "_validate_loaded_receipt": lambda receipt, **_kwargs: dict(receipt),
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["_read_receivers_ready"]
+
+
 def load_broadcast_cleanup_method():
     path = ROOT / "src/prime_rl/trainer/rl/broadcast/filesystem.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -757,6 +774,52 @@ class AdapterTransportStateTest(unittest.TestCase):
                     adapter_identity=identity,
                     admin_clients=[clients[0], clients[0]],
                     receipts=[receipts[0], receipts[1]],
+                )
+
+    def test_receiver_ack_reader_requires_current_marker_identity(self):
+        read_ack = load_receiver_ack_reader()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            step_path = root / "step_3"
+            step_path.mkdir()
+            clients = [
+                SimpleNamespace(base_url="http://h200-a/v1"),
+                SimpleNamespace(base_url="http://h200-b/v1"),
+            ]
+            write_receiver_ack(step_path, root, 3)
+            source_url = "http://source/broadcasts/step_3"
+            self.assertEqual(
+                read_ack(
+                    step_path,
+                    run_name="run_test",
+                    step=3,
+                    source_url=source_url,
+                    slot="adapter-slot1",
+                    admin_clients=clients,
+                )["step"],
+                3,
+            )
+
+            write_receiver_ack(step_path, root, 3, run_name="old_run")
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                read_ack(
+                    step_path,
+                    run_name="run_test",
+                    step=3,
+                    source_url=source_url,
+                    slot="adapter-slot1",
+                    admin_clients=clients,
+                )
+
+            (step_path / "receivers-ready.json").unlink()
+            with self.assertRaisesRegex(RuntimeError, "missing"):
+                read_ack(
+                    step_path,
+                    run_name="run_test",
+                    step=3,
+                    source_url=source_url,
+                    slot="adapter-slot1",
+                    admin_clients=clients,
                 )
 
     def test_exact_adjacent_delta_round_trip(self):

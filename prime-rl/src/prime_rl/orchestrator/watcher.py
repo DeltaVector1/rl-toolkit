@@ -24,6 +24,7 @@ from prime_rl.utils.client import (
     InferencePool,
     _validate_loaded_receipt,
     adapter_stage_limit_seconds,
+    common_loaded_lora_receipt,
     load_lora_adapter,
     model_is_visible,
     stage_full_checkpoint,
@@ -143,6 +144,79 @@ def _write_receivers_ready(
     finally:
         if temporary is not None:
             os.unlink(temporary) if os.path.exists(temporary) else None
+
+
+def _read_receivers_ready(
+    step_path,
+    *,
+    run_name: str,
+    step: int,
+    source_url: str,
+    slot: str,
+    admin_clients,
+) -> dict[str, object]:
+    marker = step_path / "receivers-ready.json"
+    if marker.is_symlink() or not marker.is_file():
+        raise RuntimeError(f"receiver ACK is missing for adapter step {step}: {marker}")
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"receiver ACK is invalid for adapter step {step}: {marker}") from exc
+    required = {
+        "version",
+        "run_name",
+        "step",
+        "source_url",
+        "target_sha256",
+        "target_size",
+        "config_sha256",
+        "config_size",
+        "slot",
+        "receivers",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise RuntimeError(f"receiver ACK fields are invalid for adapter step {step}: {marker}")
+    expected = {
+        "version": 1,
+        "run_name": run_name,
+        "step": step,
+        "source_url": source_url,
+        "slot": slot,
+    }
+    if any(payload.get(name) != value for name, value in expected.items()):
+        raise RuntimeError(f"receiver ACK is stale for adapter step {step}: {marker}")
+    receivers = payload["receivers"]
+    if not isinstance(receivers, list) or len(receivers) != len(admin_clients):
+        raise RuntimeError(f"receiver ACK records are invalid for adapter step {step}: {marker}")
+    if any(
+        not isinstance(item, dict) or set(item) != {"endpoint", "receipt"}
+        for item in receivers
+    ):
+        raise RuntimeError(f"receiver ACK records are invalid for adapter step {step}: {marker}")
+    return payload
+
+
+def _validate_receipt_against_ack(
+    receipt: dict[str, object] | None,
+    ack: dict[str, object],
+    *,
+    step: int,
+) -> None:
+    if receipt is None:
+        raise RuntimeError(f"cannot reconcile policy v{step}: no common loaded adapter receipt")
+    if receipt.get("lora_name") != ack["slot"]:
+        raise RuntimeError(f"cannot reconcile policy v{step}: loaded adapter slot differs from receiver ACK")
+    for name in (
+        "source_url",
+        "target_sha256",
+        "target_size",
+        "config_sha256",
+        "config_size",
+    ):
+        if receipt.get(name) != ack[name]:
+            raise RuntimeError(
+                f"cannot reconcile policy v{step}: loaded adapter {name} differs from receiver ACK"
+            )
 
 
 async def _run_with_retries(
@@ -811,6 +885,10 @@ class WeightWatcher:
         if self.lora_name is None or self.policy.model_name == self.config.model.name:
             return
         async with self.update_lock:
+            remote_filesystem = (
+                self.config.weight_broadcast.type == "filesystem"
+                and bool(getattr(self.config.weight_broadcast, "source_url", None))
+            )
             weights_path = self.current_weights_path
             if weights_path is None and self.model_express is None and self.ckpt_step > 0:
                 broadcast_dir = get_broadcast_dir(self.config.output_dir)
@@ -818,6 +896,10 @@ class WeightWatcher:
                 if (candidate / "STABLE").exists():
                     weights_path = inference_weight_path(self.config, candidate, self.lora_name)
                     self.current_weights_path = weights_path
+                elif remote_filesystem:
+                    raise RuntimeError(
+                        f"cannot reconcile policy v{self.ckpt_step}: adapter step is not STABLE"
+                    )
             if weights_path is None:
                 return
 
@@ -831,6 +913,28 @@ class WeightWatcher:
                     raise RuntimeError(
                         f"cannot reconcile policy v{self.ckpt_step}: verified adapter URL changed"
                     )
+
+            receiver_ack = None
+            if remote_filesystem:
+                broadcast_dir = get_broadcast_dir(self.config.output_dir)
+                step_path = get_step_path(broadcast_dir, self.ckpt_step)
+                if not (step_path / "STABLE").is_file():
+                    raise RuntimeError(
+                        f"cannot reconcile policy v{self.ckpt_step}: adapter step is not STABLE"
+                    )
+                receiver_ack = _read_receivers_ready(
+                    step_path,
+                    run_name=self.config.output_dir.name,
+                    step=self.ckpt_step,
+                    source_url=str(weights_path),
+                    slot=self.policy.model_name,
+                    admin_clients=self.inference.admin_clients,
+                )
+                loaded_receipt = await common_loaded_lora_receipt(
+                    self.inference.admin_clients,
+                    self.policy.model_name,
+                )
+                _validate_receipt_against_ack(loaded_receipt, receiver_ack, step=self.ckpt_step)
 
             checks = await asyncio.gather(
                 *(model_is_visible(client, self.policy.model_name) for client in self.inference.admin_clients)
@@ -869,6 +973,12 @@ class WeightWatcher:
                     f"Policy model {self.policy.model_name} is still missing on "
                     f"{visible.count(False)} inference endpoint(s) after reload"
                 )
+            if remote_filesystem:
+                loaded_receipt = await common_loaded_lora_receipt(
+                    self.inference.admin_clients,
+                    self.policy.model_name,
+                )
+                _validate_receipt_against_ack(loaded_receipt, receiver_ack, step=self.ckpt_step)
             self.last_reconcile_time = time.perf_counter() - t0
             self.reconcile_count += 1
             get_logger().info(
