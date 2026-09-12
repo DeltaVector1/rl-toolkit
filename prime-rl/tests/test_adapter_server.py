@@ -4,6 +4,7 @@ import http.server
 import importlib.util
 import json
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -33,6 +34,50 @@ class QuietAdapterHandler(adapter_server.RangeHandler):
 
 
 class AdapterServerTest(unittest.TestCase):
+    def test_http11_range_framing_and_disconnect(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = b"framed adapter chunk"
+            served = root / "chunk.bin"
+            served.write_bytes(payload)
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                functools.partial(QuietAdapterHandler, directory=str(root)),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{server.server_port}/chunk.bin",
+                    headers={"Range": "bytes=2-8"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.version, 11)
+                    self.assertEqual(response.headers["Content-Length"], "7")
+                    self.assertEqual(response.headers["Content-Range"], "bytes 2-8/20")
+                    self.assertEqual(
+                        response.headers["ETag"],
+                        f'"{hashlib.sha256(payload).hexdigest()}"',
+                    )
+                    self.assertEqual(response.read(), payload[2:9])
+
+                connection = socket.create_connection(
+                    ("127.0.0.1", server.server_port), timeout=5
+                )
+                try:
+                    connection.sendall(
+                        b"GET /chunk.bin HTTP/1.1\r\n"
+                        b"Host: localhost\r\n"
+                        b"Range: bytes=0-19\r\n\r\n"
+                    )
+                    connection.recv(128)
+                finally:
+                    connection.close()
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
     def test_chunk_requests_cache_identity_until_same_size_weight_rewrite(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
