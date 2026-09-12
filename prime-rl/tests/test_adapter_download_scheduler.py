@@ -235,6 +235,110 @@ class DownloadSchedulerTest(unittest.TestCase):
         ])
         self.assertTrue(all(call[1] <= filesystem._configured_chunk_timeout() for call in calls))
 
+    def test_metadata_read_tries_all_lanes_after_temporary_failures(self):
+        filesystem = load_filesystem_module()
+        source_urls = [f"http://lane-{index}/manifest" for index in range(8)]
+        calls = []
+
+        class Response(io.BytesIO):
+            headers = {"Content-Length": "4"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, **_kwargs):
+            calls.append(request.full_url if hasattr(request, "full_url") else request)
+            index = len(calls) - 1
+            if index == 0:
+                raise filesystem.HTTPError(calls[-1], 404, "missing", None, None)
+            if index == 1:
+                raise filesystem.HTTPError(calls[-1], 503, "starting", None, None)
+            if index < len(source_urls) - 1:
+                raise ConnectionResetError("connection reset by peer")
+            return Response(b"safe")
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_lanes = filesystem._adapter_source_urls
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_source_urls = lambda _source: source_urls
+        try:
+            self.assertEqual(
+                filesystem._read_source_bytes(
+                    source_urls[0],
+                    deadline=filesystem.time.monotonic() + 5,
+                    max_bytes=16,
+                ),
+                b"safe",
+            )
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_source_urls = old_lanes
+
+        self.assertEqual(calls, source_urls)
+
+    def test_metadata_read_does_not_retry_invalid_content_length(self):
+        filesystem = load_filesystem_module()
+        calls = []
+
+        class Response(io.BytesIO):
+            headers = {"Content-Length": "not-a-size"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, **_kwargs):
+            calls.append(request.full_url if hasattr(request, "full_url") else request)
+            return Response()
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_lanes = filesystem._adapter_source_urls
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_source_urls = lambda _source: [
+            "http://lane-1/manifest",
+            "http://lane-2/manifest",
+        ]
+        try:
+            with self.assertRaisesRegex(OSError, "invalid Content-Length"):
+                filesystem._read_source_bytes(
+                    "http://lane-1/manifest",
+                    max_bytes=16,
+                )
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_source_urls = old_lanes
+
+        self.assertEqual(calls, ["http://lane-1/manifest"])
+
+    def test_metadata_read_does_not_retry_identity_error(self):
+        filesystem = load_filesystem_module()
+        calls = []
+
+        def fake_urlopen(request, **_kwargs):
+            calls.append(request.full_url if hasattr(request, "full_url") else request)
+            raise OSError("adapter identity differs")
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_lanes = filesystem._adapter_source_urls
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_source_urls = lambda _source: [
+            "http://lane-1/manifest",
+            "http://lane-2/manifest",
+        ]
+        try:
+            with self.assertRaisesRegex(OSError, "identity differs"):
+                filesystem._read_source_bytes("http://lane-1/manifest")
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_source_urls = old_lanes
+
+        self.assertEqual(calls, ["http://lane-1/manifest"])
+
     def test_source_check_removes_stalled_connections(self):
         filesystem = load_filesystem_module()
         requests = []

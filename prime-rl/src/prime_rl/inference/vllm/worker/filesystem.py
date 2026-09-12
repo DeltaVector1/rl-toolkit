@@ -5,11 +5,12 @@ import math
 import os
 import re
 import shutil
+import socket
 import stat
 import threading
 import time
 import urllib.request
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from functools import wraps
@@ -67,6 +68,10 @@ _ADAPTER_CLEANUP_CANDIDATE_LIMIT = 64
 lane_rotation_delay_seconds = 0.1
 _JSON_LOCK = threading.Lock()
 _adapter_stage_publish_lock = threading.Lock()
+
+
+class _AdapterMetadataError(OSError):
+    """A metadata response is invalid and must not move to another lane."""
 
 
 def adapter_stage_limit_seconds(policy_step: int) -> float:
@@ -852,12 +857,16 @@ def _content_length(
                 try:
                     return int(response.headers["Content-Length"])
                 except (TypeError, ValueError) as exc:
-                    raise OSError(
+                    raise _AdapterMetadataError(
                         f"adapter source has no valid Content-Length: {source_url}"
                     ) from exc
-        except HTTPError:
-            raise
+        except HTTPError as exc:
+            if not _is_retryable_metadata_error(exc):
+                raise
+            last_error = exc
         except OSError as exc:
+            if not _is_retryable_metadata_error(exc):
+                raise
             last_error = exc
     assert last_error is not None
     raise last_error
@@ -907,13 +916,15 @@ def _read_source_bytes(
                     try:
                         content_length_value = int(content_length)
                     except (TypeError, ValueError) as exc:
-                        raise OSError(
+                        raise _AdapterMetadataError(
                             f"source has an invalid Content-Length: {source_url}"
                         ) from exc
                     if content_length_value < 0:
-                        raise OSError(f"source has a negative Content-Length: {source_url}")
+                        raise _AdapterMetadataError(
+                            f"source has a negative Content-Length: {source_url}"
+                        )
                     if max_bytes is not None and content_length_value > max_bytes:
-                        raise OSError(
+                        raise _AdapterMetadataError(
                             f"source exceeds the {max_bytes}-byte read limit: {source_url}"
                         )
                 chunks = []
@@ -929,14 +940,18 @@ def _read_source_bytes(
                     chunks.append(chunk)
                     total += len(chunk)
                     if max_bytes is not None and total > max_bytes:
-                        raise OSError(
+                        raise _AdapterMetadataError(
                             f"source exceeds the {max_bytes}-byte read limit: {source_url}"
                         )
                 _check_deadline(deadline, cancel_event)
                 return b"".join(chunks)
-        except HTTPError:
-            raise
+        except HTTPError as exc:
+            if not _is_retryable_metadata_error(exc):
+                raise
+            last_error = exc
         except OSError as exc:
+            if not _is_retryable_metadata_error(exc):
+                raise
             last_error = exc
     assert last_error is not None
     raise last_error
@@ -1074,12 +1089,36 @@ def _adapter_source_urls(source_url: str) -> list[str]:
 
 
 def _metadata_source_urls(source_url: str) -> list[str]:
-    """Return a bounded set of lanes for one small adapter request."""
+    """Return every configured lane, starting with the requested lane."""
     source_urls = _adapter_source_urls(source_url)
     if source_url in source_urls:
         start = source_urls.index(source_url)
         source_urls = source_urls[start:] + source_urls[:start]
-    return source_urls[: min(len(source_urls), _ADAPTER_LANE_RETRIES)]
+    return source_urls
+
+
+def _is_retryable_metadata_error(exception: BaseException) -> bool:
+    """Identify connection failures and temporary source HTTP responses."""
+    if isinstance(exception, HTTPError):
+        return exception.code in {404, 503}
+    if isinstance(exception, _AdapterMetadataError):
+        return False
+    if isinstance(exception, (TimeoutError, ConnectionError, socket.timeout)):
+        return True
+    if isinstance(exception, URLError):
+        reason = exception.reason
+        if isinstance(reason, BaseException):
+            return _is_retryable_metadata_error(reason)
+        return True
+    message = str(exception).lower()
+    if re.search(
+        r"\b(?:checksum|sha256|digest|identity|semantic)\b|"
+        r"content-length|invalid .*manifest|unsupported .*manifest|"
+        r"wrong .*step|policy step",
+        message,
+    ):
+        return False
+    return isinstance(exception, OSError)
 
 
 def _responsive_adapter_source_urls(
@@ -1103,8 +1142,19 @@ def _responsive_adapter_source_urls(
                     maximum=_configured_chunk_timeout(),
                 ),
             ) as response:
-                return 200 <= int(response.status) < 400
-        except OSError:
+                status = int(response.status)
+                if 200 <= status < 400:
+                    return True
+                if status in {404, 503}:
+                    return False
+                raise OSError(f"adapter source probe returned HTTP status {status}")
+        except HTTPError as exc:
+            if not _is_retryable_metadata_error(exc):
+                raise
+            return False
+        except OSError as exc:
+            if not _is_retryable_metadata_error(exc):
+                raise
             return False
 
     executor = ThreadPoolExecutor(max_workers=len(source_urls))

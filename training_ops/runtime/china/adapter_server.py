@@ -591,15 +591,17 @@ class RangeHandler(SimpleHTTPRequestHandler):
     def copyfile(self, source, output):
         if not hasattr(self, "remaining"):
             return super().copyfile(source, output)
-        try:
-            while self.remaining:
-                chunk = source.read(min(self.remaining, transfer_write_bytes))
-                if not chunk:
-                    break
+        while self.remaining:
+            chunk = source.read(min(self.remaining, transfer_write_bytes))
+            if not chunk:
+                break
+            try:
                 output.write(chunk)
-                self.remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
-            return
+            except OSError:
+                self.close_connection = True
+                source.close()
+                return
+            self.remaining -= len(chunk)
 
 
 class AdapterServer(ThreadingHTTPServer):

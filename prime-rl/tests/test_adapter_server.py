@@ -8,7 +8,6 @@ import tempfile
 import threading
 import time
 import unittest
-import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -120,18 +119,26 @@ class AdapterServerTest(unittest.TestCase):
                     request.join(timeout=5)
                 self.assertFalse(errors)
                 self.assertTrue(all(not request.is_alive() for request in requests))
-                self.assertEqual(calls.count("adapter_model.safetensors"), 1)
+                self.assertEqual(calls.count("adapter_config.json"), 1)
 
                 original_identity = adapter_server._identity_from_published_directory
                 replaced = False
 
-                def validate_then_replace(directory, step_number, *, cache, weight_fd=None):
+                def validate_then_replace(
+                    directory,
+                    step_number,
+                    *,
+                    cache,
+                    weight_fd=None,
+                    verify_weights=True,
+                ):
                     nonlocal replaced
                     result = original_identity(
                         directory,
                         step_number,
                         cache=cache,
                         weight_fd=weight_fd,
+                        verify_weights=verify_weights,
                     )
                     if weight_fd is not None and not replaced:
                         replacement = step / ".replacement"
@@ -148,10 +155,9 @@ class AdapterServerTest(unittest.TestCase):
                     self.assertEqual(response.read(), weights)
                 self.assertTrue(replaced)
                 adapter_server._identity_from_published_directory = original_identity
-                with self.assertRaises(urllib.error.HTTPError) as error:
-                    urllib.request.urlopen(url, timeout=5)
-                self.assertEqual(error.exception.code, 500)
-                self.assertEqual(calls.count("adapter_model.safetensors"), 2)
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    self.assertEqual(response.read(), chunk)
+                self.assertEqual(calls.count("adapter_config.json"), 3)
             finally:
                 server.shutdown()
                 thread.join(timeout=5)

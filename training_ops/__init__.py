@@ -3734,6 +3734,40 @@ echo \"adapter server ready on port {adapter_port}\"
 """
 
 
+def _adapter_transport_failure_reason(error: str) -> str | None:
+    """Return a repair-safe reason for a transport-only adapter failure."""
+    message = error.strip().lower()
+    if re.search(r"\b(?:checksum|sha256|digest|identity|semantic)\b", message):
+        return None
+    if re.search(
+        r"connection\s*(?:reset|refused|aborted)|"
+        r"remote end closed|broken pipe",
+        message,
+    ):
+        return "connection reset/refused"
+    if re.search(
+        r"(?:http(?:error| status)?|status(?:[_ ]code)?)[^0-9]{0,12}503\b|"
+        r"\b503\s+(?:service unavailable|temporarily unavailable)",
+        message,
+    ):
+        return "HTTP 503"
+    if re.search(
+        r"(?:retry|attempt).*(?:exhaust|budget|bounded)|"
+        r"(?:exhaust|budget|bounded).*(?:retry|attempt)|"
+        r"attempt\s+\d+\s*/\s*\d+\s*;?\s*(?:stopping|exhausted)",
+        message,
+    ):
+        return "bounded retry exhaustion"
+    if re.search(r"timeout(?:error)?|timed out|time limit", message):
+        return "timeout"
+    if re.fullmatch(
+        r"(?:oserror: )?adapter manifest request failed with http status 500",
+        message,
+    ):
+        return "manifest HTTP 500"
+    return None
+
+
 def _validate_adapter_stage_log(log: str) -> str:
     """Require a current adapter transfer failure, not a generic error."""
     failures = list(
@@ -3750,18 +3784,9 @@ def _validate_adapter_stage_log(log: str) -> str:
         raise Refused("the latest adapter policy update already succeeded")
     window = log[max(0, latest_failure.start() - 4000) : latest_failure.end() + 20000]
     transfer_words = ("stage_lora_adapter", "adapter", "lora")
-    transport_words = (
-        "ReadTimeout",
-        "TimeoutError",
-        "timed out",
-        "ConnectError",
-        "TransportError",
-        "incomplete adapter",
-        "byte range",
-    )
     if not any(word.lower() in window.lower() for word in transfer_words):
         raise Refused("latest policy failure has no adapter staging evidence")
-    if not any(word.lower() in window.lower() for word in transport_words):
+    if _adapter_transport_failure_reason(window) is None:
         raise Refused("latest adapter failure has no transfer timeout evidence")
     return latest_failure.group(0)
 
@@ -3889,14 +3914,8 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
             if not isinstance(error, str):
                 raise Refused(f"adapter stage failure on {host} has no error reason")
             error = error.strip()
-            if re.search(r"TimeoutError|timed out|time limit", error, re.IGNORECASE):
-                reason = "timeout"
-            elif re.fullmatch(
-                r"(?:OSError: )?adapter manifest request failed with HTTP status 500",
-                error,
-            ):
-                reason = "manifest HTTP 500"
-            else:
+            reason = _adapter_transport_failure_reason(error)
+            if reason is None:
                 raise Refused(
                     f"adapter stage failure on {host} is not an allowed transfer failure"
                 )

@@ -43,6 +43,21 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertEqual(handler.remaining, 0)
         self.assertEqual(adapter_server.connection_timeout_seconds, 60)
 
+    def test_adapter_server_closes_on_disconnected_output(self):
+        class Output:
+            def write(self, _value):
+                raise ConnectionAbortedError("peer closed")
+
+        payload = b"x" * adapter_server.transfer_write_bytes
+        handler = adapter_server.RangeHandler.__new__(adapter_server.RangeHandler)
+        handler.remaining = len(payload)
+        source = io.BytesIO(payload)
+        handler.copyfile(source, Output())
+
+        self.assertTrue(handler.close_connection)
+        self.assertEqual(handler.remaining, len(payload))
+        self.assertTrue(source.closed)
+
     def test_start_inventory_deploys_nodes_config_to_participants(self):
         selected = {
             "trainer": "configs/decensor/trainer.toml",
@@ -400,6 +415,27 @@ class AdapterUpdateTest(unittest.TestCase):
         with self.assertRaises(training_ops.Refused):
             training_ops._validate_adapter_stage_log(
                 "Failed to apply policy update 4\nadapter request failed"
+            )
+        for transport_error in (
+            "ConnectionResetError: connection reset by peer",
+            "ConnectionRefusedError: connection refused",
+            "OSError: adapter manifest request failed with HTTP status 503",
+            "OSError: adapter source retry budget exhausted",
+        ):
+            with self.subTest(transport_error=transport_error):
+                self.assertEqual(
+                    training_ops._validate_adapter_stage_log(
+                        "Failed to apply policy update 4\n"
+                        "/stage_lora_adapter\n"
+                        + transport_error
+                    ),
+                    "Failed to apply policy update 4",
+                )
+        with self.assertRaises(training_ops.Refused):
+            training_ops._validate_adapter_stage_log(
+                "Failed to apply policy update 4\n"
+                "/stage_lora_adapter\n"
+                "OSError: adapter checksum mismatch after retry exhaustion"
             )
 
     def test_stage_success_after_failure_refuses_repair(self):
