@@ -1458,19 +1458,6 @@ def _failure_evidence(
     log_lines = list(
         dict.fromkeys(line.strip() for line in logs.splitlines() if line.strip())
     )
-    has_unscored_rollout = any(
-        re.search(r"rollout is unscored|complete group will be replaced", line, re.I)
-        for line in log_lines
-    )
-    has_fatal_rollout = any(
-        re.search(r"rollout failed", line, re.I)
-        and not re.search(
-            r"rollout is unscored|complete group will be replaced", line, re.I
-        )
-        for line in log_lines
-    )
-    isolated_unscored = has_unscored_rollout and not has_fatal_rollout
-
     rollout_error_steps = sum(
         1
         for row in rollout_rows
@@ -1490,9 +1477,6 @@ def _failure_evidence(
             for key, value in row.items()
         )
     )
-    if isolated_unscored:
-        rollout_error_steps = 0
-        environment_steps = 0
     if rollout_error_steps:
         failures["transport/rollout"] = rollout_error_steps
     if environment_steps:

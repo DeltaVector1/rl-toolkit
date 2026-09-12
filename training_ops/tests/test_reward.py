@@ -687,7 +687,11 @@ dequantize_checkpoint_moe = true
             "train/agg/all/user_sim_failed/mean": 1.0,
         }]
         logs = "Rollout failed after three attempts: rollout is unscored; its complete group will be replaced"
-        self.assertEqual(training_ops._failure_evidence([], rows, logs), {})
+        self.assertEqual(training_ops._failure_evidence([], [], logs), {})
+        self.assertEqual(
+            training_ops._failure_evidence([], rows, logs),
+            {"environment": 1, "transport/rollout": 1},
+        )
 
 
 if __name__ == "__main__":
