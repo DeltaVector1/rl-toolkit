@@ -220,6 +220,30 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertIn('/run_$predictive_run/broadcasts"', launcher)
         self.assertIn("prime_rl/utils/adapter_delta.py", launcher)
 
+    def test_trainer_mounts_all_config_modules_read_only(self):
+        launcher = (
+            Path(__file__).resolve().parents[1]
+            / "runtime"
+            / "china"
+            / "cluster.sh"
+        ).read_text(encoding="utf-8")
+        start = launcher.index("trainer_docker_args=(")
+        end = launcher.index("    trainer_filtered_args=()", start)
+        mounts = [
+            line.strip()
+            for line in launcher[start:end].splitlines()
+            if "prime-rl-configs/src/prime_rl/configs/" in line
+        ]
+        expected = [
+            (
+                f'-v "$deployment/prime-rl/packages/prime-rl-configs/src/'
+                f'prime_rl/configs/{module}":/app/packages/prime-rl-configs/src/'
+                f'prime_rl/configs/{module}:ro \\'
+            )
+            for module in ("shared.py", "trainer.py", "orchestrator.py")
+        ]
+        self.assertEqual(mounts, expected)
+
     def test_server_upgrades_only_the_exact_active_broadcast_path(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
