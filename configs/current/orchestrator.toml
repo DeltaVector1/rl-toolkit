@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-7/run_glm-decensor-difficulty-7"
+output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-8/run_glm-decensor-difficulty-8"
 max_steps = 50
 skip_all_refusal_groups = true
 seq_len = 32768
@@ -13,9 +13,9 @@ level = "info"
 
 [swanlab]
 project = "glm-runs"
-name = "orchestrator-glm-decensor-difficulty-7"
+name = "orchestrator-glm-decensor-difficulty-8"
 group = "glm-runs"
-tags = ["decensor-diff-7", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
+tags = ["decensor-diff-8", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -146,8 +146,8 @@ ratios = { "decensor-easy" = 0.6, "decensor-medium" = 1.2, "decensor-hard" = 8.2
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/glm-decensor-difficulty-7"
-source_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-7"
+source_url = "http://127.0.0.1:18100/glm-decensor-difficulty-8"
+source_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-8"
 
 [rollout_transport]
 type = "filesystem"
