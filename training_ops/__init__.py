@@ -411,6 +411,12 @@ def _ssh_address(host: str) -> str:
     return address
 
 
+def _trainer_addresses(nodes: list[str]) -> str:
+    """Resolve trainer addresses in the same head-first order as launch."""
+    ordered = [trainer_head] + [host for host in nodes if host != trainer_head]
+    return " ".join(_ssh_address(host) for host in ordered if host in nodes)
+
+
 def _remote_ok(host: str, script: str, label: str, timeout: int = 120) -> str:
     code, output = _ssh(host, script, timeout)
     if code:
@@ -2116,7 +2122,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
         else:
             f_head = ex.submit(_ssh, trainer_head, _head_script(), 300)
             trainer_nodes = [host for host in trainer_hosts if host not in blocked_hosts]
-            trainer_addresses = " ".join(_ssh_address(host) for host in trainer_nodes)
+            trainer_addresses = _trainer_addresses(trainer_nodes)
             if not trainer_addresses:
                 raise RuntimeError("configured trainer addresses are empty")
             f_edge_orch = ex.submit(
@@ -4225,7 +4231,7 @@ def _recreate_orchestrator_script(
     trainer_nodes = [host for host in trainer_hosts if host not in blocked_hosts]
     if trainer_head not in trainer_nodes:
         raise Refused("configured trainer head is not in the active trainer hosts")
-    trainer_addresses = " ".join(_ssh_address(host) for host in trainer_nodes)
+    trainer_addresses = _trainer_addresses(trainer_nodes)
     if not trainer_addresses:
         raise Refused("configured trainer addresses are empty")
 
@@ -4665,7 +4671,7 @@ def _repair_adapter_tunnels(config_dir: str | None = None) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run) or run_name != f"run_{run}":
         raise Refused("selected orchestrator output directory is not an exact run path")
     trainer_nodes = [host for host in trainer_hosts if host not in blocked_hosts]
-    trainer_addresses = " ".join(_ssh_address(host) for host in trainer_nodes)
+    trainer_addresses = _trainer_addresses(trainer_nodes)
     if not trainer_addresses:
         raise Refused("configured trainer addresses are empty")
     if not deploy(

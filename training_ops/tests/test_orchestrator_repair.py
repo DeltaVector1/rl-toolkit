@@ -61,7 +61,7 @@ class OrchestratorRepairTest(unittest.TestCase):
             "ORCH_CONFIG=/data/glm52-rl/deployment/configs/general-agent/orchestrator.toml",
             script,
         )
-        self.assertIn("TRAINER_ADDRESSES='addr-n76 addr-n77 addr-n78 addr-n80 addr-n82 addr-n83 addr-n84 addr-n85'", script)
+        self.assertIn("TRAINER_ADDRESSES='addr-n82 addr-n76 addr-n77 addr-n78 addr-n80 addr-n83 addr-n84 addr-n85'", script)
         self.assertTrue(script.endswith("--tunnels-only"))
 
     def test_adapter_tunnels_does_not_fall_back_from_trainer_only_run(self):
@@ -275,7 +275,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         expected = {
             "RUN": "run",
             "RUN_NAME": "run_run",
-            "TRAINER_ADDRESSES": "10.92.20.76 10.92.20.77",
+            "TRAINER_ADDRESSES": "10.92.20.82 10.92.20.76 10.92.20.77",
             "TRAINER_CT": "trainer",
             "ORCH_CT": "orchestrator",
         }
@@ -339,6 +339,12 @@ class OrchestratorRepairTest(unittest.TestCase):
             ),
             1,
         )
+        config_order_environment = valid_environment()
+        config_order_environment[2] = "TRAINER_ADDRESSES=10.92.20.76 10.92.20.77 10.92.20.82"
+        self.assertEqual(
+            run_probe([valid_process(106, environment=config_order_environment)]),
+            0,
+        )
         self.assertEqual(
             run_probe(
                 [
@@ -375,6 +381,15 @@ class OrchestratorRepairTest(unittest.TestCase):
             count = run_probe(entries)
             self.assertEqual(count, valid_count)
             self.assertEqual(count == 1, valid_count == 1)
+
+    def test_trainer_addresses_match_head_first_watchdog_launch_order(self):
+        with mock.patch.object(
+            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+        ):
+            self.assertEqual(
+                training_ops._trainer_addresses(["n76", "n82", "n77"]),
+                "addr-n82 addr-n76 addr-n77",
+            )
 
     def test_absent_orchestrator_recreation_checks_that_it_stays_absent(self):
         with mock.patch.object(
@@ -527,7 +542,7 @@ class OrchestratorRepairTest(unittest.TestCase):
             script,
         )
         self.assertIn(
-            "TRAINER_ADDRESSES='addr-n76 addr-n77 addr-n78 addr-n80 addr-n82 addr-n83 addr-n84 addr-n85'",
+            "TRAINER_ADDRESSES='addr-n82 addr-n76 addr-n77 addr-n78 addr-n80 addr-n83 addr-n84 addr-n85'",
             script,
         )
         self.assertIn("TRAINER_CT=glm52-decensor-trainer", script)
