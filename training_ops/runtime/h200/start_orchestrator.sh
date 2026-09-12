@@ -361,10 +361,7 @@ generic_tunnel_supervisor_match() {
   local -a ssh_options=("$@")
   local ssh_command
   case "$command_line" in *"while true; do"*"done # $marker") ;; *) return 1 ;; esac
-  case "$command_line" in *"ssh "*) ;; *) return 1 ;; esac
-  ssh_command="ssh ${command_line#*ssh }"
-  ssh_command=${ssh_command%% $via*}
-  ssh_command+=" $via"
+  ssh_command=$(tunnel_supervisor_ssh_command "$command_line") || return 1
   generic_tunnel_ssh_match "$ssh_command" "$via" "$forward" "$comp" \
     "${ssh_options[@]}"
 }
@@ -530,14 +527,10 @@ peer_tunnel_marker_match() {
 
 peer_tunnel_supervisor_match() {
   local command_line=$1 shape=$2 marker=${3:-}
-  local ssh_command peer_target
+  local ssh_command
   peer_tunnel_marker_match "$command_line" "$marker" || return 1
   case "$command_line" in *"while true; do"*) ;; *) return 1 ;; esac
-  case "$command_line" in *"ssh "*) ;; *) return 1 ;; esac
-  ssh_command="ssh ${command_line#*ssh }"
-  peer_target="${peer_ssh_user}@${peer_host}"
-  ssh_command=${ssh_command%% $peer_target*}
-  ssh_command+=" $peer_target"
+  ssh_command=$(tunnel_supervisor_ssh_command "$command_line") || return 1
   peer_tunnel_ssh_args_match "$ssh_command" "$shape"
 }
 
@@ -561,7 +554,7 @@ peer_tunnel_stale_supervisor_match() {
   done
 }
 
-peer_tunnel_supervisor_ssh_command() {
+tunnel_supervisor_ssh_command() {
   local command_line=$1 ssh_command
   case "$command_line" in *"ssh "*) ;; *) return 1 ;; esac
   ssh_command="ssh ${command_line#*ssh }"
@@ -575,16 +568,16 @@ peer_tunnel_supervisor_ssh_command() {
 peer_tunnel_stale_group_safe() {
   local pgid=$1 supervisor_command=$2 shape=$3 marker=$4
   local group_command expected_ssh group_seen=0
-  expected_ssh=$(peer_tunnel_supervisor_ssh_command "$supervisor_command") || return 1
+  expected_ssh=$(tunnel_supervisor_ssh_command "$supervisor_command") || return 1
   while IFS= read -r group_command; do
     group_seen=1
     case "$group_command" in
       *"while true; do"*)
         peer_tunnel_stale_supervisor_match "$group_command" "$shape" "$marker" || return 1
-        [ "$(peer_tunnel_supervisor_ssh_command "$group_command")" = "$expected_ssh" ] || return 1
+        [ "$(tunnel_supervisor_ssh_command "$group_command")" = "$expected_ssh" ] || return 1
         ;;
       ssh\ *|/usr/bin/ssh\ *)
-        [ "$(peer_tunnel_supervisor_ssh_command "$group_command")" = "$expected_ssh" ] || return 1
+        [ "$(tunnel_supervisor_ssh_command "$group_command")" = "$expected_ssh" ] || return 1
         ;;
       *" sleep 3"|*"sleep 3") ;;
       *) return 1 ;;
@@ -849,10 +842,7 @@ china_tunnel_supervisor_match() {
   local ssh_command
   china_tunnel_marker_match "$command_line" "$marker" || return 1
   case "$command_line" in *"while true; do"*) ;; *) return 1 ;; esac
-  case "$command_line" in *"ssh "*) ;; *) return 1 ;; esac
-  ssh_command="ssh ${command_line#*ssh }"
-  ssh_command=${ssh_command%% $trainer_ssh_target*}
-  ssh_command+=" $trainer_ssh_target"
+  ssh_command=$(tunnel_supervisor_ssh_command "$command_line") || return 1
   china_tunnel_ssh_args_match "$ssh_command" "$shape"
 }
 

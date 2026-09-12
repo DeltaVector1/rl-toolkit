@@ -201,6 +201,18 @@ if peer_tunnel_ssh_args_match "${peer_exact_command/root@38.255.28.19/junk root@
   echo "peer SSH matcher accepted an extra token" >&2
   exit 1
 fi
+peer_supervisor_command="bash -c while true; do $peer_exact_command; sleep 3; done # peer-tunnel-lora-0"
+peer_tunnel_supervisor_match "$peer_supervisor_command" current peer-tunnel-lora-0
+for hostile_target in \
+  "root@38.255.28.19.evil" \
+  "" \
+  "root@38.255.28.19 extra"; do
+  hostile_peer_supervisor=${peer_supervisor_command/root@38.255.28.19/$hostile_target}
+  if peer_tunnel_supervisor_match "$hostile_peer_supervisor" current peer-tunnel-lora-0; then
+    echo "peer supervisor accepted hostile target token: $hostile_target" >&2
+    exit 1
+  fi
+done
 
 # A second launcher invocation finds the exact API and lane signatures.
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
@@ -209,6 +221,19 @@ test "$(wc -l <"$log")" -eq "$expected_peer_lines"
 china_log="$tmp/china-tunnel.log"
 trainer_ssh_target=china-trainer
 adapter_port=8100
+china_exact_command="ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100 china-trainer"
+china_supervisor_command="bash -c while true; do $china_exact_command; sleep 3; done # china-tunnel-lora-0"
+china_tunnel_supervisor_match "$china_supervisor_command" current china-tunnel-lora-0
+for hostile_target in \
+  "china-trainer.evil" \
+  "" \
+  "china-trainer extra"; do
+  hostile_china_supervisor=${china_supervisor_command/china-trainer/$hostile_target}
+  if china_tunnel_supervisor_match "$hostile_china_supervisor" current china-tunnel-lora-0; then
+    echo "China supervisor accepted hostile target token: $hostile_target" >&2
+    exit 1
+  fi
+done
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$china_log" PEER_QUERY="$query" PEER_CHINA_MODE=1 china_tunnel_remove_legacy
 china_lane_size=2
 china_lane_start=0
@@ -513,6 +538,17 @@ generic_tunnel_ssh_match "$secondary_owner" "$secondary_target" "$secondary_forw
   "${secondary_options[@]}"
 generic_tunnel_supervisor_match "$secondary_supervisor" zmq-tunnel-26407 \
   "$secondary_target" "$secondary_forward" no "${secondary_options[@]}"
+for hostile_target in \
+  "root@202.214.223.66.evil" \
+  "" \
+  "root@202.214.223.66 extra"; do
+  hostile_generic_supervisor=${secondary_supervisor/root@202.214.223.66/$hostile_target}
+  if generic_tunnel_supervisor_match "$hostile_generic_supervisor" zmq-tunnel-26407 \
+      "$secondary_target" "$secondary_forward" no "${secondary_options[@]}"; then
+    echo "generic supervisor accepted hostile target token: $hostile_target" >&2
+    exit 1
+  fi
+done
 if generic_tunnel_ssh_match "${secondary_owner/30599/30598}" "$secondary_target" \
     "$secondary_forward" no "${secondary_options[@]}"; then
   echo "generic tunnel accepted the wrong SSH port" >&2
