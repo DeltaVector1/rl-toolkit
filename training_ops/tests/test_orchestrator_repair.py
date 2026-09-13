@@ -6,7 +6,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from pathlib import Path
@@ -706,42 +705,52 @@ class OrchestratorRepairTest(unittest.TestCase):
 
 
 class SourcePortProbeTest(unittest.TestCase):
-    def run_probe(self, fail_until, budget=40, delay=False):
+    def run_probe(self, fail_until, budget=40, delay=False, stall_first=None, response=None):
         script = Path(__file__).resolve().parents[1] / "runtime/h200/start_orchestrator.sh"
         body = script.read_text().split("china_source_ports_ready() {", 1)[1]
         body = body.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
         calls = {}
-        lock = threading.Lock()
+        closed = []
 
-        class Connection:
-            def __init__(self, host, port, timeout):
-                self.port, self.timeout = port, timeout
+        class Reader:
+            def __init__(self, port, attempt):
+                self.port, self.attempt = port, attempt
 
-            def request(self, method, path):
-                with lock:
-                    calls[self.port] = calls.get(self.port, 0) + 1
-                    attempt = calls[self.port]
-                if delay:
-                    time.sleep(self.timeout)
-                if attempt <= fail_until.get(self.port, 0):
+            async def readuntil(self, separator):
+                if delay or (self.port == stall_first and self.attempt == 1):
+                    await asyncio.sleep(60)
+                if self.attempt <= fail_until.get(self.port, 0):
                     raise TimeoutError()
+                return response or b"HTTP/1.1 200 OK\r\nServer: SimpleHTTP/0.6\r\n\r\n"
 
-            def getresponse(self):
-                return SimpleNamespace(status=200, read=lambda: b"", getheader=lambda name: "SimpleHTTP/0.6")
+        class Writer:
+            def __init__(self, port):
+                self.port = port
+
+            def write(self, data):
+                assert data.startswith(b"HEAD / HTTP/1.1\r\n")
+
+            async def drain(self):
+                pass
 
             def close(self):
-                pass
+                closed.append(self.port)
+
+        async def connect(host, port, limit):
+            calls[port] = calls.get(port, 0) + 1
+            return Reader(port, calls[port]), Writer(port)
 
         stdout, stderr = io.StringIO(), io.StringIO()
         started = time.monotonic()
         status = 0
-        with mock.patch("http.client.HTTPConnection", Connection), mock.patch.object(
+        with mock.patch("asyncio.open_connection", connect), mock.patch.object(
             sys, "argv", ["probe", "18100", "18107", str(budget)]
         ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             try:
                 exec(compile(body, str(script), "exec"), {})
             except SystemExit as error:
                 status = error.code
+        self.assertEqual(len(closed), sum(calls.values()))
         return status, calls, stdout.getvalue(), stderr.getvalue(), time.monotonic() - started
 
     def test_retries_only_ports_that_failed_the_previous_attempt(self):
@@ -751,8 +760,8 @@ class SourcePortProbeTest(unittest.TestCase):
         self.assertEqual(calls[18101], 2)
         self.assertEqual(calls[18105], 3)
         self.assertTrue(all(count == 1 for port, count in calls.items() if port not in {18101, 18105}))
-        self.assertIn("attempt=1 failed=2", errors)
-        self.assertIn("attempt=2 failed=1", errors)
+        self.assertRegex(errors, r"attempt=1 elapsed=[\d.]+s failed=2")
+        self.assertRegex(errors, r"attempt=2 elapsed=[\d.]+s failed=1")
 
     def test_returns_only_persistent_failures(self):
         status, calls, output, errors, _ = self.run_probe({18101: 1, 18105: 99})
@@ -768,8 +777,31 @@ class SourcePortProbeTest(unittest.TestCase):
         )
         self.assertEqual(status, 1)
         self.assertEqual(output, "")
-        self.assertIn("deadline", errors)
+        self.assertIn("stage timeout", errors)
+        self.assertIn("attempt=3", errors)
         self.assertLess(elapsed, 1)
+
+    def test_hung_first_stage_does_not_consume_retry_budget(self):
+        status, calls, output, errors, elapsed = self.run_probe({}, budget=0.6, stall_first=18101)
+        self.assertEqual(status, 0)
+        self.assertEqual(output, "8\n")
+        self.assertEqual(calls[18101], 2)
+        self.assertTrue(all(count == 1 for port, count in calls.items() if port != 18101))
+        self.assertIn("18101:stage timeout", errors)
+        self.assertRegex(errors, r"attempt=2 elapsed=[\d.]+s failed=0")
+        self.assertLess(elapsed, 1)
+
+    def test_rejects_wrong_http_status_or_server(self):
+        for response, reason in (
+            (b"HTTP/1.1 403 Forbidden\r\nServer: SimpleHTTP/0.6\r\n\r\n", "status="),
+            (b"HTTP/1.1 200 OK\r\nServer: unrelated\r\n\r\n", "server="),
+        ):
+            with self.subTest(response=response):
+                status, calls, output, errors, _ = self.run_probe({}, budget=0.6, response=response)
+                self.assertEqual(status, 1)
+                self.assertEqual(output, "")
+                self.assertTrue(all(count == 3 for count in calls.values()))
+                self.assertIn(reason, errors)
 
 
 if __name__ == "__main__":

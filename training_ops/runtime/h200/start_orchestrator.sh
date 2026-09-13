@@ -2191,48 +2191,80 @@ china_source_ports_ready() {
   [ "$observed_lanes" = "$(seq 0 $((expected_lanes - 1)))" ] || return 1
   if ! verified_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
       python3 - "${lora_source_ports[0]}" "${lora_source_ports[-1]}" "$probe_seconds" <<'PY'
-import http.client
+import asyncio
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 first = int(sys.argv[1])
 last = int(sys.argv[2])
-deadline = time.monotonic() + float(sys.argv[3]) - 0.5
+budget = float(sys.argv[3])
+scale = min(1, budget / 40)
 
 
-def is_adapter_server(port, socket_seconds):
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        return port, "deadline"
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=min(socket_seconds, remaining))
+async def is_adapter_server(port, socket_seconds, semaphore):
+    writer = None
     try:
-        connection.request("HEAD", "/")
-        response = connection.getresponse()
-        response.read()
-        server = response.getheader("Server") or ""
-        if response.status != 200 or not server.startswith("SimpleHTTP/"):
-            return port, f"status={response.status},server={server[:48]!r}"
-    except (OSError, http.client.HTTPException) as error:
+        async with semaphore:
+            async with asyncio.timeout(socket_seconds):
+                reader, writer = await asyncio.open_connection("127.0.0.1", port, limit=16384)
+                writer.write(b"HEAD / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                await writer.drain()
+                lines = (await reader.readuntil(b"\r\n\r\n")).decode("iso-8859-1").split("\r\n")
+                status = lines[0].split(" ", 2)
+                server = next((line.split(":", 1)[1].strip() for line in lines[1:]
+                               if line.lower().startswith("server:")), "")
+                if len(status) < 2 or status[0] not in {"HTTP/1.0", "HTTP/1.1"} or status[1] != "200":
+                    return port, f"status={lines[0][:48]!r}"
+                if not server.startswith("SimpleHTTP/"):
+                    return port, f"server={server[:48]!r}"
+    except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError) as error:
         return port, type(error).__name__
     finally:
-        connection.close()
-    return None
+        if writer is not None:
+            writer.close()
+    return port, None
 
 
 ports = list(range(first, last + 1))
-failed = dict.fromkeys(ports, "not checked")
-for attempt, (workers, socket_seconds) in enumerate(((32, 2), (4, 5), (2, 5)), 1):
-    if attempt > 1:
-        time.sleep(min(0.25, max(0, deadline - time.monotonic())))
-    with ThreadPoolExecutor(max_workers=min(workers, len(failed))) as executor:
-        failed = dict(result for result in executor.map(
-            lambda port: is_adapter_server(port, socket_seconds), failed
-        ) if result is not None)
-    if not failed:
-        break
-    details = ",".join(f"{port}:{reason}" for port, reason in list(failed.items())[:16])
-    print(f"adapter source check attempt={attempt} failed={len(failed)} {details}", file=sys.stderr)
+
+
+async def check_ports():
+    failed = dict.fromkeys(ports, "not checked")
+    for attempt, (workers, socket_seconds, stage_seconds) in enumerate(((32, 2, 10), (4, 5, 12), (2, 5, 12)), 1):
+        if attempt > 1:
+            await asyncio.sleep(0.25 * scale)
+        started = time.monotonic()
+        semaphore = asyncio.Semaphore(workers)
+        tasks = {asyncio.create_task(is_adapter_server(port, socket_seconds, semaphore)): port for port in failed}
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=stage_seconds * scale)
+            failed = {tasks[task]: "stage timeout" for task in pending}
+            for task in done:
+                port, reason = task.result()
+                if reason is not None:
+                    failed[port] = reason
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        details = ",".join(f"{port}:{reason}" for port, reason in sorted(failed.items())[:16])
+        elapsed = time.monotonic() - started
+        print(f"adapter source check attempt={attempt} elapsed={elapsed:.2f}s failed={len(failed)} {details}", file=sys.stderr)
+        if not failed:
+            break
+    return failed
+
+
+async def main():
+    return await asyncio.wait_for(check_ports(), timeout=budget)
+
+
+try:
+    failed = asyncio.run(main())
+except TimeoutError:
+    print("adapter source check exceeded its time limit", file=sys.stderr)
+    raise SystemExit(1)
 if failed:
     print("persistent adapter source failures: " + ",".join(map(str, list(failed)[:16])), file=sys.stderr)
     raise SystemExit(1)
