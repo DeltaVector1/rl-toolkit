@@ -2922,6 +2922,8 @@ def _download_range(
     progress=None,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
+    typed_transport: bool = False,
+    retry_http_statuses: set[int] | None = None,
 ) -> None:
     """Download one inclusive byte range and resume its local part file."""
     destination_name = destination.name
@@ -2946,11 +2948,20 @@ def _download_range(
                 source_url,
                 headers={"Range": f"bytes={start + present}-{end}"},
             )
-            with urllib.request.urlopen(
-                request,
-                timeout=_request_timeout(deadline, cancel_event),
-            ) as response:
+            response_open = (
+                _adapter_urlopen(request, _request_timeout(deadline, cancel_event))
+                if typed_transport
+                else urllib.request.urlopen(
+                    request,
+                    timeout=_request_timeout(deadline, cancel_event),
+                )
+            )
+            with response_open as response:
                 if response.status != 206:
+                    if typed_transport:
+                        raise _PersistentProtocolError(
+                            "adapter server did not honor byte range"
+                        )
                     raise OSError("adapter server did not honor byte range")
                 with os.fdopen(
                     _open_nofollow(
@@ -2961,22 +2972,66 @@ def _download_range(
                     ),
                     "ab" if present else "wb",
                 ) as output:
-                    while present < size:
-                        _check_deadline(deadline, cancel_event)
-                        chunk = response.read(min(16 * 1024 * 1024, size - present))
-                        if not chunk:
-                            raise OSError(f"adapter range ended early: {destination.name}")
-                        _check_deadline(deadline, cancel_event)
-                        output.write(chunk)
-                        present += len(chunk)
-                        _check_deadline(deadline, cancel_event)
-                        if progress is not None:
-                            progress(source_index, len(chunk))
+                    if typed_transport:
+                        chunks = _adapter_response_chunks(
+                            response,
+                            size - present,
+                            deadline,
+                            cancel_event,
+                        )
+                    else:
+                        chunks = iter(())
+                    if typed_transport:
+                        for chunk in chunks:
+                            output.write(chunk)
+                            present += len(chunk)
+                            _check_deadline(deadline, cancel_event)
+                            if progress is not None:
+                                progress(source_index, len(chunk))
+                    else:
+                        while present < size:
+                            _check_deadline(deadline, cancel_event)
+                            chunk = response.read(min(16 * 1024 * 1024, size - present))
+                            if not chunk:
+                                raise OSError(f"adapter range ended early: {destination.name}")
+                            _check_deadline(deadline, cancel_event)
+                            output.write(chunk)
+                            present += len(chunk)
+                            _check_deadline(deadline, cancel_event)
+                            if progress is not None:
+                                progress(source_index, len(chunk))
             entry_stat = _stat_regular_entry(parent_fd, destination_name, "adapter range file")
             if entry_stat is None or entry_stat.st_size != size:
                 raise OSError(f"incomplete adapter range: {destination.name}")
             return
+        except _PersistentTransportError:
+            if not typed_transport:
+                raise
+            if not _adapter_retry_wait(
+                attempt,
+                attempt_limit,
+                len(source_urls),
+                deadline,
+                cancel_event,
+            ):
+                raise
+        except HTTPError as exc:
+            if typed_transport and (
+                retry_http_statuses is None or exc.code not in retry_http_statuses
+            ):
+                raise
+            if not _adapter_retry_wait(
+                attempt,
+                attempt_limit,
+                len(source_urls),
+                deadline,
+                cancel_event,
+                exc.code if typed_transport else None,
+            ):
+                raise
         except OSError:
+            if typed_transport:
+                raise
             # socket.timeout is retryable; only the absolute stage deadline
             # remains terminal.
             _check_deadline(deadline, cancel_event)
@@ -3009,6 +3064,67 @@ class _PersistentProtocolError(OSError):
 
 class _PersistentLocalError(OSError):
     """A local adapter destination failed and must not be retried."""
+
+
+def _adapter_urlopen(request, timeout: float):
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except HTTPError:
+        raise
+    except (OSError, http.client.HTTPException, EOFError) as exc:
+        raise _PersistentTransportError("adapter network request failed") from exc
+
+
+def _adapter_response_chunks(
+    response,
+    size: int,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+):
+    read_available = getattr(response, "read1", None) or response.read
+    remaining = size
+    while remaining:
+        _check_deadline(deadline, cancel_event)
+        try:
+            chunk = read_available(min(16 * 1024 * 1024, remaining))
+        except (OSError, http.client.HTTPException, EOFError) as exc:
+            raise _PersistentTransportError("adapter network read failed") from exc
+        _check_deadline(deadline, cancel_event)
+        if not chunk:
+            raise _PersistentTransportError("adapter response ended early")
+        if len(chunk) > remaining:
+            raise _PersistentProtocolError("adapter response body is too long")
+        yield chunk
+        remaining -= len(chunk)
+
+
+def _adapter_retry_wait(
+    attempt: int,
+    attempt_limit: int,
+    source_count: int,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+    status_code: int | None = None,
+) -> bool:
+    _check_deadline(deadline, cancel_event)
+    if attempt + 1 == attempt_limit:
+        return False
+    sleep_for = (
+        1.0
+        if status_code in {404, 503}
+        else (lane_rotation_delay_seconds if source_count > 1 else min(2**attempt, 10))
+    )
+    _check_cancelled(cancel_event)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("adapter download exceeded its time limit")
+        sleep_for = min(sleep_for, remaining)
+    if cancel_event is None:
+        time.sleep(sleep_for)
+    else:
+        cancel_event.wait(sleep_for)
+    return True
 
 
 class _PersistentAdapterConnection:
@@ -5045,6 +5161,7 @@ def _download_with_parent(
     per_request_timeout_seconds: float | None = None,
     retry_http_statuses: set[int] | None = None,
     stream_cap: int | None = None,
+    typed_transport: bool = False,
     parent_fd: int,
 ) -> None:
     _check_deadline(deadline, cancel_event)
@@ -5150,19 +5267,26 @@ def _download_with_parent(
                     source_urls[attempt % len(source_urls)],
                     headers={"Range": f"bytes={offset}-"} if offset else {},
                 )
-                with urllib.request.urlopen(
-                    request,
-                    timeout=(
-                        _request_timeout(deadline, cancel_event)
-                        if per_request_timeout_seconds is None
-                        else _request_timeout(
-                            attempt_deadline,
-                            cancel_event,
-                            maximum=_ADAPTER_LANE_TIMEOUT_S,
-                        )
-                    ),
-                ) as response:
+                request_timeout = (
+                    _request_timeout(deadline, cancel_event)
+                    if per_request_timeout_seconds is None
+                    else _request_timeout(
+                        attempt_deadline,
+                        cancel_event,
+                        maximum=_ADAPTER_LANE_TIMEOUT_S,
+                    )
+                )
+                response_open = (
+                    _adapter_urlopen(request, request_timeout)
+                    if typed_transport
+                    else urllib.request.urlopen(request, timeout=request_timeout)
+                )
+                with response_open as response:
                     if offset and response.status != 206:
+                        if typed_transport:
+                            raise _PersistentProtocolError(
+                                "adapter server did not honor byte range"
+                            )
                         os.unlink(destination.name, dir_fd=parent_fd)
                         raise OSError("adapter server did not honor byte range")
                     with os.fdopen(
@@ -5179,19 +5303,32 @@ def _download_with_parent(
                         read_available = getattr(response, "read1", None)
                         if read_available is None:
                             read_available = response.read
-                        while offset < total:
-                            _check_deadline(attempt_deadline, cancel_event)
-                            chunk = read_available(
-                                min(16 * 1024 * 1024, total - offset)
+                        if typed_transport:
+                            chunks = _adapter_response_chunks(
+                                response,
+                                total - offset,
+                                attempt_deadline,
+                                cancel_event,
                             )
-                            if not chunk:
-                                raise OSError(f"adapter file ended early: {destination.name}")
-                            output.write(chunk)
-                            offset += len(chunk)
-                            if progress is not None:
-                                progress(0, len(chunk))
-                            if offset < total:
+                            for chunk in chunks:
+                                output.write(chunk)
+                                offset += len(chunk)
+                                if progress is not None:
+                                    progress(0, len(chunk))
+                        else:
+                            while offset < total:
                                 _check_deadline(attempt_deadline, cancel_event)
+                                chunk = read_available(
+                                    min(16 * 1024 * 1024, total - offset)
+                                )
+                                if not chunk:
+                                    raise OSError(f"adapter file ended early: {destination.name}")
+                                output.write(chunk)
+                                offset += len(chunk)
+                                if progress is not None:
+                                    progress(0, len(chunk))
+                                if offset < total:
+                                    _check_deadline(attempt_deadline, cancel_event)
                 destination_stat = _stat_regular_entry(
                     parent_fd,
                     destination.name,
@@ -5210,6 +5347,27 @@ def _download_with_parent(
                     os.unlink(destination.name, dir_fd=parent_fd)
                     raise OSError(f"adapter checksum mismatch: {destination.name}")
                 return
+            except _PersistentTransportError:
+                if not typed_transport:
+                    raise
+                _check_deadline(deadline, cancel_event)
+                if attempt + 1 == attempt_limit:
+                    raise
+                sleep_for = (
+                    lane_rotation_delay_seconds
+                    if len(source_urls) > 1
+                    else min(2**attempt, 10)
+                )
+                _check_cancelled(cancel_event)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("adapter delta staging exceeded its time limit")
+                    sleep_for = min(sleep_for, remaining)
+                if cancel_event is None:
+                    time.sleep(sleep_for)
+                else:
+                    cancel_event.wait(sleep_for)
             except HTTPError as exc:
                 if retry_http_statuses is None or exc.code not in retry_http_statuses:
                     raise
@@ -5236,6 +5394,8 @@ def _download_with_parent(
                 else:
                     cancel_event.wait(sleep_for)
             except OSError:
+                if typed_transport:
+                    raise
                 # Retry network timeouts; keep the absolute stage limit.
                 _check_deadline(deadline, cancel_event)
                 if attempt + 1 == attempt_limit:
@@ -5330,6 +5490,8 @@ def _download_with_parent(
                 progress,
                 deadline,
                 cancel_event,
+                typed_transport=typed_transport,
+                retry_http_statuses=retry_http_statuses,
             )
             for index, start, end in ranges
         ]
@@ -5854,6 +6016,8 @@ def stage_lora_adapter_files(
                         deadline=operation_deadline,
                         stream_cap=full_download_streams,
                         parent_fd=temporary_fd,
+                        retry_http_statuses={404, 503},
+                        typed_transport=True,
                     )
                     if expected_sha256 is None:
                         item["sha256"] = _sha256(

@@ -86,13 +86,15 @@ class DownloadSchedulerTest(unittest.TestCase):
             def do_GET(self):
                 type(self).requests += 1
                 type(self).paths.append(self.path)
-                if self.headers.get("Range") is None:
-                    self.close_connection = True
-                    return
-                start, end = map(
-                    int,
-                    self.headers["Range"].removeprefix("bytes=").split("-", 1),
-                )
+                range_header = self.headers.get("Range")
+                if range_header is None:
+                    start, end = 0, len(payload) - 1
+                else:
+                    start_text, end_text = range_header.removeprefix(
+                        "bytes="
+                    ).split("-", 1)
+                    start = int(start_text)
+                    end = len(payload) - 1 if not end_text else int(end_text)
                 if action is not None and action(self, type(self).requests):
                     return
                 body = payload[start : end + 1]
@@ -139,6 +141,65 @@ class DownloadSchedulerTest(unittest.TestCase):
         finally:
             pool.close()
             os.close(parent_fd)
+
+    def _legacy_full_download(
+        self, filesystem, server, root, name, payload, *, stream_cap=1,
+        source_urls=None,
+    ):
+        destination = root / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        parent_fd = filesystem._open_directory_nofollow(
+            destination.parent,
+            create=False,
+            label="test legacy download parent",
+        )
+        url = f"http://127.0.0.1:{server.server_address[1]}/{name}"
+        old_streams = filesystem._configured_download_streams
+        filesystem._configured_download_streams = lambda: stream_cap
+        try:
+            filesystem._download_with_parent(
+                url,
+                destination,
+                expected_size=len(payload),
+                expected_sha256=hashlib.sha256(payload).hexdigest(),
+                source_urls=source_urls or [url],
+                stream_cap=stream_cap,
+                parallel_ranges=True,
+                deadline=time.monotonic() + 10,
+                per_request_timeout_seconds=1,
+                retry_http_statuses={404, 503},
+                typed_transport=True,
+                parent_fd=parent_fd,
+            )
+        finally:
+            filesystem._configured_download_streams = old_streams
+            os.close(parent_fd)
+        return destination
+
+    def _inject_enospc(self, filesystem):
+        old_fdopen = filesystem.os.fdopen
+
+        class FailingOutput:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.stream.close()
+
+            def write(self, _value):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        def failing_fdopen(fd, mode, *args, **kwargs):
+            stream = old_fdopen(fd, mode, *args, **kwargs)
+            if mode in {"ab", "wb"}:
+                return FailingOutput(stream)
+            return stream
+
+        filesystem.os.fdopen = failing_fdopen
+        return old_fdopen
 
     def test_persistent_chunks_reuse_one_connection(self):
         filesystem = load_filesystem_module()
@@ -514,28 +575,7 @@ class DownloadSchedulerTest(unittest.TestCase):
         filesystem = load_filesystem_module()
         payload = b"config-disk"
         server, thread, handler = self._persistent_server(filesystem, payload)
-        old_fdopen = filesystem.os.fdopen
-
-        class FailingOutput:
-            def __init__(self, stream):
-                self.stream = stream
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                self.stream.close()
-
-            def write(self, _value):
-                raise OSError(errno.ENOSPC, "No space left on device")
-
-        def failing_fdopen(fd, mode, *args, **kwargs):
-            stream = old_fdopen(fd, mode, *args, **kwargs)
-            if mode in {"ab", "wb"}:
-                return FailingOutput(stream)
-            return stream
-
-        filesystem.os.fdopen = failing_fdopen
+        old_fdopen = self._inject_enospc(filesystem)
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 with self.assertRaisesRegex(OSError, "No space left"):
@@ -549,6 +589,97 @@ class DownloadSchedulerTest(unittest.TestCase):
                 self.assertEqual(handler.requests, 1)
         finally:
             filesystem.os.fdopen = old_fdopen
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_legacy_full_single_enospc_is_terminal(self):
+        filesystem = load_filesystem_module()
+        payload = b"legacy-single"
+        server, thread, handler = self._persistent_server(filesystem, payload)
+        old_fdopen = self._inject_enospc(filesystem)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(OSError, "No space left"):
+                    self._legacy_full_download(
+                        filesystem,
+                        server,
+                        Path(temporary),
+                        "adapter_model.safetensors",
+                        payload,
+                    )
+                self.assertEqual(handler.requests, 1)
+        finally:
+            filesystem.os.fdopen = old_fdopen
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_legacy_full_parallel_enospc_is_terminal(self):
+        filesystem = load_filesystem_module()
+        payload = b"p" * (filesystem._PARALLEL_DOWNLOAD_THRESHOLD + 1)
+        server, thread, handler = self._persistent_server(filesystem, payload)
+        old_fdopen = self._inject_enospc(filesystem)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                url = f"http://127.0.0.1:{server.server_address[1]}/adapter_model.safetensors"
+                with self.assertRaisesRegex(OSError, "No space left"):
+                    self._legacy_full_download(
+                        filesystem,
+                        server,
+                        Path(temporary),
+                        "adapter_model.safetensors",
+                        payload,
+                        stream_cap=2,
+                        source_urls=[url, url],
+                    )
+                self.assertLessEqual(handler.requests, 2)
+        finally:
+            filesystem.os.fdopen = old_fdopen
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_legacy_full_network_reset_resumes_verified_bytes(self):
+        filesystem = load_filesystem_module()
+        payload = b"legacy-reset-resume"
+        ranges = []
+
+        def reset_once(request, number):
+            ranges.append(request.headers.get("Range"))
+            if number != 1:
+                return False
+            request.send_response(200)
+            request.send_header("Content-Length", str(len(payload)))
+            request.end_headers()
+            request.wfile.write(payload[:5])
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, reset_once
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        filesystem.lane_rotation_delay_seconds = 0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                url = f"http://127.0.0.1:{server.server_address[1]}/adapter_model.safetensors"
+                destination = self._legacy_full_download(
+                    filesystem,
+                    server,
+                    Path(temporary),
+                    "adapter_model.safetensors",
+                    payload,
+                    source_urls=[url, url],
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertEqual(handler.requests, 2)
+                self.assertEqual(
+                    ranges,
+                    [None, f"bytes=5-"],
+                )
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
