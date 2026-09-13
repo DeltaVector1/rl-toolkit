@@ -924,7 +924,7 @@ generic_tunnel_stale_group_safe() {
 generic_tunnel_stop_stale() {
   local pid=$1 command_line=$2 marker=$3 forward=$4 pgid expected_start
   generic_tunnel_stale_supervisor_match "$command_line" "$marker" "$forward" || return 0
-  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
   expected_start=$(process_start_time "$pid") || {
     echo "could not read stale generic tunnel process identity for $marker" >&2
     return 1
@@ -1246,22 +1246,23 @@ tunnel_channel_timeout_normalize() {
 
 china_tunnel_proxy_ssh_command() {
   local route_target=${trainer_ssh_target:-} hostname= port= proxyjump=
-  local key value
+  local key value route_output
   if [ "${china_tunnel_proxy_target:-}" = "$route_target" ]; then
     [ -n "${china_tunnel_proxy_command:-}" ] || return 1
     printf '%s\n' "$china_tunnel_proxy_command"
     return 0
   fi
-  china_tunnel_proxy_target=$route_target
   china_tunnel_proxy_command=
   [ -n "$route_target" ] || return 1
+  route_output=$(ssh -G "$route_target" 2>/dev/null) || return 2
+  china_tunnel_proxy_target=$route_target
   while read -r key value _; do
     case "$key" in
       hostname) hostname=$value ;;
       port) port=$value ;;
       proxyjump) proxyjump=$value ;;
     esac
-  done < <(ssh -G "$route_target" 2>/dev/null || true)
+  done <<<"$route_output"
   case "$hostname" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; esac
   case "$port" in ''|*[!0-9]*) return 1 ;; esac
   [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
@@ -1283,9 +1284,11 @@ china_tunnel_proxy_child_match() {
 
 peer_tunnel_stale_group_safe() {
   local pgid=$1 supervisor_command=$2 shape=$3 marker=$4
-  local group_command expected_ssh actual_ssh group_seen=0 normalized_command
+  local group_command expected_ssh actual_ssh group_seen=0 normalized_command process_output group_listing
   expected_ssh=$(tunnel_supervisor_ssh_command "$supervisor_command" "$marker") || return 1
   expected_ssh=$(tunnel_channel_timeout_normalize "$expected_ssh") || return 1
+  process_output=$(ps -eo pgid=,args=) || return 1
+  group_listing=$(awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}' <<<"$process_output") || return 1
   while IFS= read -r group_command; do
     group_seen=1
     case "$group_command" in
@@ -1306,7 +1309,7 @@ peer_tunnel_stale_group_safe() {
       "sleep 3") ;;
       *) return 1 ;;
     esac
-  done < <(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}')
+  done <<<"$group_listing"
   [ "$group_seen" = 1 ]
 }
 
@@ -1357,7 +1360,8 @@ peer_tunnel_supervisor_child_identity() {
   shift 3
   local -a forwards=("$@")
   local child_pid child_ppid child_command child_count=0 direct_ssh_count=0
-  local expected_start
+  local expected_start process_output
+  process_output=$(ps -eo pid=,ppid=,args=) || return 1
   while read -r child_pid child_ppid child_command; do
     [ "$child_ppid" = "$supervisor_pid" ] || continue
     case "$child_command" in
@@ -1371,7 +1375,7 @@ peer_tunnel_supervisor_child_identity() {
     child_count=$((child_count + 1))
     peer_snapshot_child_pid=$child_pid
     peer_snapshot_child_command=$child_command
-  done < <(ps -eo pid=,ppid=,args=)
+  done <<<"$process_output"
   [ "$direct_ssh_count" -eq 1 ] && [ "$child_count" -eq 1 ] || return 1
   expected_start=$(process_start_time "$peer_snapshot_child_pid") || return 1
   peer_snapshot_child_start=$expected_start
@@ -1391,13 +1395,13 @@ peer_tunnel_children_unchanged() {
     supervisor_command=${peer_supervisor_commands[$marker]}
     current_start=$(process_start_time "$supervisor_pid") || return 1
     [ "$current_start" = "$supervisor_start" ] || return 1
-    current_command=$(ps -o args= -p "$supervisor_pid" 2>/dev/null | sed 's/[[:space:]]*$//' || true)
+    current_command=$(process_command_line "$supervisor_pid") || return 1
     [ "$current_command" = "$supervisor_command" ] || return 1
     current_ppid=$(ps -o ppid= -p "$child_pid" 2>/dev/null | tr -d ' ') || return 1
     [ "$current_ppid" = "$supervisor_pid" ] || return 1
     current_start=$(process_start_time "$child_pid") || return 1
     [ "$current_start" = "$child_start" ] || return 1
-    current_command=$(ps -o args= -p "$child_pid" 2>/dev/null | sed 's/[[:space:]]*$//' || true)
+    current_command=$(process_command_line "$child_pid") || return 1
     [ "$current_command" = "$child_command" ] || return 1
     peer_tunnel_ssh_args_match "$current_command" "${peer_child_shapes[$marker]}" || return 1
     read -r -a expected_forwards <<<"${peer_child_forwards[$marker]}"
@@ -1408,7 +1412,9 @@ peer_tunnel_children_unchanged() {
 }
 
 peer_tunnel_group_safe() {
-  local pgid=$1 group_command group_seen=0
+  local pgid=$1 group_command group_seen=0 process_output group_listing
+  process_output=$(ps -eo pgid=,args=) || return 1
+  group_listing=$(awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}' <<<"$process_output") || return 1
   while IFS= read -r group_command; do
     group_seen=1
     case "$group_command" in
@@ -1417,7 +1423,7 @@ peer_tunnel_group_safe() {
       "sleep 3") ;;
       *) return 1 ;;
     esac
-  done < <(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}')
+  done <<<"$group_listing"
   [ "$group_seen" = 1 ]
 }
 
@@ -1447,7 +1453,7 @@ peer_kill_owned() {
   else
     peer_tunnel_supervisor_match "$command_line" cleanup || return 0
   fi
-  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
   expected_start=$(process_start_time "$pid") || {
     echo "could not read peer tunnel process identity for $marker" >&2
     return 1
@@ -1510,10 +1516,13 @@ peer_tunnel_remove_orphan_children() {
   process_output=$(ps -eo pid=,ppid=,args=) || return 1
   while read -r pid ppid command_line; do
     [ "$ppid" = 1 ] || continue
-    executable=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
-    [ "$executable" = /usr/bin/ssh ] || continue
     peer_tunnel_ssh_args_match "$command_line" cleanup || continue
-    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+    executable=$(readlink "/proc/$pid/exe" 2>/dev/null) || {
+      [ ! -e "/proc/$pid" ] && continue
+      return 1
+    }
+    [ "$executable" = /usr/bin/ssh ] || continue
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
     start_time=$(process_start_time "$pid") || return 1
     process_identity_matches "$pid" "$pgid" "$start_time" "$command_line" || return 1
     kill "$pid" 2>/dev/null || return 1
@@ -1574,7 +1583,7 @@ china_source_ports_ready() {
   local probe_seconds=${1:-10} expected_lanes observed_lanes verified_ports
   probe_seconds=$(repair_timeout "$probe_seconds") || return 1
   expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
-  observed_lanes=$(ps -eo args= | sed -n 's/.*# china-tunnel-lora-\([0-9][0-9]*\)$/\1/p' | sort -n)
+  observed_lanes=$(ps -eo args= | sed -n 's/.*# china-tunnel-lora-\([0-9][0-9]*\)$/\1/p' | sort -n) || return 1
   [ "$observed_lanes" = "$(seq 0 $((expected_lanes - 1)))" ] || return 1
   if ! verified_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
       python3 - "${lora_source_ports[0]}" "${lora_source_ports[-1]}" <<'PY'
@@ -1780,7 +1789,13 @@ china_tunnel_group_safe() {
   local group_listing
   group_listing=$(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}' | sed -E 's/[[:space:]]+$//') || return 1
   expected_ssh=
-  proxy_ssh=$(china_tunnel_proxy_ssh_command || true)
+  if proxy_ssh=$(china_tunnel_proxy_ssh_command); then
+    :
+  else
+    # A route without a proxy is valid, but an unreadable route is unknown.
+    [ "$?" -eq 1 ] || return 1
+    proxy_ssh=
+  fi
   while IFS= read -r group_command; do
     case "$group_command" in
       *"while true; do"*)
@@ -1876,11 +1891,11 @@ tunnel_listener_ready() {
   shift 4
   local -a forwards=("$@")
   local listener pid ppid owner_command supervisor_command forward forward_total
-  listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":$port" '$4 ~ port "$" {print; exit}')
+  listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":$port" '$4 ~ port "$" {print; exit}') || return 1
   [ -n "$listener" ] || return 1
   pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  owner_command=$(ps -o args= -p "$pid" 2>/dev/null || true)
+  owner_command=$(process_command_line "$pid") || return 1
   ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
   case "$ppid" in ''|*[!0-9]*|1) return 1 ;; esac
   case "$marker" in
@@ -1895,7 +1910,7 @@ tunnel_listener_ready() {
   for forward in "${forwards[@]}"; do
     tunnel_command_has "$owner_command" "$forward" || return 1
   done
-  supervisor_command=$(ps -o args= -p "$ppid" 2>/dev/null || true)
+  supervisor_command=$(process_command_line "$ppid") || return 1
   case "$supervisor_command" in *"while true; do"*) ;; *) return 1 ;; esac
   tunnel_command_has "$supervisor_command" "$target" || return 1
   tunnel_command_has "$supervisor_command" "# $marker" || return 1
@@ -1981,9 +1996,12 @@ china_tunnel_grouped_legacy_match() {
 
 china_tunnel_ssh_child_match() {
   local pid=$1 shape=${2:-cleanup} command_line executable
-  executable=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+  executable=$(readlink "/proc/$pid/exe" 2>/dev/null) || {
+    [ ! -e "/proc/$pid" ] && return 1
+    return 2
+  }
   case "$executable" in
-    ''|/usr/bin/ssh) ;;
+    /usr/bin/ssh) ;;
     *) return 1 ;;
   esac
   command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//') || return 1
@@ -2030,7 +2048,12 @@ china_tunnel_remove_orphan_children() {
     fi
     case "$ppid" in ''|*[!0-9]*) return 1 ;; esac
     [ "$ppid" = 1 ] || continue
-    china_tunnel_ssh_child_match "$pid" || continue
+    if china_tunnel_ssh_child_match "$pid"; then
+      :
+    else
+      [ "$?" -eq 1 ] && continue
+      return 1
+    fi
     listener_pids+=("$pid")
     china_legacy_cleanup_required=1
     china_legacy_cleanup_pids+=("$pid")
@@ -2039,12 +2062,10 @@ china_tunnel_remove_orphan_children() {
       *" $source_port "*) ;;
       *) china_legacy_cleanup_ports+=("$source_port") ;;
     esac
-    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
-    process_status=$?
-    if [ "$process_status" -ne 0 ]; then
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || {
       [ ! -e "/proc/$pid" ] && continue
       return 1
-    fi
+    }
     command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//') || return 1
     start_time=$(process_start_time "$pid") || return 1
     process_identity_matches "$pid" "$pgid" "$start_time" "$command_line" || return 1
@@ -2080,7 +2101,7 @@ china_tunnel_force_kill_orphan() {
     return 0
   fi
   china_tunnel_ssh_child_match "$pid" || return 1
-  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
   command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//') || return 1
   start_time=$(process_start_time "$pid") || return 1
   process_identity_matches "$pid" "$pgid" "$start_time" "$command_line" || return 1
@@ -2138,7 +2159,7 @@ china_tunnel_stop_supervisor() {
   if [ -z "$expected_marker" ]; then
     expected_marker=$(sed -n 's/.*# \(china-tunnel-lora-[0-9][0-9]*\)$/\1/p' <<<"$command_line")
   fi
-  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
   expected_start=$(process_start_time "$pid") || {
     echo "could not read China tunnel process identity for ${expected_marker:-unknown}" >&2
     return 1
@@ -2188,7 +2209,7 @@ china_tunnel_stop_supervisor() {
 
 china_tunnel_preflight_group() {
   local pid=$1 command_line=$2 stale=${3:-0} expected_marker=${4:-} pgid
-  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
   case "$pgid" in
     ''|*[!0-9]*|0|1|"$$") return 1 ;;
   esac
@@ -2628,7 +2649,7 @@ peer_tunnel_supervisors_ready() {
     matching_pids=$(pgrep_matches "$marker") || return 1
     while read -r pid; do
       [ -n "$pid" ] || continue
-      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      command_line=$(process_command_line "$pid") || return 1
       if peer_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${lane_forwards[@]}"; then
         match_count=$((match_count + 1))
         matching_pid=$pid
@@ -2663,7 +2684,7 @@ peer_tunnel_api_supervisor_ready() {
   matching_pids=$(pgrep_matches "$marker") || return 1
   while read -r pid; do
     [ -n "$pid" ] || continue
-    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    command_line=$(process_command_line "$pid") || return 1
     if peer_tunnel_supervisor_forwards_match "$command_line" api "$marker" "$api_forward"; then
       match_count=$((match_count + 1))
       matching_pid=$pid
