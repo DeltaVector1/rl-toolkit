@@ -531,6 +531,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "incomplete adapter transport chunk",
             "_PersistentTransportError: none of 8 adapter source lanes responded",
             "OSError: adapter persistent download retries exhausted",
+            "_PersistentTransportError: adapter persistent download retries exhausted",
         )
         rejected = (
             "OSError: adapter persistent request failed while reading the cache",
@@ -546,6 +547,9 @@ class AdapterUpdateTest(unittest.TestCase):
             "OSError: adapter response body is too short",
             "OSError: adapter manifest request failed with HTTP status 429",
             "OSError: adapter manifest request failed with HTTP status 503",
+            "OSError: adapter manifest request failed with HTTP status 400",
+            "OSError: adapter manifest request failed with HTTP status 401",
+            "OSError: adapter manifest request failed with HTTP status 403",
             "OSError: adapter source returned HTTP status 503",
             "OSError: adapter source retry budget exhausted",
             "stage timeout: adapter delta staging exceeded its time limit",
@@ -602,7 +606,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "stage_timeout_seconds": 300,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 298.297,
-            "error": "_PersistentTransportError: adapter response ended during read",
+            "error": "TimeoutError: adapter persistent request exceeded its stage time limit",
         }
         manifest_500 = {
             "status": "failed",
@@ -612,7 +616,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "stage_timeout_seconds": 300,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 299.102,
-            "error": "OSError: adapter persistent download retries exhausted",
+            "error": "_PersistentTransportError: adapter persistent download retries exhausted",
         }
         results = {
             "h200a": (0, json.dumps(timeout)),
@@ -625,8 +629,8 @@ class AdapterUpdateTest(unittest.TestCase):
         ), mock.patch.object(training_ops, "_fan", return_value=results):
             evidence = training_ops._adapter_stage_status_evidence("glm-perf-3", config, "")
         self.assertIn(
-            "policy update 6 failed on h200a (_PersistentTransportError: adapter response ended during read), "
-            "h200b (OSError: adapter persistent download retries exhausted)",
+            "policy update 6 failed on h200a (TimeoutError: adapter persistent request exceeded its stage time limit), "
+            "h200b (_PersistentTransportError: adapter persistent download retries exhausted)",
             evidence,
         )
 

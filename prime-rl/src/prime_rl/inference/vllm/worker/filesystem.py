@@ -3540,19 +3540,24 @@ class _PersistentAdapterLanePool:
                         )
                 except HTTPError as exc:
                     connection.close()
-                    if (
-                        not _retryable_adapter_http_status(exc.code)
-                        or attempt + 1 == attempt_limit
-                    ):
+                    if not _retryable_adapter_http_status(exc.code):
                         raise
-                except _PersistentTransportError:
+                    if attempt + 1 == attempt_limit:
+                        raise _PersistentTransportError(
+                            "adapter persistent download retries exhausted"
+                        ) from exc
+                except _PersistentTransportError as exc:
                     connection.close()
                     if attempt + 1 == attempt_limit:
-                        raise
-                except (TimeoutError, socket.timeout):
+                        raise _PersistentTransportError(
+                            "adapter persistent download retries exhausted"
+                        ) from exc
+                except (TimeoutError, socket.timeout) as exc:
                     connection.close()
                     if attempt + 1 == attempt_limit:
-                        raise
+                        raise _PersistentTransportError(
+                            "adapter persistent download retries exhausted"
+                        ) from exc
                 except _PersistentProtocolError:
                     connection.close()
                     raise

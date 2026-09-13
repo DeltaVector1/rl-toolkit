@@ -477,6 +477,88 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
+    def test_persistent_chunk_exhausted_http_retry_is_typed_transport_failure(self):
+        filesystem = load_filesystem_module()
+        payload = b"status-exhausted"
+
+        def always_unavailable(request, _number):
+            request.send_response(404)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, always_unavailable
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        old_retries = filesystem._ADAPTER_LANE_RETRIES
+        filesystem.lane_rotation_delay_seconds = 0
+        filesystem._ADAPTER_LANE_RETRIES = 3
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(
+                    filesystem._PersistentTransportError,
+                    "adapter persistent download retries exhausted",
+                ) as raised:
+                    self._persistent_download(
+                        filesystem, server, Path(temporary), "status", payload
+                    )
+                self.assertIsInstance(raised.exception.__cause__, filesystem.HTTPError)
+                self.assertEqual(raised.exception.__cause__.code, 404)
+                self.assertEqual(handler.requests, 3)
+        finally:
+            filesystem._ADAPTER_LANE_RETRIES = old_retries
+            filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_chunk_exhausted_timeout_is_typed_transport_failure(self):
+        filesystem = load_filesystem_module()
+        old_read_range = filesystem._PersistentAdapterConnection.read_range
+        old_sleep = filesystem.time.sleep
+        old_retries = filesystem._ADAPTER_LANE_RETRIES
+        filesystem._ADAPTER_LANE_RETRIES = 3
+        filesystem.time.sleep = lambda _seconds: None
+
+        def always_timeout(_connection, _source_url, **_kwargs):
+            raise TimeoutError("socket timed out")
+
+        filesystem._PersistentAdapterConnection.read_range = always_timeout
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                try:
+                    with self.assertRaisesRegex(
+                        filesystem._PersistentTransportError,
+                        "adapter persistent download retries exhausted",
+                    ) as raised:
+                        pool.download(
+                            ["http://source/chunk"],
+                            0,
+                            chunks / "chunk",
+                            parent_fd,
+                            expected_size=4,
+                            expected_sha256=hashlib.sha256(b"data").hexdigest(),
+                            per_request_timeout_seconds=1,
+                        )
+                    self.assertIsInstance(raised.exception.__cause__, TimeoutError)
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+        finally:
+            filesystem._PersistentAdapterConnection.read_range = old_read_range
+            filesystem.time.sleep = old_sleep
+            filesystem._ADAPTER_LANE_RETRIES = old_retries
+
     def test_persistent_chunk_caps_idle_timeout_at_lane_timeout(self):
         filesystem = load_filesystem_module()
         payload = b"timeout-source"
