@@ -329,7 +329,7 @@ def _build_relay_index(
         if not isinstance(raw_spec, dict):
             raise RelayRequestError(500, "relay manifest file entry is invalid")
         relative = _safe_relative_path(raw_spec.get("path"))
-        if transport in {relay_transport, predictive_transport} and name not in required_names:
+        if transport in {relay_transport, predictive_transport, full_transport} and name not in required_names:
             if relative != Path("transport-chunks") / name:
                 raise RelayRequestError(500, "relay manifest has an invalid chunk path")
         size = raw_spec.get("size")
@@ -339,7 +339,15 @@ def _build_relay_index(
     if not required_names.issubset(files):
         raise RelayRequestError(500, "relay manifest is missing an adapter file")
     if transport == full_transport and set(files) != required_names:
-        raise RelayRequestError(500, "full relay manifest contains transport chunks")
+        try:
+            source_manifest = json.loads(
+                (published_path / "adapter_manifest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            raise RelayRequestError(500, "relay source manifest is invalid") from exc
+        bundle = source_manifest.get("bundle") if isinstance(source_manifest, dict) else None
+        if not isinstance(bundle, dict) or bundle.get("path") != transport_bundle_name:
+            raise RelayRequestError(500, "full relay manifest contains transport chunks")
     return RelayIndex(transport=transport, files=files)
 
 
@@ -377,7 +385,7 @@ def _load_bundle(
     source_url: str,
     index: RelayIndex,
 ) -> RelayBundle:
-    if index.transport != relay_transport:
+    if index.transport not in {relay_transport, full_transport}:
         raise RelayRequestError(404, "adapter bundle is not published")
     try:
         source_manifest = json.loads(

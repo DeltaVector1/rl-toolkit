@@ -101,13 +101,13 @@ class DownloadSchedulerTest(unittest.TestCase):
 
             os.environ["PRIME_LORA_SOURCE_PORTS"] = ",".join(str(port) for port in ports)
             source_urls = filesystem._adapter_source_urls(source_url)
-            filesystem._responsive_adapter_source_urls = lambda *_args: (source_urls[:64], 128)
+            filesystem._responsive_adapter_source_urls = lambda *_args: (source_urls, 128)
             self.assertEqual(
                 [urlsplit(url).port for url in filesystem._bundle_responsive_source_urls(source_url, None, None)],
                 ports[:64],
             )
             filesystem._responsive_adapter_source_urls = lambda *_args: (source_urls[:63], 128)
-            with self.assertRaisesRegex(OSError, "64 responsive"):
+            with self.assertRaisesRegex(OSError, "all 128"):
                 filesystem._bundle_responsive_source_urls(source_url, None, None)
 
             bad_ports = list(ports)

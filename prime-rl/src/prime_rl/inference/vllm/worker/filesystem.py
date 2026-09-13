@@ -1733,10 +1733,18 @@ def _bundle_responsive_source_urls(
         deadline,
         cancel_event,
     )
-    responsive_ports = [urlsplit(url).port for url in responsive]
-    if configured_count != 128 or len(responsive) != 64 or responsive_ports != first:
-        raise OSError("adapter bundle requires 64 responsive first-forward URLs")
-    return responsive
+    try:
+        responsive_ports = [urlsplit(url).port for url in responsive]
+    except (TypeError, ValueError) as exc:
+        raise OSError("adapter bundle responsive port mapping is invalid") from exc
+    if (
+        configured_count != 128
+        or len(responsive) != 128
+        or responsive != source_urls
+        or responsive_ports != ports
+    ):
+        raise OSError("adapter bundle requires all 128 mapped URLs to respond")
+    return responsive[:64]
 
 
 def _read_delta_manifest_with_visibility_wait(
@@ -1886,13 +1894,20 @@ def _publish_relay_manifest(
             raise OSError("adapter relay transport is unsupported")
         if mode == "full" and transport_name not in {None, _ADAPTER_FULL_TRANSPORT}:
             raise OSError("adapter relay full transport is unsupported")
+        bundle_value = source_manifest.get("bundle")
+        has_bundle = (
+            isinstance(bundle_value, dict)
+            and bundle_value.get("path") == _ADAPTER_BUNDLE_PATH
+        )
 
         adapter_manifest_path = directory / _ADAPTER_MANIFEST
         relay_source_manifest = source_manifest
         if mode == "full" and transport_name == _ADAPTER_FULL_TRANSPORT:
             relay_source_manifest = dict(source_manifest)
-            for key in ("transport", "chunks", "chunk_count", "encoded_size"):
+            for key in ("transport", "chunk_count", "encoded_size"):
                 relay_source_manifest.pop(key, None)
+            if not has_bundle:
+                relay_source_manifest.pop("chunks", None)
         _write_json(adapter_manifest_path, relay_source_manifest, parent_fd=directory_fd)
         _check_deadline(deadline, cancel_event)
         manifest_stat = _stat_regular_entry(
@@ -1940,7 +1955,7 @@ def _publish_relay_manifest(
                 "sha256": digest,
             }
 
-        if mode == "delta":
+        if mode == "delta" or (mode == "full" and has_bundle):
             chunks = transport.get("chunks")
             if not isinstance(chunks, list) or not chunks:
                 raise OSError("adapter relay delta has no chunks")

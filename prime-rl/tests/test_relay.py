@@ -175,6 +175,64 @@ class RelayTest(unittest.TestCase):
             self.assertEqual(response.read(), payload)
         self.assertFalse((self.cache / relay.transport_bundle_name).exists())
 
+    def test_serves_full_zstd_virtual_bundle_ranges(self):
+        chunk0 = self.cache / "transport-chunks" / "chunk-0"
+        chunk1 = self.cache / "transport-chunks" / "chunk-1"
+        chunk1.write_bytes(b"tail")
+        source_manifest_path = self.cache / "adapter_manifest.json"
+        source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        payload = chunk0.read_bytes() + chunk1.read_bytes()
+        source_manifest.update(
+            {
+                "mode": "full",
+                "transport": "chunked-full-zstd",
+                "bundle": {
+                    "path": relay.transport_bundle_name,
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                },
+                "chunks": [
+                    {
+                        "file": "chunk-0",
+                        "wire_size": chunk0.stat().st_size,
+                        "wire_sha256": hashlib.sha256(chunk0.read_bytes()).hexdigest(),
+                    },
+                    {
+                        "file": "chunk-1",
+                        "wire_size": chunk1.stat().st_size,
+                        "wire_sha256": hashlib.sha256(chunk1.read_bytes()).hexdigest(),
+                    },
+                ],
+            }
+        )
+        source_manifest_path.write_text(json.dumps(source_manifest), encoding="utf-8")
+        manifest_path = self.cache / relay.relay_manifest_name
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["transport"] = relay.full_transport
+        manifest["files"]["chunk-1"] = {
+            "path": "transport-chunks/chunk-1",
+            "size": chunk1.stat().st_size,
+            "sha256": hashlib.sha256(chunk1.read_bytes()).hexdigest(),
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        with self.request(
+            "/glm-1/run_glm-1/broadcasts/step_1/.adapter-transport-bundle",
+            headers={"Range": "bytes=14-19"},
+        ) as response:
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.headers["Content-Range"], "bytes 14-19/20")
+            self.assertEqual(response.headers["ETag"], f'"{hashlib.sha256(payload).hexdigest()}"')
+            self.assertEqual(response.read(), b"ta" + b"tail")
+        with self.request(
+            "/glm-1/run_glm-1/broadcasts/step_1/.adapter-transport-bundle",
+            method="HEAD",
+            headers={"Range": "bytes=14-19"},
+        ) as response:
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.headers["Content-Length"], "6")
+            self.assertEqual(response.read(), b"")
+        self.assertFalse((self.cache / relay.transport_bundle_name).exists())
+
     def test_does_not_serve_unknown_or_unready_data(self):
         with self.assertRaises(HTTPError) as error:
             self.request("/glm-1/run_glm-1/broadcasts/step_1/not-published")
