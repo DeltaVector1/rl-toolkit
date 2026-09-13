@@ -179,6 +179,8 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('adapter_relay_start() {', source)
         self.assertIn('adapter relay unavailable', source)
         self.assertIn('source URL is not configured', source)
+        self.assertIn('headers={"Host": f"127.0.0.1:{port}"}', source)
+        self.assertIn('first wrong adapter relay:', source)
         self.assertIn("[ \"$relay_probe\" = $'source URL is not configured\\n' ]", source)
         self.assertIn("relay_status=${relay_probe: -3}", source)
         self.assertIn('Host: 127.0.0.1:${lora_source_ports[0]}', source)

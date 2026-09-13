@@ -1855,13 +1855,13 @@ last = int(sys.argv[2])
 def is_relay(port):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
     try:
-        connection.request("GET", "/adapter-relay-status")
+        connection.request("GET", "/adapter-relay-status", headers={"Host": f"127.0.0.1:{port}"})
         response = connection.getresponse()
         body = response.read()
         if response.status != 404 or body != b"source URL is not configured\n":
-            return port
-    except OSError:
-        return port
+            return port, response.status, body
+    except OSError as error:
+        return port, "error", repr(error).encode()
     finally:
         connection.close()
     return None
@@ -1869,9 +1869,11 @@ def is_relay(port):
 
 ports = list(range(first, last + 1))
 with ThreadPoolExecutor(max_workers=min(32, len(ports))) as executor:
-    failed = [port for port in executor.map(is_relay, ports) if port is not None]
+    failed = [result for result in executor.map(is_relay, ports) if result is not None]
 if failed:
-    print("wrong adapter relay ports: " + ",".join(map(str, failed)))
+    print("wrong adapter relay ports: " + ",".join(str(port) for port, _, _ in failed))
+    port, status, body = failed[0]
+    print(f"first wrong adapter relay: port={port} status={status} body={body!r}")
     raise SystemExit(1)
 print(len(ports))
 PY
