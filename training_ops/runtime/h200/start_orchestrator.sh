@@ -1714,6 +1714,31 @@ peer_tunnel_children_unchanged() {
   done
 }
 
+peer_tunnel_supervisors_unchanged() {
+  local marker supervisor_pid supervisor_start supervisor_command current_command current_start
+  [ "$peer_enabled" = 1 ] || return 0
+  for marker in "${!peer_supervisor_pids[@]}"; do
+    supervisor_pid=${peer_supervisor_pids[$marker]}
+    supervisor_start=${peer_supervisor_starts[$marker]}
+    supervisor_command=${peer_supervisor_commands[$marker]}
+    current_start=$(process_start_time "$supervisor_pid") || return 1
+    [ "$current_start" = "$supervisor_start" ] || return 1
+    current_command=$(process_command_line "$supervisor_pid") || return 1
+    [ "$current_command" = "$supervisor_command" ] || return 1
+  done
+}
+
+peer_tunnel_current_children_ready() {
+  local marker shape child_pid child_command
+  local -a expected_forwards
+  for marker in "${!peer_supervisor_pids[@]}"; do
+    shape=${peer_child_shapes[$marker]}
+    read -r -a expected_forwards <<<"${peer_child_forwards[$marker]}"
+    peer_tunnel_supervisor_child_identity "${peer_supervisor_pids[$marker]}" "$shape" \
+      "$marker" "${expected_forwards[@]}" || return 1
+  done
+}
+
 peer_tunnel_group_safe() {
   local pgid=$1 group_command group_seen=0 process_output group_listing
   process_output=$(ps -eo pgid=,args=) || return 1
@@ -1886,7 +1911,7 @@ PY
   fi
   verified_ports=$(tail -n 1 <<<"$probe_output")
   [ "$verified_ports" = "${#lora_source_ports[@]}" ] || return 1
-  peer_tunnel_children_unchanged
+  peer_tunnel_supervisors_unchanged
 }
 
 peer_repair_missing_remote_lanes() {
@@ -3183,8 +3208,14 @@ adapter_tunnel_readiness() {
     for _ in $(seq 1 10); do
       repair_remaining >/dev/null || return 1
       if peer_remote_ports_ready 10; then
-        remote_ready=1
-        break
+        sleep 0.2
+        repair_remaining >/dev/null || return 1
+        if peer_remote_ports_ready 10; then
+          if peer_tunnel_current_children_ready; then
+            remote_ready=1
+            break
+          fi
+        fi
       fi
       if [ -n "${peer_missing_remote_ports:-}" ]; then
         peer_repair_missing_remote_lanes || return 1

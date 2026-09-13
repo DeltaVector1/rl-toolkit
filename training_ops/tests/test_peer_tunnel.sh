@@ -321,6 +321,14 @@ set -euo pipefail
 if [ "${1:-}" = -G ] && [ -n "${SSH_G_OUTPUT:-}" ]; then
   cat "$SSH_G_OUTPUT"
   exit "${ssh_g_status:-0}"
+elif [ -n "${PEER_REMOTE_OUTPUT:-}" ]; then
+  cat "$PEER_REMOTE_OUTPUT"
+  exit 0
+elif [ "${PEER_REMOTE_FAIL:-0}" = 1 ]; then
+  exit 1
+elif [ "${PEER_REMOTE_MISSING:-0}" = 1 ]; then
+  printf '%s\n' "$((TEST_SOURCE_COUNT - 1))"
+  exit 0
 else
   exec "$REAL_SSH" "$@"
 fi
@@ -1711,8 +1719,7 @@ set -e
 test "$extra_peer_child_status" -ne 0
 unset PEER_CHILDREN_OUTPUT
 
-# A remote reverse-port response is not enough if the local SSH child changes
-# during the probe.
+# Complete remote reverse-port coverage accepts a child retry between probes.
 peer_supervisor_pids[peer-tunnel-lora-0]=4241
 peer_supervisor_starts[peer-tunnel-lora-0]=fixture-start-4241
 peer_supervisor_commands[peer-tunnel-lora-0]="$peer_supervisor_command"
@@ -1723,18 +1730,14 @@ peer_child_shapes[peer-tunnel-lora-0]=current
 peer_child_forwards[peer-tunnel-lora-0]="-R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port"
 printf '%s\n' "$peer_exact_command" >"$tmp/peer-owner"
 printf '%s\n' "$peer_supervisor_command" >"$tmp/peer-supervisor"
-printf '%s\n' "${TEST_SOURCE_COUNT}" >"$tmp/remote-count"
+printf '%s\n' "${#lora_source_ports[@]}" >"$tmp/remote-count"
 printf '%s\n' "${peer_exact_command/ChannelTimeout=\*-tcpip=45s/ChannelTimeout=\*-tcpip=60s}" >"$tmp/mutated-peer-child"
 : >"$tmp/peer-mutated"
 export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=4241 TUNNEL_SUPERVISOR_PID=4241 \
   TUNNEL_OWNER_COMMAND="$tmp/peer-owner" TUNNEL_SUPERVISOR_COMMAND="$tmp/peer-supervisor" \
   PEER_REMOTE_OUTPUT="$tmp/remote-count" PEER_MUTATE_MARKER="$tmp/peer-mutated" \
   PEER_MUTATED_COMMAND="$tmp/mutated-peer-child"
-set +e
 PATH="$tmp/bin:$PATH" peer_remote_ports_ready
-remote_child_race_status=$?
-set -e
-test "$remote_child_race_status" -ne 0
 unset TUNNEL_OWNER_PID TUNNEL_OWNER_PPID TUNNEL_SUPERVISOR_PID TUNNEL_OWNER_COMMAND \
   TUNNEL_SUPERVISOR_COMMAND PEER_REMOTE_OUTPUT PEER_MUTATE_MARKER PEER_MUTATED_COMMAND
 peer_supervisor_pids=()
@@ -2127,6 +2130,7 @@ else
 fi
 EOF
 chmod +x "$tmp/bin/ssh"
+hash -r
 PATH="$tmp/bin:$PATH" PEER_REMOTE_FAIL=0 PEER_REMOTE_MISSING=0 peer_remote_ports_ready
 if PATH="$tmp/bin:$PATH" PEER_REMOTE_FAIL=0 PEER_REMOTE_MISSING=1 peer_remote_ports_ready; then
   echo "remote missing reverse port was accepted" >&2
