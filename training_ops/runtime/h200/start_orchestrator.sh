@@ -1423,7 +1423,8 @@ peer_tunnel_group_safe() {
 
 peer_tunnel_remove_legacy() {
   local keep_current=${1:-0}
-  local pid command_line marker
+  local pid command_line marker process_output
+  process_output=$(ps -eo pid=,args=) || return 1
   while read -r pid command_line; do
     repair_remaining >/dev/null || return 1
     marker=$(sed -n 's/.*# \(peer-tunnel-lora-[0-9][0-9]*\)$/\1/p' <<<"$command_line")
@@ -1436,7 +1437,7 @@ peer_tunnel_remove_legacy() {
       fi
     fi
     peer_kill_owned "$pid" "$command_line" cleanup "$marker" || return 1
-  done < <(ps -eo pid=,args=)
+  done <<<"$process_output"
 }
 
 peer_kill_owned() {
@@ -1912,7 +1913,7 @@ tunnel_listener_ready() {
 
 china_tunnel_supervisor_owns_forwards() {
   local supervisor_pid=$1 supervisor_command=$2 mode=${3:-current}
-  local listener forward source_port child_pid child_ppid owner_command index ssh_command marker owner_pid=
+  local listener forward source_port child_pid child_ppid owner_command index ssh_command marker owner_pid= listener_output
   local -a forward_specs=()
   shift 3
   while [ "$#" -gt 0 ]; do
@@ -1937,7 +1938,8 @@ china_tunnel_supervisor_owns_forwards() {
     tunnel_command_has "$supervisor_command" "$forward" || return 1
     source_port=${forward#127.0.0.1:}
     source_port=${source_port%%:*}
-    listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":$source_port" '$4 ~ port "$" {print; exit}')
+    listener_output=$(ss -H -ltnp 2>/dev/null) || return 2
+    listener=$(awk -v port=":$source_port" '$4 ~ port "$" {print; exit}' <<<"$listener_output") || return 2
     [ -n "$listener" ] || return 1
     child_pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
     case "$child_pid" in ''|*[!0-9]*) return 1 ;; esac
@@ -2051,7 +2053,7 @@ china_tunnel_remove_orphan_children() {
 }
 
 china_tunnel_ports_clear() {
-  local requested source_port
+  local requested source_port listener_output
   local -a requested_ports=()
   for requested in "$@"; do
     case "$requested" in
@@ -2062,9 +2064,12 @@ china_tunnel_ports_clear() {
     esac
   done
   [ "${#requested_ports[@]}" -gt 0 ] || return 1
+  listener_output=$(ss -H -ltn 2>/dev/null) || return 2
   for source_port in "${requested_ports[@]}"; do
-    if ss -H -ltn 2>/dev/null | awk -v local_port="127.0.0.1:$source_port" '$4 == local_port {found=1} END {exit !found}'; then
+    if awk -v local_port="127.0.0.1:$source_port" '$4 == local_port {found=1} END {exit !found}' <<<"$listener_output"; then
       return 1
+    else
+      case "$?" in 1) ;; *) return 2 ;; esac
     fi
   done
 }
@@ -2084,7 +2089,7 @@ china_tunnel_force_kill_orphan() {
   else
     kill_status=1
   fi
-  while :; do
+  for _ in $(seq 1 30); do
     if [ ! -e "/proc/$pid" ]; then
       return 0
     fi
@@ -2112,6 +2117,7 @@ china_tunnel_force_kill_orphan() {
     [ "$remaining" -gt 0 ] || return 1
     repair_sleep 1 || return 1
   done
+  return 1
 }
 
 china_tunnel_stop_supervisor() {
@@ -2374,6 +2380,8 @@ china_tunnel_reconcile_connection() {
           "${current_commands[index]}" current "${forwards[@]}"; then
         keeper=${current_pids[index]}
         break
+      else
+        [ "$?" -eq 1 ] || return 1
       fi
     done
     if [ -z "$keeper" ]; then
@@ -2382,6 +2390,8 @@ china_tunnel_reconcile_connection() {
             "${old_commands[index]}" old "${forwards[@]}"; then
           old_keeper=${old_pids[index]}
           break
+        else
+          [ "$?" -eq 1 ] || return 1
         fi
       done
       [ -n "$old_keeper" ] || return 1
@@ -2454,6 +2464,8 @@ china_tunnel_connection() {
       if china_tunnel_ports_clear "${forwards[@]}"; then
         ports_clear=1
         break
+      else
+        [ "$?" -eq 1 ] || return 1
       fi
       repair_sleep 1 || return 1
     done
@@ -2824,9 +2836,9 @@ fi
 if ! adapter_tunnel_readiness; then
   repair_fail "exact tunnel readiness checks failed"
 fi
+repair_committed=1
 repair_created_tunnels=()
 repair_unregistered_tunnels=()
-repair_committed=1
 repair_release_lock || repair_fail "could not release adapter tunnel repair lock"
 if [ "$tunnels_only" = 1 ]; then
   echo "adapter tunnel reconciliation complete"
