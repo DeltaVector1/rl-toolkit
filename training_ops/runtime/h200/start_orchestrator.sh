@@ -3217,11 +3217,11 @@ adapter_relay_start() {
   sudo install -d -o 1000 -g 1000 -m 0755 "$relay_cache_dir"
   running=$(sudo docker inspect "$relay_container" --format '{{.State.Running}}' 2>/dev/null || true)
     relay_probe=$(curl -sS --max-time 2 -H "Host: 127.0.0.1:${lora_source_ports[0]}" \
-      -w $'\n%{http_code}' "http://127.0.0.1:$relay_port/" 2>/dev/null || true)
-    relay_status=${relay_probe##*$'\n'}
-    relay_probe=${relay_probe%$'\n'*}
+      -w '%{http_code}' "http://127.0.0.1:$relay_port/" 2>/dev/null || true)
+    relay_status=${relay_probe: -3}
+    relay_probe=${relay_probe:0:${#relay_probe}-3}
     if [ "$running" = true ] && ss -tln 2>/dev/null | grep -q "127.0.0.1:$relay_port" && \
-        [ "$relay_status" = 404 ] && [ "$relay_probe" = "source URL is not configured" ]; then
+        [ "$relay_status" = 404 ] && [ "$relay_probe" = $'source URL is not configured\n' ]; then
       return 0
   fi
   sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
@@ -3241,11 +3241,11 @@ adapter_relay_start() {
   for _ in $(seq 1 60); do
     running=$(sudo docker inspect "$relay_container" --format '{{.State.Running}}' 2>/dev/null || true)
     relay_probe=$(curl -sS --max-time 2 -H "Host: 127.0.0.1:${lora_source_ports[0]}" \
-      -w $'\n%{http_code}' "http://127.0.0.1:$relay_port/" 2>/dev/null || true)
-    relay_status=${relay_probe##*$'\n'}
-    relay_probe=${relay_probe%$'\n'*}
+      -w '%{http_code}' "http://127.0.0.1:$relay_port/" 2>/dev/null || true)
+    relay_status=${relay_probe: -3}
+    relay_probe=${relay_probe:0:${#relay_probe}-3}
     if [ "$running" = true ] && ss -tln 2>/dev/null | grep -q "127.0.0.1:$relay_port" && \
-        [ "$relay_status" = 404 ] && [ "$relay_probe" = "source URL is not configured" ]; then
+        [ "$relay_status" = 404 ] && [ "$relay_probe" = $'source URL is not configured\n' ]; then
       relay_ready=1
       break
     fi
