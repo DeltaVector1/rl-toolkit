@@ -517,6 +517,11 @@ class AdapterUpdateTest(unittest.TestCase):
                 "Failed to apply policy update 4\nadapter request failed"
             )
         for transport_error in (
+            "_PersistentTransportError: adapter network request failed",
+            "_PersistentTransportError: adapter network read failed",
+            "_PersistentTransportError: adapter response ended early",
+            "_PersistentTransportError: adapter response read timeout setup failed",
+            "_PersistentTransportError: adapter manifest is missing; transfer mode is unknown",
             "_PersistentTransportError: adapter persistent request failed",
             "_PersistentTransportError: adapter response ended during read",
             "_PersistentTransportError: adapter response body ended early",
@@ -553,6 +558,11 @@ class AdapterUpdateTest(unittest.TestCase):
             "OSError: adapter manifest request failed with HTTP status 500",
             "OSError: adapter persistent request failed",
             "adapter persistent request failed",
+            "adapter network request failed",
+            "_PersistentTransportError: adapter network read failed",
+            "adapter response ended early",
+            "OSError: adapter response read timeout setup failed",
+            "adapter manifest is missing; transfer mode is unknown",
             "_PersistentTransportError: adapter response ended during read",
             "OSError: adapter response body ended early",
             "incomplete adapter transport chunk",
@@ -586,6 +596,33 @@ class AdapterUpdateTest(unittest.TestCase):
         for error in rejected:
             with self.subTest(rejected=error):
                 self.assertIsNone(training_ops._adapter_transport_failure_reason(error))
+
+    def test_stage_log_transport_evidence_stays_in_latest_update_block(self):
+        earlier_evidence = (
+            "Policy update 3 failed on attempt 2/2; stopping\n"
+            "_PersistentTransportError: adapter response ended during read\n"
+            "Policy update 4 failed on attempt 2/2; stopping\n"
+        )
+        with self.assertRaises(training_ops.Refused):
+            training_ops._validate_adapter_stage_log(earlier_evidence)
+
+        later_evidence = (
+            "Policy update 4 failed on attempt 2/2; stopping\n"
+            "Policy update 5\n"
+            "_PersistentTransportError: adapter response ended during read\n"
+        )
+        with self.assertRaises(training_ops.Refused):
+            training_ops._validate_adapter_stage_log(later_evidence)
+
+        latest_evidence = (
+            "Policy update 4 failed on attempt 2/2; stopping\n"
+            "_PersistentTransportError: adapter response ended during read\n"
+            "Policy update 5\n"
+        )
+        self.assertEqual(
+            training_ops._validate_adapter_stage_log(latest_evidence),
+            "Policy update 4 failed on attempt 2/2; stopping",
+        )
 
     def test_stage_success_after_failure_refuses_repair(self):
         log = (

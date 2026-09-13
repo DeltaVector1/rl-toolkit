@@ -3774,6 +3774,17 @@ def _adapter_transport_failure_reason(error: str) -> str | None:
         ),
     )
     exact_failures = (
+        (r"adapter network request failed", "network request failed"),
+        (r"adapter network read failed", "network read failed"),
+        (r"adapter response ended early", "response ended early"),
+        (
+            r"adapter response read timeout setup failed",
+            "response read timeout setup failed",
+        ),
+        (
+            r"adapter manifest is missing; transfer mode is unknown",
+            "manifest is missing; transfer mode is unknown",
+        ),
         (r"adapter persistent request failed", "persistent request failed"),
         (r"adapter response ended during read", "response ended during read"),
         (r"adapter response body ended early", "response body ended early"),
@@ -3810,13 +3821,22 @@ def _validate_adapter_stage_log(log: str) -> str:
     successes = list(re.finditer(r"Staged policy v\d+ on every inference host", log))
     if successes and successes[-1].start() > latest_failure.start():
         raise Refused("the latest adapter policy update already succeeded")
-    window = log[max(0, latest_failure.start() - 4000) : latest_failure.end() + 20000]
+    next_update = re.search(
+        r"(?:Failed to apply policy update \d+|Policy update \d+\b)",
+        log[latest_failure.end() :],
+    )
+    block_end = (
+        latest_failure.end() + next_update.start()
+        if next_update is not None
+        else len(log)
+    )
+    block = log[latest_failure.start() : block_end]
     transfer_words = ("stage_lora_adapter", "adapter", "lora")
-    if not any(word.lower() in window.lower() for word in transfer_words):
+    if not any(word.lower() in block.lower() for word in transfer_words):
         raise Refused("latest policy failure has no adapter staging evidence")
     if not any(
         _adapter_transport_failure_reason(line) is not None
-        for line in window.splitlines()
+        for line in block.splitlines()
     ):
         raise Refused("latest adapter failure has no transfer timeout evidence")
     return latest_failure.group(0)
