@@ -1252,10 +1252,10 @@ peer_tunnel_connection() {
     -p "$peer_ssh_port"
   )
   local forward_text ssh_text peer_target marker pid command_line final_command
-  local matching_pids matching_count keep_index=0 owner_index=-1 final_count owner_status final_pid
+  local matching_pids matching_count keep_index=0 owner_index=-1 final_count owner_status final_pid child_status
   local listener_status listener_owner_pid= listener_owner_start= current_owner_start
   local owner_count=0 index
-  local -a candidate_pids=() candidate_commands=()
+  local -a candidate_pids=() candidate_commands=() live_pids=() live_commands=()
   local expected_shape=current
   forward_text=$(printf ' %q' "${forwards[@]}")
   ssh_text=$(printf ' %q' "${ssh_args[@]}")
@@ -1292,6 +1292,32 @@ peer_tunnel_connection() {
       fi
       peer_kill_owned "$pid" "$command_line" "$expected_shape" "$marker" "${forwards[@]}" || return 1
     done <<<"$matching_pids"
+    if [ "$connection_name" != api ] && [ "${#candidate_pids[@]}" -gt 0 ]; then
+      for index in "${!candidate_pids[@]}"; do
+        if peer_tunnel_supervisor_child_identity "${candidate_pids[index]}" "$expected_shape" "$marker" \
+          "${forwards[@]}"; then
+          child_status=0
+        else
+          child_status=$?
+        fi
+        case "$child_status" in
+          0)
+            live_pids+=("${candidate_pids[index]}")
+            live_commands+=("${candidate_commands[index]}")
+            ;;
+          1)
+            peer_kill_owned "${candidate_pids[index]}" "${candidate_commands[index]}" \
+              "$expected_shape" "$marker" "${forwards[@]}" || return 1
+            ;;
+          *)
+            echo "could not inspect peer tunnel child for $marker" >&2
+            return 1
+            ;;
+        esac
+      done
+      candidate_pids=("${live_pids[@]}")
+      candidate_commands=("${live_commands[@]}")
+    fi
     matching_count=${#candidate_pids[@]}
     if [ "$connection_name" = api ] && [ -n "$listener_owner_pid" ]; then
       [ "$owner_count" -eq 1 ] || {
@@ -1593,7 +1619,7 @@ peer_tunnel_supervisor_child_identity() {
   local -a forwards=("$@")
   local child_pid child_ppid child_command child_count=0 direct_ssh_count=0
   local expected_start process_output
-  process_output=$(ps -eo pid=,ppid=,args=) || return 1
+  process_output=$(ps -eo pid=,ppid=,args=) || return 2
   while read -r child_pid child_ppid child_command; do
     [ "$child_ppid" = "$supervisor_pid" ] || continue
     case "$child_command" in
@@ -1609,7 +1635,7 @@ peer_tunnel_supervisor_child_identity() {
     peer_snapshot_child_command=$child_command
   done <<<"$process_output"
   [ "$direct_ssh_count" -eq 1 ] && [ "$child_count" -eq 1 ] || return 1
-  expected_start=$(process_start_time "$peer_snapshot_child_pid") || return 1
+  expected_start=$(process_start_time "$peer_snapshot_child_pid") || return 2
   peer_snapshot_child_start=$expected_start
 }
 
@@ -1764,15 +1790,16 @@ peer_tunnel_remove_orphan_children() {
 }
 
 peer_remote_ports_ready() {
-  local probe_seconds=${1:-10} peer_target verified_ports
+  local probe_seconds=${1:-10} peer_target verified_ports probe_output probe_status
+  peer_missing_remote_ports=
   peer_tunnel_children_unchanged || return 1
   probe_seconds=$(repair_timeout "$probe_seconds") || return 1
   peer_target=$(printf '%q' "$peer_ssh_user@$peer_host")
-  if ! verified_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
+  probe_output=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
       ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout="$probe_seconds" \
       -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
       -o IPQoS=none -i "$peer_ssh_identity" -p "$peer_ssh_port" \
-      "$peer_target" "python3 - ${lora_source_ports[0]} ${lora_source_ports[-1]}" 2>/dev/null <<'PY'
+      "$peer_target" "python3 - ${lora_source_ports[0]} ${lora_source_ports[-1]}" <<'PY'
 import http.client
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -1800,15 +1827,52 @@ ports = list(range(first, last + 1))
 with ThreadPoolExecutor(max_workers=min(32, len(ports))) as executor:
     failed = [port for port in executor.map(is_relay, ports) if port is not None]
 if failed:
-    print("wrong adapter relay ports: " + ",".join(map(str, failed)), file=sys.stderr)
+    print("wrong adapter relay ports: " + ",".join(map(str, failed)))
     raise SystemExit(1)
 print(len(ports))
 PY
-  ); then
+  )
+  probe_status=$?
+  if [ "$probe_status" -ne 0 ]; then
+    peer_missing_remote_ports=$(sed -n 's/^wrong adapter relay ports: //p' <<<"$probe_output")
+    [ -n "$probe_output" ] && printf '%s\n' "$probe_output" >&2
     return 1
   fi
+  verified_ports=$(tail -n 1 <<<"$probe_output")
   [ "$verified_ports" = "${#lora_source_ports[@]}" ] || return 1
   peer_tunnel_children_unchanged
+}
+
+peer_repair_missing_remote_lanes() {
+  local port lane lane_start lane_ports lane_forwards marker pid command_line matching_pids
+  local -A seen_lanes=()
+  [ -n "${peer_missing_remote_ports:-}" ] || return 1
+  for port in $peer_missing_remote_ports; do
+    lane=$(( (port - lora_source_ports[0]) / 2 ))
+    [ "$lane" -ge 0 ] || return 1
+    [ "$lane" -lt "$(( (${#lora_source_ports[@]} + 1) / 2 ))" ] || return 1
+    seen_lanes[$lane]=1
+  done
+  for lane in "${!seen_lanes[@]}"; do
+    lane_start=$((lane * 2))
+    lane_ports=("${lora_source_ports[@]:lane_start:2}")
+    lane_forwards=()
+    for port in "${lane_ports[@]}"; do
+      lane_forwards+=("-R 127.0.0.1:$port:127.0.0.1:$relay_port")
+    done
+    marker="peer-tunnel-lora-$lane"
+    matching_pids=$(pgrep_matches "$marker") || return 1
+    while read -r pid; do
+      [ -n "$pid" ] || continue
+      command_line=$(process_command_line "$pid") || return 1
+      peer_tunnel_supervisor_forwards_match "$command_line" current "$marker" \
+        "${lane_forwards[@]}" || continue
+      peer_kill_owned "$pid" "$command_line" current "$marker" "${lane_forwards[@]}" || return 1
+    done <<<"$matching_pids"
+    peer_tunnel_connection "lora-$lane" \
+      "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:$relay_port" \
+      "${lane_forwards[@]}" || return 1
+  done
 }
 
 china_source_ports_ready() {
@@ -2781,6 +2845,7 @@ peer_tunnel() {
       "${lane_forwards[@]}" || return 1
     lane_start=$((lane_start + peer_lane_size))
     lane_number=$((lane_number + 1))
+    [ "$lane_start" -lt "${#lora_source_ports[@]}" ] && sleep 0.1
   done
   if [ "${tunnels_only:-0}" = 0 ]; then
     echo "peer tunnel :$peer_api_port -> $peer_name:8000; adapter source reverse ports ${lora_source_ports[0]}-${lora_source_ports[-1]} in $lane_number SSH lanes"
@@ -2788,7 +2853,8 @@ peer_tunnel() {
 }
 
 supervisor_lane_inventory_ready() {
-  local kind=$1 expected_lanes=$2 pid command_line marker lane prefix match_function
+  local kind=$1 expected_lanes=$2 allow_missing=${3:-0}
+  local pid command_line marker lane prefix match_function
   local inventory_count=0 process_output
   local -a seen_lanes=()
   case "$kind" in
@@ -2812,7 +2878,10 @@ supervisor_lane_inventory_ready() {
       inventory_count=$((inventory_count + 1))
     fi
   done <<<"$process_output"
-  [ "$inventory_count" -eq "$expected_lanes" ]
+  if [ "$inventory_count" -eq "$expected_lanes" ]; then
+    return 0
+  fi
+  [ "$allow_missing" = 1 ] && [ "$inventory_count" -lt "$expected_lanes" ]
 }
 
 china_tunnel_supervisors_ready() {
@@ -2860,9 +2929,28 @@ china_tunnel_supervisors_ready() {
   supervisor_lane_inventory_ready china "$expected_lanes"
 }
 
+peer_tunnel_lane_supervisor() {
+  local marker=$1
+  shift
+  local matching_pids pid command_line matching_count=0
+  peer_ready_pid=
+  peer_ready_command=
+  matching_pids=$(pgrep_matches "$marker") || return 1
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    command_line=$(process_command_line "$pid") || return 1
+    if peer_tunnel_supervisor_forwards_match "$command_line" current "$marker" "$@"; then
+      matching_count=$((matching_count + 1))
+      peer_ready_pid=$pid
+      peer_ready_command=$command_line
+    fi
+  done <<<"$matching_pids"
+  [ "$matching_count" -eq 1 ] || return 2
+}
+
 peer_tunnel_supervisors_ready() {
   local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
-  local marker lora_source_port matching_pid matching_command match_count supervisor_start matching_pids
+  local marker lora_source_port matching_pid matching_command supervisor_start child_status
   [ "$peer_enabled" = 1 ] || return 0
   local expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
   peer_supervisor_pids=()
@@ -2873,7 +2961,7 @@ peer_tunnel_supervisors_ready() {
   peer_child_commands=()
   peer_child_shapes=()
   peer_child_forwards=()
-  supervisor_lane_inventory_ready peer "$expected_lanes" || return 1
+  supervisor_lane_inventory_ready peer "$expected_lanes" 1 || return 1
   while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
     lane_ports=("${lora_source_ports[@]:lane_start:2}")
     lane_forwards=()
@@ -2881,25 +2969,40 @@ peer_tunnel_supervisors_ready() {
       lane_forwards+=("-R 127.0.0.1:$lora_source_port:127.0.0.1:$relay_port")
     done
     marker="peer-tunnel-lora-$lane_number"
-    matching_pid=
-    matching_command=
-    match_count=0
-    matching_pids=$(pgrep_matches "$marker") || return 1
-    while read -r pid; do
-      [ -n "$pid" ] || continue
-      command_line=$(process_command_line "$pid") || return 1
-      if peer_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${lane_forwards[@]}"; then
-        match_count=$((match_count + 1))
-        matching_pid=$pid
-        matching_command=$command_line
-      fi
-    done <<<"$matching_pids"
-    [ "$match_count" -eq 1 ] || return 1
+    if peer_tunnel_lane_supervisor "$marker" "${lane_forwards[@]}"; then
+      matching_pid=$peer_ready_pid
+      matching_command=$peer_ready_command
+    else
+      child_status=$?
+      [ "$child_status" -eq 2 ] || return 1
+      peer_tunnel_connection "lora-$lane_number" \
+        "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:$relay_port" \
+        "${lane_forwards[@]}" || return 1
+      peer_tunnel_lane_supervisor "$marker" "${lane_forwards[@]}" || return 1
+      matching_pid=$peer_ready_pid
+      matching_command=$peer_ready_command
+    fi
     supervisor_start=$(process_start_time "$matching_pid") || return 1
     peer_snapshot_child_pid=
     peer_snapshot_child_command=
     peer_snapshot_child_start=
-    peer_tunnel_supervisor_child_identity "$matching_pid" current "$marker" "${lane_forwards[@]}" || return 1
+    if peer_tunnel_supervisor_child_identity "$matching_pid" current "$marker" "${lane_forwards[@]}"; then
+      child_status=0
+    else
+      child_status=$?
+    fi
+    if [ "$child_status" -ne 0 ]; then
+      [ "$child_status" -eq 1 ] || return 1
+      peer_tunnel_connection "lora-$lane_number" \
+        "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:$relay_port" \
+        "${lane_forwards[@]}" || return 1
+      peer_tunnel_lane_supervisor "$marker" "${lane_forwards[@]}" || return 1
+      matching_pid=$peer_ready_pid
+      matching_command=$peer_ready_command
+      peer_tunnel_supervisor_child_identity "$matching_pid" current "$marker" \
+        "${lane_forwards[@]}" || return 1
+      supervisor_start=$(process_start_time "$matching_pid") || return 1
+    fi
     peer_supervisor_pids[$marker]=$matching_pid
     peer_supervisor_starts[$marker]=$supervisor_start
     peer_supervisor_commands[$marker]=$matching_command
@@ -3028,6 +3131,10 @@ adapter_tunnel_readiness() {
       if peer_remote_ports_ready 10; then
         remote_ready=1
         break
+      fi
+      if [ -n "${peer_missing_remote_ports:-}" ]; then
+        peer_repair_missing_remote_lanes || return 1
+        peer_tunnel_supervisors_ready || return 1
       fi
       repair_sleep 1 || return 1
     done

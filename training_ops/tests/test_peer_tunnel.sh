@@ -126,6 +126,15 @@ if [ -r "${PEER_TEST_LOG:-}" ] && grep -Fq -- "$pattern" "$PEER_TEST_LOG"; then
         echo 1234
       fi
       ;;
+    '-R 127.0.0.1:'*)
+      port=${pattern#-R 127.0.0.1:}
+      port=${port%%:*}
+      if [ "$port" -ge "${TEST_SOURCE_FIRST:?}" ] && [ "$port" -le "${TEST_SOURCE_LAST:?}" ]; then
+        echo $((10000 + (port - TEST_SOURCE_FIRST) / 2))
+      else
+        echo 1234
+      fi
+      ;;
     *)
       echo 1234
       ;;
@@ -545,10 +554,50 @@ for hostile_peer_supervisor in \
 done
 
 # A second launcher invocation finds the exact API and lane signatures.
+# Model the live SSH child for each lane. A supervisor without this child is
+# not a healthy reusable connection.
+peer_children="$tmp/peer-children"
+: >"$peer_children"
+for ((lane=0; lane<expected_lanes; lane++)); do
+  lane_first=$((test_source_first + lane * 2))
+  lane_second=$((lane_first + 1))
+  lane_command=${peer_exact_command/18100/$lane_first}
+  lane_command=${lane_command/18101/$lane_second}
+  printf '%s %s %s\n' "$((20000 + lane))" "$((10000 + lane))" "$lane_command" >>"$peer_children"
+done
 kill() { sed -i '/# peer-tunnel-api[[:space:]]*$/d' "$log"; return 0; }
-PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" \
+  PEER_CHILDREN_OUTPUT="$peer_children" peer_tunnel
 test "$(wc -l <"$log")" -eq "$expected_peer_lines"
 unset -f kill
+unset PEER_CHILDREN_OUTPUT
+
+# A lane supervisor without its SSH child is replaced without touching another
+# lane.
+dead_lane_log="$tmp/dead-lane-log"
+dead_lane_group="$tmp/dead-lane-group"
+dead_lane_children="$tmp/dead-lane-children"
+dead_lane_kill="$tmp/dead-lane-kill"
+dead_lane_command=$(grep -E '# peer-tunnel-lora-0[[:space:]]*$' "$log" | head -n 1 | sed 's/[[:space:]]*$//')
+printf '%s\n' "$dead_lane_command" >"$dead_lane_log"
+printf '%s\n' "10000 $dead_lane_command" '10000 sleep 3' >"$dead_lane_group"
+: >"$dead_lane_children"
+: >"$dead_lane_kill"
+kill() {
+  printf '%s\n' "$*" >>"$dead_lane_kill"
+  : >"$dead_lane_group"
+  sed -i '/# peer-tunnel-lora-0[[:space:]]*$/d' "$dead_lane_log"
+  return 0
+}
+export PEER_TEST_LOG="$dead_lane_log" PEER_QUERY="$query" \
+  PEER_CHILDREN_OUTPUT="$dead_lane_children" PEER_GROUP_COMMANDS="$dead_lane_group"
+PATH="$tmp/bin:$PATH" peer_tunnel_connection lora-0 \
+  "-R 127.0.0.1:18100:127.0.0.1:$relay_port" \
+  -R "127.0.0.1:18100:127.0.0.1:$relay_port" \
+  -R "127.0.0.1:18101:127.0.0.1:$relay_port"
+test "$(grep -F -c -- '-- -10000' "$dead_lane_kill")" -eq 1
+unset -f kill
+unset PEER_TEST_LOG PEER_QUERY PEER_CHILDREN_OUTPUT PEER_GROUP_COMMANDS
 
 # API reconciliation keeps the one supervisor whose exact SSH child owns the
 # listener, and removes the other two exact candidates.
