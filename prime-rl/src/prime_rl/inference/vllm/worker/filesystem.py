@@ -72,6 +72,7 @@ _ADAPTER_CLEANUP_ENTRY_LIMIT = 256
 _ADAPTER_DIRECTORY_ENTRY_LIMIT = 8192
 _ADAPTER_CLEANUP_CANDIDATE_LIMIT = 64
 persistent_read_timeout_seconds = 5.0
+persistent_connection_idle_seconds = 30.0
 lane_rotation_delay_seconds = 0.1
 _JSON_LOCK = threading.Lock()
 _adapter_stage_publish_lock = threading.Lock()
@@ -3012,11 +3013,13 @@ class _PersistentAdapterConnection:
     def __init__(self) -> None:
         self._connection = None
         self._origin = None
+        self._last_completed_at = None
 
     def close(self) -> None:
         connection = self._connection
         self._connection = None
         self._origin = None
+        self._last_completed_at = None
         if connection is not None:
             try:
                 connection.close()
@@ -3032,6 +3035,13 @@ class _PersistentAdapterConnection:
         except ValueError as exc:
             raise _PersistentProtocolError("adapter source URL has an invalid port") from exc
         origin = (parsed.scheme, parsed.hostname, port)
+        if (
+            self._connection is not None
+            and self._last_completed_at is not None
+            and time.monotonic() - self._last_completed_at
+            >= persistent_connection_idle_seconds
+        ):
+            self.close()
         if self._connection is not None and self._origin != origin:
             self.close()
         if self._connection is None:
@@ -3189,6 +3199,7 @@ class _PersistentAdapterConnection:
                     raise
                 remaining -= len(chunk)
                 remaining_timeout()
+            self._last_completed_at = time.monotonic()
         finally:
             close_response()
 
@@ -3196,10 +3207,42 @@ class _PersistentAdapterConnection:
 class _PersistentAdapterLanePool:
     """Keep one locked connection per source lane and bound retries to that lane."""
 
-    def __init__(self, lane_count: int) -> None:
+    def __init__(
+        self,
+        source_urls_or_count: list[str] | int,
+        width: int | None = None,
+    ) -> None:
+        if isinstance(source_urls_or_count, int):
+            self._source_urls = []
+            primary_urls = [None] * max(1, source_urls_or_count)
+        else:
+            self._source_urls = list(source_urls_or_count)
+            lane_count = len(self._source_urls) if width is None else width
+            if lane_count < 1 or lane_count > len(self._source_urls):
+                raise OSError("persistent adapter lane width is invalid")
+            primary_urls = self._source_urls[:lane_count]
+        self._primary_urls = primary_urls
         self._lanes = [
             (threading.Lock(), _PersistentAdapterConnection())
-            for _ in range(max(1, lane_count))
+            for _ in primary_urls
+        ]
+
+    @property
+    def slot_count(self) -> int:
+        return len(self._lanes)
+
+    def urls_for_lane(self, lane: int, name: str) -> list[str]:
+        if not self._source_urls:
+            raise OSError("persistent adapter lane URLs are unavailable")
+        primary = self._primary_urls[lane % self.slot_count]
+        assert isinstance(primary, str)
+        return [
+            f"{primary.rstrip('/')}/{name}",
+            *(
+                f"{source.rstrip('/')}/{name}"
+                for source in self._source_urls
+                if source != primary
+            ),
         ]
 
     def close(self) -> None:
@@ -4540,11 +4583,19 @@ def _stage_chunked_xor_adapter(
         **(status_metadata or {}),
         "source_connections": source_connection_count,
         "responsive_source_connections": len(lane_urls),
+        "available_source_lanes": len(lane_urls),
     }
+    download_streams = _configured_download_streams()
+    persistent_width = min(download_streams, len(lane_urls))
+    status_metadata["active_persistent_connections"] = (
+        persistent_width if full_zstd else 0
+    )
     output_path = temporary / _ADAPTER_FILES[1]
     config_path = temporary / _ADAPTER_FILES[0]
     persistent_pool = (
-        _PersistentAdapterLanePool(len(lane_urls)) if full_zstd else None
+        _PersistentAdapterLanePool(lane_urls, width=persistent_width)
+        if full_zstd
+        else None
     )
     _reject_symlink_path(output_path, "adapter output")
     _reject_symlink_path(config_path, "adapter configuration file")
@@ -4645,13 +4696,16 @@ def _stage_chunked_xor_adapter(
                 return
             _unlink_path(completed_path, "adapter completed proof")
 
-        chunk_lane = index % len(lane_urls)
-
         def lane_report(_lane: int, amount: int) -> None:
             report(chunk_lane, amount)
 
-        chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
-        chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
+        if persistent_pool is not None:
+            chunk_lane = index % persistent_pool.slot_count
+            chunk_urls = persistent_pool.urls_for_lane(chunk_lane, name)
+        else:
+            chunk_lane = index % len(lane_urls)
+            chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
+            chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
         transfer_started_at = time.monotonic()
         with timing_lock:
             if transfer_started is None or transfer_started_at < transfer_started:
@@ -4752,7 +4806,6 @@ def _stage_chunked_xor_adapter(
             },
         )
 
-    download_streams = _configured_download_streams()
     chunk_root_fd = _open_directory_nofollow(
         chunk_root,
         create=False,
