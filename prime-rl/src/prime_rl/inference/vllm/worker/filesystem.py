@@ -3076,6 +3076,10 @@ def _download_range(
                 cancel_event,
                 exc.code if typed_transport else None,
             ):
+                if typed_transport:
+                    raise _PersistentTransportError(
+                        "adapter persistent download retries exhausted"
+                    ) from exc
                 raise
         except OSError:
             if typed_transport:
@@ -5542,6 +5546,10 @@ def _download_with_parent(
                     raise
                 _check_deadline(deadline, cancel_event)
                 if attempt + 1 == attempt_limit:
+                    if typed_transport:
+                        raise _PersistentTransportError(
+                            "adapter persistent download retries exhausted"
+                        ) from exc
                     raise
                 sleep_for = (
                     lane_rotation_delay_seconds
@@ -5567,6 +5575,10 @@ def _download_with_parent(
                     raise
                 _check_deadline(deadline, cancel_event)
                 if attempt + 1 == attempt_limit:
+                    if typed_transport:
+                        raise _PersistentTransportError(
+                            "adapter persistent download retries exhausted"
+                        ) from exc
                     raise
                 sleep_for = (
                     1.0

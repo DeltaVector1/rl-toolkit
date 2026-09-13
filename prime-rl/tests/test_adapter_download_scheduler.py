@@ -515,6 +515,135 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
+    def test_typed_range_retry_exhaustion_wraps_only_retryable_http(self):
+        filesystem = load_filesystem_module()
+        payload = b"range-status"
+        old_sleep = filesystem.time.sleep
+        old_retries = filesystem._ADAPTER_LANE_RETRIES
+        filesystem.time.sleep = lambda _seconds: None
+        filesystem._ADAPTER_LANE_RETRIES = 3
+        try:
+            for status in (503, 400):
+                def always_status(request, _number, status=status):
+                    request.send_response(status)
+                    request.send_header("Content-Length", "0")
+                    request.send_header("Connection", "close")
+                    request.end_headers()
+                    request.close_connection = True
+                    return True
+
+                server, thread, handler = self._persistent_server(
+                    filesystem, payload, always_status
+                )
+                try:
+                    with tempfile.TemporaryDirectory() as temporary:
+                        chunks = Path(temporary) / "chunks"
+                        chunks.mkdir()
+                        parent_fd = filesystem._open_directory_nofollow(
+                            chunks, create=False, label="test chunks"
+                        )
+                        try:
+                            expected = (
+                                filesystem._PersistentTransportError
+                                if status == 503
+                                else filesystem.HTTPError
+                            )
+                            with self.subTest(status=status), self.assertRaises(expected) as raised:
+                                filesystem._download_range(
+                                    [
+                                        f"http://127.0.0.1:{server.server_address[1]}/range"
+                                    ],
+                                    0,
+                                    chunks / "part",
+                                    parent_fd,
+                                    0,
+                                    len(payload) - 1,
+                                    typed_transport=True,
+                                    per_request_timeout_seconds=1,
+                                )
+                            if status == 503:
+                                self.assertEqual(
+                                    str(raised.exception),
+                                    "adapter persistent download retries exhausted",
+                                )
+                                self.assertIsInstance(
+                                    raised.exception.__cause__, filesystem.HTTPError
+                                )
+                                self.assertEqual(raised.exception.__cause__.code, status)
+                            else:
+                                self.assertEqual(raised.exception.code, status)
+                            self.assertEqual(handler.requests, 3 if status == 503 else 1)
+                        finally:
+                            os.close(parent_fd)
+                finally:
+                    server.shutdown()
+                    thread.join(timeout=5)
+                    server.server_close()
+        finally:
+            filesystem.time.sleep = old_sleep
+            filesystem._ADAPTER_LANE_RETRIES = old_retries
+
+    def test_typed_sequential_retry_exhaustion_wraps_only_retryable_http(self):
+        filesystem = load_filesystem_module()
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_sleep = filesystem.time.sleep
+        old_retries = filesystem._ADAPTER_LANE_RETRIES
+        filesystem.time.sleep = lambda _seconds: None
+        filesystem._ADAPTER_LANE_RETRIES = 3
+        calls = []
+
+        def always_status(request, timeout, status):
+            calls.append((request.full_url, timeout))
+            raise filesystem.HTTPError(request.full_url, status, "test", None, None)
+
+        try:
+            for status in (503, 400):
+                calls.clear()
+                filesystem.urllib.request.urlopen = lambda request, timeout, status=status: always_status(
+                    request, timeout, status
+                )
+                with tempfile.TemporaryDirectory() as temporary:
+                    destination = Path(temporary) / "adapter"
+                    parent_fd = filesystem._open_directory_nofollow(
+                        Path(temporary), create=False, label="test download parent"
+                    )
+                    try:
+                        expected = (
+                            filesystem._PersistentTransportError
+                            if status == 503
+                            else filesystem.HTTPError
+                        )
+                        with self.subTest(status=status), self.assertRaises(expected) as raised:
+                            filesystem._download_with_parent(
+                                "http://lane/adapter",
+                                destination,
+                                expected_size=len(b"data"),
+                                expected_sha256=hashlib.sha256(b"data").hexdigest(),
+                                source_urls=["http://lane/adapter"],
+                                parallel_ranges=False,
+                                per_request_timeout_seconds=1,
+                                typed_transport=True,
+                                parent_fd=parent_fd,
+                            )
+                        if status == 503:
+                            self.assertEqual(
+                                str(raised.exception),
+                                "adapter persistent download retries exhausted",
+                            )
+                            self.assertIsInstance(
+                                raised.exception.__cause__, filesystem.HTTPError
+                            )
+                            self.assertEqual(raised.exception.__cause__.code, status)
+                        else:
+                            self.assertEqual(raised.exception.code, status)
+                        self.assertEqual(len(calls), 3 if status == 503 else 1)
+                    finally:
+                        os.close(parent_fd)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.sleep = old_sleep
+            filesystem._ADAPTER_LANE_RETRIES = old_retries
+
     def test_persistent_chunk_exhausted_timeout_is_typed_transport_failure(self):
         filesystem = load_filesystem_module()
         old_read_range = filesystem._PersistentAdapterConnection.read_range
