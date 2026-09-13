@@ -1156,6 +1156,90 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertEqual(relay_manifest["transport"], "full")
             self.assertIn("adapter_model.safetensors", relay_manifest["files"])
 
+    def test_legacy_full_stage_passes_bounded_request_timeout(self):
+        filesystem = load_filesystem_module()
+        source_url = "http://source/step_0"
+        config = b"{}\n"
+        model = b"legacy-model"
+        files = {
+            "adapter_config.json": {
+                "size": len(config),
+                "sha256": hashlib.sha256(config).hexdigest(),
+            },
+            "adapter_model.safetensors": {
+                "size": len(model),
+                "sha256": hashlib.sha256(model).hexdigest(),
+            },
+        }
+        source_manifest = {
+            "version": 1,
+            "kind": "lora-adapter",
+            "mode": "full",
+            "target_step": 0,
+            "files": [
+                {"name": name, **item} for name, item in files.items()
+            ],
+        }
+        transport = {"mode": "full", "source_manifest": source_manifest}
+        manifest = {"version": 1, "source_url": source_url, "files": files}
+        calls = []
+        statuses = []
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_streams = os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS")
+        old_reader = filesystem._read_chunked_xor_manifest
+        old_source_manifest = filesystem._source_manifest
+        old_reuse = filesystem._reuse_full_adapter_cache
+        old_download = filesystem._download_with_parent
+        old_status = filesystem._write_stage_status
+
+        def fake_download(_source, destination, **kwargs):
+            calls.append(kwargs)
+            payload = config if destination.name == "adapter_config.json" else model
+            destination.write_bytes(payload)
+            kwargs["progress"](0, len(payload))
+
+        def record_status(cache_root, value, **kwargs):
+            if "bytes_done" in value:
+                statuses.append(value["bytes_done"])
+            return old_status(cache_root, value, **kwargs)
+
+        filesystem._read_chunked_xor_manifest = lambda *_args, **_kwargs: transport
+        filesystem._source_manifest = lambda *_args, **_kwargs: manifest
+        filesystem._reuse_full_adapter_cache = lambda *_args, **_kwargs: False
+        filesystem._download_with_parent = fake_download
+        filesystem._write_stage_status = record_status
+        try:
+            with tempfile.TemporaryDirectory() as cache_dir:
+                os.environ["PRIME_LORA_CACHE_DIR"] = cache_dir
+                os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "1"
+                filesystem.stage_lora_adapter_files(source_url)
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            if old_streams is None:
+                os.environ.pop("PRIME_LORA_DOWNLOAD_STREAMS", None)
+            else:
+                os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = old_streams
+            filesystem._read_chunked_xor_manifest = old_reader
+            filesystem._source_manifest = old_source_manifest
+            filesystem._reuse_full_adapter_cache = old_reuse
+            filesystem._download_with_parent = old_download
+            filesystem._write_stage_status = old_status
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(
+            all(
+                call["per_request_timeout_seconds"]
+                == filesystem._configured_chunk_timeout()
+                for call in calls
+            )
+        )
+        self.assertEqual(statuses, sorted(statuses))
+        total_bytes = sum(item["size"] for item in files.values())
+        self.assertTrue(all(0 <= value <= total_bytes for value in statuses))
+
     def test_full_stage_corrupt_exact_size_progress_stays_bounded(self):
         filesystem = load_filesystem_module()
         with tempfile.TemporaryDirectory() as temporary:
