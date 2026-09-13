@@ -33,6 +33,11 @@ SPEC = importlib.util.spec_from_file_location("adapter_delta", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 adapter_delta = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(adapter_delta)
+SERVER_PATH = ROOT.parent / "training_ops/runtime/china/adapter_server.py"
+SERVER_SPEC = importlib.util.spec_from_file_location("adapter_server", SERVER_PATH)
+assert SERVER_SPEC is not None and SERVER_SPEC.loader is not None
+adapter_server = importlib.util.module_from_spec(SERVER_SPEC)
+SERVER_SPEC.loader.exec_module(adapter_server)
 
 
 def function_arguments(path: Path, name: str) -> list[str]:
@@ -491,7 +496,7 @@ def load_server_stage_method(stage_worker, publish_lock=None):
     return namespace["stage_lora_adapter"], FakeJSONResponse
 
 
-class QuietDirectoryHandler(http.server.SimpleHTTPRequestHandler):
+class QuietDirectoryHandler(adapter_server.RangeHandler):
     def log_message(self, *_args):
         return
 
