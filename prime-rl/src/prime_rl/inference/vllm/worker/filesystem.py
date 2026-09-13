@@ -96,6 +96,19 @@ def _adapter_step_from_source_url(source_url: str) -> int:
     return step
 
 
+def _adapter_url_entry(source_url: str, name: str) -> str:
+    parsed = urlsplit(source_url)
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            f"{parsed.path.rstrip('/')}/{name}",
+            parsed.query,
+            "",
+        )
+    )
+
+
 def _reject_symlink_path(path: Path, label: str = "adapter path") -> None:
     """Reject a path or any existing parent that is a symbolic link."""
     current = path
@@ -970,11 +983,10 @@ def _source_manifest(
     Older broadcasts have only the model checksum sidecar. Keep that fallback,
     but always return a local manifest with a size and digest for every file.
     """
-    source_root = source_url.rstrip("/")
     _check_deadline(deadline, cancel_event)
     value = published_manifest
     if value is None:
-        manifest_url = f"{source_root}/{_ADAPTER_MANIFEST}"
+        manifest_url = _adapter_url_entry(source_url, _ADAPTER_MANIFEST)
         try:
             value = json.loads(
                 _read_source_text(
@@ -1016,10 +1028,10 @@ def _source_manifest(
             raise OSError("adapter source manifest is missing an adapter file")
         return {"version": 1, "source_url": source_url, "files": files}
 
-    model_url = f"{source_root}/{_ADAPTER_FILES[1]}"
-    config_url = f"{source_root}/{_ADAPTER_FILES[0]}"
+    model_url = _adapter_url_entry(source_url, _ADAPTER_FILES[1])
+    config_url = _adapter_url_entry(source_url, _ADAPTER_FILES[0])
     digest_text = _read_source_text(
-        f"{source_root}/{_ADAPTER_DIGEST}",
+        _adapter_url_entry(source_url, _ADAPTER_DIGEST),
         deadline=deadline,
         cancel_event=cancel_event,
         max_bytes=_ADAPTER_MARKER_MAX_BYTES,
@@ -1134,7 +1146,7 @@ def _responsive_adapter_source_urls(
         return source_urls, 1
 
     def probe(candidate: str) -> bool:
-        config_url = f"{candidate.rstrip('/')}/{_ADAPTER_FILES[0]}"
+        config_url = _adapter_url_entry(candidate, _ADAPTER_FILES[0])
         try:
             with urllib.request.urlopen(
                 urllib.request.Request(config_url, method="HEAD"),
@@ -1247,12 +1259,11 @@ def _read_chunked_v1_manifest(
     cancel_event: threading.Event | None = None,
 ) -> dict[str, object] | None:
     """Read the exact version-one adapter transport manifest."""
-    source_root = source_url.rstrip("/")
     _check_deadline(deadline, cancel_event)
     try:
         value = json.loads(
             _read_source_text(
-                f"{source_root}/{_ADAPTER_MANIFEST}",
+                _adapter_url_entry(source_url, _ADAPTER_MANIFEST),
                 deadline=deadline,
                 cancel_event=cancel_event,
                 max_bytes=_ADAPTER_METADATA_MAX_BYTES,
@@ -1398,11 +1409,10 @@ def _read_chunked_linear_manifest(
     cancel_event: threading.Event | None = None,
 ) -> dict[str, object]:
     """Read and validate the version-two two-predecessor transport manifest."""
-    source_root = source_url.rstrip("/")
     try:
         value = json.loads(
             _read_source_text(
-                f"{source_root}/{_ADAPTER_MANIFEST}",
+                _adapter_url_entry(source_url, _ADAPTER_MANIFEST),
                 deadline=deadline,
                 cancel_event=cancel_event,
                 max_bytes=_ADAPTER_METADATA_MAX_BYTES,
@@ -1626,12 +1636,11 @@ def _read_chunked_xor_manifest(
     cancel_event: threading.Event | None = None,
 ) -> dict[str, object]:
     """Read a known exact adapter transport manifest."""
-    source_root = source_url.rstrip("/")
     _check_deadline(deadline, cancel_event)
     try:
         raw = json.loads(
             _read_source_text(
-                f"{source_root}/{_ADAPTER_MANIFEST}",
+                _adapter_url_entry(source_url, _ADAPTER_MANIFEST),
                 deadline=deadline,
                 cancel_event=cancel_event,
                 max_bytes=_ADAPTER_METADATA_MAX_BYTES,
@@ -1683,7 +1692,7 @@ def _bundle_identity(
         raise OSError("adapter bundle size differs from its chunks")
     parsed = urlsplit(source_url)
     bundle_url = urlunsplit(
-        (parsed.scheme, parsed.netloc, f"{parsed.path.rstrip('/')}/{path}", "", "")
+        (parsed.scheme, parsed.netloc, f"{parsed.path.rstrip('/')}/{path}", parsed.query, "")
     )
     return {"path": path, "size": size, "sha256": digest, "url": bundle_url}
 
@@ -3070,6 +3079,8 @@ def _download_bundle_range(
                 raise
         except _BundleNetworkError:
             pass
+        except URLError:
+            pass
         except (TimeoutError, socket.timeout, ConnectionError):
             pass
         else:
@@ -3687,7 +3698,7 @@ def _stage_chunked_linear_adapter(
     with reconstruct_lock:
         transfer_started = time.monotonic()
     download(
-        f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+        _adapter_url_entry(source_url, _ADAPTER_FILES[0]),
         config_incoming_path,
         expected_size=config_size,
         expected_sha256=config_sha256,
@@ -3785,7 +3796,7 @@ def _stage_chunked_linear_adapter(
             def lane_report(_lane: int, amount: int) -> None:
                 report(chunk_lane, amount)
 
-            chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
+            chunk_urls = [_adapter_url_entry(lane_url, name) for lane_url in lane_urls]
             chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
             incoming_path = chunk_path.with_name(f".{chunk_path.name}.incoming")
             transfer_started_at = time.monotonic()
@@ -4338,7 +4349,7 @@ def _stage_chunked_xor_adapter(
             if transfer_started is None or config_transfer_started < transfer_started:
                 transfer_started = config_transfer_started
         download(
-            f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+            _adapter_url_entry(source_url, _ADAPTER_FILES[0]),
             config_path,
             expected_size=(config_size if isinstance(config_size, int) else None),
             expected_sha256=config_sha256,
@@ -4421,7 +4432,7 @@ def _stage_chunked_xor_adapter(
         def lane_report(_lane: int, amount: int) -> None:
             report(chunk_lane, amount)
 
-        chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
+        chunk_urls = [_adapter_url_entry(lane_url, name) for lane_url in lane_urls]
         chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
         transfer_started_at = time.monotonic()
         with timing_lock:
@@ -4556,7 +4567,7 @@ def _stage_chunked_xor_adapter(
             if transfer_started is None or config_transfer_started < transfer_started:
                 transfer_started = config_transfer_started
         download(
-            f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+            _adapter_url_entry(source_url, _ADAPTER_FILES[0]),
             config_path,
             expected_size=(config_size if isinstance(config_size, int) else None),
             expected_sha256=config_sha256,
@@ -6084,11 +6095,13 @@ class FileSystemWeightUpdateWorker(Worker):
         self,
         source_url: str,
         require_delta: bool = False,
+        require_bundle: bool = False,
         policy_step: int | None = None,
     ) -> None:
         stage_lora_adapter_files(
             source_url,
             require_delta=require_delta,
+            require_bundle=require_bundle,
             policy_step=policy_step,
         )
 

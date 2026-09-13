@@ -472,6 +472,14 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
         require_delta = request_data.get("require_delta", False)
         if not isinstance(require_delta, bool):
             return JSONResponse(content={"error": "require_delta must be a boolean"}, status_code=400)
+        require_bundle = request_data.get("require_bundle", False)
+        if not isinstance(require_bundle, bool):
+            return JSONResponse(content={"error": "require_bundle must be a boolean"}, status_code=400)
+        if require_delta and require_bundle:
+            return JSONResponse(
+                content={"error": "require_delta and require_bundle are mutually exclusive"},
+                status_code=400,
+            )
         prefetched = request_data.get("prefetched", False)
         if not isinstance(prefetched, bool):
             return JSONResponse(content={"error": "prefetched must be a boolean"}, status_code=400)
@@ -495,6 +503,7 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
                             return {
                                 "lora_path": source_url,
                                 "require_delta": require_delta,
+                                "require_bundle": require_bundle,
                                 "policy_step": policy_step,
                             }
 
@@ -604,11 +613,24 @@ async def stage_lora_adapter(raw_request: Request):
     require_delta = data.get("require_delta", False)
     if not isinstance(require_delta, bool):
         return JSONResponse({"error": "require_delta must be a boolean"}, status_code=400)
+    require_bundle = data.get("require_bundle", False)
+    if not isinstance(require_bundle, bool):
+        return JSONResponse({"error": "require_bundle must be a boolean"}, status_code=400)
+    if require_delta and require_bundle:
+        return JSONResponse(
+            {"error": "require_delta and require_bundle are mutually exclusive"},
+            status_code=400,
+        )
     requested_step = data.get("policy_step")
     if requested_step is not None and (
         type(requested_step) is not int or requested_step <= 0
     ):
         return JSONResponse({"error": "policy_step must be a positive integer"}, status_code=400)
+    if require_bundle and requested_step is not None:
+        return JSONResponse(
+            {"error": "policy_step is invalid for bundle adapter staging"},
+            status_code=400,
+        )
     if require_delta:
         if requested_step is None:
             return JSONResponse(
@@ -634,6 +656,11 @@ async def stage_lora_adapter(raw_request: Request):
         policy_step = None
         stage_limit = None
     requested_timeout = data.get("stage_timeout_seconds")
+    if require_bundle and requested_timeout is not None:
+        return JSONResponse(
+            {"error": "stage_timeout_seconds is invalid for bundle adapter staging"},
+            status_code=400,
+        )
     configured_timeout = _delta_stage_timeout_s() if require_delta else None
     if requested_timeout is not None:
         if (
@@ -792,6 +819,7 @@ async def stage_lora_adapter(raw_request: Request):
         request = {
             "source_url": source_url,
             "require_delta": require_delta,
+            "require_bundle": require_bundle,
             "policy_step": policy_step,
             "stage_timeout_seconds": stage_timeout if require_delta else None,
             "stage_id": stage_id,

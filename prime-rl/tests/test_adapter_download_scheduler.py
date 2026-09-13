@@ -64,6 +64,85 @@ class DownloadSchedulerTest(unittest.TestCase):
                 {"source_manifest": {}, "chunks": []},
             )
 
+    def test_bundle_identity_preserves_query_and_retries_url_error(self):
+        filesystem = load_filesystem_module()
+        payload = b"bundle-wire"
+        item = {
+            "wire_size": len(payload),
+            "wire_sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        transport = {
+            "source_manifest": {
+                "bundle": {
+                    "path": ".adapter-transport-bundle",
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            },
+            "chunks": [item],
+        }
+        bundle = filesystem._bundle_identity(
+            "http://source/step_1?token=abc",
+            transport,
+        )
+        self.assertEqual(
+            bundle["url"],
+            "http://source/step_1/.adapter-transport-bundle?token=abc",
+        )
+
+        class Response(io.BytesIO):
+            status = 206
+
+            def __init__(self, value):
+                super().__init__(value)
+                self.headers = {
+                    "Content-Length": str(len(value)),
+                    "Content-Range": f"bytes 0-{len(value) - 1}/{len(payload)}",
+                    "ETag": f'"{hashlib.sha256(payload).hexdigest()}"',
+                }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        calls = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            if len(calls) == 1:
+                raise filesystem.URLError("connection reset")
+            return Response(payload)
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_sleep = filesystem.time.sleep
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunk_root = root / "chunks"
+                chunk_root.mkdir()
+                destination = chunk_root / "chunk"
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunk_root, create=False, label="test bundle chunks"
+                )
+                try:
+                    filesystem._download_bundle_range(
+                        bundle,
+                        item,
+                        destination,
+                        parent_fd,
+                    )
+                finally:
+                    os.close(parent_fd)
+                self.assertEqual(destination.read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.sleep = old_sleep
+        self.assertEqual(calls, [bundle["url"], bundle["url"]])
+
     def test_bundle_range_resume_and_wire_identity(self):
         filesystem = load_filesystem_module()
         payload = b"prefix-wire-suffix"

@@ -639,7 +639,8 @@ class Orchestrator:
                     )
 
             for sync_version in sync_versions:
-                require_delta = self.lora_name is not None and sync_version > 0
+                require_bundle = bool(getattr(config.weight_broadcast, "require_bundle", False))
+                require_delta = self.lora_name is not None and sync_version > 0 and not require_bundle
                 startup_delta_deadline = None
                 if config.weight_broadcast.type == "nixl":
                     weights_path = None
@@ -665,14 +666,15 @@ class Orchestrator:
                     source_weights_path = inference_weight_path(
                         config, weights_path, self.lora_name
                     )
-                    _verify_startup_adapter_delta(
-                        config,
-                        self.lora_name,
-                        sync_version,
-                        weights_path,
-                        source_weights_path if isinstance(source_weights_path, str) else None,
-                        deadline=startup_delta_deadline,
-                    )
+                    if not require_bundle:
+                        _verify_startup_adapter_delta(
+                            config,
+                            self.lora_name,
+                            sync_version,
+                            weights_path,
+                            source_weights_path if isinstance(source_weights_path, str) else None,
+                            deadline=startup_delta_deadline,
+                        )
                     if require_delta:
                         startup_delta_deadline = (
                             time.monotonic() + adapter_stage_limit_seconds(sync_version)
@@ -711,6 +713,7 @@ class Orchestrator:
                                 self.policy_inference.admin_clients,
                                 weights_path,
                                 require_delta=require_delta,
+                                require_bundle=require_bundle,
                                 policy_step=sync_version if require_delta else None,
                                 delta_deadline=startup_delta_deadline,
                                 origin_base_urls=self.policy_inference.adapter_origin_base_urls,
@@ -747,6 +750,7 @@ class Orchestrator:
                     lora_name=self.lora_name,
                     step=sync_version,
                     require_delta=require_delta,
+                    require_bundle=require_bundle,
                     prefetched=prefetched,
                     expected_adapter_identity=adapter_identity,
                 )

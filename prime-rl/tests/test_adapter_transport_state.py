@@ -374,13 +374,18 @@ def load_server_stage_method(stage_worker, publish_lock=None):
 
             def run_stage():
                 try:
+                    stage_kwargs = {
+                        "require_delta": request["require_delta"],
+                        "stage_timeout_seconds": request.get("stage_timeout_seconds"),
+                        "policy_step": request.get("policy_step"),
+                        "cancel_event": self.stopped,
+                        "committed_event": threading.Event(),
+                    }
+                    if request.get("require_bundle"):
+                        stage_kwargs["require_bundle"] = True
                     destination = stage_worker(
                         request["source_url"],
-                        require_delta=request["require_delta"],
-                        stage_timeout_seconds=request.get("stage_timeout_seconds"),
-                        policy_step=request.get("policy_step"),
-                        cancel_event=self.stopped,
-                        committed_event=threading.Event(),
+                        **stage_kwargs,
                     )
                     stage_path["value"] = Path(destination)
                     stage_state.update(
@@ -1433,13 +1438,13 @@ class AdapterTransportStateTest(unittest.TestCase):
         )
         self.assertEqual(
             function_arguments(worker, "stage_lora_adapter"),
-            ["self", "source_url", "require_delta", "policy_step"],
+            ["self", "source_url", "require_delta", "require_bundle", "policy_step"],
         )
         for path in (client, server, watcher):
             self.assertIn("require_delta", path.read_text(encoding="utf-8"))
         worker_source = worker.read_text(encoding="utf-8")
         self.assertIn("delta adapter transport is required", worker_source)
-        self.assertIn('chunk_urls = [f"{lane_url.rstrip(\'/\')}/{name}" for lane_url in lane_urls]', worker_source)
+        self.assertIn("chunk_urls = [_adapter_url_entry(lane_url, name) for lane_url in lane_urls]", worker_source)
         self.assertIn("chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]", worker_source)
         self.assertIn("source_urls=chunk_urls", worker_source)
         self.assertIn("parallel_ranges=False", worker_source)
@@ -1702,6 +1707,61 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertFalse(ready.exists())
             time.sleep(0.02)
             self.assertFalse(ready.exists())
+
+    def test_server_forwards_explicit_bundle_requirement_to_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            calls = []
+
+            def stage_worker(
+                _source_url,
+                *,
+                require_delta,
+                require_bundle,
+                stage_timeout_seconds,
+                policy_step,
+                cancel_event,
+                committed_event,
+            ):
+                calls.append(
+                    (require_delta, require_bundle, stage_timeout_seconds, policy_step)
+                )
+                return Path(temporary)
+
+            stage_method, response_type = load_server_stage_method(stage_worker)
+
+            class Request:
+                async def json(self):
+                    return {
+                        "lora_path": "http://source/step_1",
+                        "require_delta": False,
+                        "require_bundle": True,
+                    }
+
+                async def is_disconnected(self):
+                    return False
+
+            response = asyncio.run(stage_method(Request()))
+            self.assertIsInstance(response, dict)
+            self.assertEqual(response["status"], "ok")
+            self.assertEqual(calls, [(False, True, None, None)])
+
+    def test_server_rejects_bundle_and_delta_together(self):
+        def stage_worker(**_kwargs):
+            raise AssertionError("invalid transport requirements reached the worker")
+
+        stage_method, response_type = load_server_stage_method(stage_worker)
+
+        class Request:
+            async def json(self):
+                return {
+                    "lora_path": "http://source/step_1",
+                    "require_delta": True,
+                    "require_bundle": True,
+                }
+
+        response = asyncio.run(stage_method(Request()))
+        self.assertIsInstance(response, response_type)
+        self.assertEqual(response.status_code, 400)
 
     def test_publish_wins_timeout_race_returns_success(self):
         for _ in range(10):

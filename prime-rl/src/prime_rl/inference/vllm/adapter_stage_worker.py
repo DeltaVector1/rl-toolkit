@@ -21,6 +21,7 @@ def main() -> None:
         stage_id = request.get("stage_id")
         source_url = request.get("source_url")
         require_delta = request.get("require_delta", False)
+        require_bundle = request.get("require_bundle", False)
         policy_step = request.get("policy_step")
         stage_timeout = request.get("stage_timeout_seconds")
         if not isinstance(stage_id, str) or not stage_id:
@@ -29,6 +30,12 @@ def main() -> None:
             raise ValueError("source_url must be an HTTP URL")
         if type(require_delta) is not bool:
             raise ValueError("require_delta must be a boolean")
+        if type(require_bundle) is not bool:
+            raise ValueError("require_bundle must be a boolean")
+        if require_delta and require_bundle:
+            raise ValueError("require_delta and require_bundle are mutually exclusive")
+        if require_bundle and (policy_step is not None or stage_timeout is not None):
+            raise ValueError("policy_step and stage_timeout_seconds are invalid for bundle staging")
         if policy_step is not None and (type(policy_step) is not int or policy_step <= 0):
             raise ValueError("policy_step must be a positive integer")
         if stage_timeout is not None and (
@@ -44,6 +51,7 @@ def main() -> None:
             destination = stage_lora_adapter_files(
                 source_url,
                 require_delta=require_delta,
+                require_bundle=require_bundle,
                 stage_timeout_seconds=stage_timeout,
                 policy_step=policy_step,
             )
