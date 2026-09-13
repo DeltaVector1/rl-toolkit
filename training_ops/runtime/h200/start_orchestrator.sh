@@ -1639,6 +1639,24 @@ peer_tunnel_supervisor_child_identity() {
   peer_snapshot_child_start=$expected_start
 }
 
+peer_tunnel_wait_child_identity() {
+  local supervisor_pid=$1 shape=$2 marker=$3
+  shift 3
+  local child_status
+  for _ in $(seq 1 10); do
+    peer_snapshot_child_pid=
+    peer_snapshot_child_command=
+    peer_snapshot_child_start=
+    if peer_tunnel_supervisor_child_identity "$supervisor_pid" "$shape" "$marker" "$@"; then
+      return 0
+    fi
+    child_status=$?
+    [ "$child_status" -eq 1 ] || return "$child_status"
+    repair_sleep 1 || return 1
+  done
+  return 1
+}
+
 peer_tunnel_children_unchanged() {
   local marker child_pid child_start child_command supervisor_pid supervisor_start supervisor_command
   local current_command current_start current_ppid expected_forward
@@ -2981,6 +2999,8 @@ peer_tunnel_supervisors_ready() {
       peer_tunnel_lane_supervisor "$marker" "${lane_forwards[@]}" || return 1
       matching_pid=$peer_ready_pid
       matching_command=$peer_ready_command
+      peer_tunnel_wait_child_identity "$matching_pid" current "$marker" \
+        "${lane_forwards[@]}" || return 1
     fi
     supervisor_start=$(process_start_time "$matching_pid") || return 1
     peer_snapshot_child_pid=
@@ -2999,7 +3019,7 @@ peer_tunnel_supervisors_ready() {
       peer_tunnel_lane_supervisor "$marker" "${lane_forwards[@]}" || return 1
       matching_pid=$peer_ready_pid
       matching_command=$peer_ready_command
-      peer_tunnel_supervisor_child_identity "$matching_pid" current "$marker" \
+      peer_tunnel_wait_child_identity "$matching_pid" current "$marker" \
         "${lane_forwards[@]}" || return 1
       supervisor_start=$(process_start_time "$matching_pid") || return 1
     fi

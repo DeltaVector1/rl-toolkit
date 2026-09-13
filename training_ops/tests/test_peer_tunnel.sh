@@ -596,6 +596,7 @@ PATH="$tmp/bin:$PATH" peer_tunnel_connection lora-0 \
   -R "127.0.0.1:18100:127.0.0.1:$relay_port" \
   -R "127.0.0.1:18101:127.0.0.1:$relay_port"
 test "$(grep -F -c -- '-- -10000' "$dead_lane_kill")" -eq 1
+test "$(grep -F -c -- '-R 127.0.0.1:18100:127.0.0.1:' "$dead_lane_log")" -eq 1
 unset -f kill
 unset PEER_TEST_LOG PEER_QUERY PEER_CHILDREN_OUTPUT PEER_GROUP_COMMANDS
 
