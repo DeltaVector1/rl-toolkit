@@ -658,11 +658,12 @@ class Orchestrator:
                         )
                 else:
                     check_exists = config.weight_broadcast.type == "filesystem"
-                    wait_timeout = (
+                    configured_wait = (
                         config.ckpt.wait_for_weights_timeout
                         if config.ckpt
-                        else STARTUP_WEIGHT_WAIT_TIMEOUT_S
+                        else None
                     )
+                    wait_timeout = configured_wait or STARTUP_WEIGHT_WAIT_TIMEOUT_S
                     weights_path = get_weight_dir(
                         config.output_dir,
                         sync_version,

@@ -774,6 +774,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         stage = setup.index("await stage_lora_adapter(", initial_sync)
         dispatcher = setup.index("self.dispatcher = RolloutDispatcher(")
         self.assertIn('config.weight_broadcast.type == "filesystem"', setup[initial_sync:stage])
+        self.assertIn("configured_wait or STARTUP_WEIGHT_WAIT_TIMEOUT_S", setup[initial_sync:stage])
         self.assertLess(stage, dispatcher)
 
     def test_filesystem_lora_resume_stages_saved_policies_and_loads_only_the_last(self):
