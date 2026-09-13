@@ -487,6 +487,7 @@ peer_tunnel_connection() {
     -o ExitOnForwardFailure=yes
     -o ServerAliveInterval=10
     -o ServerAliveCountMax=3
+    -o 'ChannelTimeout=*-tcpip=45s'
     -o TCPKeepAlive=yes
     -o IPQoS=none
     -i "$peer_ssh_identity"
@@ -650,6 +651,7 @@ peer_tunnel_ssh_args_match() {
   local command_line=$1 shape=$2
   local index forward_count forward_start target_index remaining
   local -a command_args expected_args
+  command_line=$(sed 's/\\\*/\*/g' <<<"$command_line")
   expected_args=(
     -NT
     -o BatchMode=yes
@@ -658,6 +660,7 @@ peer_tunnel_ssh_args_match() {
     -o ExitOnForwardFailure=yes
     -o ServerAliveInterval=10
     -o ServerAliveCountMax=3
+    -o 'ChannelTimeout=*-tcpip=45s'
     -o TCPKeepAlive=yes
     -o IPQoS=none
     -i "$peer_ssh_identity"
@@ -940,6 +943,7 @@ china_tunnel_ssh_args_match() {
   local command_line=$1 shape=$2
   local source_port forward_count index
   local -a command_args expected_args
+  command_line=$(sed 's/\\\*/\*/g' <<<"$command_line")
   expected_args=(
     -NT
     -o BatchMode=yes
@@ -947,6 +951,7 @@ china_tunnel_ssh_args_match() {
     -o ExitOnForwardFailure=yes
     -o ServerAliveInterval=10
     -o ServerAliveCountMax=3
+    -o 'ChannelTimeout=*-tcpip=45s'
     -o TCPKeepAlive=yes
     -o IPQoS=none
     -o Compression=no
@@ -1289,6 +1294,7 @@ china_tunnel_connection() {
     -o ExitOnForwardFailure=yes
     -o ServerAliveInterval=10
     -o ServerAliveCountMax=3
+    -o 'ChannelTimeout=*-tcpip=45s'
     -o TCPKeepAlive=yes
     -o IPQoS=none
     -o Compression=no
