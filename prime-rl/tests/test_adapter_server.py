@@ -281,6 +281,18 @@ class AdapterServerTest(unittest.TestCase):
                 self.assertTrue(all(not request.is_alive() for request in requests))
                 self.assertEqual(calls.count("adapter_config.json"), 1)
 
+                chunk_path = step / "adapter_model.safetensors.transport-predictive-00000.bin"
+                original_chunk = chunk_path.read_bytes()
+                replaced_chunk = step / ".replaced-chunk"
+                replaced_chunk.write_bytes(b"X" * len(chunk))
+                os.replace(replaced_chunk, chunk_path)
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(url, timeout=5)
+                self.assertEqual(raised.exception.code, 500)
+                restored_chunk = step / ".restored-chunk"
+                restored_chunk.write_bytes(original_chunk)
+                os.replace(restored_chunk, chunk_path)
+
                 original_identity = adapter_server._identity_from_published_directory
                 replaced = False
 
@@ -403,6 +415,102 @@ class AdapterServerTest(unittest.TestCase):
                 ".identity.json",
             ):
                 self.assertEqual((destination / name).stat().st_mode & 0o777, 0o600)
+
+    def test_private_cache_links_without_reading_adapter_payload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "cache" / "step_1"
+            source.mkdir()
+            (root / "cache").mkdir(mode=0o700)
+            config = source / adapter_server.adapter_config_name
+            weights = source / adapter_server.adapter_weights_name
+            config.write_bytes(b"{}")
+            weights.write_bytes(b"weights")
+            identity = {
+                "step": 1,
+                "config_size": 2,
+                "config_sha256": hashlib.sha256(b"{}").hexdigest(),
+                "weights_size": 7,
+                "weights_sha256": hashlib.sha256(b"weights").hexdigest(),
+            }
+            original_read = adapter_server.os.read
+            adapter_server.os.read = lambda *_args: (_ for _ in ()).throw(
+                AssertionError("private cache staging must not read payload bytes")
+            )
+            try:
+                adapter_server._link_cache_entry(source, identity, destination)
+            finally:
+                adapter_server.os.read = original_read
+            self.assertEqual(config.stat().st_ino, (destination / config.name).stat().st_ino)
+            self.assertEqual(weights.stat().st_ino, (destination / weights.name).stat().st_ino)
+            self.assertEqual(weights.stat().st_mode & 0o777, 0o600)
+
+    def test_atomic_replace_rejects_source_identity_race(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "build" / "chunk"
+            destination = root / "target" / "chunk"
+            source.parent.mkdir()
+            destination.parent.mkdir()
+            source.write_bytes(b"before")
+            identity = adapter_server._stat_identity(source)
+            original_replace = adapter_server.os.replace
+
+            def replace_after_mutation(*args, **kwargs):
+                source.write_bytes(b"raced!!")
+                return original_replace(*args, **kwargs)
+
+            adapter_server.os.replace = replace_after_mutation
+            try:
+                with self.assertRaises(adapter_server.UpgradeError):
+                    adapter_server._replace_from_dirs(source, destination, identity)
+            finally:
+                adapter_server.os.replace = original_replace
+            self.assertEqual(destination.read_bytes(), b"raced!!")
+
+    def test_existing_v2_manifest_with_missing_chunk_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            step = Path(temporary) / "step_2"
+            step.mkdir()
+            config = b"{}\n"
+            weights = b"weights"
+            (step / adapter_server.stable_name).write_text("stable\n", encoding="utf-8")
+            (step / adapter_server.adapter_config_name).write_bytes(config)
+            (step / adapter_server.adapter_weights_name).write_bytes(weights)
+            digest = hashlib.sha256(weights).hexdigest()
+            (step / adapter_server.adapter_digest_name).write_text(digest + "\n", encoding="ascii")
+            (step / adapter_server.adapter_manifest_name).write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "kind": "lora-adapter",
+                        "target_step": 2,
+                        "files": [
+                            {
+                                "name": adapter_server.adapter_config_name,
+                                "size": len(config),
+                                "sha256": hashlib.sha256(config).hexdigest(),
+                            },
+                            {
+                                "name": adapter_server.adapter_weights_name,
+                                "size": len(weights),
+                                "sha256": digest,
+                            },
+                        ],
+                        "chunks": [
+                            {
+                                "file": f"{adapter_server.adapter_weights_name}.transport-predictive-00000.bin",
+                                "wire_size": 5,
+                                "wire_sha256": "0" * 64,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter_server.UpgradeError):
+                adapter_server._identity_from_published_directory(step, 2, cache=False)
 
     def test_old_stable_manifest_is_not_upgraded_after_newer_step_exists(self):
         run_path = "run_glm-1/broadcasts"

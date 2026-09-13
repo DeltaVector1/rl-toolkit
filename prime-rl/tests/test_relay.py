@@ -1,7 +1,9 @@
 import hashlib
+import io
 import importlib.util
 import json
 import sys
+import socket
 import tempfile
 import threading
 import unittest
@@ -187,6 +189,44 @@ class RelayTest(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=16) as workers:
             results = list(workers.map(lambda _value: fetch(), range(32)))
         self.assertEqual(results, [b"compressed-delta"] * 32)
+
+    def test_truncate_after_validation_closes_without_second_response(self):
+        original_load = relay._load_file
+
+        def truncated_load(*args, **kwargs):
+            selected = original_load(*args, **kwargs)
+            selected.source.close()
+            return relay.RelayFile(
+                path=selected.path,
+                size=selected.size,
+                sha256=selected.sha256,
+                source=io.BytesIO(b""),
+            )
+
+        relay._load_file = truncated_load
+        connection = socket.create_connection(
+            ("127.0.0.1", self.server.server_address[1]), timeout=5
+        )
+        try:
+            connection.sendall(
+                b"GET /glm-1/run_glm-1/broadcasts/step_1/chunk-0 HTTP/1.1\r\n"
+                b"Host: 127.0.0.1:18100\r\nConnection: close\r\n\r\n"
+            )
+            connection.settimeout(5)
+            response = bytearray()
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+        finally:
+            connection.close()
+            relay._load_file = original_load
+        headers, body = bytes(response).split(b"\r\n\r\n", 1)
+        self.assertIn(b"200 OK", headers)
+        self.assertIn(b"Content-Length: 16", headers)
+        self.assertLess(len(body), 16)
+        self.assertNotIn(b"HTTP/1", body)
 
     def test_does_not_serve_unknown_or_unready_data(self):
         with self.assertRaises(HTTPError) as error:
