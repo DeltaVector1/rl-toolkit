@@ -114,7 +114,11 @@ set -euo pipefail
 if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
   pid=${4:?missing process id}
   if [ "${TUNNEL_OWNER_PID:-}" = "$pid" ]; then
-    cat "${TUNNEL_OWNER_COMMAND:?}"
+    if [ -f "${PEER_MUTATE_MARKER:-}" ] && [ -r "${PEER_MUTATED_COMMAND:-}" ]; then
+      cat "$PEER_MUTATED_COMMAND"
+    else
+      cat "${TUNNEL_OWNER_COMMAND:?}"
+    fi
   elif [ "${TUNNEL_EXTRA_OWNER_PID:-}" = "$pid" ]; then
     cat "${TUNNEL_OWNER_COMMAND:?}"
   elif [ "${TUNNEL_SUPERVISOR_PID:-}" = "$pid" ]; then
@@ -137,8 +141,12 @@ if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
     lane=$((pid - 10000))
     grep -E "done # (china|peer)-tunnel-lora-${lane}[[:space:]]*$" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
   else
-    query=$(<"${PEER_QUERY:?}")
-    grep -F -- "$query" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
+    if [ -r "${PEER_GROUP_COMMANDS:-}" ]; then
+      sed -n '1{s/^[0-9][0-9]* //;p;}' "$PEER_GROUP_COMMANDS"
+    else
+      query=$(<"${PEER_QUERY:?}")
+      grep -F -- "$query" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
+    fi
   fi
 elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "ppid=" ]; then
   pid=${4:?missing process id}
@@ -157,6 +165,8 @@ elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "pgid=" ]; then
   else
     echo "$4"
   fi
+elif [ "${1:-}" = "-eo" ] && [ "${2:-}" = "pid=,ppid=,args=" ]; then
+  [ -r "${PEER_CHILDREN_OUTPUT:-}" ] && cat "$PEER_CHILDREN_OUTPUT"
 elif [ "${1:-}" = "-eo" ]; then
   if [ "${2:-}" = "pid=,args=" ] && [ -n "${PEER_INVENTORY_COUNTER:-}" ]; then
     inventory_count=$(cat "$PEER_INVENTORY_COUNTER" 2>/dev/null || echo 0)
@@ -231,8 +241,27 @@ repair_sleep() {
 }
 repair_register_tunnel() { :; }
 repair_fail() { echo "adapter tunnel reconciliation failed: $*" >&2; exit 1; }
+process_start_time() { printf 'fixture-start-%s\n' "$1"; }
+process_identity_matches() {
+  local pid=$1 expected_pgid=$2 expected_start=$3 expected_command=$4
+  local current_pgid current_start current_command
+  current_pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
+  [ "$current_pgid" = "$expected_pgid" ] || return 1
+  current_start=$(process_start_time "$pid") || return 1
+  [ "$current_start" = "$expected_start" ] || return 1
+  current_command=$(ps -o args= -p "$pid" 2>/dev/null | sed 's/[[:space:]]*$//' || true)
+  [ "$current_command" = "$expected_command" ]
+}
 
 lora_source_ports=("${configured_lora_ports[@]}")
+declare -A peer_supervisor_pids=()
+declare -A peer_supervisor_starts=()
+declare -A peer_supervisor_commands=()
+declare -A peer_child_pids=()
+declare -A peer_child_starts=()
+declare -A peer_child_commands=()
+declare -A peer_child_shapes=()
+declare -A peer_child_forwards=()
 expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
 expected_peer_lines=$((expected_lanes + 1))
 peer_enabled=1
@@ -311,6 +340,22 @@ done
 # A second launcher invocation finds the exact API and lane signatures.
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
 test "$(wc -l <"$log")" -eq "$expected_peer_lines"
+
+# A failed ownership/kill proof stops reconciliation before a replacement can
+# start. The stale lane remains in the fixture so the failure is observable.
+stale_peer_command=${peer_supervisor_command/ChannelTimeout=\*-tcpip=45s/ChannelTimeout=\*-tcpip=60s}
+printf '%s\n' "$stale_peer_command" >>"$log"
+peer_kill_owned_definition=$(declare -f peer_kill_owned)
+peer_kill_owned() { return 1; }
+before_peer_lines=$(wc -l <"$log")
+set +e
+PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
+peer_repair_status=$?
+set -e
+test "$peer_repair_status" -ne 0
+test "$(wc -l <"$log")" -eq "$before_peer_lines"
+eval "$peer_kill_owned_definition"
+sed -i '$d' "$log"
 
 china_log="$tmp/china-tunnel.log"
 trainer_ssh_target=china-trainer
@@ -461,6 +506,17 @@ unset CHINA_PROC_FIXTURES TUNNEL_SS_OUTPUT
 china_legacy_cleanup_pids=()
 china_legacy_cleanup_pgids=()
 china_legacy_cleanup_orphan_pids=()
+
+# Orphan cleanup failure must stop the wait instead of allowing replacement
+# lanes to start.
+china_orphan_cleanup_definition=$(declare -f china_tunnel_remove_orphan_children)
+china_tunnel_remove_orphan_children() { return 1; }
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_wait_legacy_clear
+orphan_cleanup_status=$?
+set -e
+test "$orphan_cleanup_status" -ne 0
+eval "$china_orphan_cleanup_definition"
 
 stale_listener_output="$tmp/stale-listeners"
 : >"$stale_listener_output"
@@ -993,18 +1049,76 @@ unset PEER_TEST_LOG PEER_QUERY
 peer_race_first="$tmp/peer-race-first"
 peer_race_second="$tmp/peer-race-second"
 peer_race_counter="$tmp/peer-race-counter"
+peer_race_children="$tmp/peer-race-children"
 printf '%s\n' "$peer_supervisor_command" >"$peer_race_first"
 printf '%s\n' "$peer_supervisor_command" "$peer_extra_command" >"$peer_race_second"
 printf '0\n' >"$peer_race_counter"
+printf '%s\n' "10001 10000 $peer_exact_command" >"$peer_race_children"
 export PEER_TEST_LOG="$peer_race_first" PEER_QUERY="$query" \
-  PEER_INVENTORY_COUNTER="$peer_race_counter" PEER_INVENTORY_SECOND="$peer_race_second"
+  PEER_INVENTORY_COUNTER="$peer_race_counter" PEER_INVENTORY_SECOND="$peer_race_second" \
+  PEER_CHILDREN_OUTPUT="$peer_race_children"
 set +e
 PATH="$tmp/bin:$PATH" peer_tunnel_supervisors_ready
 peer_race_status=$?
 set -e
 test "$peer_race_status" -ne 0
 test "$(<"$peer_race_counter")" -ge 2
-unset PEER_TEST_LOG PEER_QUERY PEER_INVENTORY_COUNTER PEER_INVENTORY_SECOND
+unset PEER_TEST_LOG PEER_QUERY PEER_INVENTORY_COUNTER PEER_INVENTORY_SECOND PEER_CHILDREN_OUTPUT
+peer_supervisor_pids=()
+peer_supervisor_starts=()
+peer_supervisor_commands=()
+peer_child_pids=()
+peer_child_starts=()
+peer_child_commands=()
+peer_child_shapes=()
+peer_child_forwards=()
+
+# Readiness rejects two direct SSH children under one supervisor.
+printf '%s\n' "4242 4241 $peer_exact_command" "4243 4241 $peer_exact_command" >"$tmp/extra-peer-children"
+export PEER_CHILDREN_OUTPUT="$tmp/extra-peer-children"
+set +e
+PATH="$tmp/bin:$PATH" peer_tunnel_supervisor_child_identity 4241 current peer-tunnel-lora-0 \
+  -R 127.0.0.1:18100:127.0.0.1:"$relay_port" \
+  -R 127.0.0.1:18101:127.0.0.1:"$relay_port"
+extra_peer_child_status=$?
+set -e
+test "$extra_peer_child_status" -ne 0
+unset PEER_CHILDREN_OUTPUT
+
+# A remote reverse-port response is not enough if the local SSH child changes
+# during the probe.
+peer_supervisor_pids[peer-tunnel-lora-0]=4241
+peer_supervisor_starts[peer-tunnel-lora-0]=fixture-start-4241
+peer_supervisor_commands[peer-tunnel-lora-0]="$peer_supervisor_command"
+peer_child_pids[peer-tunnel-lora-0]=4242
+peer_child_starts[peer-tunnel-lora-0]=fixture-start-4242
+peer_child_commands[peer-tunnel-lora-0]="$peer_exact_command"
+peer_child_shapes[peer-tunnel-lora-0]=current
+peer_child_forwards[peer-tunnel-lora-0]="-R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port"
+printf '%s\n' "$peer_exact_command" >"$tmp/peer-owner"
+printf '%s\n' "$peer_supervisor_command" >"$tmp/peer-supervisor"
+printf '%s\n' "${TEST_SOURCE_COUNT}" >"$tmp/remote-count"
+printf '%s\n' "${peer_exact_command/ChannelTimeout=\*-tcpip=45s/ChannelTimeout=\*-tcpip=60s}" >"$tmp/mutated-peer-child"
+: >"$tmp/peer-mutated"
+export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=4241 TUNNEL_SUPERVISOR_PID=4241 \
+  TUNNEL_OWNER_COMMAND="$tmp/peer-owner" TUNNEL_SUPERVISOR_COMMAND="$tmp/peer-supervisor" \
+  PEER_REMOTE_OUTPUT="$tmp/remote-count" PEER_MUTATE_MARKER="$tmp/peer-mutated" \
+  PEER_MUTATED_COMMAND="$tmp/mutated-peer-child"
+set +e
+PATH="$tmp/bin:$PATH" peer_remote_ports_ready
+remote_child_race_status=$?
+set -e
+test "$remote_child_race_status" -ne 0
+unset TUNNEL_OWNER_PID TUNNEL_OWNER_PPID TUNNEL_SUPERVISOR_PID TUNNEL_OWNER_COMMAND \
+  TUNNEL_SUPERVISOR_COMMAND PEER_REMOTE_OUTPUT PEER_MUTATE_MARKER PEER_MUTATED_COMMAND
+peer_supervisor_pids=()
+peer_supervisor_starts=()
+peer_supervisor_commands=()
+peer_child_pids=()
+peer_child_starts=()
+peer_child_commands=()
+peer_child_shapes=()
+peer_child_forwards=()
 lora_source_ports=("${configured_lora_ports[@]}")
 
 # Both source listeners must belong to one SSH child PID, not two split children.
@@ -1238,6 +1352,9 @@ if [ "${PEER_REMOTE_FAIL:-0}" = 1 ]; then
 fi
 if [ "${PEER_REMOTE_MISSING:-0}" = 1 ]; then
   printf '%s\n' "$((TEST_SOURCE_COUNT - 1))"
+elif [ -n "${PEER_REMOTE_OUTPUT:-}" ]; then
+  [ -n "${PEER_MUTATE_MARKER:-}" ] && : >"$PEER_MUTATE_MARKER"
+  cat "$PEER_REMOTE_OUTPUT"
 else
   printf '%s\n' "${TEST_SOURCE_COUNT:?}"
 fi
