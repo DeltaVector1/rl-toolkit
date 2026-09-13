@@ -79,6 +79,11 @@ if [ -n "${PEER_API_CANDIDATES:-}" ] &&
   cat "$PEER_API_CANDIDATES"
   exit 0
 fi
+if [ -n "${PEER_GENERIC_CANDIDATES:-}" ] &&
+    [ "$pattern" = "${PEER_GENERIC_SIGNATURE:?missing generic signature}" ]; then
+  cat "$PEER_GENERIC_CANDIDATES"
+  exit 0
+fi
 if [ -n "${PEER_QUERY:-}" ]; then
   printf '%s' "$pattern" >"$PEER_QUERY"
 elif [ -z "${PEER_TEST_LOG:-}" ]; then
@@ -151,6 +156,11 @@ if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
     printf '%s\n' "$line"
   elif [ "${PEER_API_OWNER_MODE:-0}" = 1 ] && [ "${PEER_API_OWNER_PID:-}" = "$pid" ]; then
     printf '%s\n' "${PEER_API_CHILD_COMMAND:?missing API child command}"
+  elif [ -n "${PEER_GENERIC_PID_COMMANDS:-}" ]; then
+    generic_command=$(awk -v wanted="$pid" '$1 == wanted {sub(/^[^ ]+ /, ""); print; exit}' \
+      "${PEER_GENERIC_PID_COMMANDS}")
+    [ -n "$generic_command" ] || exit 1
+    printf '%s\n' "$generic_command"
   elif [ -n "${PEER_DUPLICATE_COMMAND:-}" ] && [ "$pid" -ge 10000 ] 2>/dev/null; then
     cat "$PEER_DUPLICATE_COMMAND"
   elif [ "$pid" -ge 10000 ] 2>/dev/null; then
@@ -207,6 +217,9 @@ elif [ "${1:-}" = "-eo" ]; then
     printf '%s\n' "$inventory_count" >"$PEER_INVENTORY_COUNTER"
     if [ "$inventory_count" -ge 2 ] && [ -r "${PEER_INVENTORY_SECOND:-}" ]; then
       cat "$PEER_INVENTORY_SECOND"
+      exit 0
+    elif [ "$inventory_count" -eq 1 ] && [ -r "${PEER_INVENTORY_FIRST:-}" ]; then
+      cat "$PEER_INVENTORY_FIRST"
       exit 0
     fi
   fi
@@ -301,6 +314,8 @@ export REAL_CAT="$real_cat" REAL_SSH="$real_ssh" REAL_AWK="$real_awk"
 start=$(grep -n '^generic_tunnel_ssh_match() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
+tunnel_wait_group_exit_definition=$(declare -f tunnel_wait_group_exit)
+tunnel_wait_group_exit() { return 0; }
 
 # Keep the supervisor fixture in this shell. This avoids command lookup cache
 # selecting the host setsid binary after a PATH-scoped test invocation.
@@ -334,7 +349,31 @@ repair_sleep() {
 }
 repair_register_tunnel() { :; }
 repair_fail() { echo "adapter tunnel reconciliation failed: $*" >&2; exit 1; }
+repair_lock_held=0
+repair_lock_file="$tmp/adapter-repair-lock"
+repair_acquire_lock() {
+  local lock_timeout
+  [ "$repair_lock_held" = 1 ] && return 0
+  lock_timeout=$(repair_timeout 2) || return 1
+  exec 8>"$repair_lock_file" || return 1
+  flock -w "$lock_timeout" 8 || { exec 8>&-; return 1; }
+  repair_lock_held=1
+}
+repair_release_lock() {
+  [ "$repair_lock_held" = 1 ] || return 0
+  repair_lock_held=0
+  flock -u 8 || return 1
+  exec 8>&-
+}
 process_start_time() { printf 'fixture-start-%s\n' "$1"; }
+process_command_line() {
+  local pid=$1 output
+  if ! output=$(ps -o args= -p "$pid" 2>/dev/null); then
+    [ ! -e "/proc/$pid" ] && return 2
+    return 1
+  fi
+  sed 's/[[:space:]]*$//' <<<"$output"
+}
 process_identity_matches() {
   local pid=$1 expected_pgid=$2 expected_start=$3 expected_command=$4
   local current_pgid current_start current_command
@@ -487,6 +526,17 @@ test "$(tr '\n' ' ' <"$api_candidates")" = '10001 '
 test "$(grep -F -c -- '-- -10000' "$api_kill_log")" -eq 1
 test "$(grep -F -c -- '-- -10002' "$api_kill_log")" -eq 1
 test "$(grep -F -c -- '-- -10001' "$api_kill_log")" -eq 0
+# An existing API listener with no candidate must not get a second owner.
+: >"$api_candidates"
+: >"$api_kill_log"
+set +e
+PATH="$tmp/bin:$PATH" peer_tunnel_connection api "$api_signature" \
+  -L 127.0.0.1:18049:127.0.0.1:8000
+api_missing_owner_status=$?
+set -e
+test "$api_missing_owner_status" -ne 0
+test ! -s "$api_kill_log"
+test "$(wc -l <"$api_command_file")" -eq 1
 unset -f kill
 unset PEER_API_SIGNATURE PEER_API_CANDIDATES PEER_DUPLICATE_COMMAND PEER_GROUP_COMMANDS \
   PEER_API_OWNER_MODE PEER_API_OWNER_PID PEER_API_OWNER_PPID PEER_API_CHILD_COMMAND \
@@ -507,14 +557,33 @@ kill() { api_remove_candidate "$@"; }
 export PEER_API_SIGNATURE="$api_signature" PEER_API_CANDIDATES="$api_candidates" \
   PEER_DUPLICATE_COMMAND="$api_command_file" PEER_GROUP_COMMANDS="$api_group" \
   PEER_API_OWNER_MODE=0 PEER_TEST_LOG="$api_no_owner_log"
+setsid_fixture_definition=$(declare -f setsid)
+unset -f setsid
 hash -r
 PATH="$tmp/bin:$PATH" peer_tunnel_connection api "$api_signature" \
   -L 127.0.0.1:18049:127.0.0.1:8000
+eval "$setsid_fixture_definition"
+for _ in $(seq 1 20); do
+  grep -Fq -- '# peer-tunnel-api' "$api_no_owner_log" && break
+  sleep 0.01
+done
 test ! -s "$api_candidates"
-test "$(grep -F -c -- '# peer-tunnel-api' "$api_no_owner_log")" -eq 1
-test "$(grep -F -c -- '-- -10000' "$api_kill_log")" -eq 1
-test "$(grep -F -c -- '-- -10001' "$api_kill_log")" -eq 1
-test "$(grep -F -c -- '-- -10002' "$api_kill_log")" -eq 1
+test "$(grep -F -c -- '# peer-tunnel-api' "$api_no_owner_log")" -eq 1 || {
+  echo "no-owner API fixture did not start exactly one replacement" >&2
+  exit 1
+}
+test "$(grep -F -c -- '-- -10000' "$api_kill_log")" -eq 1 || {
+  echo "no-owner API fixture did not remove candidate 10000" >&2
+  exit 1
+}
+test "$(grep -F -c -- '-- -10001' "$api_kill_log")" -eq 1 || {
+  echo "no-owner API fixture did not remove candidate 10001" >&2
+  exit 1
+}
+test "$(grep -F -c -- '-- -10002' "$api_kill_log")" -eq 1 || {
+  echo "no-owner API fixture did not remove candidate 10002" >&2
+  exit 1
+}
 unset -f kill
 unset PEER_API_SIGNATURE PEER_API_CANDIDATES PEER_DUPLICATE_COMMAND PEER_GROUP_COMMANDS \
   PEER_API_OWNER_MODE PEER_TEST_LOG
@@ -758,8 +827,16 @@ done
 export TUNNEL_SS_OUTPUT="$stale_listener_output" PEER_STALE_LISTENERS_ACTIVE=1 PEER_TEARDOWN_POLLS=2
 printf '%s\n' 'ssh -NT stale-listener-owner' >"$tmp/tunnel-owner"
 china_legacy_cleanup_pids=(4242)
-export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_COMMAND="$tmp/tunnel-owner"
-sleep() {
+export TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=1 TUNNEL_OWNER_COMMAND="$tmp/tunnel-owner"
+PATH="$tmp/bin:$PATH"
+export PATH
+china_wait_orphan_definition=$(declare -f china_tunnel_remove_orphan_children)
+china_wait_orphan_original_definition=$(sed \
+  '1s/china_tunnel_remove_orphan_children/china_tunnel_remove_orphan_children_original/' \
+  <<<"$china_wait_orphan_definition")
+eval "$china_wait_orphan_original_definition"
+china_tunnel_remove_orphan_children() {
+  china_tunnel_remove_orphan_children_original "$@" || return 1
   if [ "${PEER_TEARDOWN_POLLS:-0}" -gt 0 ]; then
     PEER_TEARDOWN_POLLS=$((PEER_TEARDOWN_POLLS - 1))
     export PEER_TEARDOWN_POLLS
@@ -770,19 +847,21 @@ sleep() {
     fi
   fi
 }
-PATH="$tmp/bin:$PATH" china_tunnel_wait_legacy_clear
+china_tunnel_wait_legacy_clear
 test "${PEER_TEARDOWN_POLLS:-1}" -eq 0
-PEER_STALE_LISTENERS_ACTIVE=1
-export TUNNEL_OWNER_PID=4242 PEER_STALE_LISTENERS_ACTIVE
+china_wait_failure_definition=$(declare -f china_tunnel_remove_orphan_children)
+china_tunnel_remove_orphan_children() { return 1; }
 set +e
-PATH="$tmp/bin:$PATH" china_tunnel_wait_legacy_clear
+china_tunnel_wait_legacy_clear
 wait_status=$?
 set -e
 test "$wait_status" -ne 0
+eval "$china_wait_failure_definition"
 unset PEER_STALE_LISTENERS_ACTIVE PEER_TEARDOWN_POLLS TUNNEL_SS_OUTPUT \
-  TUNNEL_OWNER_PID TUNNEL_OWNER_COMMAND
+  TUNNEL_OWNER_PID TUNNEL_OWNER_PPID TUNNEL_OWNER_COMMAND
 china_legacy_cleanup_pids=()
-unset -f sleep kill
+eval "$china_wait_orphan_definition"
+unset -f kill
 
 # A fresh launch creates sixty-four two-forward lanes.
 kill() { return 0; }
@@ -1297,6 +1376,7 @@ wait_group="$tmp/wait-group"
 printf '%s\n' '1234 sleep 3' >"$wait_group"
 export PEER_GROUP_COMMANDS="$wait_group"
 sleep() { :; }
+eval "$tunnel_wait_group_exit_definition"
 set +e
 PATH="$tmp/bin:$PATH" china_tunnel_wait_group_exit 1234
 wait_live_status=$?
@@ -1317,6 +1397,7 @@ set -e
 test "$wait_ps_failure_status" -ne 0
 test "$wait_awk_failure_status" -ne 0
 unset PEER_PS_FAILURE PEER_AWK_FAILURE
+tunnel_wait_group_exit() { return 0; }
 
 # Readiness rejects two exact same-marker supervisors even when one owns both listeners.
 duplicate_command="$tmp/duplicate-command"
@@ -1365,14 +1446,17 @@ unset PEER_TEST_LOG PEER_QUERY
 # A peer supervisor added after the first inventory is rejected by the final pass.
 peer_race_first="$tmp/peer-race-first"
 peer_race_second="$tmp/peer-race-second"
+peer_race_log="$tmp/peer-race-log"
 peer_race_counter="$tmp/peer-race-counter"
 peer_race_children="$tmp/peer-race-children"
-printf '%s\n' "$peer_supervisor_command" >"$peer_race_first"
-printf '%s\n' "$peer_supervisor_command" "$peer_extra_command" >"$peer_race_second"
+printf '%s\n' "10000 $peer_supervisor_command" >"$peer_race_first"
+printf '%s\n' "10000 $peer_supervisor_command" "10001 $peer_extra_command" >"$peer_race_second"
+printf '%s\n' "$peer_supervisor_command" >"$peer_race_log"
 printf '0\n' >"$peer_race_counter"
 printf '%s\n' "10001 10000 $peer_exact_command" >"$peer_race_children"
-export PEER_TEST_LOG="$peer_race_first" PEER_QUERY="$query" \
+export PEER_TEST_LOG="$peer_race_log" PEER_QUERY="$query" \
   PEER_INVENTORY_COUNTER="$peer_race_counter" PEER_INVENTORY_SECOND="$peer_race_second" \
+  PEER_INVENTORY_FIRST="$peer_race_first" \
   PEER_CHILDREN_OUTPUT="$peer_race_children"
 set +e
 PATH="$tmp/bin:$PATH" peer_tunnel_supervisors_ready
@@ -1380,7 +1464,8 @@ peer_race_status=$?
 set -e
 test "$peer_race_status" -ne 0
 test "$(<"$peer_race_counter")" -ge 2
-unset PEER_TEST_LOG PEER_QUERY PEER_INVENTORY_COUNTER PEER_INVENTORY_SECOND PEER_CHILDREN_OUTPUT
+unset PEER_TEST_LOG PEER_QUERY PEER_INVENTORY_COUNTER PEER_INVENTORY_FIRST \
+  PEER_INVENTORY_SECOND PEER_CHILDREN_OUTPUT
 peer_supervisor_pids=()
 peer_supervisor_starts=()
 peer_supervisor_commands=()
@@ -1545,6 +1630,7 @@ for hostile_generic_supervisor in \
 done
 
 # A healthy generic tunnel is a fast no-op and does not start another group.
+eval "$tunnel_wait_group_exit_definition"
 generic_noop_log="$tmp/generic-noop-log"
 printf '%s\n' "$secondary_supervisor" >"$generic_noop_log"
 generic_noop_group="$tmp/generic-noop-group"
@@ -1555,24 +1641,75 @@ printf '%s\n' "$secondary_supervisor" >"$tmp/generic-noop-supervisor"
 printf 'LISTEN 0 128 127.0.0.1:26407 0.0.0.0:* users:(('"'"'ssh'"'"',pid=4242,fd=5))\n' \
   >"$tmp/generic-noop-ss"
 export PEER_TEST_LOG="$generic_noop_log" PEER_QUERY="$tmp/generic-noop-query" \
-  PEER_GROUP_COMMANDS="$generic_noop_group" TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=4241 \
-  TUNNEL_OWNER_COMMAND="$tmp/generic-noop-owner" TUNNEL_SUPERVISOR_PID=4241 \
+  PEER_GROUP_COMMANDS="$generic_noop_group" TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=1234 \
+  TUNNEL_OWNER_COMMAND="$tmp/generic-noop-owner" TUNNEL_SUPERVISOR_PID=1234 \
   TUNNEL_SUPERVISOR_COMMAND="$tmp/generic-noop-supervisor" TUNNEL_SS_OUTPUT="$tmp/generic-noop-ss" \
   PEER_STALE_LISTENERS_ACTIVE=1
+timeout() { return 0; }
 PATH="$tmp/bin:$PATH" tunnel 26407 127.0.0.1:8000 "$secondary_target" no \
   "${secondary_options[@]}"
+test "$(wc -l <"$generic_noop_log")" -eq 1
+
+# Keep the listener owner and stop the other exact generic group. The actual
+# group-exit wait must see the removed group disappear from the process list.
+generic_candidates="$tmp/generic-candidates"
+generic_pid_commands="$tmp/generic-pid-commands"
+generic_duplicate_kills="$tmp/generic-duplicate-kills"
+printf '%s\n' 1234 1235 >"$generic_candidates"
+printf '1235 %s\n' "$secondary_supervisor" >"$generic_pid_commands"
+printf '%s\n' "1235 $secondary_supervisor" "1235 $secondary_owner" \
+  '1235 sleep 3' >>"$generic_noop_group"
+export PEER_GENERIC_CANDIDATES="$generic_candidates" PEER_GENERIC_SIGNATURE=zmq-tunnel-26407 \
+  PEER_GENERIC_PID_COMMANDS="$generic_pid_commands"
+kill() {
+  [ "$*" = '-- -1235' ] || return 1
+  printf '%s\n' "$*" >>"$generic_duplicate_kills"
+  sed -i '/^1235$/d' "$generic_candidates"
+  sed -i '/^1235 /d' "$generic_noop_group" "$generic_pid_commands"
+}
+PATH="$tmp/bin:$PATH" tunnel 26407 127.0.0.1:8000 "$secondary_target" no \
+  "${secondary_options[@]}"
+test "$(cat "$generic_candidates")" = 1234
+test "$(cat "$generic_duplicate_kills")" = '-- -1235'
+test "$(wc -l <"$generic_noop_log")" -eq 1
+unset -f kill timeout
+unset PEER_GENERIC_CANDIDATES PEER_GENERIC_SIGNATURE PEER_GENERIC_PID_COMMANDS
 unset PEER_TEST_LOG PEER_QUERY PEER_GROUP_COMMANDS TUNNEL_OWNER_PID TUNNEL_OWNER_PPID \
   TUNNEL_OWNER_COMMAND TUNNEL_SUPERVISOR_PID TUNNEL_SUPERVISOR_COMMAND \
   TUNNEL_SS_OUTPUT PEER_STALE_LISTENERS_ACTIVE
 
+# A second reconciliation cannot mutate while the first holds the shared lock.
+generic_lock="$tmp/generic-repair-lock"
+exec 9>"$generic_lock"
+flock 9
+tunnels_only=1
+tunnel_repair_deadline=$((SECONDS + 1))
+TUNNEL_LOCK_FILE="$generic_lock"
+set +e
+tunnel 26407 127.0.0.1:8000 "$secondary_target" no "${secondary_options[@]}"
+generic_lock_status=$?
+set -e
+flock -u 9
+exec 9>&-
+tunnels_only=0
+test "$generic_lock_status" -ne 0 || {
+  echo "generic reconcile ignored a held adapter lock" >&2
+  exit 1
+}
+
 # Generic stale cleanup requires every member of the exact process group.
+eval "$tunnel_wait_group_exit_definition"
 generic_owned_group="$tmp/generic-owned-group"
 generic_owned_kill_log="$tmp/generic-owned-kill"
 printf '%s\n' \
   "1234 $secondary_supervisor" \
   "1234 $secondary_owner" \
   '1234 sleep 3' >"$generic_owned_group"
-kill() { printf '%s\n' "$*" >>"$GENERIC_OWNED_KILL_LOG"; return 0; }
+kill() {
+  printf '%s\n' "$*" >>"$GENERIC_OWNED_KILL_LOG"
+  : >"$PEER_GROUP_COMMANDS"
+  return 0
+}
 export GENERIC_OWNED_KILL_LOG="$generic_owned_kill_log" PEER_GROUP_COMMANDS="$generic_owned_group"
 export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
 PATH="$tmp/bin:$PATH" generic_tunnel_stop_stale 42 "$secondary_supervisor" \
