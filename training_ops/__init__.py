@@ -3752,6 +3752,7 @@ def _adapter_transport_failure_reason(error: str) -> str | None:
     ):
         return "HTTP 503"
     if re.search(
+        r"\badapter persistent download retries exhausted\b|"
         r"(?:retry|attempt).*(?:exhaust|budget|bounded)|"
         r"(?:exhaust|budget|bounded).*(?:retry|attempt)|"
         r"attempt\s+\d+\s*/\s*\d+\s*;?\s*(?:stopping|exhausted)",

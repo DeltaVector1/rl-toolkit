@@ -518,6 +518,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "ConnectionRefusedError: connection refused",
             "OSError: adapter manifest request failed with HTTP status 503",
             "OSError: adapter source retry budget exhausted",
+            "OSError: adapter persistent download retries exhausted",
         ):
             with self.subTest(transport_error=transport_error):
                 self.assertEqual(
