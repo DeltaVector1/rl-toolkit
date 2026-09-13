@@ -481,19 +481,20 @@ group_commands="$tmp/group-commands"
 kill_log="$tmp/kill-log"
 printf '%s\n' \
   "1234 bash -c while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19; sleep 3; done # peer-tunnel-lora-0" \
-  "1234 ssh -i /other/key -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port unrelated@peer" >"$group_commands"
+  "1234 ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19" \
+  '1234 evil sleep 3' >"$group_commands"
 kill() { printf '%s\n' "$*" >>"$KILL_LOG"; }
 export KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group_commands"
 export PEER_TEST_PGID_PID=1235 PEER_TEST_PGID=1234
 PATH="$tmp/bin:$PATH"
 export PATH
+set +e
 peer_kill_owned 1235 \
   "while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19; sleep 3; done # peer-tunnel-lora-0"
-test "$(grep -F -c -- '1235' "$kill_log")" -eq 1
-if grep -Fq -- '-1235' "$kill_log"; then
-  echo "unrelated peer group received a group kill" >&2
-  exit 1
-fi
+peer_current_status=$?
+set -e
+test "$peer_current_status" -ne 0
+test ! -s "$kill_log"
 unset -f kill
 unset KILL_LOG PEER_GROUP_COMMANDS
 unset PEER_TEST_PGID_PID PEER_TEST_PGID
@@ -505,6 +506,7 @@ legacy_kill_log="$tmp/legacy-kill-log"
 printf '%s\n' \
   "1234 bash -c while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port wrong@peer; sleep 3; done # peer-tunnel-lora-0" \
   "1234 ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port wrong@peer" \
+  '1234 sleep 3' \
   >"$legacy_group_commands"
 kill() { printf '%s\n' "$*" >>"$LEGACY_KILL_LOG"; }
 export LEGACY_KILL_LOG="$legacy_kill_log" PEER_GROUP_COMMANDS="$legacy_group_commands"
@@ -514,7 +516,27 @@ test "$(grep -F -c -- '-1234' "$legacy_kill_log")" -eq 1
 unset -f kill
 unset LEGACY_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
 
+# A stale peer group with a shell-like sleep member is not owned.
+peer_stale_evil_group="$tmp/peer-stale-evil-group"
+peer_stale_evil_kill_log="$tmp/peer-stale-evil-kill"
+printf '%s\n' \
+  "1234 $peer_supervisor_command" \
+  "1234 $peer_exact_command" \
+  '1234 evil sleep 3' >"$peer_stale_evil_group"
+kill() { printf '%s\n' "$*" >>"$PEER_STALE_EVIL_KILL_LOG"; return 0; }
+export PEER_STALE_EVIL_KILL_LOG="$peer_stale_evil_kill_log" PEER_GROUP_COMMANDS="$peer_stale_evil_group"
+export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+set +e
+PATH="$tmp/bin:$PATH" peer_kill_owned 42 "$peer_supervisor_command" cleanup peer-tunnel-lora-0
+peer_stale_evil_status=$?
+set -e
+test "$peer_stale_evil_status" -ne 0
+test ! -s "$peer_stale_evil_kill_log"
+unset -f kill
+unset PEER_STALE_EVIL_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+
 # Group cleanup accepts only an exact owned China supervisor and child.
+trainer_ssh_target=china-trainer
 china_owned_group="$tmp/china-owned-group"
 china_owned_kill_log="$tmp/china-owned-kill"
 printf '%s\n' \
@@ -544,6 +566,37 @@ test "$china_unrelated_status" -ne 0
 test ! -s "$china_owned_kill_log"
 unset -f kill
 unset CHINA_OWNED_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+
+# Normal China cleanup also accepts only the exact standalone sleep argv.
+china_normal_group="$tmp/china-normal-group"
+china_normal_kill_log="$tmp/china-normal-kill"
+printf '%s\n' \
+  "1234 $china_supervisor_command" \
+  "1234 $china_exact_command" \
+  '1234 sleep 3' >"$china_normal_group"
+kill() { printf '%s\n' "$*" >>"$CHINA_NORMAL_KILL_LOG"; return 0; }
+export CHINA_NORMAL_KILL_LOG="$china_normal_kill_log" PEER_GROUP_COMMANDS="$china_normal_group"
+export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+PATH="$tmp/bin:$PATH" china_tunnel_stop_supervisor 42 "$china_supervisor_command" \
+  china-tunnel-lora-0 0
+test "$(grep -F -c -- '-- -1234' "$china_normal_kill_log")" -eq 1
+
+china_normal_evil_group="$tmp/china-normal-evil-group"
+: >"$china_normal_kill_log"
+printf '%s\n' \
+  "1234 $china_supervisor_command" \
+  "1234 $china_exact_command" \
+  '1234 evil sleep 3' >"$china_normal_evil_group"
+export PEER_GROUP_COMMANDS="$china_normal_evil_group"
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_stop_supervisor 42 "$china_supervisor_command" \
+  china-tunnel-lora-0 0
+china_normal_evil_status=$?
+set -e
+test "$china_normal_evil_status" -ne 0
+test ! -s "$china_normal_kill_log"
+unset -f kill
+unset CHINA_NORMAL_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
 
 # Readiness accepts a listener only when its SSH child and two-port
 # supervisor both match the configured target.

@@ -639,7 +639,7 @@ peer_tunnel_stale_group_safe() {
         esac
         [ "$normalized_command" = "$expected_ssh" ] || return 1
         ;;
-      *" sleep 3"|*"sleep 3") ;;
+      "sleep 3") ;;
       *) return 1 ;;
     esac
   done < <(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}')
@@ -693,7 +693,7 @@ peer_tunnel_group_safe() {
     case "$group_command" in
       *"while true; do"*) peer_tunnel_supervisor_match "$group_command" cleanup || return 1 ;;
       ssh\ *|/usr/bin/ssh\ *) peer_tunnel_ssh_args_match "$group_command" cleanup || return 1 ;;
-      *" sleep 3"|*"sleep 3") ;;
+      "sleep 3") ;;
       *) return 1 ;;
     esac
   done < <(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}')
@@ -729,18 +729,24 @@ peer_kill_owned() {
     ''|*[!0-9]*|0|1|"$$") kill "$pid" 2>/dev/null || true ;;
     *)
       if [ -n "$shape" ] && [ -n "$marker" ]; then
-        if peer_tunnel_stale_group_safe "$pgid" "$command_line" "$shape" "$marker"; then
-          kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-        else
-          kill "$pid" 2>/dev/null || true
+        if ! peer_tunnel_stale_group_safe "$pgid" "$command_line" "$shape" "$marker"; then
+          echo "peer tunnel group $pgid failed ownership proof for $marker" >&2
+          return 1
         fi
+        kill -- "-$pgid" 2>/dev/null || {
+          echo "could not stop peer tunnel group $pgid for $marker" >&2
+          return 1
+        }
         return 0
       fi
-      if [ "$pgid" = "$pid" ] || peer_tunnel_group_safe "$pgid"; then
-        kill -- "-$pgid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-      else
-        kill "$pid" 2>/dev/null || true
+      if ! peer_tunnel_group_safe "$pgid"; then
+        echo "peer tunnel group $pgid failed ownership proof" >&2
+        return 1
       fi
+      kill -- "-$pgid" 2>/dev/null || {
+        echo "could not stop peer tunnel group $pgid" >&2
+        return 1
+      }
       ;;
   esac
 }
@@ -981,7 +987,7 @@ china_tunnel_group_safe() {
       ssh\ *|/usr/bin/ssh\ *)
         china_tunnel_ssh_args_match "$group_command" cleanup || return 1
         ;;
-      *" sleep 3"|*"sleep 3") ;;
+      "sleep 3") ;;
       *) return 1 ;;
     esac
   done <<<"$group_listing"
