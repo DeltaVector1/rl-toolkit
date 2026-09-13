@@ -4920,15 +4920,12 @@ def _stage_chunked_xor_adapter(
     }
     download_streams = _configured_download_streams()
     persistent_width = min(download_streams, len(lane_urls))
-    status_metadata["active_persistent_connections"] = (
-        persistent_width if full_zstd else 0
-    )
+    status_metadata["active_persistent_connections"] = persistent_width
     output_path = temporary / _ADAPTER_FILES[1]
     config_path = temporary / _ADAPTER_FILES[0]
-    persistent_pool = (
-        _PersistentAdapterLanePool(lane_urls, width=persistent_width)
-        if full_zstd
-        else None
+    persistent_pool = _PersistentAdapterLanePool(
+        lane_urls,
+        width=persistent_width,
     )
     _reject_symlink_path(output_path, "adapter output")
     _reject_symlink_path(config_path, "adapter configuration file")
