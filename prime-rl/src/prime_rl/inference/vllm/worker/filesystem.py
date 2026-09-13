@@ -4509,13 +4509,6 @@ def _stage_chunked_xor_adapter(
     reconstruction_worker_seconds = 0.0
     verification_started = None
     verification_finished = None
-    for item in chunks:
-        if not isinstance(item, dict) or not isinstance(item.get("file"), str):
-            continue
-        chunk_path = chunk_root / Path(str(item["file"])).name
-        _reject_symlink_path(chunk_path, "adapter transport chunk")
-        if _path_regular_size(chunk_path, "adapter transport chunk") == int(item["wire_size"]):
-            progress_bytes += int(item["wire_size"])
     last_status = 0.0
 
     def write_stage_status(value: dict[str, object]) -> None:
@@ -4669,6 +4662,11 @@ def _stage_chunked_xor_adapter(
         completed_path = chunk_path.with_name(f"{chunk_path.name}.done")
         _reject_symlink_path(completed_path, "adapter completed proof")
 
+        if persistent_pool is not None:
+            chunk_lane = index % persistent_pool.slot_count
+        else:
+            chunk_lane = index % len(lane_urls)
+
         if _path_regular_size(completed_path, "adapter completed proof") is not None:
             try:
                 proof = json.loads(
@@ -4692,18 +4690,25 @@ def _stage_chunked_xor_adapter(
             except (OSError, ValueError):
                 proof_matches = False
             if proof_matches:
-                # The final file checksum validates all resumed regions together.
-                return
+                try:
+                    proof_matches = (
+                        _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                        and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                    )
+                except (FileNotFoundError, OSError):
+                    proof_matches = False
+                if proof_matches:
+                    # The final file checksum validates all resumed regions together.
+                    report(chunk_lane, wire_size)
+                    return
             _unlink_path(completed_path, "adapter completed proof")
 
         def lane_report(_lane: int, amount: int) -> None:
             report(chunk_lane, amount)
 
         if persistent_pool is not None:
-            chunk_lane = index % persistent_pool.slot_count
             chunk_urls = persistent_pool.urls_for_lane(chunk_lane, name)
         else:
-            chunk_lane = index % len(lane_urls)
             chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
             chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
         transfer_started_at = time.monotonic()
@@ -4816,7 +4821,7 @@ def _stage_chunked_xor_adapter(
             _run_bounded_futures(
                 chunks,
                 fetch,
-                download_streams,
+                persistent_width,
                 deadline,
                 cancel_event,
             )

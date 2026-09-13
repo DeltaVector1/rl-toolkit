@@ -620,6 +620,55 @@ class DownloadSchedulerTest(unittest.TestCase):
         self.assertLessEqual(maximum_active, 2)
         self.assertLessEqual(maximum_pending, 2)
 
+    def test_bounded_full_scheduler_caps_configured_streams_to_lanes(self):
+        filesystem = load_filesystem_module()
+        lock = threading.Lock()
+        pending = 0
+        maximum_pending = 0
+
+        def worker(_index, _item):
+            time.sleep(0.005)
+
+        real_executor = filesystem.ThreadPoolExecutor
+
+        class RecordingExecutor:
+            def __init__(self, max_workers):
+                self.executor = real_executor(max_workers=max_workers)
+
+            def submit(self, callback, *args, **kwargs):
+                nonlocal pending, maximum_pending
+                with lock:
+                    pending += 1
+                    maximum_pending = max(maximum_pending, pending)
+
+                def run():
+                    nonlocal pending
+                    try:
+                        return callback(*args, **kwargs)
+                    finally:
+                        with lock:
+                            pending -= 1
+
+                return self.executor.submit(run)
+
+            def shutdown(self, *args, **kwargs):
+                return self.executor.shutdown(*args, **kwargs)
+
+        filesystem.ThreadPoolExecutor = RecordingExecutor
+        try:
+            configured_streams = 96
+            responsive_lanes = 24
+            filesystem._run_bounded_futures(
+                list(range(48)),
+                worker,
+                min(configured_streams, responsive_lanes),
+                time.monotonic() + 5,
+                threading.Event(),
+            )
+        finally:
+            filesystem.ThreadPoolExecutor = real_executor
+        self.assertLessEqual(maximum_pending, responsive_lanes)
+
     def test_persistent_chunk_header_stall_observes_cancellation(self):
         filesystem = load_filesystem_module()
         payload = b"header-stall"
