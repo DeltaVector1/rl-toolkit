@@ -507,6 +507,42 @@ china_legacy_cleanup_pids=()
 china_legacy_cleanup_pgids=()
 china_legacy_cleanup_orphan_pids=()
 
+# Empty listener output is a successful no-op. Ownership, identity, and kill
+# failures must each stop orphan cleanup with a nonzero result.
+no_orphan_ss="$tmp/no-orphan-ss"
+: >"$no_orphan_ss"
+export CHINA_PROC_FIXTURES="$proc_fixtures" TUNNEL_SS_OUTPUT="$no_orphan_ss" \
+  PEER_STALE_LISTENERS_ACTIVE=1
+PATH="$tmp/bin:$PATH" china_tunnel_remove_orphan_children
+orphan_identity_definition=$(declare -f process_identity_matches)
+process_identity_matches() { return 1; }
+write_child_cmdline "$proc_fixtures/20001" \
+  -L 127.0.0.1:18104:127.0.0.1:8100 \
+  -L 127.0.0.1:18105:127.0.0.1:8100 \
+  -L 127.0.0.1:18106:127.0.0.1:8100 \
+  -L 127.0.0.1:18107:127.0.0.1:8100 \
+  china-trainer
+printf 'LISTEN 0 128 127.0.0.1:18104 0.0.0.0:* users:(('"'"'ssh'"'"',pid=20001,fd=5))\n' >"$orphan_ss"
+export TUNNEL_SS_OUTPUT="$orphan_ss"
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_remove_orphan_children
+orphan_identity_status=$?
+set -e
+test "$orphan_identity_status" -ne 0
+eval "$orphan_identity_definition"
+orphan_kill_definition=$(declare -f kill)
+kill() { return 1; }
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_remove_orphan_children
+orphan_kill_status=$?
+set -e
+test "$orphan_kill_status" -ne 0
+eval "$orphan_kill_definition"
+unset PEER_STALE_LISTENERS_ACTIVE CHINA_PROC_FIXTURES TUNNEL_SS_OUTPUT
+china_legacy_cleanup_pids=()
+china_legacy_cleanup_pgids=()
+china_legacy_cleanup_orphan_pids=()
+
 # Orphan cleanup failure must stop the wait instead of allowing replacement
 # lanes to start.
 china_orphan_cleanup_definition=$(declare -f china_tunnel_remove_orphan_children)
@@ -720,6 +756,41 @@ peer_group_rejects_child "${peer_exact_command/ChannelTimeout=*-tcpip=45s/Channe
 peer_group_rejects_child "$peer_exact_command extra" extra
 peer_group_rejects_child "${peer_exact_command/root@38.255.28.19/wrong@peer}" target
 
+# A group mutation between the two ownership checks must abort before kill.
+peer_mutation_group="$tmp/peer-mutation-group"
+peer_mutation_kill_log="$tmp/peer-mutation-kill"
+printf '%s\n' \
+  "1234 $peer_supervisor_command" \
+  "1234 $peer_exact_command" \
+  '1234 sleep 3' >"$peer_mutation_group"
+peer_stale_group_definition=$(declare -f peer_tunnel_stale_group_safe)
+peer_stale_group_original_definition=$(sed \
+  '1s/peer_tunnel_stale_group_safe/peer_tunnel_stale_group_safe_original/' \
+  <<<"$peer_stale_group_definition")
+eval "$peer_stale_group_original_definition"
+peer_stale_group_calls=0
+peer_tunnel_stale_group_safe() {
+  peer_stale_group_calls=$((peer_stale_group_calls + 1))
+  if [ "$peer_stale_group_calls" -eq 2 ]; then
+    printf '%s\n' '1234 unrelated-member' >>"$PEER_GROUP_COMMANDS"
+  fi
+  peer_tunnel_stale_group_safe_original "$@"
+}
+kill() { printf '%s\n' "$*" >>"$PEER_MUTATION_KILL_LOG"; return 0; }
+export PEER_MUTATION_KILL_LOG="$peer_mutation_kill_log" PEER_GROUP_COMMANDS="$peer_mutation_group"
+export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+set +e
+PATH="$tmp/bin:$PATH" peer_kill_owned 42 "$peer_supervisor_command" \
+  cleanup peer-tunnel-lora-0
+peer_mutation_status=$?
+set -e
+test "$peer_mutation_status" -ne 0
+test ! -s "$peer_mutation_kill_log"
+unset -f peer_tunnel_stale_group_safe
+eval "$peer_stale_group_definition"
+unset -f kill
+unset PEER_MUTATION_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+
 # Group cleanup accepts only an exact owned China supervisor and child.
 trainer_ssh_target=china-trainer
 china_owned_group="$tmp/china-owned-group"
@@ -823,6 +894,41 @@ china_group_accepts_escaped_timeout
 china_group_rejects_child "${china_exact_command/ChannelTimeout=*-tcpip=45s/ChannelTimeout=*-tcpip=60s}" timeout
 china_group_rejects_child "$china_exact_command extra" extra
 china_group_rejects_child "${china_exact_command/china-trainer/wrong-trainer}" target
+
+# The normal China group is checked again after a member mutation.
+china_mutation_group="$tmp/china-mutation-group"
+china_mutation_kill_log="$tmp/china-mutation-kill"
+printf '%s\n' \
+  "1234 $china_supervisor_command" \
+  "1234 $china_exact_command" \
+  '1234 sleep 3' >"$china_mutation_group"
+china_group_safe_definition=$(declare -f china_tunnel_group_safe)
+china_group_safe_original_definition=$(sed \
+  '1s/china_tunnel_group_safe/china_tunnel_group_safe_original/' \
+  <<<"$china_group_safe_definition")
+eval "$china_group_safe_original_definition"
+china_group_safe_calls=0
+china_tunnel_group_safe() {
+  china_group_safe_calls=$((china_group_safe_calls + 1))
+  if [ "$china_group_safe_calls" -eq 2 ]; then
+    printf '%s\n' '1234 unrelated-member' >>"$PEER_GROUP_COMMANDS"
+  fi
+  china_tunnel_group_safe_original "$@"
+}
+kill() { printf '%s\n' "$*" >>"$CHINA_MUTATION_KILL_LOG"; return 0; }
+export CHINA_MUTATION_KILL_LOG="$china_mutation_kill_log" PEER_GROUP_COMMANDS="$china_mutation_group"
+export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_stop_supervisor 42 "$china_supervisor_command" \
+  china-tunnel-lora-0 0
+china_mutation_status=$?
+set -e
+test "$china_mutation_status" -ne 0
+test ! -s "$china_mutation_kill_log"
+unset -f china_tunnel_group_safe
+eval "$china_group_safe_definition"
+unset -f kill
+unset CHINA_MUTATION_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
 
 # Captured ProxyJump groups accept only the route-derived transport child.
 proxy_route="$tmp/proxy-route"

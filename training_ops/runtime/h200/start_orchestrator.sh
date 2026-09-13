@@ -92,22 +92,58 @@ process_identity_matches() {
   [ "$current_command" = "$expected_command" ]
 }
 
+repair_stop_unregistered_tunnel() {
+  local kind=$1 pid=$2 marker=$3 forward=${4:-} command_line pgid shape=current
+  [ -e "/proc/$pid" ] || return 0
+  command_line=$(ps -o args= -p "$pid" 2>/dev/null | sed 's/[[:space:]]*$//' || true)
+  if [ -z "$command_line" ]; then
+    [ ! -e "/proc/$pid" ]
+    return
+  fi
+  case "$kind" in
+    generic)
+      generic_tunnel_stale_supervisor_match "$command_line" "$marker" "$forward" || return 1
+      ;;
+    peer)
+      [ "$marker" = peer-tunnel-api ] && shape=api
+      peer_tunnel_stale_supervisor_match "$command_line" "$shape" "$marker" || return 1
+      ;;
+    china)
+      china_tunnel_supervisor_match "$command_line" current "$marker" || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  case "$pgid" in
+    ''|*[!0-9]*|0|1|"$$") return 1 ;;
+  esac
+  case "$kind" in
+    generic) generic_tunnel_stale_group_safe "$pgid" "$command_line" "$marker" "$forward" || return 1 ;;
+    peer) peer_tunnel_stale_group_safe "$pgid" "$command_line" "$shape" "$marker" || return 1 ;;
+    china) china_tunnel_group_safe "$pgid" "$marker" || return 1 ;;
+  esac
+  kill -- "-$pgid" 2>/dev/null
+}
+
 repair_register_tunnel() {
   [ "$tunnels_only" = 1 ] || return 0
-  local start_time
+  local kind=$1 pid=$2 marker=$3 forward=${4:-} start_time
   start_time=$(process_start_time "$2") || {
     echo "could not record adapter tunnel process identity for $3" >&2
+    if ! repair_stop_unregistered_tunnel "$kind" "$pid" "$marker" "$forward"; then
+      echo "could not stop unregistered adapter tunnel for $marker" >&2
+    fi
     repair_failed=1
     return 1
   }
-  repair_created_tunnels+=("$1$(printf '\t')$2$(printf '\t')$3$(printf '\t')${4:-}$(printf '\t')$start_time")
+  repair_created_tunnels+=("$kind|$pid|$marker|$forward|$start_time")
 }
 
 repair_cleanup_created_tunnels() {
   local item kind pid marker forward start_time command_line current_start rollback_failed=0
   [ "$repair_failed" = 1 ] || return 0
   for item in "${repair_created_tunnels[@]}"; do
-    IFS=$'\t' read -r kind pid marker forward start_time <<<"$item"
+    IFS='|' read -r kind pid marker forward start_time <<<"$item"
     command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
     [ -n "$command_line" ] || continue
     current_start=$(process_start_time "$pid") || {
@@ -643,9 +679,13 @@ generic_tunnel_stale_group_safe() {
 }
 
 generic_tunnel_stop_stale() {
-  local pid=$1 command_line=$2 marker=$3 forward=$4 pgid
+  local pid=$1 command_line=$2 marker=$3 forward=$4 pgid expected_start
   generic_tunnel_stale_supervisor_match "$command_line" "$marker" "$forward" || return 0
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  expected_start=$(process_start_time "$pid") || {
+    echo "could not read stale generic tunnel process identity for $marker" >&2
+    return 1
+  }
   case "$pgid" in
     ''|*[!0-9]*|0|1|"$$")
       echo "could not prove stale generic tunnel group for $marker" >&2
@@ -656,6 +696,14 @@ generic_tunnel_stop_stale() {
         echo "stale generic tunnel group $pgid failed ownership proof for $marker" >&2
         return 1
       fi
+      if ! generic_tunnel_stale_group_safe "$pgid" "$command_line" "$marker" "$forward"; then
+        echo "stale generic tunnel group changed before stop for $marker" >&2
+        return 1
+      fi
+      process_identity_matches "$pid" "$pgid" "$expected_start" "$command_line" || {
+        echo "stale generic tunnel process changed before stop for $marker" >&2
+        return 1
+      }
       kill -- "-$pgid" 2>/dev/null || {
         echo "could not stop stale generic tunnel group $pgid for $marker" >&2
         return 1
@@ -1036,6 +1084,10 @@ peer_kill_owned() {
           echo "peer tunnel group $pgid failed ownership proof for $marker" >&2
           return 1
         fi
+        if ! peer_tunnel_stale_group_safe "$pgid" "$command_line" "$shape" "$marker"; then
+          echo "peer tunnel group $pgid changed before stop for $marker" >&2
+          return 1
+        fi
         process_identity_matches "$pid" "$pgid" "$expected_start" "$command_line" || {
           echo "peer tunnel process changed before stop for $marker" >&2
           return 1
@@ -1048,6 +1100,10 @@ peer_kill_owned() {
       fi
       if ! peer_tunnel_group_safe "$pgid"; then
         echo "peer tunnel group $pgid failed ownership proof" >&2
+        return 1
+      fi
+      if ! peer_tunnel_group_safe "$pgid"; then
+        echo "peer tunnel group changed before stop" >&2
         return 1
       fi
       process_identity_matches "$pid" "$pgid" "$expected_start" "$command_line" || {
@@ -1543,7 +1599,7 @@ china_tunnel_ssh_child_match() {
 }
 
 china_tunnel_remove_orphan_children() {
-  local requested source_port listener state receive_queue send_queue local_address remote_address details pid ppid seen_pid pgid start_time command_line
+  local requested source_port listener listener_output state receive_queue send_queue local_address remote_address details pid ppid seen_pid pgid start_time command_line
   local -a requested_ports=() listener_pids=()
   local -A requested_port=()
   for requested in "$@"; do
@@ -1559,6 +1615,7 @@ china_tunnel_remove_orphan_children() {
   for source_port in "${requested_ports[@]}"; do
     requested_port[$source_port]=1
   done
+  listener_output=$(ss -H -ltnp 2>/dev/null) || return 1
   while IFS= read -r listener; do
     read -r state receive_queue send_queue local_address remote_address details <<<"$listener"
     [ "${local_address%:*}" = "127.0.0.1" ] || continue
@@ -1587,7 +1644,7 @@ china_tunnel_remove_orphan_children() {
     start_time=$(process_start_time "$pid") || return 1
     process_identity_matches "$pid" "$pgid" "$start_time" "$command_line" || return 1
     kill "$pid" 2>/dev/null || return 1
-  done < <(ss -H -ltnp 2>/dev/null)
+  done <<<"$listener_output"
 }
 
 china_tunnel_ports_clear() {
@@ -1607,6 +1664,22 @@ china_tunnel_ports_clear() {
       return 1
     fi
   done
+}
+
+china_tunnel_force_kill_orphan() {
+  local pid=$1 pgid command_line start_time
+  if [ ! -e "/proc/$pid" ]; then
+    return 0
+  fi
+  china_tunnel_ssh_child_match "$pid" || return 1
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//') || return 1
+  start_time=$(process_start_time "$pid") || return 1
+  process_identity_matches "$pid" "$pgid" "$start_time" "$command_line" || return 1
+  if kill -KILL "$pid" 2>/dev/null; then
+    return 0
+  fi
+  [ ! -e "/proc/$pid" ]
 }
 
 china_tunnel_stop_supervisor() {
@@ -1647,8 +1720,15 @@ china_tunnel_stop_supervisor() {
           echo "stale China tunnel group $pgid failed ownership proof for ${expected_marker:-unknown}" >&2
           return 1
         fi
+        if ! china_tunnel_stale_group_safe "$pgid" "$command_line" "$expected_marker"; then
+          echo "stale China tunnel group changed before stop for ${expected_marker:-unknown}" >&2
+          return 1
+        fi
       elif ! china_tunnel_group_safe "$pgid" "$expected_marker"; then
         echo "China tunnel group $pgid failed ownership proof for ${expected_marker:-unknown}" >&2
+        return 1
+      elif ! china_tunnel_group_safe "$pgid" "$expected_marker"; then
+        echo "China tunnel group changed before stop for ${expected_marker:-unknown}" >&2
         return 1
       fi
       process_identity_matches "$pid" "$pgid" "$expected_start" "$command_line" || {
@@ -1765,7 +1845,8 @@ china_tunnel_wait_legacy_clear() {
     china_tunnel_remove_orphan_children "${china_legacy_cleanup_ports[@]}" || return 1
     if [ "$wait_cycle" -eq 15 ]; then
       for pid in "${china_legacy_cleanup_orphan_pids[@]}"; do
-        china_tunnel_ssh_child_match "$pid" && kill -KILL "$pid" 2>/dev/null || true
+        repair_remaining >/dev/null || return 1
+        china_tunnel_force_kill_orphan "$pid" || return 1
       done
     fi
     listener_remaining=0
