@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -116,6 +117,16 @@ class RelayTest(unittest.TestCase):
             self.assertEqual(response.headers["Content-Range"], "bytes 2-8/16")
             self.assertEqual(response.read(), b"mpresse")
         with self.request(
+            "/glm-1/run_glm-1/broadcasts/step_1/chunk-0",
+            headers={"Range": "bytes=-7"},
+        ) as response:
+            self.assertEqual(response.read(), b"d-delta")
+        with self.request(
+            "/glm-1/run_glm-1/broadcasts/step_1/chunk-0",
+            headers={"Range": "bytes=9-"},
+        ) as response:
+            self.assertEqual(response.read(), b"d-delta")
+        with self.request(
             "/glm-1/run_glm-1/broadcasts/step_1/adapter_config.json", method="HEAD"
         ) as response:
             self.assertEqual(response.status, 200)
@@ -127,6 +138,55 @@ class RelayTest(unittest.TestCase):
                 headers={"Range": "bytes=bad-value"},
             )
         self.assertEqual(error.exception.code, 416)
+        self.assertEqual(error.exception.headers["Content-Range"], "bytes */9")
+        for range_value in ("bytes=9-", "bytes=-0", "bytes=3-2", "bytes=0-1,2-3"):
+            with self.assertRaises(HTTPError) as error:
+                self.request(
+                    "/glm-1/run_glm-1/broadcasts/step_1/adapter_config.json",
+                    headers={"Range": range_value},
+                )
+            self.assertEqual(error.exception.code, 416)
+            self.assertEqual(error.exception.headers["Content-Range"], "bytes */9")
+
+    def test_rejects_same_size_corruption_and_rehashes_changed_identity(self):
+        chunk = self.cache / "transport-chunks" / "chunk-0"
+        relay._relay_digest_cache.clear()
+        with self.request("/glm-1/run_glm-1/broadcasts/step_1/chunk-0") as response:
+            self.assertEqual(response.read(), b"compressed-delta")
+        chunk.write_bytes(b"corrupted-delta")
+        with self.assertRaises(HTTPError) as error:
+            self.request("/glm-1/run_glm-1/broadcasts/step_1/chunk-0")
+        self.assertEqual(error.exception.code, 503)
+
+    def test_unchanged_file_uses_bounded_digest_cache(self):
+        relay._relay_digest_cache.clear()
+        calls = 0
+        original = relay._sha256_source
+
+        def counted(source):
+            nonlocal calls
+            calls += 1
+            return original(source)
+
+        relay._sha256_source = counted
+        try:
+            for _ in range(8):
+                selected = relay._load_file(self.cache, self.source_url, "chunk-0")
+                selected.source.close()
+            self.assertEqual(calls, 1)
+        finally:
+            relay._sha256_source = original
+
+    def test_concurrent_requests_use_verified_open_files(self):
+        relay._relay_digest_cache.clear()
+
+        def fetch():
+            with self.request("/glm-1/run_glm-1/broadcasts/step_1/chunk-0") as response:
+                return response.read()
+
+        with ThreadPoolExecutor(max_workers=16) as workers:
+            results = list(workers.map(lambda _value: fetch(), range(32)))
+        self.assertEqual(results, [b"compressed-delta"] * 32)
 
     def test_does_not_serve_unknown_or_unready_data(self):
         with self.assertRaises(HTTPError) as error:
@@ -145,6 +205,7 @@ class RelayTest(unittest.TestCase):
         (self.cache / relay.relay_manifest_name).write_text(json.dumps(manifest), encoding="utf-8")
         selected = relay._load_file(self.cache, self.source_url, "adapter_model.safetensors")
         self.assertEqual(selected.path.read_bytes(), b"model-bytes")
+        selected.source.close()
 
     def test_delta_relay_publishes_only_completed_in_progress_chunks(self):
         partial = self.cache.with_name(f"{self.cache.name}.partial")
@@ -294,6 +355,7 @@ class RelayTest(unittest.TestCase):
             self.cache, self.source_url, "adapter_config.json"
         )
         self.assertEqual(selected.path.read_bytes(), b'{"r":32}\n')
+        selected.source.close()
         manifest = json.loads(
             (self.cache / relay.relay_manifest_name).read_text(encoding="utf-8")
         )
@@ -306,6 +368,7 @@ class RelayTest(unittest.TestCase):
             self.cache, self.source_url, "adapter_model.safetensors"
         )
         self.assertEqual(selected.path.read_bytes(), b"model-bytes")
+        selected.source.close()
 
     def test_reloads_index_when_partial_becomes_ready(self):
         partial = self.cache.with_name(f"{self.cache.name}.partial")
@@ -316,6 +379,7 @@ class RelayTest(unittest.TestCase):
             self.cache, self.source_url, "adapter_config.json"
         )
         self.assertEqual(selected.path.read_bytes(), b'{"r":32}\n')
+        selected.source.close()
         (partial / relay.relaying_marker_name).unlink()
         (partial / relay.ready_marker_name).write_text("ready\n", encoding="utf-8")
         partial.rename(self.cache)
@@ -323,6 +387,7 @@ class RelayTest(unittest.TestCase):
             self.cache, self.source_url, "adapter_model.safetensors"
         )
         self.assertEqual(selected.path.read_bytes(), b"model-bytes")
+        selected.source.close()
 
 
 if __name__ == "__main__":

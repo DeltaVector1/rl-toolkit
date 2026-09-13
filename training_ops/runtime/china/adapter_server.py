@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import shutil
+import stat
 import time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -44,7 +45,9 @@ def _json_object(path: Path, description: str) -> dict[str, object]:
     if path.is_symlink() or not path.is_file():
         raise UpgradeError(f"{description} is missing")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", encoding="utf-8") as source:
+            value = json.load(source)
     except (OSError, ValueError) as exc:
         raise UpgradeError(f"{description} is not valid JSON") from exc
     if not isinstance(value, dict):
@@ -55,11 +58,22 @@ def _json_object(path: Path, description: str) -> dict[str, object]:
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     try:
-        with path.open("rb") as source:
-            while chunk := source.read(16 * 1024 * 1024):
-                digest.update(chunk)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError as exc:
         raise UpgradeError(f"cannot read {path.name}") from exc
+    try:
+        stat_before = os.fstat(fd)
+        if not stat.S_ISREG(stat_before.st_mode):
+            raise UpgradeError(f"cannot read {path.name}")
+        identity_before = _stat_identity_from_stat(stat_before)
+        while chunk := os.read(fd, 16 * 1024 * 1024):
+            digest.update(chunk)
+        if _stat_identity_from_stat(os.fstat(fd)) != identity_before:
+            raise UpgradeError(f"{path.name} changed during validation")
+    except OSError as exc:
+        raise UpgradeError(f"cannot read {path.name}") from exc
+    finally:
+        os.close(fd)
     return digest.hexdigest()
 
 
@@ -81,10 +95,12 @@ def _stat_identity_from_stat(stat: os.stat_result) -> tuple[int, int, int, int, 
 
 def _stat_identity(path: Path) -> tuple[int, int, int, int, int]:
     try:
-        stat = path.stat()
+        stat_result = path.lstat()
     except OSError as exc:
         raise UpgradeError(f"cannot stat {path.name}") from exc
-    return _stat_identity_from_stat(stat)
+    if stat.S_ISLNK(stat_result.st_mode) or not stat.S_ISREG(stat_result.st_mode):
+        raise UpgradeError(f"cannot stat regular file {path.name}")
+    return _stat_identity_from_stat(stat_result)
 
 
 def _fd_stat_identity(fd: int) -> tuple[int, int, int, int, int]:
@@ -178,7 +194,9 @@ def _identity_from_published_directory(
     if digest_path.is_symlink() or not digest_path.is_file():
         raise UpgradeError(f"{description} weight checksum is missing")
     try:
-        sidecar_digest = digest_path.read_text(encoding="ascii").strip()
+        fd = os.open(digest_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", encoding="ascii") as source:
+            sidecar_digest = source.read().strip()
     except (OSError, UnicodeError) as exc:
         raise UpgradeError(f"{description} weight checksum cannot be read") from exc
     if sidecar_digest != records[adapter_weights_name]["sha256"]:
@@ -249,6 +267,111 @@ def _find_base(active_run: Path, step: int) -> tuple[Path, dict[str, object]]:
     raise UpgradeError(f"cannot find exact adapter base step {step}: {'; '.join(errors)}")
 
 
+def _copy_private_file(source: Path, destination: Path) -> None:
+    try:
+        source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise OSError("source is not a regular file")
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as exc:
+        try:
+            os.close(source_fd)
+        except UnboundLocalError:
+            pass
+        raise UpgradeError(f"cannot retain private adapter file {destination.name}") from exc
+    try:
+        while chunk := os.read(source_fd, 16 * 1024 * 1024):
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(destination_fd, view) :]
+        os.fchmod(destination_fd, 0o600)
+        if _stat_identity_from_stat(os.fstat(source_fd)) != _stat_identity_from_stat(source_stat):
+            raise UpgradeError(f"source changed while retaining {destination.name}")
+    except OSError as exc:
+        raise UpgradeError(f"cannot retain private adapter file {destination.name}") from exc
+    finally:
+        os.close(source_fd)
+        os.close(destination_fd)
+
+
+def _chmod_private_entry(directory: Path) -> None:
+    os.chmod(directory, 0o700)
+    for name in (
+        adapter_config_name,
+        adapter_weights_name,
+        adapter_digest_name,
+        ".identity.json",
+    ):
+        path = directory / name
+        if path.exists() and not path.is_symlink():
+            os.chmod(path, 0o600)
+
+
+def _replace_from_dirs(source: Path, destination: Path) -> None:
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    flags = os.O_RDONLY | directory_flag | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_dir = os.open(source.parent, flags)
+        destination_dir = os.open(destination.parent, flags)
+    except OSError as exc:
+        try:
+            os.close(source_dir)
+        except UnboundLocalError:
+            pass
+        raise UpgradeError("cannot open adapter publication directory") from exc
+    try:
+        os.replace(
+            source.name,
+            destination.name,
+            src_dir_fd=source_dir,
+            dst_dir_fd=destination_dir,
+        )
+    except OSError as exc:
+        raise UpgradeError("cannot publish adapter file") from exc
+    finally:
+        os.close(source_dir)
+        os.close(destination_dir)
+
+
+def _remove_leftover(path: Path) -> None:
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise UpgradeError("cannot inspect predictive upgrade leftover") from exc
+    try:
+        if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+    except OSError as exc:
+        raise UpgradeError("cannot remove predictive upgrade leftover") from exc
+
+
+def _scavenge_upgrade_leftovers(active_run: Path) -> None:
+    cache_root = active_run / cache_name
+    if cache_root.is_symlink() or (cache_root.exists() and not cache_root.is_dir()):
+        raise UpgradeError("adapter cache root is not a directory")
+    patterns = (re.compile(r"\.predictive-build-\d+-\d+\Z"),)
+    try:
+        candidates = list(active_run.iterdir())
+        if cache_root.is_dir():
+            candidates.extend(cache_root.iterdir())
+    except OSError as exc:
+        raise UpgradeError("cannot inspect predictive upgrade leftovers") from exc
+    for candidate in candidates:
+        if any(pattern.fullmatch(candidate.name) for pattern in patterns) or (
+            candidate.parent == cache_root and re.fullmatch(r"\.pending-\d+-\d+\Z", candidate.name)
+        ):
+            _remove_leftover(candidate)
+
+
 def _link_cache_entry(source: Path, identity: dict[str, object], destination: Path) -> None:
     if destination.exists() or destination.is_symlink():
         try:
@@ -258,19 +381,21 @@ def _link_cache_entry(source: Path, identity: dict[str, object], destination: Pa
         else:
             if existing != identity:
                 raise UpgradeError(f"adapter cache step {identity['step']} identity differs")
+            _chmod_private_entry(destination)
             return
-    destination.mkdir(parents=True)
+    destination.mkdir(parents=True, mode=0o700)
+    os.chmod(destination, 0o700)
     for name in (adapter_config_name, adapter_weights_name):
         source_path = source / name
         target_path = destination / name
-        try:
-            os.link(source_path, target_path)
-        except OSError as exc:
-            raise UpgradeError(f"cannot retain adapter cache step {identity['step']}") from exc
+        _copy_private_file(source_path, target_path)
     (destination / adapter_digest_name).write_text(f"{identity['weights_sha256']}\n", encoding="ascii")
     (destination / ".identity.json").write_text(
         json.dumps(identity, separators=(",", ":")) + "\n", encoding="utf-8"
     )
+    for name in (adapter_digest_name, ".identity.json"):
+        os.chmod(destination / name, 0o600)
+    _chmod_private_entry(destination)
 
 
 def _prepare_cache(
@@ -278,7 +403,8 @@ def _prepare_cache(
     entries: list[tuple[Path, dict[str, object]]],
     pending: Path,
 ) -> None:
-    pending.mkdir(parents=True)
+    pending.mkdir(parents=True, mode=0o700)
+    os.chmod(pending, 0o700)
     for source, identity in entries:
         step = int(identity["step"])
         _link_cache_entry(source, identity, pending / f"step_{step}")
@@ -288,7 +414,8 @@ def _promote_cache(active_run: Path, pending: Path, newest_step: int) -> None:
     root = active_run / cache_name
     if root.is_symlink() or (root.exists() and not root.is_dir()):
         raise UpgradeError("adapter cache root is not a directory")
-    root.mkdir(exist_ok=True)
+    root.mkdir(exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
 
     prepared: dict[int, tuple[Path, Path, dict[str, object]]] = {}
     for step in (newest_step, newest_step - 1):
@@ -305,7 +432,8 @@ def _promote_cache(active_run: Path, pending: Path, newest_step: int) -> None:
         if destination.exists():
             shutil.rmtree(source)
         else:
-            os.replace(source, destination)
+            _replace_from_dirs(source, destination)
+        _chmod_private_entry(destination)
 
     for step, (_source, destination, identity) in prepared.items():
         if _identity_from_published_directory(destination, step, cache=True) != identity:
@@ -359,23 +487,55 @@ def _install_predictive_manifest(
         chunk = build / name
         if chunk.is_symlink() or not chunk.is_file():
             raise UpgradeError(f"predictive manifest chunk is missing: {name}")
-        if chunk.stat().st_size != item.get("wire_size"):
+        wire_size = item.get("wire_size")
+        wire_sha256 = item.get("wire_sha256")
+        if (
+            type(wire_size) is not int
+            or wire_size < 0
+            or not isinstance(wire_sha256, str)
+            or digest_pattern.fullmatch(wire_sha256) is None
+        ):
+            raise UpgradeError(f"predictive manifest chunk identity is invalid: {name}")
+        if chunk.stat().st_size != wire_size:
             raise UpgradeError(f"predictive manifest chunk size differs: {name}")
+        if _sha256(chunk) != wire_sha256:
+            raise UpgradeError(f"predictive manifest chunk checksum differs: {name}")
         seen_chunks.add(name)
         chunk_names.append(name)
     target_manifest = target / adapter_manifest_name
     target_digest = target / adapter_digest_name
     build_manifest = build / adapter_manifest_name
     build_digest = build / adapter_digest_name
-    if target_manifest.is_symlink() or target_digest.is_symlink() or not build_manifest.is_file() or not build_digest.is_file():
+    if (
+        target_manifest.is_symlink()
+        or target_digest.is_symlink()
+        or build_manifest.is_symlink()
+        or build_digest.is_symlink()
+        or not build_manifest.is_file()
+        or not build_digest.is_file()
+    ):
         raise UpgradeError("predictive manifest files are not regular files")
+    stale_chunks = []
     for name in chunk_names:
-        os.replace(build / name, target / name)
-    os.replace(build_digest, target_digest)
-    os.replace(build_manifest, target_manifest)
+        target_chunk = target / name
+        if target_chunk.is_symlink():
+            raise UpgradeError(f"predictive target chunk is a symlink: {name}")
+    for old_chunk in target.glob(f"{adapter_weights_name}.transport-predictive-*"):
+        if old_chunk.name not in chunk_names:
+            if old_chunk.is_symlink():
+                raise UpgradeError(f"predictive stale chunk is a symlink: {old_chunk.name}")
+            if old_chunk.is_file():
+                stale_chunks.append(old_chunk)
+    for name in chunk_names:
+        _replace_from_dirs(build / name, target / name)
+    _replace_from_dirs(build_digest, target_digest)
+    _replace_from_dirs(build_manifest, target_manifest)
     for name in (adapter_config_name, adapter_weights_name):
         for old_chunk in target.glob(f"{name}.transport-delta-*"):
             if old_chunk.is_file() and not old_chunk.is_symlink():
+                old_chunk.unlink()
+        for old_chunk in target.glob(f"{name}.transport-predictive-*"):
+            if old_chunk in stale_chunks:
                 old_chunk.unlink()
 
 
@@ -405,12 +565,19 @@ def _upgrade_v1_step(active_run: Path, target: Path, step: int, source_base_url:
         raise UpgradeError("predictive upgrade lock is a symlink")
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock = lock_path.open("a+")
+        lock_fd = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.fchmod(lock_fd, 0o600)
+        lock = os.fdopen(lock_fd, "a+")
     except OSError as exc:
         raise UpgradeError("cannot open predictive upgrade lock") from exc
     with lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
+            _scavenge_upgrade_leftovers(active_run)
             stable = target / stable_name
             if stable.is_symlink() or not stable.is_file():
                 raise UpgradeError(f"adapter step {step} is not stable")
@@ -444,9 +611,10 @@ def _upgrade_v1_step(active_run: Path, target: Path, step: int, source_base_url:
                     ],
                     pending,
                 )
-                build.mkdir(parents=True)
+                build.mkdir(parents=True, mode=0o700)
+                os.chmod(build, 0o700)
                 for name in (adapter_config_name, adapter_weights_name):
-                    os.link(target / name, build / name)
+                    _copy_private_file(target / name, build / name)
                 from prime_rl.utils.adapter_delta import publish_adapter_manifest
 
                 manifest = publish_adapter_manifest(
@@ -460,6 +628,10 @@ def _upgrade_v1_step(active_run: Path, target: Path, step: int, source_base_url:
                     base_step=step - 1,
                     base2_step=step - 2,
                 )
+                for artifact in build.iterdir():
+                    if artifact.is_symlink() or not artifact.is_file():
+                        raise UpgradeError("predictive build contains a non-regular artifact")
+                    os.chmod(artifact, 0o600)
                 _promote_cache(active_run, pending, step)
                 _install_predictive_manifest(target, build, manifest, step)
                 _prune_cache(active_run, step)
@@ -491,6 +663,46 @@ def _safe_request_path(handler: SimpleHTTPRequestHandler) -> tuple[Path, tuple[s
     ):
         raise UpgradeError("private adapter state is not served")
     return path, pieces
+
+
+def _byte_range(value: str | None, size: int) -> tuple[int, int, int]:
+    if value is None:
+        return 200, 0, max(0, size - 1)
+    if not value.startswith("bytes=") or "," in value:
+        raise ValueError("only one byte range is supported")
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value)
+    if match is None or size == 0:
+        raise ValueError("byte range is invalid")
+    first, last = match.groups()
+    if not first and not last:
+        raise ValueError("byte range is invalid")
+    if not first:
+        count = int(last)
+        if count <= 0:
+            raise ValueError("byte range is invalid")
+        return 206, max(0, size - count), size - 1
+    start = int(first)
+    if start >= size:
+        raise ValueError("byte range starts after the file")
+    requested_last = int(last) if last else size - 1
+    if requested_last < start:
+        raise ValueError("byte range ends before it starts")
+    return 206, start, min(requested_last, size - 1)
+
+
+def _send_range_error(handler: SimpleHTTPRequestHandler, size: int, message: str) -> None:
+    body = f"<!DOCTYPE HTML>\n<html><head><title>Error response</title></head>\n<body><h1>Error response</h1>\n<p>{message}</p>\n</body></html>\n".encode(
+        "utf-8"
+    )
+    handler.send_response(416, "Requested Range Not Satisfiable")
+    handler.send_header("Content-Type", "text/html;charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Content-Range", f"bytes */{size}")
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    handler.close_connection = True
+    if handler.command != "HEAD":
+        handler.wfile.write(body)
 
 
 class RangeHandler(SimpleHTTPRequestHandler):
@@ -535,6 +747,24 @@ class RangeHandler(SimpleHTTPRequestHandler):
         _upgrade_v1_step(active_run, target, step, self.source_base_url)
         return path
 
+    def _predictive_chunk_is_published(self, step_path: Path, name: str) -> bool:
+        if not name.startswith(f"{adapter_weights_name}.transport-predictive-"):
+            return True
+        try:
+            manifest = _json_object(
+                step_path / adapter_manifest_name,
+                f"adapter step manifest for {step_path.name}",
+            )
+        except UpgradeError:
+            return False
+        chunks = manifest.get("chunks")
+        if not isinstance(chunks, list):
+            return False
+        return any(
+            isinstance(item, dict) and item.get("file") == name
+            for item in chunks
+        )
+
     def send_head(self):
         self.__dict__.pop("remaining", None)
         source = None
@@ -553,6 +783,14 @@ class RangeHandler(SimpleHTTPRequestHandler):
                         step_path = Path(self.directory).resolve().joinpath(
                             *pieces[: prefix_length + 1]
                         )
+            if pieces and pieces[-1].startswith(
+                f"{adapter_weights_name}.transport-predictive-"
+            ):
+                if step_path is None:
+                    step_path = path.parent
+                if not self._predictive_chunk_is_published(step_path, pieces[-1]):
+                    self.send_error(404)
+                    return None
             if not os.path.isdir(path):
                 try:
                     source = os.fdopen(
@@ -580,19 +818,14 @@ class RangeHandler(SimpleHTTPRequestHandler):
         if os.path.isdir(path):
             return super().send_head()
         size = os.fstat(source.fileno()).st_size
-        start, end = 0, size - 1
-        if value := self.headers.get("Range"):
-            try:
-                start_text, end_text = value.removeprefix("bytes=").split("-", 1)
-                start = int(start_text)
-                end = min(int(end_text), end) if end_text else end
-                if start > end:
-                    raise ValueError
-            except ValueError:
-                source.close()
-                self.send_error(416)
-                return None
-            self.send_response(206)
+        try:
+            status, start, end = _byte_range(self.headers.get("Range"), size)
+        except ValueError as exc:
+            source.close()
+            _send_range_error(self, size, str(exc))
+            return None
+        if status == 206:
+            self.send_response(status)
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         else:
             self.send_response(200)
