@@ -72,6 +72,9 @@ class DownloadSchedulerTest(unittest.TestCase):
 
             def do_GET(self):
                 type(self).requests += 1
+                if self.headers.get("Range") is None:
+                    self.close_connection = True
+                    return
                 start, end = map(
                     int,
                     self.headers["Range"].removeprefix("bytes=").split("-", 1),
@@ -372,6 +375,112 @@ class DownloadSchedulerTest(unittest.TestCase):
         try:
             self.assertFalse(worker.is_alive())
             self.assertLess(elapsed, 0.8)
+            self.assertTrue(errors)
+            self.assertIsInstance(errors[0], TimeoutError)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_bounded_full_scheduler_refills_before_slow_outlier(self):
+        filesystem = load_filesystem_module()
+        lock = threading.Lock()
+        active = 0
+        maximum_active = 0
+        started = {}
+        pending = 0
+        maximum_pending = 0
+
+        def worker(index, _item):
+            nonlocal active, maximum_active
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+                started[index] = time.monotonic()
+            time.sleep(0.25 if index == 0 else 0.03)
+            with lock:
+                active -= 1
+
+        real_executor = filesystem.ThreadPoolExecutor
+
+        class RecordingExecutor:
+            def __init__(self, max_workers):
+                self.executor = real_executor(max_workers=max_workers)
+
+            def submit(self, callback, *args, **kwargs):
+                nonlocal pending, maximum_pending
+                with lock:
+                    pending += 1
+                    maximum_pending = max(maximum_pending, pending)
+
+                def run():
+                    nonlocal pending
+                    try:
+                        return callback(*args, **kwargs)
+                    finally:
+                        with lock:
+                            pending -= 1
+
+                return self.executor.submit(run)
+
+            def shutdown(self, *args, **kwargs):
+                return self.executor.shutdown(*args, **kwargs)
+
+        filesystem.ThreadPoolExecutor = RecordingExecutor
+        try:
+            filesystem._run_bounded_futures(
+                list(range(5)),
+                worker,
+                2,
+                time.monotonic() + 2,
+                threading.Event(),
+            )
+        finally:
+            filesystem.ThreadPoolExecutor = real_executor
+        self.assertLess(started[2], started[0] + 0.20)
+        self.assertLessEqual(maximum_active, 2)
+        self.assertLessEqual(maximum_pending, 2)
+
+    def test_persistent_chunk_header_stall_observes_cancellation(self):
+        filesystem = load_filesystem_module()
+        payload = b"header-stall"
+
+        def stall_headers(_request, number):
+            if number == 1:
+                time.sleep(0.5)
+                return True
+            return False
+
+        server, thread, _handler = self._persistent_server(
+            filesystem, payload, stall_headers
+        )
+        cancel_event = threading.Event()
+        errors = []
+        started = time.monotonic()
+
+        def run_download():
+            try:
+                with tempfile.TemporaryDirectory() as temporary:
+                    self._persistent_download(
+                        filesystem,
+                        server,
+                        Path(temporary),
+                        "header",
+                        payload,
+                        cancel_event=cancel_event,
+                    )
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run_download)
+        worker.start()
+        time.sleep(0.05)
+        cancel_event.set()
+        worker.join(timeout=5.5)
+        elapsed = time.monotonic() - started
+        try:
+            self.assertFalse(worker.is_alive())
+            self.assertLess(elapsed, 5.5)
             self.assertTrue(errors)
             self.assertIsInstance(errors[0], TimeoutError)
         finally:

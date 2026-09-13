@@ -13,7 +13,12 @@ import time
 import urllib.request
 from urllib.error import HTTPError, URLError
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    wait,
+)
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -832,6 +837,64 @@ def _wait_for_futures(
         # Do not let the caller clean a path while a worker can still write it.
         # Socket reads and retry sleeps check the cancellation event and have
         # bounded timeouts, so this join completes after cancellation.
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+
+
+def _run_bounded_futures(
+    items,
+    worker,
+    width: int,
+    deadline: float | None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Run at most ``width`` active or queued tasks and refill on completion."""
+    if width < 1:
+        raise OSError("adapter download stream width must be positive")
+    entries = iter(enumerate(items))
+    pending = set()
+    executor = ThreadPoolExecutor(max_workers=min(width, len(items))) if items else None
+    if executor is None:
+        return
+    try:
+        while len(pending) < width:
+            try:
+                index, item = next(entries)
+            except StopIteration:
+                break
+            pending.add(executor.submit(worker, index, item))
+        while pending:
+            _check_deadline(deadline, cancel_event)
+            timeout = None
+            if deadline is not None:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise TimeoutError("adapter delta staging exceeded its time limit")
+            done, _ = wait(
+                pending,
+                timeout=timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError("adapter delta staging exceeded its time limit")
+            for future in done:
+                pending.remove(future)
+                future.result()
+                _check_cancelled(cancel_event)
+            while len(pending) < width:
+                try:
+                    index, item = next(entries)
+                except StopIteration:
+                    break
+                pending.add(executor.submit(worker, index, item))
+        _check_cancelled(cancel_event)
+    except BaseException:
+        if cancel_event is not None:
+            cancel_event.set()
+        for future in pending:
+            future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
         raise
     else:
@@ -3000,7 +3063,10 @@ class _PersistentAdapterConnection:
         timeout: float,
         consume,
     ) -> None:
-        connection, parsed = self._open(source_url, timeout)
+        read_timeout = min(timeout, persistent_read_timeout_seconds)
+        if read_timeout <= 0:
+            raise OSError("adapter persistent read timeout must be positive")
+        connection, parsed = self._open(source_url, read_timeout)
         request_path = parsed.path or "/"
         if parsed.query:
             request_path += f"?{parsed.query}"
@@ -3066,7 +3132,7 @@ class _PersistentAdapterConnection:
         if connection.sock is not None:
             try:
                 connection.sock.settimeout(
-                    min(timeout, persistent_read_timeout_seconds)
+                    read_timeout
                 )
             except OSError as exc:
                 self.close()
@@ -4662,14 +4728,13 @@ def _stage_chunked_xor_adapter(
     )
     try:
         if full_zstd:
-            for batch_start in range(0, len(chunks), download_streams):
-                batch = chunks[batch_start : batch_start + download_streams]
-                executor = ThreadPoolExecutor(max_workers=len(batch))
-                futures = [
-                    executor.submit(fetch, batch_start + index, item)
-                    for index, item in enumerate(batch)
-                ]
-                _wait_for_futures(executor, futures, deadline, cancel_event)
+            _run_bounded_futures(
+                chunks,
+                fetch,
+                download_streams,
+                deadline,
+                cancel_event,
+            )
         else:
             executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
             futures = [executor.submit(fetch, index, item) for index, item in enumerate(chunks)]
