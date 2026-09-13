@@ -97,7 +97,7 @@ def _adapter_stage_limit_seconds(policy_step: int) -> int:
     if type(policy_step) is not int or policy_step <= 0:
         raise Refused("adapter policy step must be a positive integer")
     if policy_step == 1:
-        return 900
+        return 600
     if policy_step == 2:
         return 600
     return adapter_delta_stage_timeout_seconds

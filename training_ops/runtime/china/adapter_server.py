@@ -485,6 +485,11 @@ def _safe_request_path(handler: SimpleHTTPRequestHandler) -> tuple[Path, tuple[s
         path.relative_to(root)
     except ValueError as exc:
         raise UpgradeError("request path is outside the adapter root") from exc
+    relative = path.relative_to(root)
+    if cache_name in relative.parts or any(
+        part.startswith(".predictive-") for part in relative.parts
+    ):
+        raise UpgradeError("private adapter state is not served")
     return path, pieces
 
 

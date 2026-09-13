@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -129,6 +130,39 @@ class AdapterServerTest(unittest.TestCase):
                 self.assertEqual(len(body), int(response.getheader("Content-Length")))
             finally:
                 connection.close()
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_symlink_into_private_predictive_cache_is_not_served(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            public = root / "public.txt"
+            public.write_text("public\n", encoding="utf-8")
+            private = root / adapter_server.cache_name
+            private.mkdir()
+            (private / "secret.txt").write_text("private\n", encoding="utf-8")
+            (root / "safe-link").symlink_to(public.name)
+            (root / "private-link").symlink_to(private.name, target_is_directory=True)
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                functools.partial(QuietAdapterHandler, directory=str(root)),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{server.server_port}/safe-link",
+                    timeout=5,
+                ) as response:
+                    self.assertEqual(response.read(), b"public\n")
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/private-link/secret.txt",
+                        timeout=5,
+                    )
+                self.assertEqual(raised.exception.code, 500)
+            finally:
                 server.shutdown()
                 thread.join(timeout=5)
                 server.server_close()

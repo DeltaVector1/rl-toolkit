@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import io
 import importlib.util
@@ -24,7 +25,60 @@ adapter_server = importlib.util.module_from_spec(adapter_server_spec)
 adapter_server_spec.loader.exec_module(adapter_server)
 
 
+def _load_function(path: Path, name: str):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    node = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    node.decorator_list = []
+    node.returns = None
+    for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
+        arg.annotation = None
+    namespace = {}
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), str(path), "exec"),
+        namespace,
+    )
+    return namespace[name]
+
+
 class AdapterUpdateTest(unittest.TestCase):
+    def test_adapter_stage_policy_matches_all_layers(self):
+        repository = Path(__file__).resolve().parents[2]
+        receiver_limit = _load_function(
+            repository / "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py",
+            "adapter_stage_limit_seconds",
+        )
+        client_limit = _load_function(
+            repository / "prime-rl/src/prime_rl/utils/client.py",
+            "adapter_stage_limit_seconds",
+        )
+        layers = (
+            ("training ops", training_ops._adapter_stage_limit_seconds, training_ops.Refused),
+            ("receiver", receiver_limit, OSError),
+            ("client", client_limit, RuntimeError),
+        )
+        for step, expected in ((1, 600), (2, 600), (3, 300), (4, 300), (99, 300)):
+            with self.subTest(step=step):
+                self.assertEqual(
+                    [int(limit(step)) for _, limit, _ in layers],
+                    [expected, expected, expected],
+                )
+        for name, limit, error_type in layers:
+            with self.subTest(layer=name):
+                with self.assertRaises(error_type):
+                    limit(0)
+        receiver_source = (
+            repository / "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py"
+        ).read_text(encoding="utf-8")
+        client_source = (
+            repository / "prime-rl/src/prime_rl/utils/client.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("full_adapter_stage_timeout_s = 1800.0", receiver_source)
+        self.assertIn("LORA_STAGE_TOTAL_TIMEOUT_S = 1800.0", client_source)
+
     def test_adapter_server_uses_short_bounded_writes(self):
         payload = b"x" * (adapter_server.transfer_write_bytes * 3 + 17)
         writes = []
@@ -536,7 +590,7 @@ class AdapterUpdateTest(unittest.TestCase):
             evidence,
         )
 
-    def test_step_one_terminal_status_uses_900_limit_and_reports_target_overrun(self):
+    def test_step_one_terminal_status_uses_600_limit_and_reports_target_overrun(self):
         config = training_ops._adapter_update_config("glm-perf-3")
         broadcast = training_ops.AdapterBroadcast(
             path="/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3/broadcasts/step_1",
@@ -549,7 +603,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 1,
-            "stage_timeout_seconds": 900,
+            "stage_timeout_seconds": 600,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 600.0,
             "error": "TimeoutError: adapter delta staging exceeded its time limit",
@@ -564,7 +618,7 @@ class AdapterUpdateTest(unittest.TestCase):
             return_value={"h200a": (0, json.dumps(failed)), "h200b": (0, json.dumps(failed))},
         ):
             evidence = training_ops._adapter_stage_status_evidence("glm-perf-3", config, "")
-        self.assertIn("operational limit 900s", evidence)
+        self.assertIn("operational limit 600s", evidence)
         self.assertIn("300s acceptance target exceeded on h200a, h200b", evidence)
 
     def test_terminal_stage_status_refuses_stale_unknown_and_success(self):

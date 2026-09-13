@@ -69,6 +69,7 @@ class DownloadSchedulerTest(unittest.TestCase):
             maximum_active_connections = 0
             requests = 0
             paths = []
+            ranges = []
 
             def setup(self):
                 super().setup()
@@ -87,6 +88,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 type(self).requests += 1
                 type(self).paths.append(self.path)
                 range_header = self.headers.get("Range")
+                type(self).ranges.append(range_header)
                 if range_header is None:
                     start, end = 0, len(payload) - 1
                 else:
@@ -366,7 +368,10 @@ class DownloadSchedulerTest(unittest.TestCase):
                 root = Path(temporary)
                 self._persistent_download(filesystem, server, root, "chunk", payload)
                 self.assertEqual((root / "chunks" / "chunk").read_bytes(), payload)
-                self.assertEqual(handler.connections, 2)
+                self.assertGreaterEqual(handler.requests, 2)
+                self.assertLessEqual(handler.requests, filesystem._ADAPTER_LANE_RETRIES)
+                self.assertEqual(handler.ranges[0], "bytes=0-15")
+                self.assertTrue(all(value == "bytes=3-15" for value in handler.ranges[1:]))
         finally:
             server.shutdown()
             thread.join(timeout=5)
