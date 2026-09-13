@@ -6986,11 +6986,28 @@ def qualify(
 
 def stop() -> None:
     """Stop the edge orchestrator, then the trainer. Supervisors stop first."""
+    try:
+        run = current_run()
+    except RuntimeError:
+        selected = _config_dir(default_config_dir)
+        with (repo_root / selected["trainer"]).open("rb") as stream:
+            trainer_config = tomllib.load(stream)
+        output_dir = trainer_config.get("output_dir")
+        run = Path(output_dir).name if isinstance(output_dir, str) else ""
+        expected_output_dir = f"{run_root.rstrip('/')}/{run}" if run else ""
+        if output_dir != expected_output_dir:
+            raise Refused("cannot identify the run whose batch publisher must stop")
     _remote_ok(
         trainer_head,
         "pkill -f 'bash .*[r]un_supervisor.sh' 2>/dev/null || true; "
         "pkill -f 'bash .*[t]unnel_watchdog.sh' 2>/dev/null || true; echo done",
         "supervisor stop",
+    )
+    _remote_ok(
+        trainer_head,
+        _cold_cleanup_script(run, stop_only=True),
+        "batch publisher stop",
+        timeout=300,
     )
     _remote_ok(
         orchestrator_host,

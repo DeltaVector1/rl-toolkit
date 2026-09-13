@@ -630,7 +630,7 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
     """
     from pathlib import Path
 
-    from safetensors.torch import load_file
+    from safetensors import safe_open
 
     path = Path(adapter_path)
     if path.is_dir():
@@ -638,7 +638,6 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
     if not path.is_file():
         raise FileNotFoundError(f"Initial LoRA adapter not found: {path}")
 
-    state_dict = load_file(str(path), device="cpu")
     if adapter_idx < 0:
         raise ValueError(f"Initial LoRA adapter index {adapter_idx} is invalid")
     entries = _initial_lora_adapter_entries(model, adapter_idx)
@@ -657,35 +656,35 @@ def load_initial_lora_adapter(model: nn.Module, adapter_path: str, adapter_idx: 
         key: tuple(parameter.shape[1:] if expert_index is not None else parameter.shape)
         for key, parameter, expert_index in entries
     }
-    _validate_initial_lora_adapter_inventory(
-        {key: tuple(value.shape) for key, value in state_dict.items()}, expected
-    )
-    # Every PP stage loads the same global adapter file but constructs only its
-    # own layers. Inventory validation above covers the complete model before
-    # any rank-specific parameter is changed.
-
     from torch.distributed.tensor import DTensor, distribute_tensor
 
     grouped: dict[int, list[tuple[str, nn.Parameter, int]]] = {}
-    with torch.no_grad():
-        for key, parameter, expert_index in entries:
-            if expert_index is None:
-                value = state_dict[key]
-                value = value.to(device=parameter.device, dtype=parameter.dtype)
+    with safe_open(str(path), framework="pt", device="cpu") as state:
+        inventory = {
+            key: tuple(state.get_slice(key).get_shape()) for key in state.keys()
+        }
+        _validate_initial_lora_adapter_inventory(inventory, expected)
+        with torch.no_grad():
+            for key, parameter, expert_index in entries:
+                if expert_index is None:
+                    value = state.get_tensor(key)
+                    value = value.to(device=parameter.device, dtype=parameter.dtype)
+                    if isinstance(parameter, DTensor):
+                        value = distribute_tensor(value, parameter.device_mesh, parameter.placements)
+                    parameter.copy_(value)
+                else:
+                    grouped.setdefault(id(parameter), []).append((key, parameter, expert_index))
+            for values in grouped.values():
+                parameter = values[0][1]
+                value = torch.stack(
+                    [
+                        state.get_tensor(key)
+                        for key, _, _ in sorted(values, key=lambda item: item[2])
+                    ]
+                ).to(device=parameter.device, dtype=parameter.dtype)
                 if isinstance(parameter, DTensor):
                     value = distribute_tensor(value, parameter.device_mesh, parameter.placements)
                 parameter.copy_(value)
-            else:
-                grouped.setdefault(id(parameter), []).append((key, parameter, expert_index))
-        for values in grouped.values():
-            parameter = values[0][1]
-            stacked = []
-            for key, _, _ in sorted(values, key=lambda item: item[2]):
-                stacked.append(state_dict[key])
-            value = torch.stack(stacked).to(device=parameter.device, dtype=parameter.dtype)
-            if isinstance(parameter, DTensor):
-                value = distribute_tensor(value, parameter.device_mesh, parameter.placements)
-            parameter.copy_(value)
 
     get_logger().info(
         f"Loaded {len(expected)} local initial LoRA tensors from {path} into adapter slot "
