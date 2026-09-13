@@ -1682,16 +1682,21 @@ peer_tunnel() {
   fi
 }
 
-china_tunnel_supervisor_inventory_ready() {
-  local expected_lanes=$1 pid command_line marker lane
+supervisor_lane_inventory_ready() {
+  local kind=$1 expected_lanes=$2 pid command_line marker lane prefix match_function
   local inventory_count=0
   local -a seen_lanes=()
+  case "$kind" in
+    china) prefix=china-tunnel-lora; match_function=china_tunnel_supervisor_match ;;
+    peer) prefix=peer-tunnel-lora; match_function=peer_tunnel_supervisor_match ;;
+    *) return 1 ;;
+  esac
   while read -r pid command_line; do
-    if [[ "$command_line" =~ \#\ (china-tunnel-lora-[^[:space:]]+)[[:space:]]*$ ]]; then
+    if [[ "$command_line" =~ \#\ ($prefix-[^[:space:]]+)[[:space:]]*$ ]]; then
       marker=${BASH_REMATCH[1]}
       case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-      china_tunnel_supervisor_match "$command_line" current "$marker" || return 1
-      lane=${marker#china-tunnel-lora-}
+      "$match_function" "$command_line" current "$marker" || return 1
+      lane=${marker#${prefix}-}
       case "$lane" in ''|*[!0-9]*) return 1 ;; esac
       [ "$lane" -lt "$expected_lanes" ] || return 1
       case " ${seen_lanes[*]} " in
@@ -1708,7 +1713,7 @@ china_tunnel_supervisors_ready() {
   local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
   local marker ready lora_source_port matching_pid matching_command match_count invalid
   local expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
-  china_tunnel_supervisor_inventory_ready "$expected_lanes" || return 1
+  supervisor_lane_inventory_ready china "$expected_lanes" || return 1
   china_tunnel_preflight_pgids=()
   while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
     lane_ports=("${lora_source_ports[@]:lane_start:2}")
@@ -1739,12 +1744,15 @@ china_tunnel_supervisors_ready() {
     lane_start=$((lane_start + 2))
     lane_number=$((lane_number + 1))
   done
+  supervisor_lane_inventory_ready china "$expected_lanes"
 }
 
 peer_tunnel_supervisors_ready() {
   local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
   local marker ready lora_source_port
   [ "$peer_enabled" = 1 ] || return 0
+  local expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
+  supervisor_lane_inventory_ready peer "$expected_lanes" || return 1
   while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
     lane_ports=("${lora_source_ports[@]:lane_start:2}")
     lane_forwards=()
@@ -1764,6 +1772,7 @@ peer_tunnel_supervisors_ready() {
     lane_start=$((lane_start + 2))
     lane_number=$((lane_number + 1))
   done
+  supervisor_lane_inventory_ready peer "$expected_lanes"
 }
 
 adapter_tunnel_readiness() {

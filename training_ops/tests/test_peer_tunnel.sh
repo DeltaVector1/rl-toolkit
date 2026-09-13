@@ -73,7 +73,7 @@ pattern=${3:?missing pgrep pattern}
 printf '%s' "$pattern" >"${PEER_QUERY:?}"
 if [ -r "${PEER_TEST_LOG:?}" ] && grep -Fq -- "$pattern" "$PEER_TEST_LOG"; then
   case "$pattern" in
-    china-tunnel-lora-*)
+    china-tunnel-lora-*|peer-tunnel-lora-*)
       if [ "${PEER_DUPLICATE_MARKER:-}" = "$pattern" ]; then
         echo 10000
         echo 10001
@@ -123,7 +123,7 @@ if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
     "$REAL_CAT" "$CHINA_PROC_FIXTURES/$pid" | tr '\0' ' '
   elif [ "${PEER_CHINA_OWNER_MODE:-0}" = 1 ] && [ "$pid" -ge 30000 ] 2>/dev/null; then
     lane=$((pid - 30000))
-    line=$(grep -E "done # china-tunnel-lora-${lane}[[:space:]]*$" "${PEER_TEST_LOG:?}" | tail -n 1)
+    line=$(grep -E "done # (china|peer)-tunnel-lora-${lane}[[:space:]]*$" "${PEER_TEST_LOG:?}" | tail -n 1)
     line=${line#*while true; do }
     line=${line%% sleep 3*}
     printf '%s\n' "$line"
@@ -135,7 +135,7 @@ if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
       exit 0
     fi
     lane=$((pid - 10000))
-    grep -E "done # china-tunnel-lora-${lane}[[:space:]]*$" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
+    grep -E "done # (china|peer)-tunnel-lora-${lane}[[:space:]]*$" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
   else
     query=$(<"${PEER_QUERY:?}")
     grep -F -- "$query" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
@@ -158,13 +158,23 @@ elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "pgid=" ]; then
     echo "$4"
   fi
 elif [ "${1:-}" = "-eo" ]; then
+  if [ "${2:-}" = "pid=,args=" ] && [ -n "${PEER_INVENTORY_COUNTER:-}" ]; then
+    inventory_count=$(cat "$PEER_INVENTORY_COUNTER" 2>/dev/null || echo 0)
+    inventory_count=$((inventory_count + 1))
+    printf '%s\n' "$inventory_count" >"$PEER_INVENTORY_COUNTER"
+    if [ "$inventory_count" -ge 2 ] && [ -r "${PEER_INVENTORY_SECOND:-}" ]; then
+      cat "$PEER_INVENTORY_SECOND"
+      exit 0
+    fi
+  fi
   if [ -n "${PEER_GROUP_COMMANDS:-}" ]; then
     cat "$PEER_GROUP_COMMANDS"
   elif [ "${PEER_STALE_GROUP_ACTIVE:-0}" = 1 ] && [ -r "${PEER_STALE_GROUP_COMMAND:?}" ]; then
     printf '10000 %s\n' "$(<"$PEER_STALE_GROUP_COMMAND")"
   elif [ -r "${PEER_TEST_LOG:-}" ]; then
     while IFS= read -r group_command; do
-      lane=$(sed -n 's/.*# china-tunnel-lora-\([0-9][0-9]*\)[[:space:]]*$/\1/p' <<<"$group_command")
+      marker=$(sed -n -E 's/.*# ((china|peer)-tunnel-lora-[0-9][0-9]*)[[:space:]]*$/\1/p' <<<"$group_command")
+      lane=${marker##*-}
       [ -n "$lane" ] || continue
       printf '%s %s\n' "$((10000 + lane))" "$group_command"
     done <"$PEER_TEST_LOG"
@@ -941,6 +951,35 @@ extra_marker_status=$?
 set -e
 test "$extra_marker_status" -ne 0
 unset PEER_TEST_LOG
+
+# Peer readiness rejects an otherwise valid out-of-range lane marker.
+peer_extra_log="$tmp/peer-extra-marker-log"
+peer_extra_command="${peer_supervisor_command%# peer-tunnel-lora-0}# peer-tunnel-lora-64"
+printf '%s\n' "$peer_supervisor_command" "$peer_extra_command" >"$peer_extra_log"
+export PEER_TEST_LOG="$peer_extra_log" PEER_QUERY="$query"
+set +e
+PATH="$tmp/bin:$PATH" peer_tunnel_supervisors_ready
+peer_extra_status=$?
+set -e
+test "$peer_extra_status" -ne 0
+unset PEER_TEST_LOG PEER_QUERY
+
+# A peer supervisor added after the first inventory is rejected by the final pass.
+peer_race_first="$tmp/peer-race-first"
+peer_race_second="$tmp/peer-race-second"
+peer_race_counter="$tmp/peer-race-counter"
+printf '%s\n' "$peer_supervisor_command" >"$peer_race_first"
+printf '%s\n' "$peer_supervisor_command" "$peer_extra_command" >"$peer_race_second"
+printf '0\n' >"$peer_race_counter"
+export PEER_TEST_LOG="$peer_race_first" PEER_QUERY="$query" \
+  PEER_INVENTORY_COUNTER="$peer_race_counter" PEER_INVENTORY_SECOND="$peer_race_second"
+set +e
+PATH="$tmp/bin:$PATH" peer_tunnel_supervisors_ready
+peer_race_status=$?
+set -e
+test "$peer_race_status" -ne 0
+test "$(<"$peer_race_counter")" -ge 2
+unset PEER_TEST_LOG PEER_QUERY PEER_INVENTORY_COUNTER PEER_INVENTORY_SECOND
 lora_source_ports=("${configured_lora_ports[@]}")
 
 # Both source listeners must belong to one SSH child PID, not two split children.
