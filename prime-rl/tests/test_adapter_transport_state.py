@@ -1151,6 +1151,65 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertEqual(relay_manifest["transport"], "full")
             self.assertIn("adapter_model.safetensors", relay_manifest["files"])
 
+    def test_full_stage_corrupt_exact_size_progress_stays_bounded(self):
+        filesystem = load_filesystem_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "step_0"
+            source.mkdir()
+            config = b"{}\n"
+            model = (b"\x01\x02" * ((adapter_delta.default_chunk_size + 18) // 2))[
+                : adapter_delta.default_chunk_size + 17
+            ]
+            (source / "adapter_config.json").write_bytes(config)
+            (source / "adapter_model.safetensors").write_bytes(model)
+            manifest = adapter_delta.publish_adapter_manifest(source, target_step=0, max_workers=2)
+            (source / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            handler = functools.partial(QuietDirectoryHandler, directory=str(root))
+            with socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler) as server:
+                server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                server_thread.start()
+                source_url = f"http://127.0.0.1:{server.server_address[1]}/step_0"
+                old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+                old_streams = os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS")
+                os.environ["PRIME_LORA_CACHE_DIR"] = str(root / "cache")
+                os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "24"
+                try:
+                    destination = filesystem.stage_lora_adapter_files(source_url)
+                    partial = destination.with_name(f"{destination.name}.partial")
+                    destination.rename(partial)
+                    (partial / "READY").unlink()
+                    chunk = partial / "transport-chunks" / manifest["chunks"][0]["file"]
+                    chunk.write_bytes(b"x" * chunk.stat().st_size)
+                    statuses = []
+                    old_status = filesystem._write_stage_status
+
+                    def record_status(cache_root, value, **kwargs):
+                        statuses.append(dict(value))
+                        return old_status(cache_root, value, **kwargs)
+
+                    filesystem._write_stage_status = record_status
+                    try:
+                        resumed = filesystem.stage_lora_adapter_files(source_url)
+                    finally:
+                        filesystem._write_stage_status = old_status
+                finally:
+                    if old_cache is None:
+                        os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+                    else:
+                        os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+                    if old_streams is None:
+                        os.environ.pop("PRIME_LORA_DOWNLOAD_STREAMS", None)
+                    else:
+                        os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = old_streams
+                    server.shutdown()
+                    server_thread.join()
+            self.assertEqual(resumed, destination)
+            for status in statuses:
+                self.assertGreaterEqual(status["bytes_done"], 0)
+                self.assertLessEqual(status["bytes_done"], status["bytes_total"])
+            self.assertEqual((resumed / "adapter_model.safetensors").read_bytes(), model)
+
     def test_full_stage_rejects_corrupt_wire_chunk(self):
         filesystem = load_filesystem_module()
         old_retries = filesystem._ADAPTER_LANE_RETRIES

@@ -25,8 +25,8 @@ digest_pattern = re.compile(r"[0-9a-f]{64}\Z")
 step_pattern = re.compile(r"step_(\d+)\Z")
 run_pattern = re.compile(r"[A-Za-z0-9_-]+\Z")
 transfer_write_bytes = 256 * 1024
-# End idle reads before the worker's 45-second chunk deadline.
-connection_timeout_seconds = 40
+# Keep the server idle read bound above the worker's 45-second chunk deadline.
+connection_timeout_seconds = 60
 
 
 class UpgradeError(RuntimeError):

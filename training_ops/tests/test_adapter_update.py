@@ -41,7 +41,7 @@ class AdapterUpdateTest(unittest.TestCase):
 
         self.assertEqual(b"".join(writes), payload)
         self.assertEqual(handler.remaining, 0)
-        self.assertEqual(adapter_server.connection_timeout_seconds, 40)
+        self.assertEqual(adapter_server.connection_timeout_seconds, 60)
 
     def test_adapter_server_closes_on_disconnected_output(self):
         class Output:
