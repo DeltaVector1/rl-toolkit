@@ -40,6 +40,19 @@ v1_adapter_transport = "chunked-shuffled-xor-zstd"
 v2_adapter_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
 
 
+def _adapter_manifest_url(source_url: str) -> str:
+    parsed = urlsplit(source_url)
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            f"{parsed.path.rstrip('/')}/adapter_manifest.json",
+            parsed.query,
+            "",
+        )
+    )
+
+
 def _receiver_id(client) -> str:
     return str(client.base_url).rstrip("/").removesuffix("/v1")
 
@@ -427,11 +440,11 @@ def _read_adapter_manifest(
         location = manifest_path.as_posix()
     else:
         try:
-            with urlopen(f"{source_url.rstrip('/')}/adapter_manifest.json", timeout=timeout) as source:
+            with urlopen(_adapter_manifest_url(source_url), timeout=timeout) as source:
                 manifest = json.load(source)
         except (OSError, ValueError) as exc:
             raise RuntimeError("published adapter manifest is unavailable from the adapter source") from exc
-        location = f"{source_url.rstrip('/')}/adapter_manifest.json"
+        location = _adapter_manifest_url(source_url)
     if not isinstance(manifest, dict):
         raise RuntimeError("published adapter manifest is not an object")
     return manifest, location

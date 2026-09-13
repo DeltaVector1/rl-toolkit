@@ -610,6 +610,17 @@ class StageLoraAdapterTest(unittest.TestCase):
                 )
             )
 
+    def test_bundle_requirement_rejects_local_stage_without_silent_success(self):
+        stage_lora_adapter, _namespace = _load_stage_function()
+        with self.assertRaisesRegex(RuntimeError, "remote HTTP URL"):
+            asyncio.run(
+                stage_lora_adapter(
+                    [],
+                    "/tmp/prefetched-adapter",
+                    require_bundle=True,
+                )
+            )
+
     def test_exact_duplicate_origins_stage_once(self):
         stage_lora_adapter, namespace = _load_stage_function()
         calls = []

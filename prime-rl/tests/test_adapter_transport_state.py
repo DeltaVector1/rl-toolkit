@@ -23,7 +23,7 @@ import uuid
 from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,11 +52,14 @@ def load_watcher_delta_method(urlopen):
     nodes = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name in {"_read_adapter_manifest", "_adapter_delta_base"}
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_adapter_manifest_url", "_read_adapter_manifest", "_adapter_delta_base"}
     ]
     namespace = {
         "json": json,
         "urlopen": urlopen,
+        "urlsplit": urlsplit,
+        "urlunsplit": urlunsplit,
         "_delta_stage_timeout_s": lambda: 30,
         "adapter_stage_limit_seconds": lambda step: {
             1: 600.0,
@@ -73,13 +76,19 @@ def load_watcher_delta_method(urlopen):
 def load_manifest_reader(urlopen):
     path = ROOT / "src/prime_rl/orchestrator/watcher.py"
     source = path.read_text(encoding="utf-8")
-    function = next(
+    tree = ast.parse(source)
+    nodes = [
         node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.FunctionDef) and node.name == "_read_adapter_manifest"
-    )
-    namespace = {"json": json, "urlopen": urlopen}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name in {"_adapter_manifest_url", "_read_adapter_manifest"}
+    ]
+    namespace = {
+        "json": json,
+        "urlopen": urlopen,
+        "urlsplit": urlsplit,
+        "urlunsplit": urlunsplit,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return namespace["_read_adapter_manifest"]
 
 
@@ -1062,16 +1071,16 @@ class AdapterTransportStateTest(unittest.TestCase):
             reader = load_manifest_reader(fake_urlopen)
             manifest, location = reader(
                 root,
-                "http://source/step_2",
+                "http://source/step_2?token=abc",
                 30,
                 prefer_remote=True,
             )
 
             self.assertEqual(manifest, remote_manifest)
-            self.assertEqual(location, "http://source/step_2/adapter_manifest.json")
+            self.assertEqual(location, "http://source/step_2/adapter_manifest.json?token=abc")
             self.assertEqual(
                 calls,
-                [("http://source/step_2/adapter_manifest.json", 30)],
+                [("http://source/step_2/adapter_manifest.json?token=abc", 30)],
             )
 
     def test_manifest_prewarm_does_not_block_the_event_loop(self):
