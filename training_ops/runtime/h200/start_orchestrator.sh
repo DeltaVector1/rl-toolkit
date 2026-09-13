@@ -1199,7 +1199,7 @@ tunnel_listener_ready() {
 
 china_tunnel_supervisor_owns_forwards() {
   local supervisor_pid=$1 supervisor_command=$2 mode=${3:-current}
-  local listener forward source_port child_pid child_ppid owner_command index ssh_command marker
+  local listener forward source_port child_pid child_ppid owner_command index ssh_command marker owner_pid=
   local -a forward_specs=()
   shift 3
   while [ "$#" -gt 0 ]; do
@@ -1228,6 +1228,11 @@ china_tunnel_supervisor_owns_forwards() {
     [ -n "$listener" ] || return 1
     child_pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
     case "$child_pid" in ''|*[!0-9]*) return 1 ;; esac
+    if [ -z "$owner_pid" ]; then
+      owner_pid=$child_pid
+    else
+      [ "$child_pid" = "$owner_pid" ] || return 1
+    fi
     child_ppid=$(ps -o ppid= -p "$child_pid" 2>/dev/null | tr -d ' ')
     [ "$child_ppid" = "$supervisor_pid" ] || return 1
     owner_command=$(ps -o args= -p "$child_pid" 2>/dev/null || true)
@@ -1376,6 +1381,23 @@ china_tunnel_stop_supervisor() {
   esac
 }
 
+china_tunnel_preflight_group() {
+  local pid=$1 command_line=$2 stale=${3:-0} expected_marker=${4:-} pgid
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  case "$pgid" in
+    ''|*[!0-9]*|0|1|"$$") return 1 ;;
+  esac
+  case " ${china_tunnel_preflight_pgids[*]:-} " in
+    *" $pgid "*) return 1 ;;
+  esac
+  if [ "$stale" = 1 ]; then
+    china_tunnel_stale_group_safe "$pgid" "$command_line" "$expected_marker" || return 1
+  else
+    china_tunnel_group_safe "$pgid" "$expected_marker" || return 1
+  fi
+  china_tunnel_preflight_pgids+=("$pgid")
+}
+
 china_tunnel_remove_all_owned() {
   local pid command_line marker invalid=0 index
   local -a current_pids=() current_commands=() old_pids=() old_commands=()
@@ -1393,6 +1415,15 @@ china_tunnel_remove_all_owned() {
     fi
   done < <(ps -eo pid=,args=)
   [ "$invalid" -eq 0 ] || return 1
+  china_tunnel_preflight_pgids=()
+  for index in "${!current_pids[@]}"; do
+    marker=$(sed -n 's/.*# \(china-tunnel-lora-[0-9][0-9]*\)$/\1/p' <<<"${current_commands[index]}")
+    china_tunnel_preflight_group "${current_pids[index]}" "${current_commands[index]}" 0 "$marker" || return 1
+  done
+  for index in "${!old_pids[@]}"; do
+    marker=$(sed -n 's/.*# \(china-tunnel-lora-[0-9][0-9]*\)$/\1/p' <<<"${old_commands[index]}")
+    china_tunnel_preflight_group "${old_pids[index]}" "${old_commands[index]}" 1 "$marker" || return 1
+  done
   for index in "${!current_pids[@]}"; do
     china_tunnel_stop_supervisor "${current_pids[index]}" "${current_commands[index]}" || return 1
   done
@@ -1527,6 +1558,13 @@ china_tunnel_reconcile_connection() {
       replace_all=1
     fi
   fi
+  china_tunnel_preflight_pgids=()
+  for index in "${!old_pids[@]}"; do
+    china_tunnel_preflight_group "${old_pids[index]}" "${old_commands[index]}" 1 "$marker" || return 1
+  done
+  for index in "${!current_pids[@]}"; do
+    china_tunnel_preflight_group "${current_pids[index]}" "${current_commands[index]}" 0 "$marker" || return 1
+  done
   for index in "${!old_pids[@]}"; do
     pgid=$(ps -o pgid= -p "${old_pids[index]}" 2>/dev/null | tr -d ' ')
     china_tunnel_stop_supervisor "${old_pids[index]}" "${old_commands[index]}" "$marker" 1 || return 1
@@ -1647,6 +1685,7 @@ peer_tunnel() {
 china_tunnel_supervisors_ready() {
   local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
   local marker ready lora_source_port matching_pid matching_command match_count invalid
+  china_tunnel_preflight_pgids=()
   while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
     lane_ports=("${lora_source_ports[@]:lane_start:2}")
     lane_forwards=()
@@ -1672,6 +1711,7 @@ china_tunnel_supervisors_ready() {
     [ "$match_count" -eq 1 ] || return 1
     china_tunnel_supervisor_owns_forwards "$matching_pid" "$matching_command" current \
       "${lane_forwards[@]}" || return 1
+    china_tunnel_preflight_group "$matching_pid" "$matching_command" 0 "$marker" || return 1
     lane_start=$((lane_start + 2))
     lane_number=$((lane_number + 1))
   done

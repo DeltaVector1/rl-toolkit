@@ -115,12 +115,14 @@ if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
   pid=${4:?missing process id}
   if [ "${TUNNEL_OWNER_PID:-}" = "$pid" ]; then
     cat "${TUNNEL_OWNER_COMMAND:?}"
+  elif [ "${TUNNEL_EXTRA_OWNER_PID:-}" = "$pid" ]; then
+    cat "${TUNNEL_OWNER_COMMAND:?}"
   elif [ "${TUNNEL_SUPERVISOR_PID:-}" = "$pid" ]; then
     cat "${TUNNEL_SUPERVISOR_COMMAND:?}"
   elif [ -n "${CHINA_PROC_FIXTURES:-}" ] && [ -s "$CHINA_PROC_FIXTURES/$pid" ]; then
     "$REAL_CAT" "$CHINA_PROC_FIXTURES/$pid" | tr '\0' ' '
   elif [ "${PEER_CHINA_OWNER_MODE:-0}" = 1 ] && [ "$pid" -ge 30000 ] 2>/dev/null; then
-    lane=$(( (pid - 30000) / 2 ))
+    lane=$((pid - 30000))
     line=$(grep -E "done # china-tunnel-lora-${lane}[[:space:]]*$" "${PEER_TEST_LOG:?}" | tail -n 1)
     line=${line#*while true; do }
     line=${line%% sleep 3*}
@@ -142,8 +144,10 @@ elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "ppid=" ]; then
   pid=${4:?missing process id}
   if [ "${TUNNEL_OWNER_PID:-}" = "$pid" ]; then
     printf '%s\n' "${TUNNEL_OWNER_PPID:?}"
+  elif [ "${TUNNEL_EXTRA_OWNER_PID:-}" = "$pid" ]; then
+    printf '%s\n' "${TUNNEL_OWNER_PPID:?}"
   elif [ "${PEER_CHINA_OWNER_MODE:-0}" = 1 ] && [ "$pid" -ge 30000 ] 2>/dev/null; then
-    echo $((10000 + (pid - 30000) / 2))
+    echo $((10000 + pid - 30000))
   else
     printf '%s\n' 1
   fi
@@ -463,7 +467,7 @@ china_owner_ss="$tmp/china-owner-ss"
 : >"$china_owner_ss"
 for ((owner_index=0; owner_index<${#lora_source_ports[@]}; owner_index++)); do
   printf 'LISTEN 0 128 127.0.0.1:%s 0.0.0.0:* users:(("ssh",pid=%s,fd=5))\n' \
-    "${lora_source_ports[owner_index]}" "$((30000 + owner_index))" >>"$china_owner_ss"
+    "${lora_source_ports[owner_index]}" "$((30000 + owner_index / 2))" >>"$china_owner_ss"
 done
 export PEER_CHINA_OWNER_MODE=1 CHINA_OWNER_SS_OUTPUT="$china_owner_ss"
 run_china_lanes
@@ -793,6 +797,68 @@ set -e
 test "$old_bad_status" -ne 0
 test ! -s "$old_kill_log"
 
+# Reconcile also preflights all old candidates before it kills any group.
+reconcile_log="$tmp/china-reconcile-log"
+reconcile_group="$tmp/china-reconcile-group"
+reconcile_kill_log="$tmp/china-reconcile-kill"
+printf '%s\n' "$old_supervisor" >"$reconcile_log"
+printf '%s\n' \
+  "10000 $old_supervisor" \
+  "10000 $old_exact_command" \
+  '10000 sleep 3' \
+  "10001 $old_supervisor" \
+  "10001 $old_exact_command" \
+  '10001 evil sleep 3' >"$reconcile_group"
+kill() { printf '%s\n' "$*" >>"$RECONCILE_KILL_LOG"; return 0; }
+printf '%s\n' "$old_supervisor" >"$tmp/reconcile-command"
+export RECONCILE_KILL_LOG="$reconcile_kill_log" PEER_TEST_LOG="$reconcile_log" \
+  PEER_DUPLICATE_MARKER=china-tunnel-lora-0 \
+  PEER_DUPLICATE_COMMAND="$tmp/reconcile-command" PEER_GROUP_COMMANDS="$reconcile_group"
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_reconcile_connection china-tunnel-lora-0 \
+  -L 127.0.0.1:18100:127.0.0.1:8100 \
+  -L 127.0.0.1:18101:127.0.0.1:8100
+reconcile_status=$?
+set -e
+test "$reconcile_status" -ne 0
+test ! -s "$reconcile_kill_log"
+unset -f kill
+unset RECONCILE_KILL_LOG PEER_TEST_LOG PEER_DUPLICATE_MARKER \
+  PEER_DUPLICATE_COMMAND PEER_GROUP_COMMANDS
+
+# A listener-owning keeper is also rejected when its group has an unknown member.
+keeper_log="$tmp/china-keeper-log"
+keeper_group="$tmp/china-keeper-group"
+keeper_ss="$tmp/china-keeper-ss"
+keeper_kill_log="$tmp/china-keeper-kill"
+printf '%s\n' "$china_supervisor_command" >"$keeper_log"
+printf '%s\n' \
+  "10000 $china_supervisor_command" \
+  "10000 $china_exact_command" \
+  '10000 evil sleep 3' >"$keeper_group"
+printf '%s\n' \
+  'LISTEN 0 128 127.0.0.1:18100 0.0.0.0:* users:(('"ssh"',pid=4242,fd=5))' \
+  'LISTEN 0 128 127.0.0.1:18101 0.0.0.0:* users:(('"ssh"',pid=4242,fd=6))' >"$keeper_ss"
+kill() { printf '%s\n' "$*" >>"$KEEPER_KILL_LOG"; return 0; }
+printf '%s\n' "$china_supervisor_command" >"$tmp/keeper-command"
+export KEEPER_KILL_LOG="$keeper_kill_log" PEER_TEST_LOG="$keeper_log" \
+  PEER_DUPLICATE_MARKER=china-tunnel-lora-0 \
+  PEER_DUPLICATE_COMMAND="$tmp/keeper-command" PEER_GROUP_COMMANDS="$keeper_group" \
+  PEER_STALE_LISTENERS_ACTIVE=1 TUNNEL_SS_OUTPUT="$keeper_ss" \
+  TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=10000 TUNNEL_OWNER_COMMAND="$tmp/keeper-command"
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_reconcile_connection china-tunnel-lora-0 \
+  -L 127.0.0.1:18100:127.0.0.1:8100 \
+  -L 127.0.0.1:18101:127.0.0.1:8100
+keeper_status=$?
+set -e
+test "$keeper_status" -ne 0
+test ! -s "$keeper_kill_log"
+unset -f kill
+unset KEEPER_KILL_LOG PEER_TEST_LOG PEER_DUPLICATE_MARKER \
+  PEER_DUPLICATE_COMMAND PEER_GROUP_COMMANDS PEER_STALE_LISTENERS_ACTIVE \
+  TUNNEL_SS_OUTPUT TUNNEL_OWNER_PID TUNNEL_OWNER_PPID TUNNEL_OWNER_COMMAND
+
 # A supervisor-only or sleep-only transition is safe and has no unknown member.
 sleep_group="$tmp/sleep-group"
 printf '%s\n' "1234 $china_supervisor_command" '1234 sleep 3' >"$sleep_group"
@@ -807,6 +873,27 @@ printf '%s\n' "1234 $china_supervisor_command" >"$sleep_group"
 PATH="$tmp/bin:$PATH" china_tunnel_stop_supervisor 42 "$china_supervisor_command" \
   china-tunnel-lora-0 0
 test "$(grep -F -c -- '-- -1234' "$SLEEP_KILL_LOG")" -eq 1
+
+# Group cleanup preflights every candidate before it kills any group.
+two_candidate_group="$tmp/china-two-candidate-group"
+two_candidate_kill_log="$tmp/china-two-candidate-kill"
+printf '%s\n' \
+  "10000 $china_supervisor_command" \
+  "10000 $china_exact_command" \
+  '10000 sleep 3' \
+  "10001 $china_supervisor_command" \
+  "10001 $china_exact_command" \
+  '10001 evil sleep 3' >"$two_candidate_group"
+kill() { printf '%s\n' "$*" >>"$TWO_CANDIDATE_KILL_LOG"; return 0; }
+export TWO_CANDIDATE_KILL_LOG="$two_candidate_kill_log" PEER_GROUP_COMMANDS="$two_candidate_group"
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_remove_all_owned
+two_candidate_status=$?
+set -e
+test "$two_candidate_status" -ne 0
+test ! -s "$two_candidate_kill_log"
+unset -f kill
+unset TWO_CANDIDATE_KILL_LOG PEER_GROUP_COMMANDS
 
 # Group exit waits reject a live PGID and accept an absent PGID.
 wait_group="$tmp/wait-group"
@@ -839,6 +926,31 @@ test "$duplicate_ready_status" -ne 0
 unset PEER_DUPLICATE_MARKER PEER_DUPLICATE_COMMAND TUNNEL_OWNER_PPID \
   TUNNEL_SS_OUTPUT PEER_STALE_LISTENERS_ACTIVE
 lora_source_ports=("${configured_lora_ports[@]}")
+
+# Both source listeners must belong to one SSH child PID, not two split children.
+shared_owner="$tmp/shared-owner"
+printf '%s\n' "$china_exact_command" >"$shared_owner"
+shared_ss="$tmp/shared-ss"
+printf 'LISTEN 0 128 127.0.0.1:18100 0.0.0.0:* users:(("ssh",pid=4242,fd=5))\n' >"$shared_ss"
+printf 'LISTEN 0 128 127.0.0.1:18101 0.0.0.0:* users:(("ssh",pid=4242,fd=6))\n' >>"$shared_ss"
+export TUNNEL_SS_OUTPUT="$shared_ss" PEER_STALE_LISTENERS_ACTIVE=1 \
+  TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=4241 TUNNEL_OWNER_COMMAND="$shared_owner"
+PATH="$tmp/bin:$PATH" china_tunnel_supervisor_owns_forwards 4241 \
+  "$china_supervisor_command" current \
+  -L 127.0.0.1:18100:127.0.0.1:8100 \
+  -L 127.0.0.1:18101:127.0.0.1:8100
+printf 'LISTEN 0 128 127.0.0.1:18101 0.0.0.0:* users:(("ssh",pid=4243,fd=6))\n' >"$shared_ss"
+export TUNNEL_EXTRA_OWNER_PID=4243
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_supervisor_owns_forwards 4241 \
+  "$china_supervisor_command" current \
+  -L 127.0.0.1:18100:127.0.0.1:8100 \
+  -L 127.0.0.1:18101:127.0.0.1:8100
+split_owner_status=$?
+set -e
+test "$split_owner_status" -ne 0
+unset TUNNEL_SS_OUTPUT PEER_STALE_LISTENERS_ACTIVE TUNNEL_OWNER_PID \
+  TUNNEL_EXTRA_OWNER_PID TUNNEL_OWNER_PPID TUNNEL_OWNER_COMMAND
 
 # Readiness accepts a listener only when its SSH child and two-port
 # supervisor both match the configured target.
