@@ -641,14 +641,26 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 if self.command != "GET" or length == 0:
                     return
-                source.seek(start)
+                try:
+                    source.seek(start)
+                except OSError:
+                    self.close_connection = True
+                    return
                 remaining = length
                 while remaining:
-                    chunk = source.read(min(1024 * 1024, remaining))
+                    try:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                    except OSError:
+                        self.close_connection = True
+                        return
                     if not chunk:
                         self.close_connection = True
-                        raise RelayRequestError(503, "relay file ended before its declared size")
-                    self.wfile.write(chunk)
+                        return
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        self.close_connection = True
+                        return
                     remaining -= len(chunk)
             finally:
                 source.close()
