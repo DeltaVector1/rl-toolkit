@@ -153,6 +153,125 @@ class AdapterServerTest(unittest.TestCase):
                 thread.join(timeout=5)
                 server.server_close()
 
+    def test_send_head_closes_source_when_seek_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            served = root / "file.bin"
+            served.write_bytes(b"payload")
+            opened = []
+            original_fdopen = adapter_server.os.fdopen
+
+            class SeekFailure:
+                def __init__(self, wrapped):
+                    self.wrapped = wrapped
+                    self.closed = False
+
+                def fileno(self):
+                    return self.wrapped.fileno()
+
+                def seek(self, *_args):
+                    raise OSError("seek failed")
+
+                def close(self):
+                    self.closed = True
+                    self.wrapped.close()
+
+            def fdopen(fd, mode):
+                source = SeekFailure(original_fdopen(fd, mode))
+                opened.append(source)
+                return source
+
+            handler = QuietAdapterHandler.__new__(QuietAdapterHandler)
+            handler.path = "/file.bin"
+            handler.directory = str(root)
+            handler.upgrade_path = None
+            handler.headers = {}
+            handler.command = "GET"
+            handler.translate_path = lambda _path: str(served)
+            handler._maybe_upgrade = lambda: served
+            handler.send_response = lambda *_args: None
+            handler.send_header = lambda *_args: None
+            handler.end_headers = lambda: None
+            before = len(os.listdir("/proc/self/fd"))
+            adapter_server.os.fdopen = fdopen
+            try:
+                with self.assertRaises(OSError):
+                    handler.send_head()
+                self.assertTrue(opened[0].closed)
+            finally:
+                adapter_server.os.fdopen = original_fdopen
+                if opened and not opened[0].closed:
+                    opened[0].close()
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+    def test_copyfile_closes_source_when_read_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source_path = Path(temporary) / "source"
+            source_path.write_bytes(b"payload")
+
+            class ReadFailure:
+                def __init__(self):
+                    self.wrapped = source_path.open("rb")
+                    self.closed = False
+
+                def read(self, _size):
+                    raise OSError("read failed")
+
+                def close(self):
+                    self.closed = True
+                    self.wrapped.close()
+
+            before = len(os.listdir("/proc/self/fd"))
+            source = ReadFailure()
+            handler = QuietAdapterHandler.__new__(QuietAdapterHandler)
+            handler.remaining = 7
+            handler.close_connection = False
+            try:
+                with self.assertRaises(OSError):
+                    handler.copyfile(source, object())
+                self.assertTrue(source.closed)
+                self.assertTrue(handler.close_connection)
+            finally:
+                if not source.closed:
+                    source.close()
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+    def test_copyfile_closes_source_when_write_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source_path = Path(temporary) / "source"
+            source_path.write_bytes(b"payload")
+
+            class Source:
+                def __init__(self):
+                    self.wrapped = source_path.open("rb")
+                    self.closed = False
+
+                def read(self, _size):
+                    return b"payload"
+
+                def close(self):
+                    self.closed = True
+                    self.wrapped.close()
+
+            class WriteFailure:
+                def write(self, _chunk):
+                    raise OSError("write failed")
+
+            before = len(os.listdir("/proc/self/fd"))
+            source = Source()
+            handler = QuietAdapterHandler.__new__(QuietAdapterHandler)
+            handler.remaining = 7
+            handler.close_connection = False
+            try:
+                with self.assertRaises(OSError):
+                    handler.copyfile(source, WriteFailure())
+                self.assertTrue(source.closed)
+                self.assertTrue(handler.close_connection)
+            finally:
+                if not source.closed:
+                    source.close()
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
     def test_symlink_into_private_predictive_cache_is_not_served(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

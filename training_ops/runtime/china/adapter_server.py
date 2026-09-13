@@ -1246,51 +1246,60 @@ class RangeHandler(SimpleHTTPRequestHandler):
                 )
             if chunk_identity is not None:
                 _verify_transport_fd(source.fileno(), *chunk_identity)
+            if os.path.isdir(path):
+                if source is not None:
+                    source.close()
+                    source = None
+                return super().send_head()
+            size = os.fstat(source.fileno()).st_size
+            try:
+                status, start, end = _byte_range(self.headers.get("Range"), size)
+            except ValueError as exc:
+                source.close()
+                source = None
+                _send_range_error(self, size, str(exc))
+                return None
+            if status == 206:
+                self.send_response(status)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            else:
+                self.send_response(200)
+            self.send_header("Content-Type", self.guess_type(path))
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Last-Modified", self.date_time_string(os.fstat(source.fileno()).st_mtime))
+            self.end_headers()
+            source.seek(start)
+            self.remaining = end - start + 1
+            return source
         except UpgradeError as exc:
             if source is not None:
                 source.close()
+                source = None
             self.send_error(500, str(exc))
             return None
-        if os.path.isdir(path):
-            return super().send_head()
-        size = os.fstat(source.fileno()).st_size
-        try:
-            status, start, end = _byte_range(self.headers.get("Range"), size)
-        except ValueError as exc:
-            source.close()
-            _send_range_error(self, size, str(exc))
-            return None
-        if status == 206:
-            self.send_response(status)
-            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-        else:
-            self.send_response(200)
-        self.send_header("Content-Type", self.guess_type(path))
-        self.send_header("Content-Length", str(end - start + 1))
-        self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Last-Modified", self.date_time_string(os.fstat(source.fileno()).st_mtime))
-        self.end_headers()
-        source.seek(start)
-        self.remaining = end - start + 1
-        return source
+        except Exception:
+            if source is not None:
+                source.close()
+                source = None
+            raise
 
     def copyfile(self, source, output):
         if not hasattr(self, "remaining"):
             return super().copyfile(source, output)
-        while self.remaining:
-            chunk = source.read(min(self.remaining, transfer_write_bytes))
-            if not chunk:
-                self.close_connection = True
-                source.close()
-                break
-            try:
+        try:
+            while self.remaining:
+                chunk = source.read(min(self.remaining, transfer_write_bytes))
+                if not chunk:
+                    self.close_connection = True
+                    return
                 output.write(chunk)
-            except OSError:
-                self.close_connection = True
-                source.close()
-                return
-            self.remaining -= len(chunk)
-        source.close()
+                self.remaining -= len(chunk)
+        except Exception:
+            self.close_connection = True
+            raise
+        finally:
+            source.close()
 
 
 class AdapterServer(ThreadingHTTPServer):
