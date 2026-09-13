@@ -70,8 +70,13 @@ cat >"$tmp/bin/pgrep" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 pattern=${3:?missing pgrep pattern}
-printf '%s' "$pattern" >"${PEER_QUERY:?}"
-if [ -r "${PEER_TEST_LOG:?}" ] && grep -Fq -- "$pattern" "$PEER_TEST_LOG"; then
+if [ -n "${PEER_QUERY:-}" ]; then
+  printf '%s' "$pattern" >"$PEER_QUERY"
+elif [ -z "${PEER_TEST_LOG:-}" ]; then
+  echo "pgrep fixture has no query or process log" >&2
+  exit 2
+fi
+if [ -r "${PEER_TEST_LOG:-}" ] && grep -Fq -- "$pattern" "$PEER_TEST_LOG"; then
   case "$pattern" in
     china-tunnel-lora-*|peer-tunnel-lora-*)
       if [ "${PEER_DUPLICATE_MARKER:-}" = "$pattern" ]; then
@@ -111,6 +116,10 @@ EOF
 cat >"$tmp/bin/ps" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [ "${PEER_PS_FAILURE:-0}" = 1 ]; then
+  echo "ps fixture failure" >&2
+  exit 1
+fi
 if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
   pid=${4:?missing process id}
   if [ "${TUNNEL_OWNER_PID:-}" = "$pid" ]; then
@@ -144,7 +153,12 @@ if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
     if [ -r "${PEER_GROUP_COMMANDS:-}" ]; then
       sed -n '1{s/^[0-9][0-9]* //;p;}' "$PEER_GROUP_COMMANDS"
     else
-      query=$(<"${PEER_QUERY:?}")
+      if [ -r "${PEER_QUERY:-}" ]; then
+        query=$("$REAL_CAT" "$PEER_QUERY")
+      else
+        query=
+      fi
+      [ -n "$query" ] || exit 0
       grep -F -- "$query" "${PEER_TEST_LOG:?}" | tail -n 1 | sed 's/[[:space:]]*$//' || true
     fi
   fi
@@ -160,13 +174,19 @@ elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "ppid=" ]; then
     printf '%s\n' 1
   fi
 elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "pgid=" ]; then
+  if [ -n "${PEER_GROUP_PID_FILE:-}" ]; then
+    printf '%s' "${4:?missing process id}" >"$PEER_GROUP_PID_FILE"
+  fi
   if [ "${PEER_TEST_PGID_PID:-}" = "${4:?missing process id}" ]; then
     echo "${PEER_TEST_PGID:?missing test process group id}"
   else
     echo "$4"
   fi
 elif [ "${1:-}" = "-eo" ] && [ "${2:-}" = "pid=,ppid=,args=" ]; then
-  [ -r "${PEER_CHILDREN_OUTPUT:-}" ] && cat "$PEER_CHILDREN_OUTPUT"
+  if [ -r "${PEER_CHILDREN_OUTPUT:-}" ]; then
+    cat "$PEER_CHILDREN_OUTPUT"
+  fi
+  exit 0
 elif [ "${1:-}" = "-eo" ]; then
   if [ "${2:-}" = "pid=,args=" ] && [ -n "${PEER_INVENTORY_COUNTER:-}" ]; then
     inventory_count=$(cat "$PEER_INVENTORY_COUNTER" 2>/dev/null || echo 0)
@@ -181,12 +201,52 @@ elif [ "${1:-}" = "-eo" ]; then
     cat "$PEER_GROUP_COMMANDS"
   elif [ "${PEER_STALE_GROUP_ACTIVE:-0}" = 1 ] && [ -r "${PEER_STALE_GROUP_COMMAND:?}" ]; then
     printf '10000 %s\n' "$(<"$PEER_STALE_GROUP_COMMAND")"
+  elif [ -r "${PEER_GROUP_PID_FILE:-}" ] && [ -r "${PEER_TEST_LOG:-}" ]; then
+    requested_pid=$(<"$PEER_GROUP_PID_FILE")
+    case "$requested_pid" in
+      1234) requested_marker=peer-tunnel-api ;;
+      10000|10001|10002|10003|10004|10005|10006|10007|10008|10009|1001[0-9]|1002[0-9]|1003[0-9]|1004[0-9]|1005[0-9]|1006[0-9]|1007[0-9]|1008[0-9]|1009[0-9]|101[0-1][0-9]|1012[0-7])
+        requested_marker=china-tunnel-lora-$((requested_pid - 10000))
+        grep -Eq -- "# ${requested_marker}[[:space:]]*$" "$PEER_TEST_LOG" || requested_marker=peer-tunnel-lora-$((requested_pid - 10000))
+        ;;
+      *) requested_marker= ;;
+    esac
+    if [ -n "$requested_marker" ]; then
+      group_line=$(grep -E -- "# ${requested_marker}[[:space:]]*$" "$PEER_TEST_LOG" | tail -n 1 | sed 's/[[:space:]]*$//' || true)
+      if [ -n "$group_line" ]; then
+        printf '%s %s\n' "$requested_pid" "$group_line"
+        case "$group_line" in
+          *"while true; do "*)
+            group_ssh=${group_line#*while true; do }
+            group_ssh=${group_ssh%% sleep 3*}
+            group_ssh=$(sed 's/[[:space:]]*$//' <<<"$group_ssh")
+            printf '%s %s\n%s sleep 3\n' "$requested_pid" "$group_ssh" "$requested_pid"
+            ;;
+        esac
+      fi
+    fi
   elif [ -r "${PEER_TEST_LOG:-}" ]; then
     while IFS= read -r group_command; do
-      marker=$(sed -n -E 's/.*# ((china|peer)-tunnel-lora-[0-9][0-9]*)[[:space:]]*$/\1/p' <<<"$group_command")
-      lane=${marker##*-}
-      [ -n "$lane" ] || continue
-      printf '%s %s\n' "$((10000 + lane))" "$group_command"
+      group_command=$(sed 's/[[:space:]]*$//' <<<"$group_command")
+      marker=$(sed -n -E 's/.*# ([^[:space:]]+)[[:space:]]*$/\1/p' <<<"$group_command")
+      case "$marker" in
+        china-tunnel-lora-*|peer-tunnel-lora-*)
+          lane=${marker##*-}
+          group_id=$((10000 + lane))
+          ;;
+        *)
+          group_id=1234
+          ;;
+      esac
+      printf '%s %s\n' "$group_id" "$group_command"
+      case "$group_command" in
+        *"while true; do "*)
+          group_ssh=${group_command#*while true; do }
+          group_ssh=${group_ssh%% sleep 3*}
+          group_ssh=$(sed 's/[[:space:]]*$//' <<<"$group_ssh")
+          printf '%s %s\n%s sleep 3\n' "$group_id" "$group_ssh" "$group_id"
+          ;;
+      esac
     done <"$PEER_TEST_LOG"
   fi
 fi
@@ -277,6 +337,8 @@ china_legacy_cleanup_pids=()
 china_legacy_cleanup_pgids=()
 log="$tmp/peer-tunnel.log"
 query="$tmp/peer-query"
+group_pid_file="$tmp/group-pid"
+export PEER_GROUP_PID_FILE="$group_pid_file"
 
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
 for _ in $(seq 1 50); do
@@ -304,6 +366,13 @@ while IFS= read -r line; do
   test "$reverse_count" -eq 2
   grep -Fq -- '-o ExitOnForwardFailure=yes' <<<"$line"
 done < <(grep -F -- '-R 127.0.0.1:' "$log")
+
+# A process-list failure must stop peer orphan cleanup.
+set +e
+PATH="$tmp/bin:$PATH" PEER_PS_FAILURE=1 peer_tunnel_remove_orphan_children
+peer_ps_failure_status=$?
+set -e
+test "$peer_ps_failure_status" -ne 0
 
 # SSH matching rejects an extra token even when the forwards and target match.
 peer_exact_command="ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ChannelTimeout=*-tcpip=45s -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19"
@@ -338,8 +407,10 @@ for hostile_peer_supervisor in \
 done
 
 # A second launcher invocation finds the exact API and lane signatures.
+kill() { sed -i '/# peer-tunnel-api[[:space:]]*$/d' "$log"; return 0; }
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
 test "$(wc -l <"$log")" -eq "$expected_peer_lines"
+unset -f kill
 
 # A failed ownership/kill proof stops reconciliation before a replacement can
 # start. The stale lane remains in the fixture so the failure is observable.
@@ -610,6 +681,10 @@ while IFS= read -r line; do
   grep -Fq -- '-o ExitOnForwardFailure=yes' <<<"$line"
 done <"$china_log"
 # A repeat launch preserves all matching groups without adding processes.
+# The process-list fixture uses PEER_QUERY to select the group being checked.
+# Point it at a China supervisor before the second reconciliation; the query
+# still gets replaced by the pgrep fixture when peer tests resume.
+printf '%s\n' "$(head -n 1 "$china_log")" >"$query"
 run_china_lanes
 test "$(wc -l <"$china_log")" -eq "$expected_lanes"
 # A target change fails closed and does not start a second owner.
@@ -1332,6 +1407,27 @@ for hostile_generic_supervisor in \
     exit 1
   fi
 done
+
+# A healthy generic tunnel is a fast no-op and does not start another group.
+generic_noop_log="$tmp/generic-noop-log"
+printf '%s\n' "$secondary_supervisor" >"$generic_noop_log"
+generic_noop_group="$tmp/generic-noop-group"
+printf '%s\n' "1234 $secondary_supervisor" "1234 $secondary_owner" \
+  '1234 sleep 3' >"$generic_noop_group"
+printf '%s\n' "$secondary_owner" >"$tmp/generic-noop-owner"
+printf '%s\n' "$secondary_supervisor" >"$tmp/generic-noop-supervisor"
+printf 'LISTEN 0 128 127.0.0.1:26407 0.0.0.0:* users:(('"'"'ssh'"'"',pid=4242,fd=5))\n' \
+  >"$tmp/generic-noop-ss"
+export PEER_TEST_LOG="$generic_noop_log" PEER_QUERY="$tmp/generic-noop-query" \
+  PEER_GROUP_COMMANDS="$generic_noop_group" TUNNEL_OWNER_PID=4242 TUNNEL_OWNER_PPID=4241 \
+  TUNNEL_OWNER_COMMAND="$tmp/generic-noop-owner" TUNNEL_SUPERVISOR_PID=4241 \
+  TUNNEL_SUPERVISOR_COMMAND="$tmp/generic-noop-supervisor" TUNNEL_SS_OUTPUT="$tmp/generic-noop-ss" \
+  PEER_STALE_LISTENERS_ACTIVE=1
+PATH="$tmp/bin:$PATH" tunnel 26407 127.0.0.1:8000 "$secondary_target" no \
+  "${secondary_options[@]}"
+unset PEER_TEST_LOG PEER_QUERY PEER_GROUP_COMMANDS TUNNEL_OWNER_PID TUNNEL_OWNER_PPID \
+  TUNNEL_OWNER_COMMAND TUNNEL_SUPERVISOR_PID TUNNEL_SUPERVISOR_COMMAND \
+  TUNNEL_SS_OUTPUT PEER_STALE_LISTENERS_ACTIVE
 
 # Generic stale cleanup requires every member of the exact process group.
 generic_owned_group="$tmp/generic-owned-group"
