@@ -237,6 +237,12 @@ elif [ "${1:-}" = "-eo" ] && [ "${2:-}" = "pid=,ppid=,args=" ]; then
   fi
   exit 0
 elif [ "${1:-}" = "-eo" ]; then
+  if [ "${2:-}" = "pid=,ppid=,pgid=,stat=" ]; then
+    if [ -r "${PEER_GROUP_COMMANDS:-}" ]; then
+      awk '{print NR+10000, 1, $1, "S"}' "$PEER_GROUP_COMMANDS"
+    fi
+    exit 0
+  fi
   if [ "${2:-}" = "pid=,args=" ] && [ -n "${PEER_INVENTORY_COUNTER:-}" ]; then
     inventory_count=$(cat "$PEER_INVENTORY_COUNTER" 2>/dev/null || echo 0)
     inventory_count=$((inventory_count + 1))
@@ -356,6 +362,8 @@ end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
 source <(sed -n '/^repair_launch_tunnel() {/,/^}/p' "$script")
 api_reconcile_definition=$(declare -f peer_tunnel_remove_duplicate_api_supervisors)
+tunnel_prepare_definition=$(declare -f tunnel_prepare_group_stop)
+tunnel_prepare_group_stop() { :; }
 # The process-free lane tests do not provide /proc. Test API migration with
 # exact NUL process fixtures below instead.
 peer_tunnel_remove_duplicate_api_supervisors() { :; }
@@ -1702,6 +1710,36 @@ unset -f kill
 unset TWO_CANDIDATE_KILL_LOG PEER_GROUP_COMMANDS
 
 # Group exit waits reject a live PGID and accept an absent PGID.
+(
+  eval "$tunnel_prepare_definition"
+  eval "$tunnel_wait_group_exit_definition"
+  process_identity_matches() { [ "$uncertain" = 0 ]; }
+  process_start_time() { printf 'start-%s\n' "$1"; }
+  tunnel_process_argv() { printf 'argv-%s\n' "$1"; }
+  ps() {
+    [ "$live" = 1 ] || return 0
+    printf '%s\n' "9001 1 9001 $state" "9002 9001 9001 $state"
+  }
+  owned() { :; }
+  sleep() { [ "$term_exits" = 0 ] || live=0; }
+  kill() { test "$*" = '-KILL -- -9001'; killed=1; live=0; }
+  repair_remaining() { return 1; }
+  for mode in zombie term kill uncertain; do
+    live=1; state=S; uncertain=0; killed=0; term_exits=0
+    tunnel_prepare_group_stop 9001 9001 start-9001 supervisor owned
+    case "$mode" in
+      zombie) state=Z ;;
+      term) term_exits=1 ;;
+      uncertain) uncertain=1 ;;
+    esac
+    if [ "$mode" = uncertain ]; then
+      if tunnel_wait_group_exit 9001; then exit 1; fi
+    else
+      tunnel_wait_group_exit 9001
+    fi
+    if [ "$mode" = kill ]; then test "$killed" = 1; else test "$killed" = 0; fi
+  done
+)
 wait_group="$tmp/wait-group"
 printf '%s\n' '1234 sleep 3' >"$wait_group"
 export PEER_GROUP_COMMANDS="$wait_group"

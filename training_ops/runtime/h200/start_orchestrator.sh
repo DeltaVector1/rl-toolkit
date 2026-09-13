@@ -980,22 +980,70 @@ pgrep_matches() {
   return "$status"
 }
 
+tunnel_live_group() {
+  local process_output
+  process_output=$(ps -eo pid=,ppid=,pgid=,stat= 2>/dev/null) || return 1
+  awk -v group="$1" '$3 == group && $4 !~ /^Z/ {print $1, $2}' <<<"$process_output"
+}
+
+tunnel_process_argv() {
+  base64 -w0 "/proc/$1/cmdline"
+}
+
+tunnel_stop_identity_matches() {
+  local pgid=$1 output pid ppid current seen=0
+  [ "${tunnel_stop_pgid:-}" = "$pgid" ] || return 1
+  process_identity_matches "$tunnel_stop_pid" "$pgid" "$tunnel_stop_start" "$tunnel_stop_command" || return 1
+  output=$(tunnel_live_group "$pgid") || return 1
+  while read -r pid ppid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" != "$tunnel_stop_pid" ] || seen=1
+    [ -n "${tunnel_stop_starts[$pid]:-}" ] || return 1
+    [ "$(process_start_time "$pid")" = "${tunnel_stop_starts[$pid]}" ] || return 1
+    current=$(tunnel_process_argv "$pid") || return 1
+    [ -n "$current" ] && [ "$current" = "${tunnel_stop_args[$pid]}" ] || return 1
+    [ "$ppid" = "${tunnel_stop_parents[$pid]}" ] || return 1
+  done <<<"$output"
+  [ "$seen" = 1 ]
+}
+
+tunnel_prepare_group_stop() {
+  local pgid=$1 pid=$2 start=$3 command_line=$4 output member ppid
+  shift 4
+  [ -n "$command_line" ] || command_line=$(process_command_line "$pid") || return 1
+  declare -gA tunnel_stop_args=() tunnel_stop_starts=() tunnel_stop_parents=()
+  tunnel_stop_pgid=$pgid
+  tunnel_stop_pid=$pid
+  tunnel_stop_start=$start
+  tunnel_stop_command=$command_line
+  output=$(tunnel_live_group "$pgid") || return 1
+  while read -r member ppid; do
+    [ -n "$member" ] || continue
+    tunnel_stop_args[$member]=$(tunnel_process_argv "$member") || return 1
+    tunnel_stop_starts[$member]=$(process_start_time "$member") || return 1
+    tunnel_stop_parents[$member]=$ppid
+  done <<<"$output"
+  "$@" || return 1
+  tunnel_stop_identity_matches "$pgid"
+}
+
 tunnel_wait_group_exit() {
-  local pgid=$1 process_output
+  local pgid=$1 process_output attempt phase
   case "$pgid" in ''|*[!0-9]*|0|1) return 1 ;; esac
-  for _ in $(seq 1 30); do
-    repair_remaining >/dev/null || return 1
-    process_output=$(ps -eo pgid= 2>/dev/null) || return 1
-    if awk -v group="$pgid" '$1 == group {found=1} END {exit !found}' <<<"$process_output"; then
-      :
-    else
-      case "$?" in
-        1) return 0 ;;
-        *) return 1 ;;
-      esac
+  for phase in term kill; do
+    for attempt in $(seq 1 20); do
+      process_output=$(tunnel_live_group "$pgid") || return 1
+      [ -n "$process_output" ] || return 0
+      sleep 0.25
+    done
+    [ "$phase" = term ] || break
+    if ! tunnel_stop_identity_matches "$pgid"; then
+      echo "tunnel group $pgid ownership changed; no KILL sent; remaining PIDs: $(awk 'NR <= 16 {printf "%s ", $1}' <<<"$process_output")" >&2
+      return 1
     fi
-    repair_sleep 1 || return 1
+    kill -KILL -- "-$pgid" || return 1
   done
+  echo "tunnel group $pgid did not exit; remaining PIDs: $(awk 'NR <= 16 {printf "%s ", $1}' <<<"$process_output")" >&2
   return 1
 }
 
@@ -1205,6 +1253,8 @@ generic_tunnel_stop_stale() {
         echo "stale generic tunnel process changed before stop for $marker" >&2
         return 1
       }
+      tunnel_prepare_group_stop "$pgid" "$pid" "$expected_start" "$command_line" \
+        generic_tunnel_stale_group_safe "$pgid" "$command_line" "$marker" "$forward" || return 1
       kill -- "-$pgid" 2>/dev/null || {
         echo "could not stop stale generic tunnel group $pgid for $marker" >&2
         return 1
@@ -1893,6 +1943,8 @@ peer_kill_owned() {
           echo "peer tunnel process changed before stop for $marker" >&2
           return 1
         }
+        tunnel_prepare_group_stop "$pgid" "$pid" "$expected_start" "$command_line" \
+          peer_tunnel_stale_group_safe "$pgid" "$command_line" "$shape" "$marker" || return 1
         kill -- "-$pgid" 2>/dev/null || {
           echo "could not stop peer tunnel group $pgid for $marker" >&2
           return 1
@@ -1915,6 +1967,8 @@ peer_kill_owned() {
         echo "peer tunnel process changed before stop" >&2
         return 1
       }
+      tunnel_prepare_group_stop "$pgid" "$pid" "$expected_start" "$command_line" \
+        peer_tunnel_group_safe "$pgid" || return 1
       kill -- "-$pgid" 2>/dev/null || {
         echo "could not stop peer tunnel group $pgid" >&2
         return 1
@@ -2007,29 +2061,34 @@ peer_tunnel_remove_duplicate_api_supervisors() {
   fi
 }
 
+peer_tunnel_api_group_safe() {
+  local pgid=$1 pid=$2 start=$3 variant=$4 member member_group member_parent output count
+  peer_tunnel_api_pid_match "$pid" supervisor "$variant" || return 1
+  [ "$(process_start_time "$pid")" = "$start" ] || return 1
+  output=$(ps -eo pid=,ppid=,pgid=) || return 1
+  count=0
+  while read -r member member_parent member_group; do
+    [ "$member_group" = "$pgid" ] || continue
+    count=$((count + 1))
+    [ "$member" = "$pid" ] && continue
+    [ "$member_parent" = "$pid" ] || return 1
+    peer_tunnel_api_read_args "$member" || return 1
+    if [ "${#peer_api_actual[@]}" = 2 ] && [ "${peer_api_actual[0]}" = sleep ] && [ "${peer_api_actual[1]}" = 3 ]; then
+      continue
+    fi
+    peer_tunnel_api_pid_match "$member" child "$variant" || return 1
+  done <<<"$output"
+  [ "$count" -ge 1 ] || return 1
+}
+
 peer_tunnel_api_stop_group() {
-  local pid=$1 variant=$2 pgid start member member_group member_parent output count
+  local pid=$1 variant=$2 pgid start
   pgid=$(ps -o pgid= -p "$pid" | tr -d ' ') || return 1
   [ "$pgid" = "$pid" ] && [ "$pgid" -gt 1 ] && [ "$pgid" != "$$" ] || return 1
   start=$(process_start_time "$pid") || return 1
-  for _ in 1 2; do
-    peer_tunnel_api_pid_match "$pid" supervisor "$variant" || return 1
-    [ "$(process_start_time "$pid")" = "$start" ] || return 1
-    output=$(ps -eo pid=,ppid=,pgid=) || return 1
-    count=0
-    while read -r member member_parent member_group; do
-      [ "$member_group" = "$pgid" ] || continue
-      count=$((count + 1))
-      [ "$member" = "$pid" ] && continue
-      [ "$member_parent" = "$pid" ] || return 1
-      peer_tunnel_api_read_args "$member" || return 1
-      if [ "${#peer_api_actual[@]}" = 2 ] && [ "${peer_api_actual[0]}" = sleep ] && [ "${peer_api_actual[1]}" = 3 ]; then
-        continue
-      fi
-      peer_tunnel_api_pid_match "$member" child "$variant" || return 1
-    done <<<"$output"
-    [ "$count" -ge 1 ] || return 1
-  done
+  peer_tunnel_api_group_safe "$pgid" "$pid" "$start" "$variant" || return 1
+  tunnel_prepare_group_stop "$pgid" "$pid" "$start" "" \
+    peer_tunnel_api_group_safe "$pgid" "$pid" "$start" "$variant" || return 1
   peer_tunnel_api_pid_match "$pid" supervisor "$variant" || return 1
   [ "$(process_start_time "$pid")" = "$start" ] || return 1
   [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pgid" ] || return 1
@@ -2125,42 +2184,57 @@ peer_repair_missing_remote_lanes() {
 }
 
 china_source_ports_ready() {
-  local probe_seconds=${1:-10} expected_lanes observed_lanes verified_ports
+  local probe_seconds=40 expected_lanes observed_lanes verified_ports
   probe_seconds=$(repair_timeout "$probe_seconds") || return 1
   expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
   observed_lanes=$(ps -eo args= | sed -n 's/.*# china-tunnel-lora-\([0-9][0-9]*\)$/\1/p' | sort -n) || return 1
   [ "$observed_lanes" = "$(seq 0 $((expected_lanes - 1)))" ] || return 1
   if ! verified_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
-      python3 - "${lora_source_ports[0]}" "${lora_source_ports[-1]}" <<'PY'
+      python3 - "${lora_source_ports[0]}" "${lora_source_ports[-1]}" "$probe_seconds" <<'PY'
 import http.client
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 first = int(sys.argv[1])
 last = int(sys.argv[2])
+deadline = time.monotonic() + float(sys.argv[3]) - 0.5
 
 
-def is_adapter_server(port):
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+def is_adapter_server(port, socket_seconds):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return port, "deadline"
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=min(socket_seconds, remaining))
     try:
         connection.request("HEAD", "/")
         response = connection.getresponse()
         response.read()
         server = response.getheader("Server") or ""
         if response.status != 200 or not server.startswith("SimpleHTTP/"):
-            return port
-    except OSError:
-        return port
+            return port, f"status={response.status},server={server[:48]!r}"
+    except (OSError, http.client.HTTPException) as error:
+        return port, type(error).__name__
     finally:
         connection.close()
     return None
 
 
 ports = list(range(first, last + 1))
-with ThreadPoolExecutor(max_workers=min(32, len(ports))) as executor:
-    failed = [port for port in executor.map(is_adapter_server, ports) if port is not None]
+failed = dict.fromkeys(ports, "not checked")
+for attempt, (workers, socket_seconds) in enumerate(((32, 2), (4, 5), (2, 5)), 1):
+    if attempt > 1:
+        time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+    with ThreadPoolExecutor(max_workers=min(workers, len(failed))) as executor:
+        failed = dict(result for result in executor.map(
+            lambda port: is_adapter_server(port, socket_seconds), failed
+        ) if result is not None)
+    if not failed:
+        break
+    details = ",".join(f"{port}:{reason}" for port, reason in list(failed.items())[:16])
+    print(f"adapter source check attempt={attempt} failed={len(failed)} {details}", file=sys.stderr)
 if failed:
-    print("wrong adapter source ports: " + ",".join(map(str, failed)), file=sys.stderr)
+    print("persistent adapter source failures: " + ",".join(map(str, list(failed)[:16])), file=sys.stderr)
     raise SystemExit(1)
 print(len(ports))
 PY
@@ -2746,6 +2820,13 @@ china_tunnel_stop_supervisor() {
         echo "China tunnel process changed before stop for ${expected_marker:-unknown}" >&2
         return 1
       }
+      if [ "$stale" = 1 ]; then
+        tunnel_prepare_group_stop "$pgid" "$pid" "$expected_start" "$command_line" \
+          china_tunnel_stale_group_safe "$pgid" "$command_line" "$expected_marker" || return 1
+      else
+        tunnel_prepare_group_stop "$pgid" "$pid" "$expected_start" "$command_line" \
+          china_tunnel_group_safe "$pgid" "$expected_marker" || return 1
+      fi
       kill -- "-$pgid" 2>/dev/null || {
         echo "could not stop China tunnel group $pgid for ${expected_marker:-unknown}" >&2
         return 1
@@ -3333,7 +3414,7 @@ peer_tunnel_api_supervisor_ready() {
 adapter_tunnel_local_snapshot() {
   repair_remaining >/dev/null || return 1
   china_tunnel_supervisors_ready || return 1
-  china_source_ports_ready 10 || return 1
+  china_source_ports_ready || return 1
   if [ "$peer_enabled" = 1 ]; then
     peer_tunnel_supervisors_ready || return 1
     tunnel_listener_ready "$peer_api_port" peer-tunnel-api \
@@ -3364,7 +3445,7 @@ adapter_tunnel_readiness() {
   for attempt in $(seq 1 30); do
     repair_remaining >/dev/null || return 1
     tunnels_ready=0
-    china_tunnel_supervisors_ready && china_source_ports_ready 10 && tunnels_ready=1
+    china_tunnel_supervisors_ready && china_source_ports_ready && tunnels_ready=1
     if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ]; then
       peer_tunnel_supervisors_ready || {
         peer_readiness_failure="supervisor inventory/identity attempt $attempt"

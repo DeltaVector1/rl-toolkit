@@ -1,9 +1,13 @@
 import ast
 import asyncio
+import contextlib
+import io
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -699,6 +703,73 @@ class OrchestratorRepairTest(unittest.TestCase):
             with self.assertRaisesRegex(training_ops.Refused, "idle or waiting"):
                 training_ops._repair_orchestrator()
         deploy.assert_not_called()
+
+
+class SourcePortProbeTest(unittest.TestCase):
+    def run_probe(self, fail_until, budget=40, delay=False):
+        script = Path(__file__).resolve().parents[1] / "runtime/h200/start_orchestrator.sh"
+        body = script.read_text().split("china_source_ports_ready() {", 1)[1]
+        body = body.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        calls = {}
+        lock = threading.Lock()
+
+        class Connection:
+            def __init__(self, host, port, timeout):
+                self.port, self.timeout = port, timeout
+
+            def request(self, method, path):
+                with lock:
+                    calls[self.port] = calls.get(self.port, 0) + 1
+                    attempt = calls[self.port]
+                if delay:
+                    time.sleep(self.timeout)
+                if attempt <= fail_until.get(self.port, 0):
+                    raise TimeoutError()
+
+            def getresponse(self):
+                return SimpleNamespace(status=200, read=lambda: b"", getheader=lambda name: "SimpleHTTP/0.6")
+
+            def close(self):
+                pass
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        started = time.monotonic()
+        status = 0
+        with mock.patch("http.client.HTTPConnection", Connection), mock.patch.object(
+            sys, "argv", ["probe", "18100", "18107", str(budget)]
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                exec(compile(body, str(script), "exec"), {})
+            except SystemExit as error:
+                status = error.code
+        return status, calls, stdout.getvalue(), stderr.getvalue(), time.monotonic() - started
+
+    def test_retries_only_ports_that_failed_the_previous_attempt(self):
+        status, calls, output, errors, _ = self.run_probe({18101: 1, 18105: 2})
+        self.assertEqual(status, 0)
+        self.assertEqual(output, "8\n")
+        self.assertEqual(calls[18101], 2)
+        self.assertEqual(calls[18105], 3)
+        self.assertTrue(all(count == 1 for port, count in calls.items() if port not in {18101, 18105}))
+        self.assertIn("attempt=1 failed=2", errors)
+        self.assertIn("attempt=2 failed=1", errors)
+
+    def test_returns_only_persistent_failures(self):
+        status, calls, output, errors, _ = self.run_probe({18101: 1, 18105: 99})
+        self.assertEqual(status, 1)
+        self.assertEqual(output, "")
+        self.assertEqual(calls[18101], 2)
+        self.assertEqual(calls[18105], 3)
+        self.assertEqual(errors.splitlines()[-1], "persistent adapter source failures: 18105")
+
+    def test_socket_and_retries_obey_the_whole_probe_deadline(self):
+        status, _, output, errors, elapsed = self.run_probe(
+            dict.fromkeys(range(18100, 18108), 99), budget=0.6, delay=True
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(output, "")
+        self.assertIn("deadline", errors)
+        self.assertLess(elapsed, 1)
 
 
 if __name__ == "__main__":
