@@ -3634,17 +3634,19 @@ adapter_tunnel_exact_snapshot() {
 adapter_tunnel_readiness() {
   local tunnels_ready=0 readiness_port="" listener_status=0 remote_ready=1 attempt api_repair_attempted=0
   for attempt in $(seq 1 30); do
-    repair_stage=local-readiness
+    repair_stage=local-china-readiness
     repair_remaining >/dev/null || return 1
     tunnels_ready=0
     china_tunnel_supervisors_ready && tunnels_ready=1
     if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ]; then
+      repair_stage=local-peer-readiness
       peer_tunnel_supervisors_ready || {
         peer_readiness_failure="supervisor inventory/identity attempt $attempt"
         tunnels_ready=0
         readiness_port=peer
       }
       if [ "$tunnels_ready" = 1 ]; then
+        repair_stage=local-api-readiness
         listener_status=0
         peer_tunnel_api_listener_owner || listener_status=$?
         if [ "$listener_status" = 0 ]; then
@@ -3669,6 +3671,7 @@ adapter_tunnel_readiness() {
       fi
     fi
     if [ "$tunnels_ready" = 1 ] && [ "$secondary_enabled" = 1 ]; then
+      repair_stage=local-secondary-readiness
       listener_status=0
       generic_tunnel_listener_ready "$secondary_local_api_port" "zmq-tunnel-$secondary_local_api_port" \
         "$secondary_ssh_target" \
