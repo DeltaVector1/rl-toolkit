@@ -1018,6 +1018,69 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
+    def test_persistent_chunk_checks_each_lane_before_checksum_retries(self):
+        filesystem = load_filesystem_module()
+        payload = b"checksum-good"
+        corrupt = b"checksum-bad!"
+        digest = hashlib.sha256(payload).hexdigest()
+
+        def only_lane_one_is_good(request, _number):
+            if request.path == "/lane1/chunk":
+                return False
+            if not request.path.startswith("/lane"):
+                return False
+            request.send_response(206)
+            request.send_header("Content-Length", str(len(corrupt)))
+            request.send_header(
+                "Content-Range", f"bytes 0-{len(corrupt) - 1}/{len(payload)}"
+            )
+            request.send_header("ETag", f'"{digest}"')
+            request.end_headers()
+            request.wfile.write(corrupt)
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, only_lane_one_is_good
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        filesystem.lane_rotation_delay_seconds = 0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                urls = [
+                    f"http://127.0.0.1:{server.server_address[1]}/lane{index}"
+                    for index in range(12)
+                ]
+                pool = filesystem._PersistentAdapterLanePool(urls, width=1)
+                try:
+                    pool.download(
+                        pool.urls_for_lane(0, "chunk"),
+                        0,
+                        chunks / "chunk",
+                        parent_fd,
+                        expected_size=len(payload),
+                        expected_sha256=digest,
+                        per_request_timeout_seconds=1,
+                    )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertEqual((chunks / "chunk").read_bytes(), payload)
+                self.assertEqual(
+                    handler.paths[:2], ["/lane0/chunk", "/lane1/chunk"]
+                )
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
     def test_persistent_chunk_resets_corrupt_local_prefix(self):
         filesystem = load_filesystem_module()
         payload = b"prefix-recovery"

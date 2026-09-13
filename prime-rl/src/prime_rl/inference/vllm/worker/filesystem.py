@@ -3452,13 +3452,11 @@ class _PersistentAdapterLanePool:
         if not source_urls:
             raise OSError("adapter download has no source lane")
         lock, connection = self._lanes[lane % len(self._lanes)]
-        attempt_limit = (
-            max(_ADAPTER_LANE_RETRIES, len(source_urls))
-            if deadline is not None
-            else _ADAPTER_LANE_RETRIES
-        )
+        attempt_limit = max(_ADAPTER_LANE_RETRIES, len(source_urls))
         bad_sources: set[str] = set()
         checksum_error: OSError | None = None
+        source_cursor = 0
+        retry_cursor = 0
         with lock:
             for attempt in range(attempt_limit):
                 _check_deadline(deadline, cancel_event)
@@ -3482,14 +3480,19 @@ class _PersistentAdapterLanePool:
                     os.unlink(destination.name, dir_fd=parent_fd)
                     present = 0
 
-                available_sources = [
-                    source for source in source_urls if source not in bad_sources
-                ]
-                if not available_sources:
-                    # Every lane has returned bad bytes. Keep the bounded retry
-                    # policy, but allow a transiently repaired lane to recover.
-                    available_sources = source_urls
-                source_url = available_sources[attempt % len(available_sources)]
+                while source_cursor < len(source_urls):
+                    source_url = source_urls[source_cursor]
+                    source_cursor += 1
+                    if source_url not in bad_sources:
+                        break
+                else:
+                    available_sources = [
+                        source for source in source_urls if source not in bad_sources
+                    ]
+                    if not available_sources:
+                        available_sources = source_urls
+                    source_url = available_sources[retry_cursor % len(available_sources)]
+                    retry_cursor += 1
                 if per_request_timeout_seconds is None:
                     timeout = _request_timeout(deadline, cancel_event)
                 else:
@@ -3574,10 +3577,6 @@ class _PersistentAdapterLanePool:
                         cancel_event,
                         parent_fd=parent_fd,
                     ) != expected_sha256:
-                        # A complete response with a bad digest is an integrity
-                        # failure, not a transport failure. Close this lane,
-                        # discard this exact partial, and rotate to another
-                        # lane. Never resume from corrupt bytes.
                         connection.close()
                         os.unlink(destination.name, dir_fd=parent_fd)
                         bad_sources.add(source_url)
