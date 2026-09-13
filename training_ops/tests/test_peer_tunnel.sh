@@ -52,6 +52,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin"
 real_cat=$(command -v cat)
 real_ssh=$(command -v ssh)
+real_awk=$(command -v awk)
 cat >"$tmp/bin/cat" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -70,6 +71,14 @@ cat >"$tmp/bin/pgrep" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 pattern=${3:?missing pgrep pattern}
+if [ -n "${PEER_PGREP_STATUS:-}" ]; then
+  exit "$PEER_PGREP_STATUS"
+fi
+if [ -n "${PEER_API_CANDIDATES:-}" ] &&
+    [ "$pattern" = "${PEER_API_SIGNATURE:?missing API signature}" ]; then
+  cat "$PEER_API_CANDIDATES"
+  exit 0
+fi
 if [ -n "${PEER_QUERY:-}" ]; then
   printf '%s' "$pattern" >"$PEER_QUERY"
 elif [ -z "${PEER_TEST_LOG:-}" ]; then
@@ -140,6 +149,8 @@ if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
     line=${line#*while true; do }
     line=${line%% sleep 3*}
     printf '%s\n' "$line"
+  elif [ "${PEER_API_OWNER_MODE:-0}" = 1 ] && [ "${PEER_API_OWNER_PID:-}" = "$pid" ]; then
+    printf '%s\n' "${PEER_API_CHILD_COMMAND:?missing API child command}"
   elif [ -n "${PEER_DUPLICATE_COMMAND:-}" ] && [ "$pid" -ge 10000 ] 2>/dev/null; then
     cat "$PEER_DUPLICATE_COMMAND"
   elif [ "$pid" -ge 10000 ] 2>/dev/null; then
@@ -168,6 +179,8 @@ elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "ppid=" ]; then
     printf '%s\n' "${TUNNEL_OWNER_PPID:?}"
   elif [ "${TUNNEL_EXTRA_OWNER_PID:-}" = "$pid" ]; then
     printf '%s\n' "${TUNNEL_OWNER_PPID:?}"
+  elif [ "${PEER_API_OWNER_MODE:-0}" = 1 ] && [ "${PEER_API_OWNER_PID:-}" = "$pid" ]; then
+    printf '%s\n' "${PEER_API_OWNER_PPID:?missing API owner PPID}"
   elif [ "${PEER_CHINA_OWNER_MODE:-0}" = 1 ] && [ "$pid" -ge 30000 ] 2>/dev/null; then
     echo $((10000 + pid - 30000))
   else
@@ -256,6 +269,8 @@ cat >"$tmp/bin/ss" <<'EOF'
 set -euo pipefail
 if [ -n "${TUNNEL_SS_OUTPUT:-}" ] && [ "${PEER_STALE_LISTENERS_ACTIVE:-}" != 0 ]; then
   cat "${TUNNEL_SS_OUTPUT:?missing tunnel ss output}"
+elif [ "${PEER_API_OWNER_MODE:-0}" = 1 ] && [[ "$*" == *ltnp* ]]; then
+  cat "${PEER_API_SS_OUTPUT:?missing API listener fixture}"
 elif [ "${PEER_CHINA_OWNER_MODE:-0}" = 1 ] && [[ "$*" == *ltnp* ]]; then
   cat "${CHINA_OWNER_SS_OUTPUT:?missing China owner fixture}"
 fi
@@ -269,13 +284,31 @@ else
   exec "$REAL_SSH" "$@"
 fi
 EOF
+cat >"$tmp/bin/awk" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${PEER_AWK_FAILURE:-0}" = 1 ]; then
+  echo "awk fixture failure" >&2
+  exit 2
+fi
+exec "$REAL_AWK" "$@"
+EOF
 chmod +x "$tmp/bin/cat" "$tmp/bin/pgrep" "$tmp/bin/setsid" "$tmp/bin/ssh"
 chmod +x "$tmp/bin/ps" "$tmp/bin/ss"
-export REAL_CAT="$real_cat" REAL_SSH="$real_ssh"
+chmod +x "$tmp/bin/awk"
+export REAL_CAT="$real_cat" REAL_SSH="$real_ssh" REAL_AWK="$real_awk"
 
 start=$(grep -n '^generic_tunnel_ssh_match() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
+
+# Keep the supervisor fixture in this shell. This avoids command lookup cache
+# selecting the host setsid binary after a PATH-scoped test invocation.
+setsid() {
+  local line
+  line=$(printf '%s\n' "$*" | tr '\n' ' ')
+  printf '%s\n' "$line" >>"${PEER_TEST_LOG:?}"
+}
 
 # The launcher preamble supplies these helpers in production. Keep this
 # function-level fixture independent from its remote configuration parser.
@@ -411,6 +444,98 @@ kill() { sed -i '/# peer-tunnel-api[[:space:]]*$/d' "$log"; return 0; }
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
 test "$(wc -l <"$log")" -eq "$expected_peer_lines"
 unset -f kill
+
+# API reconciliation keeps the one supervisor whose exact SSH child owns the
+# listener, and removes the other two exact candidates.
+api_signature='-L 127.0.0.1:18049:127.0.0.1:8000'
+api_child_command="ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ChannelTimeout=*-tcpip=45s -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -L 127.0.0.1:18049:127.0.0.1:8000 root@38.255.28.19"
+api_supervisor_command="nohup bash -c while true; do $api_child_command; sleep 3; done # peer-tunnel-api"
+api_command_file="$tmp/api-command"
+api_candidates="$tmp/api-candidates"
+api_group="$tmp/api-group"
+api_kill_log="$tmp/api-kill"
+printf '%s\n' "$api_supervisor_command" >"$api_command_file"
+printf '%s\n' 10000 10001 10002 >"$api_candidates"
+printf '%s\n' \
+  "10000 $api_supervisor_command" "10000 $api_child_command" '10000 sleep 3' \
+  "10001 $api_supervisor_command" "10001 $api_child_command" '10001 sleep 3' \
+  "10002 $api_supervisor_command" "10002 $api_child_command" '10002 sleep 3' >"$api_group"
+api_ss="$tmp/api-ss"
+printf '%s\n' 'LISTEN 0 128 127.0.0.1:18049 0.0.0.0:* users:(('"'"'ssh'"'"',pid=30000,fd=5))' >"$api_ss"
+api_remove_candidate() {
+  local argument pid
+  printf '%s\n' "$*" >>"$api_kill_log"
+  case "${1:-}:${2:-}" in
+    --:-[0-9]*)
+      argument=${2#-}
+      pid=${argument%%[[:space:]]*}
+      sed -i -E "/^${pid}([[:space:]]|$)/d" "$api_candidates" "$api_group"
+      ;;
+  esac
+  return 0
+}
+export PEER_API_SIGNATURE="$api_signature" PEER_API_CANDIDATES="$api_candidates" \
+  PEER_DUPLICATE_COMMAND="$api_command_file" PEER_GROUP_COMMANDS="$api_group" \
+  PEER_API_OWNER_MODE=1 PEER_API_OWNER_PID=30000 PEER_API_OWNER_PPID=10001 \
+  PEER_API_CHILD_COMMAND="$api_child_command" PEER_API_SS_OUTPUT="$api_ss" \
+  PEER_TEST_LOG="$api_command_file"
+test "$(PATH="$tmp/bin:$PATH" ps -o args= -p 30000)" = "$api_child_command"
+kill() { api_remove_candidate "$@"; }
+PATH="$tmp/bin:$PATH" peer_tunnel_connection api "$api_signature" \
+  -L 127.0.0.1:18049:127.0.0.1:8000
+test "$(tr '\n' ' ' <"$api_candidates")" = '10001 '
+test "$(grep -F -c -- '-- -10000' "$api_kill_log")" -eq 1
+test "$(grep -F -c -- '-- -10002' "$api_kill_log")" -eq 1
+test "$(grep -F -c -- '-- -10001' "$api_kill_log")" -eq 0
+unset -f kill
+unset PEER_API_SIGNATURE PEER_API_CANDIDATES PEER_DUPLICATE_COMMAND PEER_GROUP_COMMANDS \
+  PEER_API_OWNER_MODE PEER_API_OWNER_PID PEER_API_OWNER_PPID PEER_API_CHILD_COMMAND \
+  PEER_API_SS_OUTPUT PEER_TEST_LOG
+
+# With no listener owner, all exact API candidates are removed and a fresh
+# supervisor is started.
+api_no_owner_log="$tmp/api-no-owner-log"
+: >"$api_candidates"
+printf '%s\n' 10000 10001 10002 >"$api_candidates"
+printf '%s\n' \
+  "10000 $api_supervisor_command" "10000 $api_child_command" '10000 sleep 3' \
+  "10001 $api_supervisor_command" "10001 $api_child_command" '10001 sleep 3' \
+  "10002 $api_supervisor_command" "10002 $api_child_command" '10002 sleep 3' >"$api_group"
+: >"$api_kill_log"
+: >"$api_no_owner_log"
+kill() { api_remove_candidate "$@"; }
+export PEER_API_SIGNATURE="$api_signature" PEER_API_CANDIDATES="$api_candidates" \
+  PEER_DUPLICATE_COMMAND="$api_command_file" PEER_GROUP_COMMANDS="$api_group" \
+  PEER_API_OWNER_MODE=0 PEER_TEST_LOG="$api_no_owner_log"
+hash -r
+PATH="$tmp/bin:$PATH" peer_tunnel_connection api "$api_signature" \
+  -L 127.0.0.1:18049:127.0.0.1:8000
+test ! -s "$api_candidates"
+test "$(grep -F -c -- '# peer-tunnel-api' "$api_no_owner_log")" -eq 1
+test "$(grep -F -c -- '-- -10000' "$api_kill_log")" -eq 1
+test "$(grep -F -c -- '-- -10001' "$api_kill_log")" -eq 1
+test "$(grep -F -c -- '-- -10002' "$api_kill_log")" -eq 1
+unset -f kill
+unset PEER_API_SIGNATURE PEER_API_CANDIDATES PEER_DUPLICATE_COMMAND PEER_GROUP_COMMANDS \
+  PEER_API_OWNER_MODE PEER_TEST_LOG
+
+# A pgrep error is not an empty inventory and must not mutate the candidates.
+printf '%s\n' 10001 >"$api_candidates"
+api_error_log="$tmp/api-pgrep-error-log"
+printf '%s\n' "$api_supervisor_command" >"$api_error_log"
+api_before_candidates=$(<"$api_candidates")
+api_before_log=$(<"$api_error_log")
+set +e
+PEER_PGREP_STATUS=2 PEER_API_SIGNATURE="$api_signature" \
+  PEER_API_CANDIDATES="$api_candidates" PEER_TEST_LOG="$api_error_log" \
+  PATH="$tmp/bin:$PATH" peer_tunnel_connection api "$api_signature" \
+  -L 127.0.0.1:18049:127.0.0.1:8000
+api_pgrep_status=$?
+set -e
+test "$api_pgrep_status" -ne 0
+test "$(<"$api_candidates")" = "$api_before_candidates"
+test "$(<"$api_error_log")" = "$api_before_log"
+unset PEER_PGREP_STATUS PEER_API_SIGNATURE PEER_API_CANDIDATES PEER_TEST_LOG
 
 # A failed ownership/kill proof stops reconciliation before a replacement can
 # start. The stale lane remains in the fixture so the failure is observable.
@@ -1181,6 +1306,17 @@ test "$wait_live_status" -ne 0
 PATH="$tmp/bin:$PATH" china_tunnel_wait_group_exit 1234
 unset -f sleep
 unset PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+
+# Process-list and matcher failures are not the same as an absent group.
+set +e
+PATH="$tmp/bin:$PATH" PEER_PS_FAILURE=1 tunnel_wait_group_exit 1234
+wait_ps_failure_status=$?
+PATH="$tmp/bin:$PATH" PEER_AWK_FAILURE=1 tunnel_wait_group_exit 1234
+wait_awk_failure_status=$?
+set -e
+test "$wait_ps_failure_status" -ne 0
+test "$wait_awk_failure_status" -ne 0
+unset PEER_PS_FAILURE PEER_AWK_FAILURE
 
 # Readiness rejects two exact same-marker supervisors even when one owns both listeners.
 duplicate_command="$tmp/duplicate-command"

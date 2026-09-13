@@ -649,6 +649,33 @@ generic_tunnel_supervisor_match() {
     "${ssh_options[@]}"
 }
 
+pgrep_matches() {
+  local pattern=$1 status
+  pgrep -f -- "$pattern"
+  status=$?
+  [ "$status" -eq 1 ] && return 0
+  return "$status"
+}
+
+tunnel_wait_group_exit() {
+  local pgid=$1 process_output
+  case "$pgid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+  for _ in $(seq 1 30); do
+    repair_remaining >/dev/null || return 1
+    process_output=$(ps -eo pgid= 2>/dev/null) || return 1
+    if awk -v group="$pgid" '$1 == group {found=1} END {exit !found}' <<<"$process_output"; then
+      :
+    else
+      case "$?" in
+        1) return 0 ;;
+        *) return 1 ;;
+      esac
+    fi
+    repair_sleep 1 || return 1
+  done
+  return 1
+}
+
 generic_tunnel_listener_ready() {
   local lp=$1 marker=$2 via=$3 forward=$4 comp=$5
   shift 5
@@ -677,8 +704,10 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
   local ssh_text=""
   [ "${#ssh_options[@]}" -eq 0 ] || ssh_text=$(printf ' %q' "${ssh_options[@]}")
   local marker="zmq-tunnel-$lp" forward="127.0.0.1:$lp:$tgt"
-  local pid command_line
-  for pid in $(pgrep -f -- "$marker" || true); do
+  local pid command_line matching_pids
+  matching_pids=$(pgrep_matches "$marker") || return 1
+  while read -r pid; do
+    [ -n "$pid" ] || continue
     command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
     if generic_tunnel_supervisor_match "$command_line" "$marker" "$via" "$forward" "$comp" \
       "${ssh_options[@]}" \
@@ -687,7 +716,7 @@ tunnel() { # local_port  target_host:port  ssh_target  [compress]
       return 0
     fi
     generic_tunnel_stop_stale "$pid" "$command_line" "$marker" "$forward" || return 1
-  done
+  done <<<"$matching_pids"
   setsid nohup bash -c "while true; do
       ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes \
           -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
@@ -769,6 +798,10 @@ generic_tunnel_stop_stale() {
         echo "could not stop stale generic tunnel group $pgid for $marker" >&2
         return 1
       }
+      tunnel_wait_group_exit "$pgid" || {
+        echo "stale generic tunnel group $pgid did not exit for $marker" >&2
+        return 1
+      }
       ;;
   esac
 }
@@ -819,13 +852,7 @@ peer_tunnel_connection() {
   repair_remaining >/dev/null || return 1
   [ "$connection_name" = api ] && expected_shape=api
   if [ "${restart_tunnels:-0}" = 0 ]; then
-    if matching_pids=$(pgrep -f -- "$signature"); then
-      :
-    else
-      pgrep_status=$?
-      [ "$pgrep_status" -eq 1 ] || return 1
-      matching_pids=
-    fi
+    matching_pids=$(pgrep_matches "$signature") || return 1
     while read -r pid; do
       [ -n "$pid" ] || continue
       command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
@@ -862,13 +889,7 @@ peer_tunnel_connection() {
         peer_kill_owned "${candidate_pids[index]}" "${candidate_commands[index]}" \
           "$expected_shape" "$marker" "${forwards[@]}" || return 1
       done
-      if matching_pids=$(pgrep -f -- "$signature"); then
-        :
-      else
-        pgrep_status=$?
-        [ "$pgrep_status" -eq 1 ] || return 1
-        matching_pids=
-      fi
+      matching_pids=$(pgrep_matches "$signature") || return 1
       final_count=0
       final_command=
       while read -r pid; do
@@ -1238,6 +1259,10 @@ peer_kill_owned() {
           echo "could not stop peer tunnel group $pgid for $marker" >&2
           return 1
         }
+        tunnel_wait_group_exit "$pgid" || {
+          echo "peer tunnel group $pgid did not exit for $marker" >&2
+          return 1
+        }
         return 0
       fi
       if ! peer_tunnel_group_safe "$pgid"; then
@@ -1254,6 +1279,10 @@ peer_kill_owned() {
       }
       kill -- "-$pgid" 2>/dev/null || {
         echo "could not stop peer tunnel group $pgid" >&2
+        return 1
+      }
+      tunnel_wait_group_exit "$pgid" || {
+        echo "peer tunnel group $pgid did not exit" >&2
         return 1
       }
       ;;
@@ -1964,7 +1993,7 @@ china_tunnel_remove_all_owned() {
 
 china_tunnel_remove_legacy() {
   local only_marker=${1:-}
-  local lora_source_port pattern pid command_line cleanup_port
+  local lora_source_port pattern pid command_line cleanup_port matching_pids
   local grouped_legacy stale
   local -a cleanup_ports=()
   for cleanup_port in "${@:2}"; do
@@ -1980,7 +2009,9 @@ china_tunnel_remove_legacy() {
   for lora_source_port in "${cleanup_ports[@]}"; do
     repair_remaining >/dev/null || return 1
     pattern="-L 127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port"
-    for pid in $(pgrep -f -- "$pattern" || true); do
+    matching_pids=$(pgrep_matches "$pattern") || return 1
+    while read -r pid; do
+      [ -n "$pid" ] || continue
       repair_remaining >/dev/null || return 1
       command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
       grouped_legacy=0
@@ -2002,7 +2033,7 @@ china_tunnel_remove_legacy() {
         fi
         china_tunnel_stop_supervisor "$pid" "$command_line" "$only_marker" "$stale" || return 1
       fi
-    done
+    done <<<"$matching_pids"
   done
 }
 
@@ -2041,26 +2072,19 @@ china_tunnel_wait_legacy_clear() {
 }
 
 china_tunnel_wait_group_exit() {
-  local pgid=$1
-  case "$pgid" in ''|*[!0-9]*|0|1) return 1 ;; esac
-  for _ in $(seq 1 30); do
-    repair_remaining >/dev/null || return 1
-    if ! ps -eo pgid= 2>/dev/null | awk -v group="$pgid" '$1 == group {found=1} END {exit !found}'; then
-      return 0
-    fi
-    repair_sleep 1 || return 1
-  done
-  return 1
+  tunnel_wait_group_exit "$1"
 }
 
 china_tunnel_reconcile_connection() {
   local marker=$1
   shift
   local -a forwards=("$@")
-  local pid command_line current_count=0 keeper= old_keeper= pgid invalid=0 index replace_all=0
+  local pid command_line current_count=0 keeper= old_keeper= pgid invalid=0 index replace_all=0 matching_pids
   local -a current_pids=() current_commands=() old_pids=() old_commands=()
   repair_remaining >/dev/null || return 1
-  for pid in $(pgrep -f -- "$marker" || true); do
+  matching_pids=$(pgrep_matches "$marker") || return 1
+  while read -r pid; do
+    [ -n "$pid" ] || continue
     repair_remaining >/dev/null || return 1
     command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
     if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${forwards[@]}"; then
@@ -2073,7 +2097,7 @@ china_tunnel_reconcile_connection() {
     elif [ -n "$command_line" ] && china_tunnel_marker_match "$command_line" "$marker"; then
       invalid=1
     fi
-  done
+  done <<<"$matching_pids"
   [ "$invalid" -eq 0 ] || return 1
   if [ "$current_count" -gt 0 ]; then
     for index in "${!current_pids[@]}"; do
@@ -2257,7 +2281,7 @@ supervisor_lane_inventory_ready() {
 
 china_tunnel_supervisors_ready() {
   local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
-  local marker ready lora_source_port matching_pid matching_command match_count invalid
+  local marker ready lora_source_port matching_pid matching_command match_count invalid matching_pids
   local expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
   supervisor_lane_inventory_ready china "$expected_lanes" || return 1
   china_tunnel_preflight_pgids=()
@@ -2272,7 +2296,9 @@ china_tunnel_supervisors_ready() {
     matching_pid=
     match_count=0
     invalid=0
-    for pid in $(pgrep -f -- "$marker" || true); do
+    matching_pids=$(pgrep_matches "$marker") || return 1
+    while read -r pid; do
+      [ -n "$pid" ] || continue
       command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
       if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${lane_forwards[@]}"; then
         match_count=$((match_count + 1))
@@ -2281,7 +2307,7 @@ china_tunnel_supervisors_ready() {
       elif [ -n "$command_line" ] && china_tunnel_marker_match "$command_line" "$marker"; then
         invalid=1
       fi
-    done
+    done <<<"$matching_pids"
     [ "$invalid" -eq 0 ] || return 1
     [ "$match_count" -eq 1 ] || return 1
     china_tunnel_supervisor_owns_forwards "$matching_pid" "$matching_command" current \
@@ -2295,7 +2321,7 @@ china_tunnel_supervisors_ready() {
 
 peer_tunnel_supervisors_ready() {
   local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
-  local marker lora_source_port matching_pid matching_command match_count supervisor_start
+  local marker lora_source_port matching_pid matching_command match_count supervisor_start matching_pids
   [ "$peer_enabled" = 1 ] || return 0
   local expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
   peer_supervisor_pids=()
@@ -2317,14 +2343,16 @@ peer_tunnel_supervisors_ready() {
     matching_pid=
     matching_command=
     match_count=0
-    for pid in $(pgrep -f -- "$marker" || true); do
+    matching_pids=$(pgrep_matches "$marker") || return 1
+    while read -r pid; do
+      [ -n "$pid" ] || continue
       command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
       if peer_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${lane_forwards[@]}"; then
         match_count=$((match_count + 1))
         matching_pid=$pid
         matching_command=$command_line
       fi
-    done
+    done <<<"$matching_pids"
     [ "$match_count" -eq 1 ] || return 1
     supervisor_start=$(process_start_time "$matching_pid") || return 1
     peer_snapshot_child_pid=
@@ -2346,18 +2374,20 @@ peer_tunnel_supervisors_ready() {
 }
 
 peer_tunnel_api_supervisor_ready() {
-  local marker=peer-tunnel-api pid command_line matching_pid= matching_command=
+  local marker=peer-tunnel-api pid command_line matching_pid= matching_command= matching_pids
   local match_count=0 supervisor_start
   local api_forward="-L 127.0.0.1:$peer_api_port:127.0.0.1:8000"
   [ "$peer_enabled" = 1 ] || return 0
-  for pid in $(pgrep -f -- "$marker" || true); do
+  matching_pids=$(pgrep_matches "$marker") || return 1
+  while read -r pid; do
+    [ -n "$pid" ] || continue
     command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
     if peer_tunnel_supervisor_forwards_match "$command_line" api "$marker" "$api_forward"; then
       match_count=$((match_count + 1))
       matching_pid=$pid
       matching_command=$command_line
     fi
-  done
+  done <<<"$matching_pids"
   [ "$match_count" -eq 1 ] || return 1
   supervisor_start=$(process_start_time "$matching_pid") || return 1
   peer_snapshot_child_pid=
