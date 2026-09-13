@@ -9,6 +9,7 @@ import socketserver
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -96,7 +97,9 @@ class DownloadSchedulerTest(unittest.TestCase):
         thread.start()
         return server, thread, Handler
 
-    def _persistent_download(self, filesystem, server, root, name, payload):
+    def _persistent_download(
+        self, filesystem, server, root, name, payload, cancel_event=None
+    ):
         chunks = root / "chunks"
         chunks.mkdir(exist_ok=True)
         parent_fd = filesystem._open_directory_nofollow(
@@ -114,6 +117,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 expected_size=len(payload),
                 expected_sha256=hashlib.sha256(payload).hexdigest(),
                 per_request_timeout_seconds=2,
+                cancel_event=cancel_event,
             )
         finally:
             pool.close()
@@ -268,6 +272,108 @@ class DownloadSchedulerTest(unittest.TestCase):
                     os.close(parent_fd)
                 self.assertEqual((chunks / "identity").read_bytes(), payload[:2])
                 self.assertEqual(handler.requests, 1)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_chunk_http500_is_terminal(self):
+        filesystem = load_filesystem_module()
+        payload = b"server-error"
+
+        def server_error(request, number):
+            if number != 1:
+                return False
+            request.send_response(500)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, server_error
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                try:
+                    with self.assertRaisesRegex(OSError, "unexpected HTTP status"):
+                        pool.download(
+                            [f"http://127.0.0.1:{server.server_address[1]}/error"],
+                            0,
+                            chunks / "error",
+                            parent_fd,
+                            expected_size=len(payload),
+                            expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            per_request_timeout_seconds=2,
+                        )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertEqual(handler.requests, 1)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_chunk_read_timeout_observes_cancellation(self):
+        filesystem = load_filesystem_module()
+        payload = b"cancel-read"
+
+        def stall_body(request, number):
+            if number != 1:
+                return False
+            request.send_response(206)
+            request.send_header("Content-Length", str(len(payload)))
+            request.send_header(
+                "Content-Range", f"bytes 0-{len(payload) - 1}/{len(payload)}"
+            )
+            request.end_headers()
+            time.sleep(0.5)
+            return True
+
+        server, thread, _handler = self._persistent_server(
+            filesystem, payload, stall_body
+        )
+        old_read_timeout = filesystem.persistent_read_timeout_seconds
+        filesystem.persistent_read_timeout_seconds = 0.05
+        cancel_event = threading.Event()
+        errors = []
+        started = time.monotonic()
+
+        def run_download():
+            try:
+                with tempfile.TemporaryDirectory() as temporary:
+                    self._persistent_download(
+                        filesystem,
+                        server,
+                        Path(temporary),
+                        "cancel",
+                        payload,
+                        cancel_event=cancel_event,
+                    )
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run_download)
+        worker.start()
+        time.sleep(0.05)
+        cancel_event.set()
+        worker.join(timeout=1)
+        elapsed = time.monotonic() - started
+        filesystem.persistent_read_timeout_seconds = old_read_timeout
+        try:
+            self.assertFalse(worker.is_alive())
+            self.assertLess(elapsed, 0.8)
+            self.assertTrue(errors)
+            self.assertIsInstance(errors[0], TimeoutError)
         finally:
             server.shutdown()
             thread.join(timeout=5)
