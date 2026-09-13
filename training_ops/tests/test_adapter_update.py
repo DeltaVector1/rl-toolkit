@@ -113,6 +113,25 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertEqual(handler.remaining, len(payload))
         self.assertTrue(source.closed)
 
+    def test_adapter_server_propagates_source_read_failure(self):
+        class Source:
+            closed = False
+
+            def read(self, _size):
+                raise OSError("source read failed")
+
+            def close(self):
+                self.closed = True
+
+        handler = adapter_server.RangeHandler.__new__(adapter_server.RangeHandler)
+        handler.remaining = adapter_server.transfer_write_bytes
+        source = Source()
+        with self.assertRaisesRegex(OSError, "source read failed"):
+            handler.copyfile(source, io.BytesIO())
+
+        self.assertTrue(handler.close_connection)
+        self.assertTrue(source.closed)
+
     def test_start_inventory_deploys_nodes_config_to_participants(self):
         selected = {
             "trainer": "configs/decensor/trainer.toml",

@@ -190,6 +190,21 @@ def _fd_stat_identity(fd: int) -> tuple[int, int, int, int, int]:
         raise UpgradeError("cannot stat served adapter file") from exc
 
 
+def _stable_rename_identity(stat_result: os.stat_result) -> tuple[int, ...]:
+    file_type = stat.S_IFMT(stat_result.st_mode)
+    if stat.S_ISDIR(stat_result.st_mode):
+        return stat_result.st_dev, stat_result.st_ino, file_type
+    if stat.S_ISREG(stat_result.st_mode):
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            file_type,
+        )
+    return stat_result.st_dev, stat_result.st_ino, file_type
+
+
 def _file_records(manifest: dict[str, object], description: str) -> dict[str, dict[str, object]]:
     records = manifest.get("files")
     if not isinstance(records, list):
@@ -494,6 +509,7 @@ def _replace_directory_from_dirs(
     source_identity = _stat_identity_from_stat(source_stat)
     if expected_identity is not None and source_identity != expected_identity:
         raise OSError("adapter publication source changed")
+    stable_source_identity = _stable_rename_identity(source_stat)
     candidate_name = f".{destination_name}.candidate-{os.getpid()}-{time.time_ns()}"
     backup_name = f".{destination_name}.backup-{os.getpid()}-{time.time_ns()}"
     candidate_path = destination_parent / candidate_name
@@ -507,13 +523,13 @@ def _replace_directory_from_dirs(
             dst_dir_fd=destination_dir,
         )
         candidate_stat = os.stat(candidate_name, dir_fd=destination_dir, follow_symlinks=False)
-        if _stat_identity_from_stat(candidate_stat) != source_identity:
+        if _stable_rename_identity(candidate_stat) != stable_source_identity:
             raise OSError("adapter publication candidate identity differs")
         if validator is not None:
             validator(candidate_path)
             validator(candidate_path)
         candidate_stat = os.stat(candidate_name, dir_fd=destination_dir, follow_symlinks=False)
-        if _stat_identity_from_stat(candidate_stat) != source_identity:
+        if _stable_rename_identity(candidate_stat) != stable_source_identity:
             raise OSError("adapter publication candidate changed")
         try:
             old_stat = os.stat(destination_name, dir_fd=destination_dir, follow_symlinks=False)
@@ -537,7 +553,7 @@ def _replace_directory_from_dirs(
         )
         destination_replaced = True
         destination_stat = os.stat(destination_name, dir_fd=destination_dir, follow_symlinks=False)
-        if _stat_identity_from_stat(destination_stat) != source_identity:
+        if _stable_rename_identity(destination_stat) != stable_source_identity:
             raise OSError("adapter publication destination identity differs")
         if destination_exists:
             shutil.rmtree(destination_parent / backup_name)
@@ -629,7 +645,7 @@ def _replace_regular_from_dirs(
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=destination_dir,
             )
-            if _stat_identity_from_stat(os.fstat(backup_fd)) != _stat_identity_from_stat(destination_stat):
+            if _stable_rename_identity(os.fstat(backup_fd)) != _stable_rename_identity(destination_stat):
                 raise OSError("adapter publication backup identity differs")
         os.link(
             source_name,
@@ -1293,7 +1309,11 @@ class RangeHandler(SimpleHTTPRequestHandler):
                 if not chunk:
                     self.close_connection = True
                     return
-                output.write(chunk)
+                try:
+                    output.write(chunk)
+                except OSError:
+                    self.close_connection = True
+                    return
                 self.remaining -= len(chunk)
         except Exception:
             self.close_connection = True

@@ -263,8 +263,7 @@ class AdapterServerTest(unittest.TestCase):
             handler.remaining = 7
             handler.close_connection = False
             try:
-                with self.assertRaises(OSError):
-                    handler.copyfile(source, WriteFailure())
+                handler.copyfile(source, WriteFailure())
                 self.assertTrue(source.closed)
                 self.assertTrue(handler.close_connection)
             finally:
@@ -631,6 +630,31 @@ class AdapterServerTest(unittest.TestCase):
                 )
             self.assertEqual((destination / "value").read_bytes(), b"old-tree")
             self.assertEqual(manifest.read_bytes(), old_manifest)
+
+    def test_directory_candidate_rename_ignores_ctime_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "pending" / "step_1"
+            destination = root / "cache" / "step_1"
+            source.mkdir(parents=True, mode=0o700)
+            destination.parent.mkdir()
+            identity = adapter_server._directory_identity(source)
+            changed = False
+
+            def validate(candidate):
+                nonlocal changed
+                if not changed:
+                    os.chmod(candidate, 0o700)
+                    changed = True
+
+            adapter_server._replace_from_dirs(
+                source,
+                destination,
+                identity,
+                directory_validator=validate,
+            )
+            self.assertTrue(destination.is_dir())
+            self.assertEqual(destination.stat().st_ino, identity[1])
 
     def test_existing_v2_manifest_with_missing_chunk_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
