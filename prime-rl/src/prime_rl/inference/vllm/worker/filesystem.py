@@ -3061,12 +3061,30 @@ class _PersistentAdapterConnection:
         total: int,
         expected_sha256: str | None,
         timeout: float,
+        stage_deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
         consume,
     ) -> None:
-        read_timeout = min(timeout, persistent_read_timeout_seconds)
-        if read_timeout <= 0:
+        if timeout <= 0 or persistent_read_timeout_seconds <= 0:
             raise OSError("adapter persistent read timeout must be positive")
-        connection, parsed = self._open(source_url, read_timeout)
+        attempt_deadline = time.monotonic() + timeout
+        if stage_deadline is not None:
+            attempt_deadline = min(attempt_deadline, stage_deadline)
+
+        def remaining_timeout() -> float:
+            _check_cancelled(cancel_event)
+            remaining = attempt_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("adapter persistent request exceeded its time limit")
+            return min(persistent_read_timeout_seconds, remaining)
+
+        try:
+            connection, parsed = self._open(source_url, remaining_timeout())
+        except _PersistentProtocolError:
+            raise
+        except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
+            self.close()
+            raise _PersistentTransportError("adapter persistent request failed") from exc
         request_path = parsed.path or "/"
         if parsed.query:
             request_path += f"?{parsed.query}"
@@ -3079,7 +3097,10 @@ class _PersistentAdapterConnection:
                     "Range": f"bytes={start}-{end}",
                 },
             )
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining_timeout())
             response = connection.getresponse()
+            remaining_timeout()
         except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
             self.close()
             raise _PersistentTransportError("adapter persistent request failed") from exc
@@ -3131,10 +3152,9 @@ class _PersistentAdapterConnection:
 
         if connection.sock is not None:
             try:
-                connection.sock.settimeout(
-                    read_timeout
-                )
-            except OSError as exc:
+                connection.sock.settimeout(remaining_timeout())
+            except (OSError, TimeoutError) as exc:
+                close_response()
                 self.close()
                 raise _PersistentTransportError(
                     "adapter response read timeout setup failed"
@@ -3142,11 +3162,20 @@ class _PersistentAdapterConnection:
         remaining = expected_length
         try:
             while remaining:
+                if connection.sock is not None:
+                    try:
+                        connection.sock.settimeout(remaining_timeout())
+                    except (OSError, TimeoutError) as exc:
+                        self.close()
+                        raise _PersistentTransportError(
+                            "adapter response read timeout setup failed"
+                        ) from exc
                 try:
                     chunk = response.read(min(16 * 1024 * 1024, remaining))
                 except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
                     self.close()
                     raise _PersistentTransportError("adapter response ended during read") from exc
+                remaining_timeout()
                 if not chunk:
                     self.close()
                     raise _PersistentTransportError("adapter response body ended early")
@@ -3159,6 +3188,7 @@ class _PersistentAdapterConnection:
                     self.close()
                     raise
                 remaining -= len(chunk)
+                remaining_timeout()
         finally:
             close_response()
 
@@ -3262,6 +3292,8 @@ class _PersistentAdapterLanePool:
                             total=expected_size,
                             expected_sha256=expected_sha256,
                             timeout=timeout,
+                            stage_deadline=deadline,
+                            cancel_event=cancel_event,
                             consume=consume,
                         )
                 except HTTPError as exc:
