@@ -171,7 +171,10 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('china_tunnel_remove_orphan_children "${china_legacy_cleanup_ports[@]}" || return 1', source)
         self.assertIn('china_tunnel_remove_orphan_children || repair_fail', source)
         self.assertIn('china_tunnel_remove_all_owned', source)
-        self.assertIn('done < <(ps -eo pid=,args=)', source)
+        self.assertNotIn('done < <(ps -eo pid=,args=)', source)
+        legacy_cleanup = source.split('peer_tunnel_remove_legacy() {', 1)[1].split('\n}\n', 1)[0]
+        self.assertIn('process_output=$(ps -eo pid=,args=) || return 1', legacy_cleanup)
+        self.assertIn('done <<<"$process_output"', legacy_cleanup)
         self.assertIn('adapter_tunnel_readiness() {', source)
         self.assertIn('tunnel_repair_deadline=$((SECONDS + tunnel_repair_deadline_s))', source)
         self.assertIn('repair_timeout "$probe_seconds"', source)

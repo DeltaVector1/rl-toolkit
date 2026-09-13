@@ -287,6 +287,7 @@ elif [ "${PEER_API_OWNER_MODE:-0}" = 1 ] && [[ "$*" == *ltnp* ]]; then
 elif [ "${PEER_CHINA_OWNER_MODE:-0}" = 1 ] && [[ "$*" == *ltnp* ]]; then
   cat "${CHINA_OWNER_SS_OUTPUT:?missing China owner fixture}"
 fi
+exit "${PEER_SS_STATUS:-0}"
 EOF
 cat >"$tmp/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
@@ -316,6 +317,34 @@ end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
 tunnel_wait_group_exit_definition=$(declare -f tunnel_wait_group_exit)
 tunnel_wait_group_exit() { return 0; }
+
+# Interrupt the real readiness commit sequence at every state change. Before
+# commit, rollback must retain both records. After commit it must not run.
+commit_block=$(sed -n '/^if ! adapter_tunnel_readiness;/,/^repair_release_lock .*repair_fail/p' "$script")
+for interrupt_command in 'repair_committed=1' 'repair_created_tunnels=()' \
+    'repair_unregistered_tunnels=()' repair_release_lock; do
+  set +e
+  boundary_output=$(
+    source <(sed '/^RUN=\${RUN:/,$d' "$script")
+    repair_created_tunnels=(created)
+    repair_unregistered_tunnels=(unregistered)
+    repair_lock_held=1
+    adapter_tunnel_readiness() { return 0; }
+    repair_cleanup_created_tunnels() { printf 'created:%s\n' "${#repair_created_tunnels[@]}"; }
+    repair_cleanup_unregistered_tunnels() { printf 'unregistered:%s\n' "${#repair_unregistered_tunnels[@]}"; }
+    repair_release_lock() { printf 'lock:%s\n' "$repair_lock_held"; repair_lock_held=0; }
+    trap 'if [ "$BASH_COMMAND" = "$interrupt_command" ]; then trap - DEBUG; kill -TERM "$BASHPID"; fi' DEBUG
+    eval "$commit_block"
+  )
+  boundary_status=$?
+  set -e
+  test "$boundary_status" -eq 124
+  if [ "$interrupt_command" = repair_committed=1 ]; then
+    test "$boundary_output" = $'created:1\nunregistered:1\nlock:1'
+  else
+    test "$boundary_output" = 'lock:1'
+  fi
+done
 
 # Keep the supervisor fixture in this shell. This avoids command lookup cache
 # selecting the host setsid binary after a PATH-scoped test invocation.
@@ -969,6 +998,14 @@ export LEGACY_KILL_LOG="$legacy_kill_log" PEER_GROUP_COMMANDS="$legacy_group_com
 export PEER_TEST_PGID_PID=1234 PEER_TEST_PGID=1234
 PATH="$tmp/bin:$PATH" peer_tunnel_remove_legacy
 test "$(grep -F -c -- '-1234' "$legacy_kill_log")" -eq 1
+# A failed process snapshot must not become an empty successful cleanup.
+: >"$legacy_kill_log"
+set +e
+PATH="$tmp/bin:$PATH" PEER_PS_FAILURE=1 peer_tunnel_remove_legacy
+legacy_ps_status=$?
+set -e
+test "$legacy_ps_status" -ne 0
+test ! -s "$legacy_kill_log"
 unset -f kill
 unset LEGACY_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
 
@@ -1535,6 +1572,26 @@ PATH="$tmp/bin:$PATH" china_tunnel_supervisor_owns_forwards 4241 \
   "$china_supervisor_command" current \
   -L 127.0.0.1:18100:127.0.0.1:8100 \
   -L 127.0.0.1:18101:127.0.0.1:8100
+# Valid-looking listener output with a failed observation is still unknown.
+for failure_kind in ss awk; do
+  set +e
+  (
+    if [ "$failure_kind" = ss ]; then export PEER_SS_STATUS=2; else export PEER_AWK_FAILURE=1; fi
+    PATH="$tmp/bin:$PATH" china_tunnel_supervisor_owns_forwards 4241 \
+      "$china_supervisor_command" current \
+      -L 127.0.0.1:18100:127.0.0.1:8100
+  )
+  owner_observation_status=$?
+  (
+    if [ "$failure_kind" = ss ]; then export PEER_SS_STATUS=2; else export PEER_AWK_FAILURE=1; fi
+    PATH="$tmp/bin:$PATH" china_tunnel_ports_clear 127.0.0.1:18227:127.0.0.1:8100
+  )
+  ports_observation_status=$?
+  set -e
+  test "$owner_observation_status" -eq 2
+  test "$ports_observation_status" -eq 2
+done
+PATH="$tmp/bin:$PATH" china_tunnel_ports_clear 127.0.0.1:18227:127.0.0.1:8100
 printf 'LISTEN 0 128 127.0.0.1:18101 0.0.0.0:* users:(("ssh",pid=4243,fd=6))\n' >"$shared_ss"
 export TUNNEL_EXTRA_OWNER_PID=4243
 set +e
@@ -1871,3 +1928,26 @@ printf 'deadline-limited remote probe elapsed_seconds=%s\n' "$elapsed"
 test "$elapsed" -le 3
 unset PEER_REMOTE_SLEEP
 printf 'peer tunnel uses one API connection and sixty-four bounded two-port lanes\n'
+
+# A non-exiting orphan has a fixed wait count in normal mode. Process reads,
+# kill, and sleep are mocked; a 31st wait fails instead of hanging the suite.
+(
+  tunnels_only=0
+  orphan_waits=0
+  orphan_kills=0
+  china_tunnel_ssh_child_match() { return 0; }
+  process_identity_matches() { return 0; }
+  process_start_time() { printf 'start\n'; }
+  process_command_line() { printf 'owned\n'; }
+  ps() { case "$2" in pgid=) printf '1234\n' ;; stat=) printf 'S\n' ;; *) return 1 ;; esac; }
+  cat() { printf 'owned'; }
+  kill() { orphan_kills=$((orphan_kills + 1)); return 0; }
+  repair_sleep() { orphan_waits=$((orphan_waits + 1)); [ "$orphan_waits" -le 30 ]; }
+  set +e
+  china_tunnel_force_kill_orphan "$$"
+  orphan_wait_status=$?
+  set -e
+  test "$orphan_wait_status" -ne 0
+  test "$orphan_kills" -eq 1
+  test "$orphan_waits" -eq 30
+)
