@@ -1639,20 +1639,24 @@ peer_tunnel_ssh_args_match() {
 }
 
 peer_tunnel_api_variant_match() {
-  local command_line=$1 expected option index
+  local command_line=$1 expected option index match
   local -a args expected_args
   command_line=$(tunnel_channel_timeout_normalize "$command_line") || return 1
   read -r -a args <<<"$command_line"
   expected_args=(ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30
     -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3
     -o 'ChannelTimeout=*-tcpip=45s' -o TCPKeepAlive=yes -o IPQoS=none
-    -i "$peer_ssh_identity" -p "$peer_ssh_port")
+    -o Compression=no -i "$peer_ssh_identity" -p "$peer_ssh_port")
   for option in current compression channel-compression; do
     local -a candidate=("${expected_args[@]}")
-    [ "$option" = compression ] && candidate=(${candidate[@]/-o Compression=no/})
+    [ "$option" = compression ] || [ "$option" = channel-compression ] && candidate=(${candidate[@]/-o Compression=no/})
     [ "$option" = channel-compression ] && candidate=(${candidate[@]/-o 'ChannelTimeout=*-tcpip=45s'/})
     [ "${#args[@]}" -ge "$(( ${#candidate[@]} + 3 ))" ] || continue
-    for index in "${!candidate[@]}"; do [ "${args[index]}" = "${candidate[index]}" ] || break 2; done
+    match=1
+    for index in "${!candidate[@]}"; do
+      [ "${args[index]}" = "${candidate[index]}" ] || { match=0; break; }
+    done
+    [ "$match" = 1 ] || continue
     [ "${args[-1]}" = "$peer_ssh_user@$peer_host" ] || continue
     return 0
   done
