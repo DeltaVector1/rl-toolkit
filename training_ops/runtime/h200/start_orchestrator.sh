@@ -1838,6 +1838,12 @@ peer_tunnel_api_args() {
     current)
       peer_api_args=(ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30
         -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+        -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no
+        -i "$peer_ssh_identity" -p "$peer_ssh_port"
+        -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" "$peer_ssh_user@$peer_host") ;;
+    legacy-timeout)
+      peer_api_args=(ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30
+        -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3
         -o 'ChannelTimeout=*-tcpip=45s' -o TCPKeepAlive=yes -o IPQoS=none
         -o Compression=no -i "$peer_ssh_identity" -p "$peer_ssh_port"
         -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" "$peer_ssh_user@$peer_host") ;;
@@ -1866,7 +1872,7 @@ peer_tunnel_api_payload() {
 peer_tunnel_api_variant_match() {
   local command_line=$1 variant expected
   command_line=$(tunnel_channel_timeout_normalize "$command_line") || return 1
-  for variant in ${2:-current compression channel-compression}; do
+  for variant in ${2:-current legacy-timeout compression channel-compression}; do
     peer_tunnel_api_args "$variant" || return 1
     expected="${peer_api_args[*]}"
     [ "$command_line" != "$expected" ] || return 0
@@ -1878,7 +1884,7 @@ peer_tunnel_api_supervisor_variant_match() {
   local command_line=$1 marker=$2 forward=$3 variant payload
   [ "$marker" = peer-tunnel-api ] || return 1
   [ "$forward" = "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" ] || return 1
-  for variant in current compression channel-compression; do
+  for variant in current legacy-timeout compression channel-compression; do
     payload=$(peer_tunnel_api_payload "$variant") || return 1
     [ "$command_line" != "bash -c $payload" ] || return 0
   done
@@ -1893,7 +1899,7 @@ peer_tunnel_api_read_args() {
 peer_tunnel_api_pid_match() {
   local pid=$1 kind=$2 variant index equal payload
   peer_tunnel_api_read_args "$pid" || return 1
-  for variant in ${3:-current compression channel-compression}; do
+  for variant in ${3:-current legacy-timeout compression channel-compression}; do
     peer_tunnel_api_args "$variant" || return 1
     if [ "$kind" = supervisor ]; then
       payload=$(peer_tunnel_api_payload "$variant") || return 1

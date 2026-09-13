@@ -642,12 +642,16 @@ unset PEER_TEST_LOG PEER_QUERY PEER_CHILDREN_OUTPUT PEER_GROUP_COMMANDS
 # listener, and removes the other two exact candidates.
 (
   peer_tunnel_api_read_args() { mapfile -d '' -t peer_api_actual <"$tmp/api-argv-$1"; }
-  for variant in current compression channel-compression; do
+  for variant in current legacy-timeout compression channel-compression; do
     args=(ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30
       -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
-    [ "$variant" = channel-compression ] || args+=(-o 'ChannelTimeout=*-tcpip=45s')
+    case "$variant" in
+      legacy-timeout|compression) args+=(-o 'ChannelTimeout=*-tcpip=45s') ;;
+    esac
     args+=(-o TCPKeepAlive=yes -o IPQoS=none)
-    [ "$variant" != current ] || args+=(-o Compression=no)
+    case "$variant" in
+      current|legacy-timeout) args+=(-o Compression=no) ;;
+    esac
     args+=(-i /data/trinity/h200_rollout_ed25519 -p 20099
       -L 127.0.0.1:18049:127.0.0.1:8000 root@38.255.28.19)
     printf '%s\0' "${args[@]}" >"$tmp/api-argv-1"
@@ -714,7 +718,7 @@ unset PEER_TEST_LOG PEER_QUERY PEER_CHILDREN_OUTPUT PEER_GROUP_COMMANDS
   }
   printf '%s\0' sleep 3 >"$tmp/api-argv-2002"
   printf '%s\0' unrelated >"$tmp/api-argv-1003"
-  for variant in current compression channel-compression; do
+  for variant in current legacy-timeout compression channel-compression; do
     peer_tunnel_api_args "$variant"
     printf '%s\0' "${peer_api_args[@]}" >"$tmp/api-argv-1002"
     payload=$(peer_tunnel_api_payload "$variant")
@@ -735,7 +739,7 @@ unset PEER_TEST_LOG PEER_QUERY PEER_CHILDREN_OUTPUT PEER_GROUP_COMMANDS
   done
 )
 api_signature='-L 127.0.0.1:18049:127.0.0.1:8000'
-api_child_command="ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ChannelTimeout=*-tcpip=45s -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -i /data/trinity/h200_rollout_ed25519 -p 20099 -L 127.0.0.1:18049:127.0.0.1:8000 root@38.255.28.19"
+api_child_command="ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -i /data/trinity/h200_rollout_ed25519 -p 20099 -L 127.0.0.1:18049:127.0.0.1:8000 root@38.255.28.19"
 api_supervisor_command="nohup bash -c while true; do $api_child_command; sleep 3; done # peer-tunnel-api"
 # Full-mode rollback must use the exact API shape only for the API marker.
 (
