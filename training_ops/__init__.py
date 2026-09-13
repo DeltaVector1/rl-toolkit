@@ -4783,10 +4783,10 @@ def _repair_adapter_tunnels(config_dir: str | None = None, *, reset: bool = Fals
         f"ORCH_CONFIG={shlex.quote(f'{remote_repo}/{orchestrator_config}')} "
         f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
         f"TRAINER_CT={shlex.quote(trainer_container)} ORCH_CT={shlex.quote(orchestrator_container)} "
-        f"TUNNEL_REPAIR_DEADLINE_S=150 timeout --signal=TERM --kill-after=5s 155s "
+        f"TUNNEL_REPAIR_DEADLINE_S=300 timeout --signal=TERM --kill-after=5s 305s "
         f"bash {shlex.quote(orchestrator_launcher)} {tunnel_mode}"
     )
-    code, output = _ssh(orchestrator_host, command, timeout=180)
+    code, output = _ssh(orchestrator_host, command, timeout=330)
     if code:
         raise RuntimeError(f"adapter tunnel reconciliation failed: {output.strip() or f'exit {code}'}")
     result = output.strip().splitlines()[-1] if output.strip() else "adapter tunnel reconciliation complete"

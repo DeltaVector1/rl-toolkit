@@ -36,7 +36,7 @@ peer_phase_failure=
 repair_lock_held=0
 repair_lock_file=${ADAPTER_TUNNEL_LOCK_FILE:-/tmp/prime-rl-adapter-tunnel-repair.lock}
 if [ "$tunnels_only" = 1 ]; then
-  tunnel_repair_deadline_s=${TUNNEL_REPAIR_DEADLINE_S:-150}
+  tunnel_repair_deadline_s=${TUNNEL_REPAIR_DEADLINE_S:-300}
   case "$tunnel_repair_deadline_s" in
     ''|*[!0-9]*) echo "TUNNEL_REPAIR_DEADLINE_S must be a positive integer" >&2; exit 2 ;;
   esac

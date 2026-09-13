@@ -108,7 +108,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertEqual(len(ssh_calls), 1)
         host, script, timeout = ssh_calls[0]
         self.assertEqual(host, training_ops.orchestrator_host)
-        self.assertEqual(timeout, 180)
+        self.assertEqual(timeout, 330)
         self.assertIn("RUN=glm-perf-3 RUN_NAME=run_glm-perf-3", script)
         self.assertIn(
             "ORCH_CONFIG=/data/glm52-rl/deployment/configs/general-agent/orchestrator.toml",
@@ -117,7 +117,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("TRAINER_ADDRESSES='addr-n82 addr-n76 addr-n77 addr-n78 addr-n80 addr-n83 addr-n84 addr-n85'", script)
         self.assertTrue(script.endswith("--tunnels-only"))
         self.assertNotIn("--restart-tunnels", script)
-        self.assertIn("TUNNEL_REPAIR_DEADLINE_S=150 timeout --signal=TERM --kill-after=5s 155s", script)
+        self.assertIn("TUNNEL_REPAIR_DEADLINE_S=300 timeout --signal=TERM --kill-after=5s 305s", script)
 
     def test_adapter_tunnels_reset_is_the_explicit_full_reset(self):
         ssh_calls = []
@@ -202,7 +202,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('tunnel_repair_deadline=$((SECONDS + tunnel_repair_deadline_s))', source)
         self.assertIn('repair_timeout "$probe_seconds"', source)
         self.assertIn('repair_sleep 1 || return 1', source)
-        self.assertIn('tunnel_repair_deadline_s=${TUNNEL_REPAIR_DEADLINE_S:-150}', source)
+        self.assertIn('tunnel_repair_deadline_s=${TUNNEL_REPAIR_DEADLINE_S:-300}', source)
         self.assertIn('adapter_tunnel_exact_snapshot()', source)
         self.assertIn('adapter_tunnel_local_snapshot()', source)
         self.assertIn('adapter_tunnel_remote_snapshot()', source)
@@ -1019,13 +1019,13 @@ repair_exit 1
         preamble = self.source.split("\nrepair_cleanup_remaining() {", 1)[0]
         result = subprocess.run(["bash", "-uc", preamble + '\necho "$tunnel_repair_deadline:$repair_total_deadline"', "bash", "--tunnels-only"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "120:150\n")
+        self.assertEqual(result.stdout, "270:300\n")
 
     def test_explicit_reset_uses_existing_total_deadline_for_cleanup(self):
         preamble = self.source.split("\nrepair_cleanup_remaining() {", 1)[0]
         result = subprocess.run(["bash", "-uc", preamble + '\necho "$tunnel_repair_deadline:$repair_total_deadline:$repair_cleanup_limit_us"', "bash", "--tunnels-only", "--restart-tunnels"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "120:150:120000000\n")
+        self.assertEqual(result.stdout, "270:300:270000000\n")
 
     def test_reset_exit_uses_reserved_cleanup_time(self):
         result = self.shell(["repair_exit"], '''
