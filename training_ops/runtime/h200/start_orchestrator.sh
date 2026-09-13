@@ -1682,9 +1682,33 @@ peer_tunnel() {
   fi
 }
 
+china_tunnel_supervisor_inventory_ready() {
+  local expected_lanes=$1 pid command_line marker lane
+  local inventory_count=0
+  local -a seen_lanes=()
+  while read -r pid command_line; do
+    if [[ "$command_line" =~ \#\ (china-tunnel-lora-[^[:space:]]+)[[:space:]]*$ ]]; then
+      marker=${BASH_REMATCH[1]}
+      case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+      china_tunnel_supervisor_match "$command_line" current "$marker" || return 1
+      lane=${marker#china-tunnel-lora-}
+      case "$lane" in ''|*[!0-9]*) return 1 ;; esac
+      [ "$lane" -lt "$expected_lanes" ] || return 1
+      case " ${seen_lanes[*]} " in
+        *" $lane "*) return 1 ;;
+        *) seen_lanes+=("$lane") ;;
+      esac
+      inventory_count=$((inventory_count + 1))
+    fi
+  done < <(ps -eo pid=,args=)
+  [ "$inventory_count" -eq "$expected_lanes" ]
+}
+
 china_tunnel_supervisors_ready() {
   local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
   local marker ready lora_source_port matching_pid matching_command match_count invalid
+  local expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
+  china_tunnel_supervisor_inventory_ready "$expected_lanes" || return 1
   china_tunnel_preflight_pgids=()
   while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
     lane_ports=("${lora_source_ports[@]:lane_start:2}")
