@@ -4774,11 +4774,9 @@ def _repair_adapter_tunnels(config_dir: str | None = None, *, reset: bool = Fals
     trainer_addresses = _trainer_addresses(trainer_nodes)
     if not trainer_addresses:
         raise Refused("configured trainer addresses are empty")
-    if not deploy(
-        "training_ops/runtime/h200/start_orchestrator.sh",
-        nodes=[orchestrator_host],
-    ):
-        raise RuntimeError("adapter tunnel launcher deployment failed")
+    for path in (orchestrator_config, "training_ops/runtime/h200/start_orchestrator.sh"):
+        if not deploy(path, nodes=[orchestrator_host]):
+            raise RuntimeError(f"adapter tunnel deployment failed: {path}")
     tunnel_mode = "--restart-tunnels --tunnels-only" if reset else "--tunnels-only"
     command = (
         f"RUN={shlex.quote(run)} RUN_NAME={shlex.quote(run_name)} "

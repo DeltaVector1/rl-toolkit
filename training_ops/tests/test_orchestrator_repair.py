@@ -101,10 +101,10 @@ class OrchestratorRepairTest(unittest.TestCase):
             result = training_ops._repair_adapter_tunnels("configs/general-agent")
 
         self.assertEqual(result, "adapter tunnel reconciliation complete")
-        deploy.assert_called_once_with(
-            "training_ops/runtime/h200/start_orchestrator.sh",
-            nodes=[training_ops.orchestrator_host],
-        )
+        self.assertEqual(deploy.call_args_list, [
+            mock.call("configs/general-agent/orchestrator.toml", nodes=[training_ops.orchestrator_host]),
+            mock.call("training_ops/runtime/h200/start_orchestrator.sh", nodes=[training_ops.orchestrator_host]),
+        ])
         self.assertEqual(len(ssh_calls), 1)
         host, script, timeout = ssh_calls[0]
         self.assertEqual(host, training_ops.orchestrator_host)
@@ -136,6 +136,15 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertEqual(result, "adapter tunnel reconciliation complete")
         self.assertEqual(len(ssh_calls), 1)
         self.assertTrue(ssh_calls[0][1].endswith("--restart-tunnels --tunnels-only"))
+
+    def test_adapter_tunnels_stops_if_selected_config_cannot_be_verified(self):
+        with mock.patch.object(training_ops, "deploy", return_value=False) as deploy, mock.patch.object(
+            training_ops, "_ssh"
+        ) as ssh, mock.patch.object(training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"):
+            with self.assertRaisesRegex(RuntimeError, "orchestrator.toml"):
+                training_ops._repair_adapter_tunnels("configs/general-agent")
+        deploy.assert_called_once_with("configs/general-agent/orchestrator.toml", nodes=[training_ops.orchestrator_host])
+        ssh.assert_not_called()
 
     def test_repair_dispatch_keeps_reset_explicit(self):
         with mock.patch.object(
@@ -855,6 +864,184 @@ china_source_ports_ready
                 self.assertEqual(output, "")
                 self.assertTrue(all(count == 3 for count in calls.values()))
                 self.assertIn(reason, errors)
+
+
+class TunnelRepairBoundsTest(unittest.TestCase):
+    source = (Path(__file__).resolve().parents[2] / "training_ops/runtime/h200/start_orchestrator.sh").read_text()
+
+    def function(self, name):
+        return name + "() {" + self.source.split(name + "() {", 1)[1].split("\n}\n", 1)[0] + "\n}\n"
+
+    def shell(self, functions, body):
+        return subprocess.run(
+            ["bash", "-uc", "\n".join(self.function(name) for name in functions) + body],
+            text=True, capture_output=True, timeout=3,
+        )
+
+    def peer_config(self, peers, urls):
+        program = self.source.split('if ! peer_settings=$(python3 - "$nodes_file" "$config_file" <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            nodes = Path(directory) / "nodes.toml"
+            config = Path(directory) / "orchestrator.toml"
+            nodes.write_text('[hosts]\ninference=' + repr(peers) + '\norchestrator="h200a"\n'
+                '[inference.h200b]\nssh_host="192.0.2.1"\nssh_port=20099\nssh_user="root"\n'
+                'peer_ssh_identity_file="/data/test/key"\napi_tunnel_port=18049\n')
+            config.write_text('[model.client]\nbase_url=' + repr(urls) + '\n')
+            return subprocess.run([sys.executable, "-c", program, str(nodes), str(config)], text=True, capture_output=True)
+
+    def test_peer_config_requires_exact_url_before_tunnels_change(self):
+        for urls in (["http://127.0.0.1:8000/v1"], ["http://127.0.0.1:18049/v1/extra"]):
+            result = self.peer_config(["h200a", "h200b"], urls)
+            self.assertNotEqual(result.returncode, 0)
+            for text in ("h200b", "nodes.toml", "orchestrator.toml", "http://127.0.0.1:18049/v1", "no tunnels changed"):
+                self.assertIn(text, result.stderr)
+
+    def test_peer_config_supports_single_host_and_enabled_peer(self):
+        single = self.peer_config(["h200a"], ["http://127.0.0.1:8000/v1"])
+        self.assertEqual(single.returncode, 0, single.stderr)
+        self.assertEqual(single.stdout, "none - 0 0 - 0 0\n")
+        dual = self.peer_config(["h200a", "h200b"], ["http://127.0.0.1:18049/v1"])
+        self.assertEqual(dual.returncode, 0, dual.stderr)
+        self.assertTrue(dual.stdout.endswith("18049 1\n"))
+
+    def test_all_comma_separated_missing_lanes_are_repaired_once(self):
+        result = self.shell(["peer_repair_missing_remote_lanes"], '''
+lora_source_ports=({18100..18107}); relay_port=18200
+peer_missing_remote_ports=18100,18101,18104,18107,18104
+pgrep_matches() { return 0; }
+peer_tunnel_connection() { echo "$1"; }
+peer_repair_missing_remote_lanes
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(result.stdout.splitlines()), ["lora-0", "lora-2", "lora-3"])
+
+    def test_invalid_missing_ports_fail_before_any_repair(self):
+        for value in ("18100,,18104", "18100,", "18100+1", "18100,19000", "variable", ""):
+            result = self.shell(["peer_repair_missing_remote_lanes"], f'''
+lora_source_ports=({{18100..18107}}); relay_port=18200
+peer_missing_remote_ports='{value}'
+pgrep_matches() {{ echo unexpected; }}
+peer_tunnel_connection() {{ echo unexpected; }}
+peer_repair_missing_remote_lanes
+''')
+            self.assertNotEqual(result.returncode, 0, value)
+            self.assertEqual(result.stdout, "", value)
+
+    def test_fractional_sleep_is_valid_and_still_checks_deadline(self):
+        result = self.shell(["repair_sleep"], '''
+repair_remaining() { return 0; }
+sleep() { echo "$1"; }
+repair_sleep 0.1 || exit 1
+repair_remaining() { return 1; }
+if repair_sleep 0.1; then exit 1; fi
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "0.1\n")
+
+    def test_many_stuck_groups_share_one_cleanup_budget(self):
+        program = self.function("repair_cleanup_remaining").replace("20000000", "100000") + self.function("repair_cleanup_call") + '''
+repair_total_deadline=0; repair_cleanup_spent_us=0; repair_cleanup_active_us=0
+repair_cleanup_completed=0; calls=0
+stuck_group() {
+  calls=$((calls + 1))
+  while repair_cleanup_remaining; do sleep 0.01; done
+  return 1
+}
+for group in {1..100}; do repair_cleanup_call stuck_group || :; done
+echo "$calls:$repair_cleanup_completed"
+'''
+        started = time.monotonic()
+        result = subprocess.run(["bash", "-uc", program], text=True, capture_output=True, timeout=2)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "1:1\n")
+        self.assertIn("stage=stuck_group completed=1", result.stderr)
+
+    def test_successful_cleanup_keeps_one_shared_counter(self):
+        result = self.shell(["repair_cleanup_remaining", "repair_cleanup_call"], '''
+repair_total_deadline=0; repair_cleanup_spent_us=0; repair_cleanup_active_us=0
+repair_cleanup_completed=0
+stop_group() { sleep 0.01; }
+for group in {1..4}; do repair_cleanup_call stop_group || exit 1; done
+[ "$repair_cleanup_spent_us" -ge 40000 ] || exit 1
+echo "$repair_cleanup_completed"
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "4\n")
+
+    def test_exit_keeps_original_failure_stage_and_cleanup_result(self):
+        for cleanup_status, status, label in ((0, 1, "passed"), (1, 125, "failed")):
+            result = self.shell(["repair_exit"], f'''
+repair_stage=remote-readiness; repair_started_seconds=$SECONDS; repair_committed=0
+repair_cleanup_call() {{ return {cleanup_status}; }}
+repair_release_lock() {{ return 0; }}
+repair_exit 1
+''')
+            self.assertEqual(result.returncode, status, result.stderr)
+            self.assertIn(f"status={status} cause_status=1 stage=remote-readiness", result.stderr)
+            self.assertIn(f"elapsed=0s cleanup={label}", result.stderr)
+            self.assertIn("status=1 stage=remote-readiness elapsed=0s cleanup=starting", result.stderr.splitlines()[0])
+
+    def test_production_cleanup_reserve_does_not_raise_total_limit(self):
+        preamble = self.source.split("\nrepair_cleanup_remaining() {", 1)[0]
+        result = subprocess.run(["bash", "-uc", preamble + '\necho "$tunnel_repair_deadline:$repair_total_deadline"', "bash", "--tunnels-only"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "130:150\n")
+
+    def test_explicit_reset_uses_existing_total_deadline_for_cleanup(self):
+        preamble = self.source.split("\nrepair_cleanup_remaining() {", 1)[0]
+        result = subprocess.run(["bash", "-uc", preamble + '\necho "$tunnel_repair_deadline:$repair_total_deadline:$repair_cleanup_limit_us"', "bash", "--tunnels-only", "--restart-tunnels"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "130:150:150000000\n")
+
+    def test_reset_exit_caps_rollback_at_twenty_seconds(self):
+        result = self.shell(["repair_exit"], '''
+repair_stage=peer-lane-0; repair_started_seconds=$SECONDS; repair_committed=0
+repair_cleanup_limit_us=150000000; repair_cleanup_spent_us=30000000
+repair_cleanup_call() { echo "$repair_cleanup_limit_us"; }
+repair_release_lock() { return 0; }
+repair_exit 1
+''')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "50000000\n")
+
+    def test_api_loss_during_readiness_repairs_once_and_rechecks(self):
+        for failed_check in ("listener", "supervisor"):
+            result = self.shell(["adapter_tunnel_readiness"], f'''
+peer_enabled=1; secondary_enabled=0; peer_api_port=18049; repaired=0; checks=0
+repair_remaining() {{ return 0; }}
+repair_sleep() {{ return 0; }}
+sleep() {{ return 0; }}
+china_tunnel_supervisors_ready() {{ return 0; }}
+peer_tunnel_supervisors_ready() {{ return 0; }}
+peer_tunnel_api_listener_owner() {{ checks=$((checks+1)); [ '{failed_check}' != listener ] || [ "$repaired" = 1 ]; }}
+peer_tunnel_api_supervisor_ready() {{ [ '{failed_check}' != supervisor ] || [ "$repaired" = 1 ]; }}
+peer_tunnel_connection() {{ repaired=$((repaired+1)); [ "$1" = api ]; }}
+peer_remote_ports_ready() {{ return 0; }}
+peer_tunnel_current_children_ready() {{ return 0; }}
+adapter_tunnel_local_snapshot() {{ return 0; }}
+adapter_tunnel_remote_snapshot() {{ return 0; }}
+adapter_tunnel_readiness || exit 1
+echo "$repaired:$checks"
+''')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "1:2\n")
+
+    def test_unknown_api_owner_or_child_does_not_trigger_repair(self):
+        for failed_check in ("listener", "supervisor"):
+            result = self.shell(["adapter_tunnel_readiness"], f'''
+peer_enabled=1; secondary_enabled=0; peer_api_port=18049
+repair_remaining() {{ return 0; }}
+china_tunnel_supervisors_ready() {{ return 0; }}
+peer_tunnel_supervisors_ready() {{ return 0; }}
+peer_tunnel_api_listener_owner() {{ [ '{failed_check}' != listener ] || return 2; }}
+peer_tunnel_api_supervisor_ready() {{ return 2; }}
+peer_tunnel_connection() {{ echo unexpected; }}
+adapter_tunnel_readiness
+''')
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("no repair started", result.stderr)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,13 @@ for argument in "$@"; do
 done
 
 tunnel_repair_deadline=0
+repair_total_deadline=0
+repair_cleanup_spent_us=0
+repair_cleanup_active_us=0
+repair_cleanup_completed=0
+repair_cleanup_limit_us=20000000
+repair_stage=initialization
+repair_started_seconds=$SECONDS
 repair_failed=0
 repair_created_tunnels=()
 repair_unregistered_tunnels=()
@@ -37,7 +44,42 @@ if [ "$tunnels_only" = 1 ]; then
     exit 2
   }
   tunnel_repair_deadline=$((SECONDS + tunnel_repair_deadline_s))
+  repair_total_deadline=$tunnel_repair_deadline
+  if [ "$restart_tunnels" = 1 ]; then
+    repair_cleanup_limit_us=$((tunnel_repair_deadline_s * 1000000))
+  fi
+  repair_reserve_seconds=$((tunnel_repair_deadline_s / 5))
+  [ "$repair_reserve_seconds" -le 20 ] || repair_reserve_seconds=20
+  tunnel_repair_deadline=$((tunnel_repair_deadline - repair_reserve_seconds))
 fi
+
+repair_cleanup_remaining() {
+  local now=${EPOCHREALTIME/./} used=${repair_cleanup_spent_us:-0}
+  if [ "${repair_cleanup_active_us:-0}" -gt 0 ]; then
+    used=$((used + now - repair_cleanup_active_us))
+  fi
+  [ "$used" -lt "${repair_cleanup_limit_us:-20000000}" ] || return 1
+  [ "${repair_total_deadline:-0}" = 0 ] || [ "$SECONDS" -lt "$repair_total_deadline" ]
+}
+
+repair_cleanup_call() {
+  local stage=$1 status finished
+  repair_cleanup_remaining || {
+    echo "tunnel cleanup time limit reached: stage=$stage completed=${repair_cleanup_completed:-0}" >&2
+    return 1
+  }
+  if [ "${repair_cleanup_active_us:-0}" -gt 0 ]; then
+    "$@"
+    return $?
+  fi
+  repair_cleanup_active_us=${EPOCHREALTIME/./}
+  if "$@"; then status=0; else status=$?; fi
+  finished=${EPOCHREALTIME/./}
+  repair_cleanup_spent_us=$(( ${repair_cleanup_spent_us:-0} + finished - repair_cleanup_active_us ))
+  repair_cleanup_active_us=0
+  repair_cleanup_completed=$(( ${repair_cleanup_completed:-0} + 1 ))
+  return "$status"
+}
 
 repair_remaining() {
   local remaining
@@ -69,6 +111,12 @@ repair_timeout() {
 
 repair_sleep() {
   local requested=$1 duration
+  if [[ "$requested" =~ ^0\.[0-9]+$ ]]; then
+    repair_remaining >/dev/null || return 1
+    sleep "$requested" || return 1
+    repair_remaining >/dev/null
+    return $?
+  fi
   duration=$(repair_timeout "$requested") || return 1
   sleep "$duration"
   repair_remaining >/dev/null
@@ -163,6 +211,10 @@ repair_direct_child_owned() {
 }
 
 repair_stop_unregistered_tunnel() {
+  repair_cleanup_call repair_stop_unregistered_tunnel_inner "$@"
+}
+
+repair_stop_unregistered_tunnel_inner() {
   local kind=$1 pid=$2 marker=$3 forward=${4:-} command_line pgid shape=current
   local start_time current_start current_command current_pgid process_status group_output
   [ -e "/proc/$pid" ] || return 0
@@ -235,8 +287,10 @@ repair_stop_unregistered_tunnel() {
     peer) peer_tunnel_stale_group_safe "$pgid" "$command_line" "$shape" "$marker" || return 1 ;;
     china) china_tunnel_group_safe "$pgid" "$marker" || return 1 ;;
   esac
+  repair_cleanup_remaining || return 1
   if kill -- "-$pgid" 2>/dev/null; then
     for _ in $(seq 1 30); do
+      repair_cleanup_remaining || return 1
       # Check the complete proven group, not only its supervisor. Zombies
       # have exited and cannot own a listener; their parent must reap them.
       group_output=$(ps -eo pgid=,stat= 2>/dev/null) || return 1
@@ -246,8 +300,7 @@ repair_stop_unregistered_tunnel() {
       else
         case "$?" in 1) return 0 ;; *) return 1 ;; esac
       fi
-      repair_remaining >/dev/null || return 1
-      repair_sleep 1 || return 1
+      sleep 0.1
     done
     return 1
   fi
@@ -301,7 +354,7 @@ repair_register_tunnel() {
 }
 
 repair_cleanup_starting_tunnels() {
-  local item pid start_time marker kind forward expected members route failed=0
+  local item pid start_time marker kind forward expected members route failed=0 processed=0
   for item in "${repair_unidentified_tunnels[@]}"; do
     IFS='|' read -r pid marker <<<"$item"
     if [ -e "/proc/$pid" ]; then
@@ -310,6 +363,11 @@ repair_cleanup_starting_tunnels() {
     fi
   done
   for item in "${repair_starting_tunnels[@]}"; do
+    repair_cleanup_remaining || {
+      echo "tunnel cleanup stopped: stage=starting remaining=$((${#repair_starting_tunnels[@]} - processed))" >&2
+      return 1
+    }
+    processed=$((processed + 1))
     IFS='|' read -r pid start_time marker kind forward expected members route <<<"$item"
     if ! repair_stop_starting_tunnel "$pid" "$start_time" "$kind" "$marker" "$forward" "$expected" "$members" "$route"; then
       echo "unresolved starting tunnel PID $pid marker $marker" >&2
@@ -368,8 +426,10 @@ repair_stop_starting_group() {
   [ -n "$repair_starting_members" ] || return 0
   repair_starting_group "$pid" "$start_time" "$expected" "$marker" "$bound" stop "$kind" "" "$route" || return 1
   [ -n "$repair_starting_members" ] || return 0
+  repair_cleanup_remaining || return 1
   kill -KILL -- "-$pid" || return 1
   for _ in $(seq 1 40); do
+    repair_cleanup_remaining || return 1
     output=$(ps -eo pgid=,stat=) || return 1
     remaining=$(awk -v group="$pid" '$1 == group && $2 !~ /^Z/ {print}' <<<"$output") || return 1
     [ -n "$remaining" ] || return 0
@@ -423,6 +483,10 @@ repair_wait_started_tunnel() {
 }
 
 repair_stop_starting_tunnel() {
+  repair_cleanup_call repair_stop_starting_tunnel_inner "$@"
+}
+
+repair_stop_starting_tunnel_inner() {
   local pid=$1 start_time=$2 command_line pgid current_start
   local kind=${3:-} marker=${4:-} forward=${5:-} expected=${6:-} members=${7:-} route=${8:-}
   if [ ! -e "/proc/$pid" ]; then
@@ -458,6 +522,7 @@ repair_stop_starting_tunnel() {
 repair_kill_stopped_tunnel() {
   local pid=$1 start_time=$2 current_start pgid sid process_output children state
   for _ in $(seq 1 40); do
+    repair_cleanup_remaining || return 1
     state=$(ps -o stat= -p "$pid" | tr -d ' ') || return 1
     case "$state" in T*) break ;; Z*) return 0 ;; esac
     sleep 0.01
@@ -476,6 +541,7 @@ repair_kill_stopped_tunnel() {
     kill -KILL "$pid" || return 1
   fi
   for _ in $(seq 1 40); do
+    repair_cleanup_remaining || return 1
     [ -e "/proc/$pid" ] || return 0
     sleep 0.05
   done
@@ -483,8 +549,13 @@ repair_kill_stopped_tunnel() {
 }
 
 repair_cleanup_unregistered_tunnels() {
-  local item kind pid marker forward cleanup_failed=0
+  local item kind pid marker forward cleanup_failed=0 processed=0
   for item in "${repair_unregistered_tunnels[@]}"; do
+    repair_cleanup_remaining || {
+      echo "tunnel cleanup stopped: stage=unregistered remaining=$((${#repair_unregistered_tunnels[@]} - processed))" >&2
+      return 1
+    }
+    processed=$((processed + 1))
     IFS='|' read -r kind pid marker forward <<<"$item"
     if ! repair_stop_unregistered_tunnel "$kind" "$pid" "$marker" "$forward"; then
       echo "adapter tunnel rollback failed to stop unregistered $marker" >&2
@@ -495,9 +566,14 @@ repair_cleanup_unregistered_tunnels() {
 }
 
 repair_cleanup_created_tunnels() {
-  local item kind pid marker forward start_time command_line current_start shape rollback_failed=0
+  local item kind pid marker forward start_time command_line current_start shape rollback_failed=0 processed=0
   [ "$repair_failed" = 1 ] || return 0
   for item in "${repair_created_tunnels[@]}"; do
+    repair_cleanup_remaining || {
+      echo "tunnel cleanup stopped: stage=created remaining=$((${#repair_created_tunnels[@]} - processed))" >&2
+      return 1
+    }
+    processed=$((processed + 1))
     IFS='|' read -r kind pid marker forward start_time <<<"$item"
     command_line=$(process_command_line "$pid")
     case "$?" in
@@ -579,7 +655,41 @@ repair_preserve_created_tunnels() {
   repair_created_tunnels=()
 }
 
-trap 'status=$?; if [ "$status" -ne 0 ]; then repair_failed=1; fi; if [ "$repair_committed" = 0 ]; then if ! repair_cleanup_created_tunnels; then status=125; fi; if ! repair_cleanup_unregistered_tunnels; then status=125; fi; if ! repair_cleanup_starting_tunnels; then status=125; fi; fi; if ! repair_release_lock; then status=125; fi; exit "$status"' EXIT
+repair_cleanup_all() {
+  local status=0
+  if ! repair_cleanup_created_tunnels; then status=125; fi
+  if ! repair_cleanup_unregistered_tunnels; then status=125; fi
+  if ! repair_cleanup_starting_tunnels; then status=125; fi
+  return "$status"
+}
+
+repair_exit() {
+  local status=$1 cause_status=$1 failure_stage=${repair_stage:-unknown} cleanup_result=not-needed cleanup_limit
+  if [ "$status" -ne 0 ]; then repair_failed=1; fi
+  if [ "$repair_committed" = 0 ]; then
+    if [ "$status" -ne 0 ]; then
+      echo "adapter tunnel exit status=$status stage=$failure_stage elapsed=$((SECONDS - repair_started_seconds))s cleanup=starting" >&2
+    fi
+    repair_stage=cleanup
+    cleanup_limit=$(( ${repair_cleanup_spent_us:-0} + 20000000 ))
+    if [ "$cleanup_limit" -lt "${repair_cleanup_limit_us:-20000000}" ]; then
+      repair_cleanup_limit_us=$cleanup_limit
+    fi
+    if repair_cleanup_call repair_cleanup_all; then
+      cleanup_result=passed
+    else
+      cleanup_result=failed
+      status=125
+    fi
+  fi
+  if ! repair_release_lock; then status=125; cleanup_result=failed; fi
+  if [ "$status" -ne 0 ]; then
+    echo "adapter tunnel exit status=$status cause_status=$cause_status stage=$failure_stage elapsed=$((SECONDS - repair_started_seconds))s cleanup=$cleanup_result" >&2
+  fi
+  exit "$status"
+}
+
+trap 'repair_exit "$?"' EXIT
 trap 'repair_signal' TERM HUP INT
 
 RUN=${RUN:?set RUN}
@@ -770,6 +880,7 @@ peers = [item for item in inference_hosts if item != orchestrator]
 if len(peers) > 1:
     raise SystemExit("two-H200 routing supports one inference peer")
 if not peers:
+    print(f"inference peer: none; config={sys.argv[2]}; nodes={sys.argv[1]}", file=sys.stderr)
     print("none - 0 0 - 0 0")
     raise SystemExit
 
@@ -807,6 +918,9 @@ for field in ("base_url", "admin_base_url"):
         urls.extend(item for item in value if isinstance(item, str))
 expected = f"http://127.0.0.1:{api_port}/v1"
 enabled = int(expected in urls)
+if not enabled:
+    raise SystemExit(f"inference peer {peer_name} is configured in {sys.argv[1]}, but {sys.argv[2]} does not use {expected}; no tunnels changed")
+print(f"inference peer: {peer_name} enabled; config={sys.argv[2]}; API={expected}", file=sys.stderr)
 print(peer_name, host, port, user, identity, api_port, enabled)
 PY
 ); then
@@ -1032,6 +1146,10 @@ tunnel_wait_group_exit() {
   case "$pgid" in ''|*[!0-9]*|0|1) return 1 ;; esac
   for phase in term kill; do
     for attempt in $(seq 1 20); do
+      repair_cleanup_remaining || {
+        echo "tunnel cleanup time limit reached: stage=$phase group=$pgid" >&2
+        return 1
+      }
       process_output=$(tunnel_live_group "$pgid") || return 1
       [ -n "$process_output" ] || return 0
       sleep 0.25
@@ -1041,6 +1159,7 @@ tunnel_wait_group_exit() {
       echo "tunnel group $pgid ownership changed; no KILL sent; remaining PIDs: $(awk 'NR <= 16 {printf "%s ", $1}' <<<"$process_output")" >&2
       return 1
     fi
+    repair_cleanup_remaining || return 1
     kill -KILL -- "-$pgid" || return 1
   done
   echo "tunnel group $pgid did not exit; remaining PIDs: $(awk 'NR <= 16 {printf "%s ", $1}' <<<"$process_output")" >&2
@@ -1228,6 +1347,10 @@ generic_tunnel_stale_group_safe() {
 }
 
 generic_tunnel_stop_stale() {
+  repair_cleanup_call generic_tunnel_stop_stale_inner "$@"
+}
+
+generic_tunnel_stop_stale_inner() {
   local pid=$1 command_line=$2 marker=$3 forward=$4 pgid expected_start
   generic_tunnel_stale_supervisor_match "$command_line" "$marker" "$forward" || return 0
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
@@ -1255,6 +1378,7 @@ generic_tunnel_stop_stale() {
       }
       tunnel_prepare_group_stop "$pgid" "$pid" "$expected_start" "$command_line" \
         generic_tunnel_stale_group_safe "$pgid" "$command_line" "$marker" "$forward" || return 1
+      repair_cleanup_remaining || return 1
       kill -- "-$pgid" 2>/dev/null || {
         echo "could not stop stale generic tunnel group $pgid for $marker" >&2
         return 1
@@ -1913,6 +2037,10 @@ peer_tunnel_remove_legacy() {
 }
 
 peer_kill_owned() {
+  repair_cleanup_call peer_kill_owned_inner "$@"
+}
+
+peer_kill_owned_inner() {
   local pid=$1 command_line=$2 shape=${3:-} marker=${4:-} pgid expected_start
   if [ -n "$shape" ] && [ -n "$marker" ]; then
     peer_tunnel_stale_supervisor_match "$command_line" "$shape" "$marker" || return 0
@@ -1945,6 +2073,7 @@ peer_kill_owned() {
         }
         tunnel_prepare_group_stop "$pgid" "$pid" "$expected_start" "$command_line" \
           peer_tunnel_stale_group_safe "$pgid" "$command_line" "$shape" "$marker" || return 1
+        repair_cleanup_remaining || return 1
         kill -- "-$pgid" 2>/dev/null || {
           echo "could not stop peer tunnel group $pgid for $marker" >&2
           return 1
@@ -1969,6 +2098,7 @@ peer_kill_owned() {
       }
       tunnel_prepare_group_stop "$pgid" "$pid" "$expected_start" "$command_line" \
         peer_tunnel_group_safe "$pgid" || return 1
+      repair_cleanup_remaining || return 1
       kill -- "-$pgid" 2>/dev/null || {
         echo "could not stop peer tunnel group $pgid" >&2
         return 1
@@ -2082,6 +2212,10 @@ peer_tunnel_api_group_safe() {
 }
 
 peer_tunnel_api_stop_group() {
+  repair_cleanup_call peer_tunnel_api_stop_group_inner "$@"
+}
+
+peer_tunnel_api_stop_group_inner() {
   local pid=$1 variant=$2 pgid start
   pgid=$(ps -o pgid= -p "$pid" | tr -d ' ') || return 1
   [ "$pgid" = "$pid" ] && [ "$pgid" -gt 1 ] && [ "$pgid" != "$$" ] || return 1
@@ -2092,6 +2226,7 @@ peer_tunnel_api_stop_group() {
   peer_tunnel_api_pid_match "$pid" supervisor "$variant" || return 1
   [ "$(process_start_time "$pid")" = "$start" ] || return 1
   [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pgid" ] || return 1
+  repair_cleanup_remaining || return 1
   kill -- "-$pgid" || return 1
   tunnel_wait_group_exit "$pgid"
 }
@@ -2153,9 +2288,14 @@ PY
 
 peer_repair_missing_remote_lanes() {
   local port lane lane_start lane_ports lane_forwards marker pid command_line matching_pids
+  local -a missing_ports
   local -A seen_lanes=()
-  [ -n "${peer_missing_remote_ports:-}" ] || return 1
-  for port in $peer_missing_remote_ports; do
+  [[ "${peer_missing_remote_ports:-}" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  IFS=, read -r -a missing_ports <<<"$peer_missing_remote_ports"
+  for port in "${missing_ports[@]}"; do
+    [ "${#port}" -le 5 ] || return 1
+    port=$((10#$port))
+    case " ${lora_source_ports[*]} " in *" $port "*) ;; *) return 1 ;; esac
     lane=$(( (port - lora_source_ports[0]) / 2 ))
     [ "$lane" -ge 0 ] || return 1
     [ "$lane" -lt "$(( (${#lora_source_ports[@]} + 1) / 2 ))" ] || return 1
@@ -2798,6 +2938,10 @@ china_tunnel_force_kill_orphan() {
 }
 
 china_tunnel_stop_supervisor() {
+  repair_cleanup_call china_tunnel_stop_supervisor_inner "$@"
+}
+
+china_tunnel_stop_supervisor_inner() {
   local pid=$1 command_line=$2 expected_marker=${3:-} stale=${4:-0} pgid forward source_port expected_start
   local -a owned_forwards=()
   mapfile -t owned_forwards < <(grep -oE -- '-L 127\.0\.0\.1:[0-9]+:127\.0\.0\.1:[0-9]+' <<<"$command_line")
@@ -2857,6 +3001,7 @@ china_tunnel_stop_supervisor() {
         tunnel_prepare_group_stop "$pgid" "$pid" "$expected_start" "$command_line" \
           china_tunnel_group_safe "$pgid" "$expected_marker" || return 1
       fi
+      repair_cleanup_remaining || return 1
       kill -- "-$pgid" 2>/dev/null || {
         echo "could not stop China tunnel group $pgid for ${expected_marker:-unknown}" >&2
         return 1
@@ -3168,6 +3313,7 @@ peer_tunnel() {
   peer_keep_current=$peer_enabled
   [ "${restart_tunnels:-0}" = 1 ] && peer_keep_current=0
   phase_start=$SECONDS
+  repair_stage=peer-legacy
   peer_tunnel_remove_legacy "$peer_keep_current" || {
     echo "peer phase=legacy stage=remove elapsed=$((SECONDS - phase_start))" >&2
     return 1
@@ -3193,6 +3339,7 @@ peer_tunnel() {
     return 1
   fi
   [ "$peer_enabled" = 1 ] || return 0
+  repair_stage=peer-api
   peer_tunnel_remove_duplicate_api_supervisors || {
     echo "peer phase=api stage=duplicate-cleanup elapsed=$((SECONDS - phase_start))" >&2
     return 1
@@ -3214,6 +3361,7 @@ peer_tunnel() {
   local lane_start=0 lane_number=0
   local -a lane_ports lane_forwards
   while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
+    repair_stage=peer-lane-$lane_number
     lane_ports=("${lora_source_ports[@]:lane_start:peer_lane_size}")
     lane_forwards=()
     for lora_source_port in "${lane_ports[@]}"; do
@@ -3415,10 +3563,10 @@ peer_tunnel_api_supervisor_ready() {
   local match_count=0 supervisor_start
   local api_forward="-L 127.0.0.1:$peer_api_port:127.0.0.1:8000"
   [ "$peer_enabled" = 1 ] || return 0
-  matching_pids=$(pgrep_matches "$marker") || return 1
+  matching_pids=$(pgrep_matches "$marker") || return 2
   while read -r pid; do
     [ -n "$pid" ] || continue
-    command_line=$(process_command_line "$pid") || return 1
+    command_line=$(process_command_line "$pid") || return 2
     if peer_tunnel_supervisor_forwards_match "$command_line" api "$marker" "$api_forward"; then
       match_count=$((match_count + 1))
       matching_pid=$pid
@@ -3426,11 +3574,11 @@ peer_tunnel_api_supervisor_ready() {
     fi
   done <<<"$matching_pids"
   [ "$match_count" -eq 1 ] || return 1
-  supervisor_start=$(process_start_time "$matching_pid") || return 1
+  supervisor_start=$(process_start_time "$matching_pid") || return 2
   peer_snapshot_child_pid=
   peer_snapshot_child_command=
   peer_snapshot_child_start=
-  peer_tunnel_supervisor_child_identity "$matching_pid" api "$marker" "$api_forward" || return 1
+  peer_tunnel_supervisor_child_identity "$matching_pid" api "$marker" "$api_forward" || return $?
   peer_supervisor_pids[$marker]=$matching_pid
   peer_supervisor_starts[$marker]=$supervisor_start
   peer_supervisor_commands[$marker]=$matching_command
@@ -3470,8 +3618,9 @@ adapter_tunnel_exact_snapshot() {
 }
 
 adapter_tunnel_readiness() {
-  local tunnels_ready=0 readiness_port="" listener_status=0 remote_ready=1 attempt
+  local tunnels_ready=0 readiness_port="" listener_status=0 remote_ready=1 attempt api_repair_attempted=0
   for attempt in $(seq 1 30); do
+    repair_stage=local-readiness
     repair_remaining >/dev/null || return 1
     tunnels_ready=0
     china_tunnel_supervisors_ready && tunnels_ready=1
@@ -3483,15 +3632,25 @@ adapter_tunnel_readiness() {
       }
       if [ "$tunnels_ready" = 1 ]; then
         listener_status=0
-        tunnel_listener_ready "$peer_api_port" peer-tunnel-api \
-          "$peer_ssh_user@$peer_host" 1 \
-          -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" || listener_status=$?
+        peer_tunnel_api_listener_owner || listener_status=$?
+        if [ "$listener_status" = 0 ]; then
+          peer_tunnel_api_supervisor_ready || listener_status=$?
+        fi
+        if [ "$listener_status" -gt 1 ]; then
+          echo "peer API ownership could not be verified; no repair started" >&2
+          return 1
+        fi
         if [ "$listener_status" -ne 0 ]; then
           tunnels_ready=0
           readiness_port=$peer_api_port
-        elif ! peer_tunnel_api_supervisor_ready; then
-          tunnels_ready=0
-          readiness_port=$peer_api_port
+          if [ "$api_repair_attempted" = 0 ]; then
+            api_repair_attempted=1
+            repair_stage=peer-api-repair
+            echo "adapter tunnel retry stage=$repair_stage attempt=1 port=$peer_api_port" >&2
+            peer_tunnel_connection api \
+              "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
+              -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" || return 1
+          fi
         fi
       fi
     fi
@@ -3507,6 +3666,7 @@ adapter_tunnel_readiness() {
       fi
     fi
     [ "$tunnels_ready" = 1 ] && break
+    echo "adapter tunnel retry stage=$repair_stage attempt=$attempt port=${readiness_port:-source}" >&2
     repair_sleep 1 || return 1
   done
   if [ "$tunnels_ready" != 1 ]; then
@@ -3520,6 +3680,7 @@ adapter_tunnel_readiness() {
   if [ "$peer_enabled" = 1 ]; then
     remote_ready=0
     for attempt in $(seq 1 10); do
+      repair_stage=remote-readiness
       repair_remaining >/dev/null || return 1
       if peer_remote_ports_ready 10; then
         sleep 0.2
@@ -3547,6 +3708,7 @@ adapter_tunnel_readiness() {
           return 1
         }
       fi
+      echo "adapter tunnel retry stage=$repair_stage attempt=$attempt reason=${peer_readiness_failure:-unknown}" >&2
       repair_sleep 1 || return 1
     done
   fi
@@ -3556,6 +3718,7 @@ adapter_tunnel_readiness() {
     return 1
   fi
   for _ in $(seq 1 10); do
+    repair_stage=final-snapshot
     if adapter_tunnel_local_snapshot && \
         adapter_tunnel_remote_snapshot && \
         adapter_tunnel_local_snapshot && \
@@ -3563,6 +3726,7 @@ adapter_tunnel_readiness() {
       return 0
     fi
     peer_readiness_failure="final local/remote snapshot attempt $_"
+    echo "adapter tunnel retry stage=$repair_stage attempt=$_" >&2
     repair_sleep 1 || return 1
   done
   echo "adapter tunnel final local/remote snapshots failed" >&2
@@ -3625,6 +3789,7 @@ china_legacy_cleanup_pgids=()
 china_legacy_cleanup_orphan_pids=()
 china_legacy_cleanup_ports=()
 repair_acquire_lock || repair_fail "could not acquire adapter tunnel repair lock"
+repair_stage=china-legacy
 if [ "$restart_tunnels" = 1 ]; then
   china_tunnel_remove_all_owned || repair_fail "full reset cleanup failed"
 else
@@ -3643,6 +3808,7 @@ china_lane_size=2
 china_lane_start=0 china_lane_number=0
 china_lane_ports=() china_lane_forwards=()
 while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do
+  repair_stage=china-lane-$china_lane_number
   china_lane_ports=("${lora_source_ports[@]:china_lane_start:china_lane_size}")
   china_lane_forwards=()
   for lora_source_port in "${china_lane_ports[@]}"; do
@@ -3655,6 +3821,7 @@ while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do
   china_lane_start=$((china_lane_start + china_lane_size))
   china_lane_number=$((china_lane_number + 1))
 done
+repair_stage=china-source
 china_source_ports_ready || repair_fail "China adapter source check failed"
 if [ "$tunnels_only" = 0 ]; then
   echo "China adapter forwards ${lora_source_ports[0]}-${lora_source_ports[-1]} in $china_lane_number SSH lanes"
@@ -3666,6 +3833,7 @@ if ! peer_tunnel; then
   repair_fail "peer tunnel reconciliation failed"
 fi
 if [ "$secondary_enabled" = 1 ]; then
+  repair_stage=secondary
   if [ "$tunnels_only" = 1 ]; then
     tunnel "$secondary_local_api_port" "127.0.0.1:$secondary_remote_api_port" \
       "$secondary_ssh_target" no "${secondary_ssh_options[@]}" || repair_fail "secondary tunnel failed"

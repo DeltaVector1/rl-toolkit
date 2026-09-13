@@ -361,6 +361,9 @@ start=$(grep -n '^generic_tunnel_ssh_match() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
 source <(sed -n '/^repair_launch_tunnel() {/,/^}/p' "$script")
+for helper in repair_cleanup_remaining repair_cleanup_call; do
+  source <(sed -n "/^$helper() {/,/^}/p" "$script")
+done
 api_reconcile_definition=$(declare -f peer_tunnel_remove_duplicate_api_supervisors)
 tunnel_prepare_definition=$(declare -f tunnel_prepare_group_stop)
 tunnel_prepare_group_stop() { :; }
@@ -1687,6 +1690,28 @@ printf '%s\n' "1234 $china_supervisor_command" >"$sleep_group"
 PATH="$tmp/bin:$PATH" china_tunnel_stop_supervisor 42 "$china_supervisor_command" \
   china-tunnel-lora-0 0
 test "$(grep -F -c -- '-- -1234' "$SLEEP_KILL_LOG")" -eq 1
+
+# A full reset has 64 China groups and 64 peer groups to stop.
+(
+  repair_cleanup_spent_us=0
+  repair_cleanup_active_us=0
+  repair_cleanup_completed=0
+  repair_total_deadline=$((SECONDS + 150))
+  repair_cleanup_limit_us=150000000
+  reset_started=$SECONDS
+  : >"$SLEEP_KILL_LOG"
+  for group in {1..128}; do
+    PATH="$tmp/bin:$PATH" china_tunnel_stop_supervisor 42 "$china_supervisor_command" \
+      china-tunnel-lora-0 0 || {
+        echo "128-group cleanup failed at group=$group elapsed_seconds=$((SECONDS - reset_started))" >&2
+        exit 1
+      }
+  done
+  test "$(grep -F -c -- '-- -1234' "$SLEEP_KILL_LOG")" -eq 128
+  test "$repair_cleanup_completed" -eq 128
+  test "$repair_cleanup_spent_us" -lt 130000000
+  echo "128-group cleanup fixture elapsed_seconds=$((SECONDS - reset_started))"
+)
 
 # Group cleanup preflights every candidate before it kills any group.
 two_candidate_group="$tmp/china-two-candidate-group"
