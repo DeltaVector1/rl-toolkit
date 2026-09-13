@@ -254,10 +254,11 @@ repair_stop_unregistered_tunnel() {
 
 repair_register_tunnel() {
   local kind=$1 pid=$2 marker=$3 forward=${4:-} expected_command=${5:-} start_time= observed_start
-  local starting_index=${#repair_starting_tunnels[@]}
+  local starting_index=${#repair_starting_tunnels[@]} route=
+  [ "$kind" != china ] || route=${trainer_ssh_target:-}
   expected_command=${expected_command//$'\n'/ }
   expected_command=${expected_command//$'\t'/ }
-  repair_starting_tunnels+=("$pid||$marker|$kind|$forward|$expected_command|")
+  repair_starting_tunnels+=("$pid||$marker|$kind|$forward|$expected_command||$route")
   for _ in $(seq 1 100); do
     if observed_start=$(process_start_time "$pid") && [ -n "$observed_start" ]; then
       start_time=$observed_start
@@ -265,7 +266,7 @@ repair_register_tunnel() {
     fi
     if [ ! -e "/proc/$pid" ]; then
       repair_failed=1
-      repair_stop_starting_tunnel "$pid" "" "$kind" "$marker" "$forward" "$expected_command" || return 125
+      repair_stop_starting_tunnel "$pid" "" "$kind" "$marker" "$forward" "$expected_command" "" "$route" || return 125
       return 1
     fi
     [ "$repair_launch_active" = 1 ] || break
@@ -279,26 +280,26 @@ repair_register_tunnel() {
     return 125
   fi
   if [ -n "$expected_command" ]; then
-    repair_starting_tunnels[$starting_index]="$pid|$start_time|$marker|$kind|$forward|$expected_command|"
+    repair_starting_tunnels[$starting_index]="$pid|$start_time|$marker|$kind|$forward|$expected_command||$route"
     repair_starting_members=
-    if ! repair_wait_started_tunnel "$kind" "$pid" "$marker" "$forward" "$start_time" "$expected_command"; then
-      repair_starting_tunnels[$starting_index]+="$repair_starting_members"
+    if ! repair_wait_started_tunnel "$kind" "$pid" "$marker" "$forward" "$start_time" "$expected_command" "$route"; then
+      repair_starting_tunnels[$starting_index]="$pid|$start_time|$marker|$kind|$forward|$expected_command|$repair_starting_members|$route"
       repair_failed=1
-      repair_stop_starting_tunnel "$pid" "$start_time" "$kind" "$marker" "$forward" "$expected_command" "$repair_starting_members" || {
+      repair_stop_starting_tunnel "$pid" "$start_time" "$kind" "$marker" "$forward" "$expected_command" "$repair_starting_members" "$route" || {
         echo "could not safely stop starting tunnel PID $pid marker $marker" >&2
         return 125
       }
       return 1
     fi
-    repair_starting_tunnels[$starting_index]+="$repair_starting_members"
+    repair_starting_tunnels[$starting_index]="$pid|$start_time|$marker|$kind|$forward|$expected_command|$repair_starting_members|$route"
   else
-    repair_starting_tunnels[$starting_index]="$pid|$start_time|$marker|$kind|$forward||"
+    repair_starting_tunnels[$starting_index]="$pid|$start_time|$marker|$kind|$forward|||$route"
   fi
   repair_created_tunnels+=("$kind|$pid|$marker|$forward|$start_time")
 }
 
 repair_cleanup_starting_tunnels() {
-  local item pid start_time marker kind forward expected members failed=0
+  local item pid start_time marker kind forward expected members route failed=0
   for item in "${repair_unidentified_tunnels[@]}"; do
     IFS='|' read -r pid marker <<<"$item"
     if [ -e "/proc/$pid" ]; then
@@ -307,8 +308,8 @@ repair_cleanup_starting_tunnels() {
     fi
   done
   for item in "${repair_starting_tunnels[@]}"; do
-    IFS='|' read -r pid start_time marker kind forward expected members <<<"$item"
-    if ! repair_stop_starting_tunnel "$pid" "$start_time" "$kind" "$marker" "$forward" "$expected" "$members"; then
+    IFS='|' read -r pid start_time marker kind forward expected members route <<<"$item"
+    if ! repair_stop_starting_tunnel "$pid" "$start_time" "$kind" "$marker" "$forward" "$expected" "$members" "$route"; then
       echo "unresolved starting tunnel PID $pid marker $marker" >&2
       failed=1
     fi
@@ -318,12 +319,12 @@ repair_cleanup_starting_tunnels() {
 
 repair_starting_group() {
   local pid=$1 start_time=$2 expected=$3 marker=$4 bound=$5 mode=$6
-  local kind=${7:-} forward=${8:-}
+  local kind=${7:-} forward=${8:-} trainer_ssh_target=${9:-} proxy_ssh
   local output rows member parent pgid sid state command_line member_start expected_ssh anchor=0 found=0 leader_seen=0
   output=$(ps -eo pid=,ppid=,pgid=,sid=,stat=,args=) || return 1
   rows=$(awk -v group="$pid" '$3 == group {print}' <<<"$output") || return 1
   repair_starting_members=
-  [ -n "$rows" ] || return 0
+  [ -n "$rows" ] || { [ "$mode" = stop ]; return "$?"; }
   while read -r member parent pgid sid state command_line; do
     [ "$pgid" = "$pid" ] && [ "$sid" = "$pid" ] || return 1
     case "$state" in Z*) continue ;; esac
@@ -337,7 +338,17 @@ repair_starting_group() {
       leader_seen=1
     else
       expected_ssh=$(tunnel_supervisor_ssh_command "bash -c $expected" "$marker") || return 1
-      case "$command_line" in "$expected_ssh"|'sleep 3') ;; *) return 1 ;; esac
+      expected_ssh=$(tunnel_channel_timeout_normalize "$expected_ssh") || return 1
+      command_line=$(tunnel_channel_timeout_normalize "$command_line") || return 1
+      case "$command_line" in /usr/bin/ssh\ *) command_line="ssh ${command_line#/usr/bin/ssh }" ;; esac
+      case "$command_line" in
+        "$expected_ssh"|'sleep 3') ;;
+        *)
+          [ "$kind" = china ] && [ -n "$trainer_ssh_target" ] || return 1
+          proxy_ssh=$(china_tunnel_proxy_ssh_command) || return 1
+          [ "$command_line" = "$proxy_ssh" ] || return 1
+          ;;
+      esac
       case ",$bound," in *",$member:$member_start,"*) anchor=1 ;; esac
       repair_starting_members+="$member:$member_start,"
     fi
@@ -350,10 +361,10 @@ repair_starting_group() {
 }
 
 repair_stop_starting_group() {
-  local pid=$1 start_time=$2 expected=$3 marker=$4 bound=$5 output remaining
-  repair_starting_group "$pid" "$start_time" "$expected" "$marker" "$bound" stop || return 1
+  local pid=$1 start_time=$2 expected=$3 marker=$4 bound=$5 kind=${6:-} route=${7:-} output remaining
+  repair_starting_group "$pid" "$start_time" "$expected" "$marker" "$bound" stop "$kind" "" "$route" || return 1
   [ -n "$repair_starting_members" ] || return 0
-  repair_starting_group "$pid" "$start_time" "$expected" "$marker" "$bound" stop || return 1
+  repair_starting_group "$pid" "$start_time" "$expected" "$marker" "$bound" stop "$kind" "" "$route" || return 1
   [ -n "$repair_starting_members" ] || return 0
   kill -KILL -- "-$pid" || return 1
   for _ in $(seq 1 40); do
@@ -379,11 +390,13 @@ repair_started_command_matches() {
   esac
   actual_ssh=$(tunnel_supervisor_ssh_command "$command_line" "$marker") || return 1
   expected_ssh=$(tunnel_supervisor_ssh_command "bash -c $expected" "$marker") || return 1
+  actual_ssh=$(tunnel_channel_timeout_normalize "$actual_ssh") || return 1
+  expected_ssh=$(tunnel_channel_timeout_normalize "$expected_ssh") || return 1
   [ "$actual_ssh" = "$expected_ssh" ]
 }
 
 repair_wait_started_tunnel() {
-  local kind=$1 pid=$2 marker=$3 forward=$4 start_time=$5 expected=$6
+  local kind=$1 pid=$2 marker=$3 forward=$4 start_time=$5 expected=$6 route=${7:-}
   local command_line current_start pgid startup_deadline=$((SECONDS + 10))
   while [ "$SECONDS" -lt "$startup_deadline" ]; do
     repair_remaining >/dev/null || return 1
@@ -395,7 +408,7 @@ repair_wait_started_tunnel() {
     if [ "$pgid" = "$pid" ] &&
         repair_started_command_matches "$kind" "$command_line" "$marker" "$forward" "$expected"; then
       process_identity_matches "$pid" "$pid" "$start_time" "$command_line" || return 1
-      repair_starting_group "$pid" "$start_time" "$expected" "$marker" "" capture "$kind" "$forward" || return 1
+      repair_starting_group "$pid" "$start_time" "$expected" "$marker" "" capture "$kind" "$forward" "$route" || return 1
       return 0
     fi
     sleep 0.05
@@ -405,9 +418,9 @@ repair_wait_started_tunnel() {
 
 repair_stop_starting_tunnel() {
   local pid=$1 start_time=$2 command_line pgid current_start
-  local kind=${3:-} marker=${4:-} forward=${5:-} expected=${6:-} members=${7:-}
+  local kind=${3:-} marker=${4:-} forward=${5:-} expected=${6:-} members=${7:-} route=${8:-}
   if [ ! -e "/proc/$pid" ]; then
-    repair_stop_starting_group "$pid" "$start_time" "$expected" "$marker" "$members"
+    repair_stop_starting_group "$pid" "$start_time" "$expected" "$marker" "$members" "$kind" "$route"
     return "$?"
   fi
   repair_direct_child_owned "$pid" || return 1
@@ -416,19 +429,19 @@ repair_stop_starting_tunnel() {
   process_identity_matches "$pid" "$pgid" "$start_time" "$command_line" || return 1
   kill -STOP "$pid" || return 1
   if repair_kill_stopped_tunnel "$pid" "$start_time"; then
-    repair_stop_starting_group "$pid" "$start_time" "$expected" "$marker" "$members"
+    repair_stop_starting_group "$pid" "$start_time" "$expected" "$marker" "$members" "$kind" "$route"
     return "$?"
   fi
   # Resume after a failed stop only while the same identity is still proven.
   if [ ! -e "/proc/$pid" ]; then
-    repair_stop_starting_group "$pid" "$start_time" "$expected" "$marker" "$members"
+    repair_stop_starting_group "$pid" "$start_time" "$expected" "$marker" "$members" "$kind" "$route"
     return "$?"
   fi
   current_start=$(process_start_time "$pid") || return 1
   [ "$current_start" = "$start_time" ] || return 1
   kill -CONT "$pid" 2>/dev/null || {
     if [ ! -e "/proc/$pid" ]; then
-      repair_stop_starting_group "$pid" "$start_time" "$expected" "$marker" "$members"
+      repair_stop_starting_group "$pid" "$start_time" "$expected" "$marker" "$members" "$kind" "$route"
       return "$?"
     fi
     return 1
