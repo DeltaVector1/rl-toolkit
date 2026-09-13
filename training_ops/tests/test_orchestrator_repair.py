@@ -705,10 +705,63 @@ class OrchestratorRepairTest(unittest.TestCase):
 
 
 class SourcePortProbeTest(unittest.TestCase):
+    def test_source_probe_runs_before_peer_changes_and_is_not_repeated(self):
+        script = Path(__file__).resolve().parents[1] / "runtime/h200/start_orchestrator.sh"
+        source = script.read_text()
+        for name in ("adapter_tunnel_local_snapshot", "adapter_tunnel_readiness"):
+            function = source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
+            self.assertNotIn("china_source_ports_ready", function)
+            self.assertNotIn("china_tunnel_connection", function)
+        phase = "china_lane_size=2\n" + source.split("china_lane_size=2\n", 1)[1]
+        phase = phase.split('if [ "$secondary_enabled" = 1 ]; then', 1)[0]
+        for probe_status in (0, 1):
+            fixtures = f'''
+lora_source_ports=(18100 18101)
+adapter_port=8000
+tunnels_only=1
+china_tunnel_connection() {{ echo china; }}
+china_source_ports_ready() {{ echo source; return {probe_status}; }}
+peer_tunnel() {{ echo peer; }}
+repair_fail() {{ exit 1; }}
+'''
+            result = subprocess.run(["bash", "-c", fixtures + phase], capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, probe_status, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["china", "source"] + ([] if probe_status else ["peer"]))
+
+    def test_production_probe_uses_fixed_real_seconds(self):
+        script = Path(__file__).resolve().parents[1] / "runtime/h200/start_orchestrator.sh"
+        section = script.read_text().split("china_source_ports_ready() {", 1)[1].split("\ntunnel_command_has()", 1)[0]
+        wrapper, body = section.split("<<'PY'\n", 1)
+        self.assertIn("local probe_seconds=40", wrapper)
+        self.assertNotIn("repair_timeout", wrapper)
+        self.assertIn("budget = 40.0", body)
+        self.assertNotIn("scale", body)
+        self.assertIn("enumerate(((32, 2, 10), (4, 5, 12), (2, 5, 12)), 1)", body)
+        self.assertIn("asyncio.timeout(socket_seconds)", body)
+        self.assertIn("asyncio.wait(tasks, timeout=stage_seconds)", body)
+        self.assertIn("asyncio.wait_for(check_ports(), timeout=budget)", body)
+        result = subprocess.run(
+            ["bash", "-c", "china_source_ports_ready() {" + section + "\n" + r'''
+repair_timeout() { echo 'unexpected repair timeout call' >&2; echo 5; }
+ps() { echo 'bash source # china-tunnel-lora-0'; }
+timeout() { printf '%s\n' "$*" >&2; cat >/dev/null; echo 2; }
+lora_source_ports=(18100 18101)
+china_source_ports_ready
+'''], capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.strip(), "--signal=TERM --kill-after=1s 40 python3 - 18100 18101")
+
     def run_probe(self, fail_until, budget=40, delay=False, stall_first=None, response=None):
         script = Path(__file__).resolve().parents[1] / "runtime/h200/start_orchestrator.sh"
         body = script.read_text().split("china_source_ports_ready() {", 1)[1]
         body = body.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        if budget != 40:
+            fixture_stages = tuple((workers, seconds, stage * budget / 40)
+                                   for workers, seconds, stage in ((32, 2, 10), (4, 5, 12), (2, 5, 12)))
+            body = body.replace("budget = 40.0", f"budget = {budget!r}")
+            body = body.replace("((32, 2, 10), (4, 5, 12), (2, 5, 12))", repr(fixture_stages))
+            body = body.replace("asyncio.sleep(0.25)", f"asyncio.sleep({0.25 * budget / 40!r})")
         calls = {}
         closed = []
 
@@ -744,7 +797,7 @@ class SourcePortProbeTest(unittest.TestCase):
         started = time.monotonic()
         status = 0
         with mock.patch("asyncio.open_connection", connect), mock.patch.object(
-            sys, "argv", ["probe", "18100", "18107", str(budget)]
+            sys, "argv", ["probe", "18100", "18107"]
         ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             try:
                 exec(compile(body, str(script), "exec"), {})

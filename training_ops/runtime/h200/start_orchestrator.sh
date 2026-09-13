@@ -2185,20 +2185,18 @@ peer_repair_missing_remote_lanes() {
 
 china_source_ports_ready() {
   local probe_seconds=40 expected_lanes observed_lanes verified_ports
-  probe_seconds=$(repair_timeout "$probe_seconds") || return 1
   expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
   observed_lanes=$(ps -eo args= | sed -n 's/.*# china-tunnel-lora-\([0-9][0-9]*\)$/\1/p' | sort -n) || return 1
   [ "$observed_lanes" = "$(seq 0 $((expected_lanes - 1)))" ] || return 1
   if ! verified_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
-      python3 - "${lora_source_ports[0]}" "${lora_source_ports[-1]}" "$probe_seconds" <<'PY'
+      python3 - "${lora_source_ports[0]}" "${lora_source_ports[-1]}" <<'PY'
 import asyncio
 import sys
 import time
 
 first = int(sys.argv[1])
 last = int(sys.argv[2])
-budget = float(sys.argv[3])
-scale = min(1, budget / 40)
+budget = 40.0
 
 
 async def is_adapter_server(port, socket_seconds, semaphore):
@@ -2232,12 +2230,12 @@ async def check_ports():
     failed = dict.fromkeys(ports, "not checked")
     for attempt, (workers, socket_seconds, stage_seconds) in enumerate(((32, 2, 10), (4, 5, 12), (2, 5, 12)), 1):
         if attempt > 1:
-            await asyncio.sleep(0.25 * scale)
+            await asyncio.sleep(0.25)
         started = time.monotonic()
         semaphore = asyncio.Semaphore(workers)
         tasks = {asyncio.create_task(is_adapter_server(port, socket_seconds, semaphore)): port for port in failed}
         try:
-            done, pending = await asyncio.wait(tasks, timeout=stage_seconds * scale)
+            done, pending = await asyncio.wait(tasks, timeout=stage_seconds)
             failed = {tasks[task]: "stage timeout" for task in pending}
             for task in done:
                 port, reason = task.result()
@@ -3446,7 +3444,6 @@ peer_tunnel_api_supervisor_ready() {
 adapter_tunnel_local_snapshot() {
   repair_remaining >/dev/null || return 1
   china_tunnel_supervisors_ready || return 1
-  china_source_ports_ready || return 1
   if [ "$peer_enabled" = 1 ]; then
     peer_tunnel_supervisors_ready || return 1
     tunnel_listener_ready "$peer_api_port" peer-tunnel-api \
@@ -3477,7 +3474,7 @@ adapter_tunnel_readiness() {
   for attempt in $(seq 1 30); do
     repair_remaining >/dev/null || return 1
     tunnels_ready=0
-    china_tunnel_supervisors_ready && china_source_ports_ready && tunnels_ready=1
+    china_tunnel_supervisors_ready && tunnels_ready=1
     if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ]; then
       peer_tunnel_supervisors_ready || {
         peer_readiness_failure="supervisor inventory/identity attempt $attempt"
@@ -3658,6 +3655,7 @@ while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do
   china_lane_start=$((china_lane_start + china_lane_size))
   china_lane_number=$((china_lane_number + 1))
 done
+china_source_ports_ready || repair_fail "China adapter source check failed"
 if [ "$tunnels_only" = 0 ]; then
   echo "China adapter forwards ${lora_source_ports[0]}-${lora_source_ports[-1]} in $china_lane_number SSH lanes"
 fi
