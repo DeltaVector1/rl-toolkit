@@ -147,6 +147,21 @@ def rollout_budget(
             budget = max(budget, refill)
     return budget
 
+
+def token_batch_rollout_budget(
+    *,
+    current_tokens: int,
+    target_tokens: int,
+    live: int,
+    group_size: int,
+    max_inflight: int,
+) -> int:
+    if current_tokens >= target_tokens:
+        return 0
+    group_size = max(1, group_size)
+    refill = max(0, max_inflight - live)
+    return ((refill + group_size - 1) // group_size) * group_size
+
 # Let a valid old-policy batch finish before an adapter update.
 POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S = 1200
 
@@ -1364,16 +1379,25 @@ class Orchestrator:
         return time.perf_counter() - t
 
     def update_rollout_budget(self) -> None:
-        if self.config.batch_size is None:
-            return
-        current, _, _ = self.train_sink.batch_progress()
+        current, target, _ = self.train_sink.batch_progress()
         live = (
             self.dispatcher.queued_train_count
             + self.dispatcher.inflight_train_count
             + self.dispatcher.pending_train_schedule_count
         )
-        buffered = self.train_sink.buffered_count()
         group = max(1, getattr(self.config, "group_size", 1))
+        if self.config.batch_size is None:
+            budget = token_batch_rollout_budget(
+                current_tokens=current,
+                target_tokens=target,
+                live=live,
+                group_size=group,
+                max_inflight=self.config.max_inflight_rollouts,
+            )
+            self.dispatcher.set_fresh_train_rollout_budget(budget)
+            return
+
+        buffered = self.train_sink.buffered_count()
         # Full-group overflow carries into the next step.
         budget = rollout_budget(
             batch_size=self.config.batch_size,

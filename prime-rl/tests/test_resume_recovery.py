@@ -23,6 +23,26 @@ ORCHESTRATOR_PATH = ROOT / "src/prime_rl/orchestrator/orchestrator.py"
 SERVER_PATH = ROOT / "src/prime_rl/inference/vllm/server.py"
 
 
+def load_rollout_budget_functions():
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    functions = {
+        node.name: node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"rollout_budget", "token_batch_rollout_budget"}
+    }
+    namespace = {"ROLLOUT_TAIL_SPARE_GROUPS": 32}
+    exec(
+        compile(
+            ast.Module(body=list(functions.values()), type_ignores=[]),
+            str(ORCHESTRATOR_PATH),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["rollout_budget"], namespace["token_batch_rollout_budget"]
+
+
 def load_startup_validator(urlopen, validate_manifest, file_records):
     source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
     function = next(
@@ -227,6 +247,45 @@ def write_cached_adapter(
 
 
 class ResumeRecoveryTest(unittest.TestCase):
+    def test_token_batch_budget_refills_a_drained_pipeline(self):
+        _, budget = load_rollout_budget_functions()
+        self.assertEqual(
+            budget(
+                current_tokens=699_296,
+                target_tokens=1_500_000,
+                live=0,
+                group_size=16,
+                max_inflight=256,
+            ),
+            256,
+        )
+
+    def test_token_batch_budget_refills_whole_groups(self):
+        _, budget = load_rollout_budget_functions()
+        self.assertEqual(
+            budget(
+                current_tokens=699_296,
+                target_tokens=1_500_000,
+                live=249,
+                group_size=16,
+                max_inflight=256,
+            ),
+            16,
+        )
+
+    def test_token_batch_budget_stops_at_target(self):
+        _, budget = load_rollout_budget_functions()
+        self.assertEqual(
+            budget(
+                current_tokens=1_500_000,
+                target_tokens=1_500_000,
+                live=0,
+                group_size=16,
+                max_inflight=256,
+            ),
+            0,
+        )
+
     def test_server_load_receipt_requires_backend_success_and_exact_slot(self):
         source_url = "http://source/step_2"
         with tempfile.TemporaryDirectory() as temporary:
