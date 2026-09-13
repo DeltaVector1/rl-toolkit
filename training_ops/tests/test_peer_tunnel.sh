@@ -218,6 +218,7 @@ if peer_tunnel_ssh_args_match "${peer_exact_command/root@38.255.28.19/junk root@
   exit 1
 fi
 peer_supervisor_command="bash -c while true; do $peer_exact_command; sleep 3; done # peer-tunnel-lora-0"
+peer_escaped_supervisor_command=$(sed 's/ChannelTimeout=\*-tcpip=45s/ChannelTimeout=\\*-tcpip=45s/' <<<"$peer_supervisor_command")
 peer_tunnel_supervisor_match "$peer_supervisor_command" current peer-tunnel-lora-0
 for hostile_target in \
   "root@38.255.28.19.evil" \
@@ -250,6 +251,7 @@ trainer_ssh_target=china-trainer
 adapter_port=8100
 china_exact_command="ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ChannelTimeout=*-tcpip=45s -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100 china-trainer"
 china_supervisor_command="bash -c while true; do $china_exact_command; sleep 3; done # china-tunnel-lora-0"
+china_escaped_supervisor_command=$(sed 's/ChannelTimeout=\*-tcpip=45s/ChannelTimeout=\\*-tcpip=45s/' <<<"$china_supervisor_command")
 china_tunnel_supervisor_match "$china_supervisor_command" current china-tunnel-lora-0
 for hostile_target in \
   "china-trainer.evil" \
@@ -541,6 +543,50 @@ test ! -s "$peer_stale_evil_kill_log"
 unset -f kill
 unset PEER_STALE_EVIL_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
 
+# The supervisor command escapes the wildcard for its shell, while its SSH
+# child has the literal wildcard.  Only that exact timeout argument is
+# normalized for group comparison.
+peer_group_accepts_escaped_timeout() {
+  local group="$tmp/peer-escaped-group" kill_log="$tmp/peer-escaped-kill"
+  printf '%s\n' \
+    "1234 $peer_escaped_supervisor_command" \
+    "1234 $peer_exact_command" \
+    '1234 sleep 3' >"$group"
+  kill() { printf '%s\n' "$*" >>"$PEER_ESCAPED_KILL_LOG"; return 0; }
+  export PEER_ESCAPED_KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group"
+  export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+  PATH="$tmp/bin:$PATH" peer_kill_owned 42 "$peer_escaped_supervisor_command" \
+    cleanup peer-tunnel-lora-0
+  test "$(grep -F -c -- '-- -1234' "$kill_log")" -eq 1
+  unset -f kill
+  unset PEER_ESCAPED_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+}
+
+peer_group_rejects_child() {
+  local child=$1 name=$2 group="$tmp/peer-$2-group" kill_log="$tmp/peer-$2-kill"
+  printf '%s\n' \
+    "1234 $peer_escaped_supervisor_command" \
+    "1234 $child" \
+    '1234 sleep 3' >"$group"
+  kill() { printf '%s\n' "$*" >>"$PEER_REJECT_KILL_LOG"; return 0; }
+  export PEER_REJECT_KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group"
+  export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+  set +e
+  PATH="$tmp/bin:$PATH" peer_kill_owned 42 "$peer_escaped_supervisor_command" \
+    cleanup peer-tunnel-lora-0
+  local status=$?
+  set -e
+  test "$status" -ne 0
+  test ! -s "$kill_log"
+  unset -f kill
+  unset PEER_REJECT_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+}
+
+peer_group_accepts_escaped_timeout
+peer_group_rejects_child "${peer_exact_command/ChannelTimeout=*-tcpip=45s/ChannelTimeout=*-tcpip=60s}" timeout
+peer_group_rejects_child "$peer_exact_command extra" extra
+peer_group_rejects_child "${peer_exact_command/root@38.255.28.19/wrong@peer}" target
+
 # Group cleanup accepts only an exact owned China supervisor and child.
 trainer_ssh_target=china-trainer
 china_owned_group="$tmp/china-owned-group"
@@ -603,6 +649,47 @@ test "$china_normal_evil_status" -ne 0
 test ! -s "$china_normal_kill_log"
 unset -f kill
 unset CHINA_NORMAL_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+
+china_group_accepts_escaped_timeout() {
+  local group="$tmp/china-escaped-group" kill_log="$tmp/china-escaped-kill"
+  printf '%s\n' \
+    "1234 $china_escaped_supervisor_command" \
+    "1234 $china_exact_command" \
+    '1234 sleep 3' >"$group"
+  kill() { printf '%s\n' "$*" >>"$CHINA_ESCAPED_KILL_LOG"; return 0; }
+  export CHINA_ESCAPED_KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group"
+  export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+  PATH="$tmp/bin:$PATH" china_tunnel_stop_supervisor 42 "$china_escaped_supervisor_command" \
+    china-tunnel-lora-0 1
+  test "$(grep -F -c -- '-- -1234' "$kill_log")" -eq 1
+  unset -f kill
+  unset CHINA_ESCAPED_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+}
+
+china_group_rejects_child() {
+  local child=$1 name=$2 group="$tmp/china-$2-group" kill_log="$tmp/china-$2-kill"
+  printf '%s\n' \
+    "1234 $china_escaped_supervisor_command" \
+    "1234 $child" \
+    '1234 sleep 3' >"$group"
+  kill() { printf '%s\n' "$*" >>"$CHINA_REJECT_KILL_LOG"; return 0; }
+  export CHINA_REJECT_KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group"
+  export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+  set +e
+  PATH="$tmp/bin:$PATH" china_tunnel_stop_supervisor 42 "$china_escaped_supervisor_command" \
+    china-tunnel-lora-0 1
+  local status=$?
+  set -e
+  test "$status" -ne 0
+  test ! -s "$kill_log"
+  unset -f kill
+  unset CHINA_REJECT_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+}
+
+china_group_accepts_escaped_timeout
+china_group_rejects_child "${china_exact_command/ChannelTimeout=*-tcpip=45s/ChannelTimeout=*-tcpip=60s}" timeout
+china_group_rejects_child "$china_exact_command extra" extra
+china_group_rejects_child "${china_exact_command/china-trainer/wrong-trainer}" target
 
 # Readiness accepts a listener only when its SSH child and two-port
 # supervisor both match the configured target.

@@ -622,22 +622,30 @@ tunnel_supervisor_ssh_command() {
   printf '%s\n' "$ssh_command"
 }
 
+tunnel_channel_timeout_normalize() {
+  sed 's/ChannelTimeout=\\\*-tcpip=45s/ChannelTimeout=*-tcpip=45s/g' <<<"$1"
+}
+
 peer_tunnel_stale_group_safe() {
   local pgid=$1 supervisor_command=$2 shape=$3 marker=$4
-  local group_command expected_ssh group_seen=0 normalized_command
+  local group_command expected_ssh actual_ssh group_seen=0 normalized_command
   expected_ssh=$(tunnel_supervisor_ssh_command "$supervisor_command" "$marker") || return 1
+  expected_ssh=$(tunnel_channel_timeout_normalize "$expected_ssh") || return 1
   while IFS= read -r group_command; do
     group_seen=1
     case "$group_command" in
       *"while true; do"*)
         peer_tunnel_stale_supervisor_match "$group_command" "$shape" "$marker" || return 1
-        [ "$(tunnel_supervisor_ssh_command "$group_command" "$marker")" = "$expected_ssh" ] || return 1
+        actual_ssh=$(tunnel_supervisor_ssh_command "$group_command" "$marker") || return 1
+        actual_ssh=$(tunnel_channel_timeout_normalize "$actual_ssh") || return 1
+        [ "$actual_ssh" = "$expected_ssh" ] || return 1
         ;;
       ssh\ *|/usr/bin/ssh\ *)
         normalized_command=$group_command
         case "$normalized_command" in
           /usr/bin/ssh\ *) normalized_command="ssh ${normalized_command#/usr/bin/ssh }" ;;
         esac
+        normalized_command=$(tunnel_channel_timeout_normalize "$normalized_command") || return 1
         [ "$normalized_command" = "$expected_ssh" ] || return 1
         ;;
       "sleep 3") ;;
@@ -651,7 +659,7 @@ peer_tunnel_ssh_args_match() {
   local command_line=$1 shape=$2
   local index forward_count forward_start target_index remaining
   local -a command_args expected_args
-  command_line=$(sed 's/\\\*/\*/g' <<<"$command_line")
+  command_line=$(tunnel_channel_timeout_normalize "$command_line") || return 1
   expected_args=(
     -NT
     -o BatchMode=yes
@@ -943,7 +951,7 @@ china_tunnel_ssh_args_match() {
   local command_line=$1 shape=$2
   local source_port forward_count index
   local -a command_args expected_args
-  command_line=$(sed 's/\\\*/\*/g' <<<"$command_line")
+  command_line=$(tunnel_channel_timeout_normalize "$command_line") || return 1
   expected_args=(
     -NT
     -o BatchMode=yes
@@ -1001,8 +1009,9 @@ china_tunnel_group_safe() {
 
 china_tunnel_stale_group_safe() {
   local pgid=$1 supervisor_command=$2 marker=$3
-  local group_command expected_ssh group_listing group_seen=0 normalized_command
+  local group_command expected_ssh actual_ssh group_listing group_seen=0 normalized_command
   expected_ssh=$(tunnel_supervisor_ssh_command "$supervisor_command" "$marker") || return 1
+  expected_ssh=$(tunnel_channel_timeout_normalize "$expected_ssh") || return 1
   group_listing=$(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[^ ]+ +/, ""); print}' | sed -E 's/[[:space:]]+$//') || return 1
   while IFS= read -r group_command; do
     [ -n "$group_command" ] || continue
@@ -1010,13 +1019,16 @@ china_tunnel_stale_group_safe() {
     case "$group_command" in
       *"while true; do"*)
         china_tunnel_stale_supervisor_match "$group_command" cleanup "$marker" || return 1
-        [ "$(tunnel_supervisor_ssh_command "$group_command" "$marker")" = "$expected_ssh" ] || return 1
+        actual_ssh=$(tunnel_supervisor_ssh_command "$group_command" "$marker") || return 1
+        actual_ssh=$(tunnel_channel_timeout_normalize "$actual_ssh") || return 1
+        [ "$actual_ssh" = "$expected_ssh" ] || return 1
         ;;
       ssh\ *|/usr/bin/ssh\ *)
         normalized_command=$group_command
         case "$normalized_command" in
           /usr/bin/ssh\ *) normalized_command="ssh ${normalized_command#/usr/bin/ssh }" ;;
         esac
+        normalized_command=$(tunnel_channel_timeout_normalize "$normalized_command") || return 1
         [ "$normalized_command" = "$expected_ssh" ] || return 1
         ;;
       "sleep 3") ;;
