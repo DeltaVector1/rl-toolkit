@@ -558,9 +558,17 @@ class Orchestrator:
         else:
             get_logger().info("Training from scratch")
 
-        # Sync inference to the incoming policy before the first step when resuming or when using
-        # an in-memory transport, which rendezvouses with the trainer's startup broadcast.
-        if self.resume_policy_step is not None or config.weight_broadcast.type in ("nccl", "nixl"):
+        # Sync inference to the incoming policy before the first step when resuming, when using
+        # an in-memory transport, or when a filesystem LoRA needs an exact policy-zero receipt.
+        initial_filesystem_lora = (
+            self.lora_name is not None
+            and config.weight_broadcast.type == "filesystem"
+        )
+        if (
+            self.resume_policy_step is not None
+            or config.weight_broadcast.type in ("nccl", "nixl")
+            or initial_filesystem_lora
+        ):
             final_sync_version = self.resume_policy_step if self.resume_policy_step is not None else 0
             sync_versions = (final_sync_version,)
             if (

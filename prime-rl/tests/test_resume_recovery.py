@@ -760,6 +760,22 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertLess(stage_at, update_at)
         self.assertIn("prefetched=prefetched", setup[update_at:])
 
+    def test_fresh_filesystem_lora_loads_policy_zero_before_rollouts(self):
+        source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+        setup = ast.get_source_segment(
+            source,
+            next(
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
+            ),
+        )
+        initial_sync = setup.index("initial_filesystem_lora =")
+        stage = setup.index("await stage_lora_adapter(", initial_sync)
+        dispatcher = setup.index("self.dispatcher = RolloutDispatcher(")
+        self.assertIn('config.weight_broadcast.type == "filesystem"', setup[initial_sync:stage])
+        self.assertLess(stage, dispatcher)
+
     def test_filesystem_lora_resume_stages_saved_policies_and_loads_only_the_last(self):
         source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
         setup = ast.get_source_segment(
