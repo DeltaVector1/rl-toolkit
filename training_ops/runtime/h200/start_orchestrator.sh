@@ -3208,6 +3208,56 @@ adapter_tunnel_readiness() {
   return 1
 }
 
+adapter_relay_start() {
+  local running relay_ready=0 relay_probe relay_status
+  if [ "$peer_enabled" != 1 ]; then
+    [ "$tunnels_only" = 1 ] || sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+    return 0
+  fi
+  sudo install -d -o 1000 -g 1000 -m 0755 "$relay_cache_dir"
+  running=$(sudo docker inspect "$relay_container" --format '{{.State.Running}}' 2>/dev/null || true)
+    relay_probe=$(curl -sS --max-time 2 -H "Host: 127.0.0.1:${lora_source_ports[0]}" \
+      -w $'\n%{http_code}' "http://127.0.0.1:$relay_port/" 2>/dev/null || true)
+    relay_status=${relay_probe##*$'\n'}
+    relay_probe=${relay_probe%$'\n'*}
+    if [ "$running" = true ] && ss -tln 2>/dev/null | grep -q "127.0.0.1:$relay_port" && \
+        [ "$relay_status" = 404 ] && [ "$relay_probe" = "source URL is not configured" ]; then
+      return 0
+  fi
+  sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+  sudo docker run -d --name "$relay_container" --restart unless-stopped \
+    --user 0:0 \
+    --network host \
+    --log-opt max-size=128m --log-opt max-file=2 \
+    -v "$relay_cache_dir":"$relay_cache_dir":ro \
+    -v "$deployment/prime-rl/src/prime_rl/inference/relay.py":/app/relay.py:ro \
+    --entrypoint /app/.venv/bin/python \
+    "$image" /app/relay.py \
+    --host 127.0.0.1 --port "$relay_port" \
+    --cache-dir "$relay_cache_dir" \
+    --source-port-first "${lora_source_ports[0]}" \
+    --source-port-last "${lora_source_ports[-1]}" \
+    --canonical-source-url "$relay_source_url" >/dev/null || return 1
+  for _ in $(seq 1 60); do
+    running=$(sudo docker inspect "$relay_container" --format '{{.State.Running}}' 2>/dev/null || true)
+    relay_probe=$(curl -sS --max-time 2 -H "Host: 127.0.0.1:${lora_source_ports[0]}" \
+      -w $'\n%{http_code}' "http://127.0.0.1:$relay_port/" 2>/dev/null || true)
+    relay_status=${relay_probe##*$'\n'}
+    relay_probe=${relay_probe%$'\n'*}
+    if [ "$running" = true ] && ss -tln 2>/dev/null | grep -q "127.0.0.1:$relay_port" && \
+        [ "$relay_status" = 404 ] && [ "$relay_probe" = "source URL is not configured" ]; then
+      relay_ready=1
+      break
+    fi
+    sleep 1
+  done
+  [ "$relay_ready" = 1 ] || {
+    sudo docker logs --tail 100 "$relay_container" >&2 || true
+    sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+    return 1
+  }
+}
+
 china_legacy_cleanup_required=0
 china_legacy_cleanup_pids=()
 china_legacy_cleanup_pgids=()
@@ -3225,6 +3275,9 @@ if [ "$china_legacy_cleanup_required" = 1 ] && ! china_tunnel_wait_legacy_clear;
   repair_fail "old China tunnel groups did not stop"
 fi
 repair_remaining >/dev/null || repair_fail "deadline exceeded after cleanup"
+if ! adapter_relay_start; then
+  repair_fail "adapter relay unavailable"
+fi
 china_lane_size=2
 china_lane_start=0 china_lane_number=0
 china_lane_ports=() china_lane_forwards=()
@@ -3280,43 +3333,8 @@ fi
 if [ "$secondary_enabled" = 1 ]; then
   ports+=("$secondary_local_api_port")
 fi
-sudo install -d -o 1000 -g 1000 -m 0755 "$relay_cache_dir"
 if [ "$peer_enabled" = 1 ]; then
-  sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
-  if ! sudo docker run -d --name "$relay_container" --restart unless-stopped \
-    --user 0:0 \
-    --network host \
-    --log-opt max-size=128m --log-opt max-file=2 \
-    -v "$relay_cache_dir":"$relay_cache_dir":ro \
-    -v "$deployment/prime-rl/src/prime_rl/inference/relay.py":/app/relay.py:ro \
-    --entrypoint /app/.venv/bin/python \
-    "$image" /app/relay.py \
-    --host 127.0.0.1 --port "$relay_port" \
-    --cache-dir "$relay_cache_dir" \
-    --source-port-first "${lora_source_ports[0]}" \
-    --source-port-last "${lora_source_ports[-1]}" \
-    --canonical-source-url "$relay_source_url" >/dev/null; then
-    echo "adapter relay failed to start" >&2
-    exit 1
-  fi
-  relay_ready=0
-  for _ in $(seq 1 60); do
-    running=$(sudo docker inspect "$relay_container" --format '{{.State.Running}}' 2>/dev/null || true)
-    if [ "$running" = true ] && ss -tln 2>/dev/null | grep -q "127.0.0.1:$relay_port"; then
-      relay_ready=1
-      break
-    fi
-    sleep 1
-  done
-  if [ "$relay_ready" != 1 ]; then
-    echo "adapter relay did not become ready on 127.0.0.1:$relay_port" >&2
-    sudo docker logs --tail 100 "$relay_container" >&2 || true
-    sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
-    exit 1
-  fi
   ports+=("$relay_port")
-else
-  sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
 fi
 if [ "$transport" = zmq ]; then
   tunnel 29620 10.92.20.82:29620 "$trainer_ssh_target" yes
