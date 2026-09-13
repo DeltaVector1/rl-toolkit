@@ -117,7 +117,14 @@ class DownloadSchedulerTest(unittest.TestCase):
         return server, thread, Handler
 
     def _persistent_download(
-        self, filesystem, server, root, name, payload, cancel_event=None
+        self,
+        filesystem,
+        server,
+        root,
+        name,
+        payload,
+        cancel_event=None,
+        per_request_timeout_seconds=2,
     ):
         chunks = root / "chunks"
         chunks.mkdir(exist_ok=True)
@@ -135,7 +142,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 parent_fd,
                 expected_size=len(payload),
                 expected_sha256=hashlib.sha256(payload).hexdigest(),
-                per_request_timeout_seconds=2,
+                per_request_timeout_seconds=per_request_timeout_seconds,
                 cancel_event=cancel_event,
             )
         finally:
@@ -366,7 +373,7 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
-    def test_persistent_chunk_attempt_deadline_stops_trickle_and_rotates(self):
+    def test_persistent_chunk_allows_continuous_trickle(self):
         filesystem = load_filesystem_module()
         payload = b"trickle-body"
 
@@ -426,16 +433,16 @@ class DownloadSchedulerTest(unittest.TestCase):
                     os.close(parent_fd)
                 elapsed = time.monotonic() - started
                 self.assertEqual((chunks / "trickle").read_bytes(), payload)
-                self.assertEqual(handler.requests, 2)
-                self.assertGreaterEqual(elapsed, 0.15)
-                self.assertLess(elapsed, 0.8)
+                self.assertEqual(handler.requests, 1)
+                self.assertGreaterEqual(elapsed, 0.55)
+                self.assertLess(elapsed, 1.2)
         finally:
             filesystem.lane_rotation_delay_seconds = old_delay
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
 
-    def test_persistent_chunk_retries_only_404_and_503(self):
+    def test_persistent_chunk_retries_temporary_http_status(self):
         filesystem = load_filesystem_module()
         payload = b"status-retry"
 
@@ -465,6 +472,43 @@ class DownloadSchedulerTest(unittest.TestCase):
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
+
+    def test_persistent_chunk_caps_idle_timeout_at_lane_timeout(self):
+        filesystem = load_filesystem_module()
+        payload = b"timeout-source"
+        seen_timeouts = []
+        old_read_range = filesystem._PersistentAdapterConnection.read_range
+
+        def fake_read_range(connection, source_url, **kwargs):
+            seen_timeouts.append(kwargs["timeout"])
+            kwargs["consume"](payload)
+
+        filesystem._PersistentAdapterConnection.read_range = fake_read_range
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                try:
+                    pool.download(
+                        ["http://source/chunk"],
+                        0,
+                        chunks / "chunk",
+                        parent_fd,
+                        expected_size=len(payload),
+                        expected_sha256=hashlib.sha256(payload).hexdigest(),
+                        per_request_timeout_seconds=60,
+                    )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+        finally:
+            filesystem._PersistentAdapterConnection.read_range = old_read_range
+        self.assertEqual(seen_timeouts, [filesystem._ADAPTER_LANE_TIMEOUT_S])
 
     def test_persistent_config_retries_404_then_succeeds(self):
         filesystem = load_filesystem_module()
@@ -540,7 +584,7 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
-    def test_persistent_config_http500_is_terminal(self):
+    def test_persistent_config_retries_http500(self):
         filesystem = load_filesystem_module()
         payload = b"config-500"
 
@@ -559,15 +603,16 @@ class DownloadSchedulerTest(unittest.TestCase):
         )
         try:
             with tempfile.TemporaryDirectory() as temporary:
-                with self.assertRaisesRegex(OSError, "unexpected HTTP status"):
-                    filesystem._download_persistent_file(
-                        [f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json"],
-                        Path(temporary) / "adapter_config.json",
-                        expected_size=len(payload),
-                        expected_sha256=hashlib.sha256(payload).hexdigest(),
-                        per_request_timeout_seconds=1,
-                    )
-                self.assertEqual(handler.requests, 1)
+                destination = Path(temporary) / "adapter_config.json"
+                filesystem._download_persistent_file(
+                    [f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json"],
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    per_request_timeout_seconds=1,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertEqual(handler.requests, 2)
         finally:
             server.shutdown()
             thread.join(timeout=5)
@@ -764,7 +809,6 @@ class DownloadSchedulerTest(unittest.TestCase):
         cancel_event = threading.Event()
         errors = []
         started = time.monotonic()
-
         def run_download():
             try:
                 with tempfile.TemporaryDirectory() as temporary:
@@ -909,7 +953,7 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
-    def test_persistent_chunk_http500_is_terminal(self):
+    def test_persistent_chunk_retries_http500(self):
         filesystem = load_filesystem_module()
         payload = b"server-error"
 
@@ -936,20 +980,20 @@ class DownloadSchedulerTest(unittest.TestCase):
                 )
                 pool = filesystem._PersistentAdapterLanePool(1)
                 try:
-                    with self.assertRaisesRegex(OSError, "unexpected HTTP status"):
-                        pool.download(
-                            [f"http://127.0.0.1:{server.server_address[1]}/error"],
-                            0,
-                            chunks / "error",
-                            parent_fd,
-                            expected_size=len(payload),
-                            expected_sha256=hashlib.sha256(payload).hexdigest(),
-                            per_request_timeout_seconds=2,
-                        )
+                    pool.download(
+                        [f"http://127.0.0.1:{server.server_address[1]}/error"],
+                        0,
+                        chunks / "error",
+                        parent_fd,
+                        expected_size=len(payload),
+                        expected_sha256=hashlib.sha256(payload).hexdigest(),
+                        per_request_timeout_seconds=2,
+                    )
                 finally:
                     pool.close()
                     os.close(parent_fd)
-                self.assertEqual(handler.requests, 1)
+                self.assertEqual((chunks / "error").read_bytes(), payload)
+                self.assertEqual(handler.requests, 2)
         finally:
             server.shutdown()
             thread.join(timeout=5)
@@ -974,8 +1018,6 @@ class DownloadSchedulerTest(unittest.TestCase):
         server, thread, _handler = self._persistent_server(
             filesystem, payload, stall_body
         )
-        old_read_timeout = filesystem.persistent_read_timeout_seconds
-        filesystem.persistent_read_timeout_seconds = 0.05
         cancel_event = threading.Event()
         errors = []
         started = time.monotonic()
@@ -990,6 +1032,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                         "cancel",
                         payload,
                         cancel_event=cancel_event,
+                        per_request_timeout_seconds=0.05,
                     )
             except BaseException as exc:
                 errors.append(exc)
@@ -1000,7 +1043,6 @@ class DownloadSchedulerTest(unittest.TestCase):
         cancel_event.set()
         worker.join(timeout=1)
         elapsed = time.monotonic() - started
-        filesystem.persistent_read_timeout_seconds = old_read_timeout
         try:
             self.assertFalse(worker.is_alive())
             self.assertLess(elapsed, 0.8)
@@ -1146,6 +1188,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                         "header",
                         payload,
                         cancel_event=cancel_event,
+                        per_request_timeout_seconds=0.05,
                     )
             except BaseException as exc:
                 errors.append(exc)
@@ -1458,13 +1501,16 @@ class DownloadSchedulerTest(unittest.TestCase):
             ConnectionRefusedError("connection refused"),
             filesystem.URLError(ConnectionResetError("connection reset by peer")),
             filesystem.HTTPError("http://lane/manifest", 404, "missing", None, None),
+            filesystem.HTTPError("http://lane/manifest", 429, "busy", None, None),
+            filesystem.HTTPError("http://lane/manifest", 500, "server error", None, None),
+            filesystem.HTTPError("http://lane/manifest", 502, "bad gateway", None, None),
             filesystem.HTTPError("http://lane/manifest", 503, "starting", None, None),
+            filesystem.HTTPError("http://lane/manifest", 504, "timeout", None, None),
         )
         terminal = (
             OSError("generic metadata failure"),
             OSError("connection reset by peer"),
             filesystem.URLError("connection reset by peer"),
-            filesystem.HTTPError("http://lane/manifest", 500, "server error", None, None),
             OSError("adapter checksum mismatch"),
             OSError("adapter identity differs"),
             OSError("adapter protocol error"),

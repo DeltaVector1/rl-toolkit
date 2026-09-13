@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -120,6 +121,117 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 total=4,
                 expected_sha256="a" * 64,
                 timeout=10,
+                consume=lambda _chunk: None,
+            )
+        self.assertEqual(closed, ["response", "connection"])
+
+    def test_persistent_read_allows_slow_continuous_progress(self):
+        filesystem = load_filesystem()
+        closed = []
+
+        class Response:
+            status = 206
+            reason = "partial"
+            headers = {}
+            pieces = iter(b"abcd")
+
+            def getheader(self, name):
+                return {"Content-Length": "4", "Content-Range": "bytes 0-3/4"}.get(name)
+
+            def read1(self, _size):
+                time.sleep(0.005)
+                try:
+                    return bytes((next(self.pieces),))
+                except StopIteration:
+                    return b""
+
+            def close(self):
+                closed.append("response")
+
+        response = Response()
+
+        class Connection:
+            sock = None
+
+            def request(self, *_args, **_kwargs):
+                return None
+
+            def getresponse(self):
+                return response
+
+            def close(self):
+                closed.append("connection")
+
+        connection = filesystem._PersistentAdapterLanePool(1)._lanes[0][1]
+        raw_connection = Connection()
+        connection._connection = raw_connection
+        connection._open = lambda *_args, **_kwargs: (
+            raw_connection,
+            types.SimpleNamespace(path="/adapter", query=""),
+        )
+        received = []
+        try:
+            connection.read_range(
+                "http://source/adapter",
+                start=0,
+                end=3,
+                total=4,
+                expected_sha256=None,
+                timeout=0.01,
+                consume=received.append,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(b"".join(received), b"abcd")
+        self.assertEqual(closed.count("response"), 1)
+
+    def test_persistent_idle_read_closes_response_and_connection(self):
+        filesystem = load_filesystem()
+        closed = []
+
+        class Response:
+            status = 206
+            reason = "partial"
+            headers = {}
+
+            def getheader(self, name):
+                return {"Content-Length": "1", "Content-Range": "bytes 0-0/1"}.get(name)
+
+            def read1(self, _size):
+                raise TimeoutError("idle read")
+
+            def close(self):
+                closed.append("response")
+
+        response = Response()
+
+        class Connection:
+            sock = None
+
+            def request(self, *_args, **_kwargs):
+                return None
+
+            def getresponse(self):
+                return response
+
+            def close(self):
+                closed.append("connection")
+
+        connection = filesystem._PersistentAdapterLanePool(1)._lanes[0][1]
+        raw_connection = Connection()
+        connection._connection = raw_connection
+        connection._open = lambda *_args, **_kwargs: (
+            raw_connection,
+            types.SimpleNamespace(path="/adapter", query=""),
+        )
+        with self.assertRaises(filesystem._PersistentTransportError):
+            connection.read_range(
+                "http://source/adapter",
+                start=0,
+                end=0,
+                total=1,
+                expected_sha256=None,
+                timeout=1,
                 consume=lambda _chunk: None,
             )
         self.assertEqual(closed, ["response", "connection"])

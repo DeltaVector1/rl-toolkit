@@ -1240,7 +1240,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         total_bytes = sum(item["size"] for item in files.values())
         self.assertTrue(all(0 <= value <= total_bytes for value in statuses))
 
-    def test_full_stage_corrupt_exact_size_progress_stays_bounded(self):
+    def test_full_stage_corrupt_output_reuses_wire_and_bounds_progress(self):
         filesystem = load_filesystem_module()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1268,20 +1268,30 @@ class AdapterTransportStateTest(unittest.TestCase):
                     partial = destination.with_name(f"{destination.name}.partial")
                     destination.rename(partial)
                     (partial / "READY").unlink()
-                    chunk = partial / "transport-chunks" / manifest["chunks"][0]["file"]
-                    chunk.write_bytes(b"x" * chunk.stat().st_size)
+                    output = partial / "adapter_model.safetensors"
+                    output.write_bytes(b"x" * output.stat().st_size)
                     statuses = []
                     old_status = filesystem._write_stage_status
+                    old_download = filesystem._PersistentAdapterLanePool.download
+                    downloads = []
+
+                    def fail_download(*args, **kwargs):
+                        if args[3].name == "adapter_config.json":
+                            return old_download(*args, **kwargs)
+                        downloads.append((args, kwargs))
+                        raise AssertionError("corrupt output must reuse verified wire")
 
                     def record_status(cache_root, value, **kwargs):
                         statuses.append(dict(value))
                         return old_status(cache_root, value, **kwargs)
 
                     filesystem._write_stage_status = record_status
+                    filesystem._PersistentAdapterLanePool.download = fail_download
                     try:
                         resumed = filesystem.stage_lora_adapter_files(source_url)
                     finally:
                         filesystem._write_stage_status = old_status
+                        filesystem._PersistentAdapterLanePool.download = old_download
                 finally:
                     if old_cache is None:
                         os.environ.pop("PRIME_LORA_CACHE_DIR", None)
@@ -1294,6 +1304,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                     server.shutdown()
                     server_thread.join()
             self.assertEqual(resumed, destination)
+            self.assertEqual(downloads, [])
             for status in statuses:
                 self.assertGreaterEqual(status["bytes_done"], 0)
                 self.assertLessEqual(status["bytes_done"], status["bytes_total"])
@@ -1403,18 +1414,32 @@ class AdapterTransportStateTest(unittest.TestCase):
 
     def test_retryable_stage_errors_keep_matching_partial_data(self):
         filesystem = load_filesystem_module()
-        self.assertTrue(filesystem._preserve_adapter_stage_partial(OSError("connection reset")))
-        self.assertTrue(filesystem._preserve_adapter_stage_partial(TimeoutError("request timed out")))
         self.assertTrue(
+            filesystem._preserve_adapter_stage_partial(
+                filesystem._PersistentTransportError("adapter persistent request failed")
+            )
+        )
+        self.assertTrue(filesystem._preserve_adapter_stage_partial(TimeoutError("request timed out")))
+        self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("connection reset")))
+        self.assertFalse(
             filesystem._preserve_adapter_stage_partial(
                 OSError("adapter manifest is missing; transfer mode is unknown")
             )
         )
-        self.assertTrue(
-            filesystem._preserve_adapter_stage_partial(
-                filesystem.HTTPError("http://relay", 404, "not ready", None, None)
-            )
-        )
+        for status in (404, 429, 500, 502, 503, 504):
+            with self.subTest(status=status):
+                self.assertTrue(
+                    filesystem._preserve_adapter_stage_partial(
+                        filesystem.HTTPError("http://relay", status, "temporary", None, None)
+                    )
+                )
+        for status in (400, 403):
+            with self.subTest(status=status):
+                self.assertFalse(
+                    filesystem._preserve_adapter_stage_partial(
+                        filesystem.HTTPError("http://relay", status, "permanent", None, None)
+                    )
+                )
         self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("checksum mismatch")))
         self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("path is a symbolic link")))
 
@@ -1610,10 +1635,15 @@ class AdapterTransportStateTest(unittest.TestCase):
     def test_stage_failure_preserves_transport_but_removes_invalid_partial(self):
         filesystem = load_filesystem_module()
         self.assertTrue(
-            filesystem._preserve_adapter_stage_partial(OSError("connection reset by peer"))
+            filesystem._preserve_adapter_stage_partial(
+                filesystem._PersistentTransportError("adapter persistent request failed")
+            )
         )
         self.assertTrue(
             filesystem._preserve_adapter_stage_partial(TimeoutError("request timed out"))
+        )
+        self.assertFalse(
+            filesystem._preserve_adapter_stage_partial(OSError("connection reset by peer"))
         )
         for message in (
             "adapter range ended early",
@@ -1622,7 +1652,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             "incomplete adapter file",
         ):
             with self.subTest(message=message):
-                self.assertTrue(filesystem._preserve_adapter_stage_partial(OSError(message)))
+                self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError(message)))
         for message in (
             "adapter checksum mismatch",
             "adapter digest mismatch",
@@ -2237,7 +2267,9 @@ class AdapterTransportStateTest(unittest.TestCase):
             destination.write_bytes(payload)
             if "chunk-1" in destination.name and fail_second_chunk:
                 fail_second_chunk = False
-                raise TimeoutError("test deadline")
+                raise filesystem._PersistentTransportError(
+                    "adapter persistent request failed"
+                )
 
         filesystem._delta_stage_timeout_s = lambda: 30.0
         filesystem._read_chunked_xor_manifest = lambda *_args, **_kwargs: transport
@@ -2257,7 +2289,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
-                with self.assertRaises(TimeoutError):
+                with self.assertRaises(filesystem._PersistentTransportError):
                     filesystem.stage_lora_adapter_files(source_url, require_delta=True)
 
                 destination = filesystem.adapter_cache_path(source_url)
