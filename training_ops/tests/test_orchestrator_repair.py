@@ -168,6 +168,8 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('china_tunnel_remove_orphan_children "${forwards[@]}"', source)
         self.assertIn('old adapter tunnel ports did not clear for $marker', source)
         self.assertIn('china_tunnel_remove_orphan_children "${china_legacy_cleanup_ports[@]}"', source)
+        self.assertIn('china_tunnel_remove_orphan_children "${china_legacy_cleanup_ports[@]}" || return 1', source)
+        self.assertIn('china_tunnel_remove_orphan_children || repair_fail', source)
         self.assertIn('china_tunnel_remove_all_owned', source)
         self.assertIn('done < <(ps -eo pid=,args=)', source)
         self.assertIn('adapter_tunnel_readiness() {', source)
@@ -176,10 +178,33 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('repair_sleep 1 || return 1', source)
         self.assertIn('tunnel_repair_deadline_s=${TUNNEL_REPAIR_DEADLINE_S:-150}', source)
         self.assertIn('adapter_tunnel_exact_snapshot()', source)
+        self.assertIn('adapter_tunnel_local_snapshot()', source)
+        self.assertIn('adapter_tunnel_remote_snapshot()', source)
+        self.assertIn('rollback_failed=0', source)
+        self.assertIn('status=125', source)
+        self.assertIn('process_start_time()', source)
+        self.assertIn('process_identity_matches()', source)
+        self.assertIn('rollback refused reused PID', source)
+        self.assertIn('direct_ssh_count=0', source)
+        self.assertIn('peer_tunnel_children_unchanged()', source)
+        self.assertIn('print(f"RANGE {first} {last} {last - first + 1}")', source)
+        self.assertNotIn('readarray -t lora_source_ports < <(python3', source)
         self.assertIn('repair_register_tunnel', source)
         self.assertIn('repair_signal() {', source)
         self.assertIn("trap 'repair_signal' TERM HUP INT", source)
-        self.assertIn('trap \'status=$?; repair_cleanup_created_tunnels; exit "$status"\' EXIT', source)
+        self.assertIn('if ! repair_cleanup_created_tunnels; then status=125; fi', source)
+        final_start = source.index('if ! adapter_tunnel_local_snapshot ||')
+        final_block = source[final_start:source.index('fi', final_start) + 2]
+        self.assertEqual(final_block.count('adapter_tunnel_local_snapshot'), 2)
+        self.assertEqual(final_block.count('adapter_tunnel_remote_snapshot'), 2)
+        self.assertLess(
+            final_block.index('adapter_tunnel_local_snapshot'),
+            final_block.index('adapter_tunnel_remote_snapshot'),
+        )
+        self.assertLess(
+            final_block.index('adapter_tunnel_remote_snapshot'),
+            final_block.rindex('adapter_tunnel_local_snapshot'),
+        )
         readiness_call = source.index('if ! adapter_tunnel_readiness; then')
         self.assertLess(readiness_call, docker_start)
         self.assertLess(mode_start, docker_start)
