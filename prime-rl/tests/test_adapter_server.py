@@ -469,6 +469,56 @@ class AdapterServerTest(unittest.TestCase):
                 adapter_server.os.replace = original_replace
             self.assertEqual(destination.read_bytes(), b"raced!!")
 
+    def test_atomic_replace_accepts_directory_ctime_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "build" / "step_2"
+            destination = root / "target" / "step_2"
+            source.mkdir(parents=True, mode=0o700)
+            destination.parent.mkdir()
+            identity = adapter_server._directory_identity(source)
+            original_replace = adapter_server.os.replace
+
+            def replace_and_change_ctime(*args, **kwargs):
+                result = original_replace(*args, **kwargs)
+                os.chmod(destination, 0o700)
+                return result
+
+            adapter_server.os.replace = replace_and_change_ctime
+            try:
+                adapter_server._replace_from_dirs(source, destination, identity)
+            finally:
+                adapter_server.os.replace = original_replace
+            self.assertTrue(destination.is_dir())
+            self.assertEqual(destination.stat().st_ino, identity[1])
+
+    def test_atomic_replace_rejects_file_replacement_race(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "build" / "chunk"
+            replacement = root / "build" / "replacement"
+            destination = root / "target" / "chunk"
+            source.parent.mkdir()
+            destination.parent.mkdir()
+            source.write_bytes(b"before")
+            replacement.write_bytes(b"replacement")
+            identity = adapter_server._stat_identity(source)
+            original_replace = adapter_server.os.replace
+
+            def replace_after_swap(*args, **kwargs):
+                original_replace(replacement, source)
+                return original_replace(*args, **kwargs)
+
+            adapter_server.os.replace = replace_after_swap
+            try:
+                with self.assertRaisesRegex(
+                    adapter_server.UpgradeError, "cannot publish adapter file"
+                ):
+                    adapter_server._replace_from_dirs(source, destination, identity)
+            finally:
+                adapter_server.os.replace = original_replace
+            self.assertEqual(destination.read_bytes(), b"replacement")
+
     def test_existing_v2_manifest_with_missing_chunk_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             step = Path(temporary) / "step_2"

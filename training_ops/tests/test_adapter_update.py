@@ -419,7 +419,13 @@ class AdapterUpdateTest(unittest.TestCase):
                 "target_step": 2,
                 "base_step": 1,
                 "base2_step": 0,
-                "chunks": [{"file": chunk_name, "wire_size": 5}],
+                "chunks": [
+                    {
+                        "file": chunk_name,
+                        "wire_size": 5,
+                        "wire_sha256": hashlib.sha256(b"delta").hexdigest(),
+                    }
+                ],
             }
 
             adapter_server._install_predictive_manifest(target, build, manifest, 2)

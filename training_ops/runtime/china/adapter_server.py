@@ -183,6 +183,21 @@ def _directory_identity(path: Path) -> tuple[int, int, int, int, int]:
     return _stat_identity_from_stat(stat_result)
 
 
+def _stable_rename_identity(stat_result: os.stat_result) -> tuple[int, ...]:
+    file_type = stat.S_IFMT(stat_result.st_mode)
+    if stat.S_ISDIR(stat_result.st_mode):
+        return stat_result.st_dev, stat_result.st_ino, file_type
+    if stat.S_ISREG(stat_result.st_mode):
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            file_type,
+        )
+    return stat_result.st_dev, stat_result.st_ino, file_type
+
+
 def _fd_stat_identity(fd: int) -> tuple[int, int, int, int, int]:
     try:
         return _stat_identity_from_stat(os.fstat(fd))
@@ -440,6 +455,7 @@ def _replace_from_dirs(
 ) -> None:
     directory_flag = getattr(os, "O_DIRECTORY", 0)
     flags = os.O_RDONLY | directory_flag | getattr(os, "O_NOFOLLOW", 0)
+    source_fd = None
     try:
         source_dir = os.open(source.parent, flags)
         destination_dir = os.open(destination.parent, flags)
@@ -450,28 +466,46 @@ def _replace_from_dirs(
             pass
         raise UpgradeError("cannot open adapter publication directory") from exc
     try:
-        source_stat = os.stat(source.name, dir_fd=source_dir, follow_symlinks=False)
-        if stat.S_ISLNK(source_stat.st_mode):
+        source_path_stat = os.stat(source.name, dir_fd=source_dir, follow_symlinks=False)
+        if stat.S_ISLNK(source_path_stat.st_mode):
             raise OSError("adapter publication source is a symlink")
+        if not (
+            stat.S_ISDIR(source_path_stat.st_mode)
+            or stat.S_ISREG(source_path_stat.st_mode)
+        ):
+            raise OSError("adapter publication source is not a regular file or directory")
+        source_fd = os.open(
+            source.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=source_dir,
+        )
+        source_stat = os.fstat(source_fd)
+        if _stat_identity_from_stat(source_path_stat) != _stat_identity_from_stat(source_stat):
+            raise OSError("adapter publication source changed")
         source_identity = _stat_identity_from_stat(source_stat)
         if expected_identity is not None and source_identity != expected_identity:
             raise OSError("adapter publication source changed")
+        stable_source_identity = _stable_rename_identity(source_stat)
         os.replace(
             source.name,
             destination.name,
             src_dir_fd=source_dir,
             dst_dir_fd=destination_dir,
         )
+        if _stable_rename_identity(os.fstat(source_fd)) != stable_source_identity:
+            raise OSError("adapter publication source changed")
         destination_stat = os.stat(
             destination.name,
             dir_fd=destination_dir,
             follow_symlinks=False,
         )
-        if stat.S_ISLNK(destination_stat.st_mode) or _stat_identity_from_stat(destination_stat) != source_identity:
+        if stat.S_ISLNK(destination_stat.st_mode) or _stable_rename_identity(destination_stat) != stable_source_identity:
             raise OSError("adapter publication destination identity differs")
     except OSError as exc:
         raise UpgradeError("cannot publish adapter file") from exc
     finally:
+        if source_fd is not None:
+            os.close(source_fd)
         os.close(source_dir)
         os.close(destination_dir)
 
