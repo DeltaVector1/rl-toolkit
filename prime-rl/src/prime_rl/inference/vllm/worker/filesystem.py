@@ -3461,6 +3461,12 @@ class _PersistentAdapterLanePool:
             raise OSError("adapter download has no source lane")
         lock, connection = self._lanes[lane % len(self._lanes)]
         attempt_limit = max(_ADAPTER_LANE_RETRIES, len(source_urls))
+        if deadline is not None and len(source_urls) > 1:
+            remaining = max(0.0, deadline - time.monotonic())
+            attempt_limit = max(
+                attempt_limit,
+                math.ceil(remaining / lane_rotation_delay_seconds) + 1,
+            )
         bad_sources: set[str] = set()
         checksum_error: OSError | None = None
         source_cursor = 0

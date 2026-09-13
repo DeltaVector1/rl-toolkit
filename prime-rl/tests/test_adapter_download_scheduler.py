@@ -861,6 +861,50 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
+    def test_persistent_config_waits_for_relay_until_stage_deadline(self):
+        filesystem = load_filesystem_module()
+        payload = b"late-relay-config"
+
+        def unavailable_five_times(request, number):
+            if number > 5:
+                return False
+            request.send_response(404)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, unavailable_five_times
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        old_retries = filesystem._ADAPTER_LANE_RETRIES
+        filesystem.lane_rotation_delay_seconds = 0.01
+        filesystem._ADAPTER_LANE_RETRIES = 1
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "adapter_config.json"
+                filesystem._download_persistent_file(
+                    [
+                        f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json",
+                        f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json",
+                    ],
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    deadline=time.monotonic() + 1,
+                    per_request_timeout_seconds=0.1,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertEqual(handler.requests, 6)
+        finally:
+            filesystem._ADAPTER_LANE_RETRIES = old_retries
+            filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
     def test_persistent_config_retries_503_then_succeeds(self):
         filesystem = load_filesystem_module()
         payload = b"config-503"
