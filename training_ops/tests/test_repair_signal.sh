@@ -240,6 +240,81 @@ run_register_failure() {
   fi
 }
 
+# Full-mode transactions use real local process groups and the production
+# register, identity, signal, commit, and EXIT functions. Sleep groups stand
+# in for SSH groups; the narrow stop fixture proves their exact identities.
+full_fixture="$tmp/full-repair-fixture.sh"
+cat >"$full_fixture" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+source <(sed '/^RUN=\${RUN:/,$d' "$launcher")
+test "$tunnels_only" -eq 0 || exit 1
+setsid sleep 1000 >/dev/null 2>&1 &
+old_pid=$!
+setsid sleep 1000 >/dev/null 2>&1 &
+new_pid=$!
+printf '%s\n' "$old_pid" "$new_pid" >"$full_ready"
+for _ in $(seq 1 50); do
+  [ "$(ps -o pgid= -p "$new_pid" | tr -d ' ')" = "$new_pid" ] && break
+  sleep 0.01
+done
+new_start=$(process_start_time "$new_pid") || exit 1
+repair_direct_child_owned "$new_pid" || exit 1
+generic_tunnel_stale_supervisor_match() {
+  [ "$1" = 'sleep 1000' ] && [ "$2" = full-created ] && [ "$3" = fixture-forward ]
+}
+generic_tunnel_stop_stale() {
+  [ "$1" = "$new_pid" ] || return 1
+  generic_tunnel_stale_supervisor_match "$2" "$3" "$4" || return 1
+  process_identity_matches "$1" "$new_pid" "$new_start" 'sleep 1000' || return 1
+  printf '%s\n' "$1" >>"$full_log"
+  kill -- "-$new_pid" || return 1
+  for _ in $(seq 1 50); do
+    kill -0 "$new_pid" 2>/dev/null || return 0
+    sleep 0.01
+  done
+  return 1
+}
+repair_register_tunnel generic "$new_pid" full-created fixture-forward || exit 1
+test "${#repair_created_tunnels[@]}" -eq 1 || exit 1
+case "$full_mode" in
+  fail) exit 7 ;;
+  signal) repair_signal ;;
+  committed)
+    adapter_tunnel_readiness() { return 0; }
+    eval "$(sed -n '/^if ! adapter_tunnel_readiness;/,/^repair_release_lock .*repair_fail/p' "$launcher")"
+    test "${#repair_created_tunnels[@]}" -eq 0 || exit 1
+    exit 7
+    ;;
+esac
+EOF
+for full_mode in fail signal committed; do
+  full_ready="$tmp/ready-full-$full_mode"
+  full_log="$tmp/full-$full_mode-log"
+  set +e
+  launcher="$launcher" full_mode="$full_mode" full_ready="$full_ready" full_log="$full_log" \
+    bash "$full_fixture"
+  full_status=$?
+  set -e
+  if [ "$full_mode" = signal ]; then test "$full_status" -eq 124; else test "$full_status" -eq 7; fi
+  readarray -t full_pids <"$full_ready"
+  old_pid=${full_pids[0]}
+  new_pid=${full_pids[1]}
+  kill -0 "$old_pid"
+  if [ "$full_mode" = committed ]; then
+    kill -0 "$new_pid"
+    test ! -s "$full_log"
+  else
+    test "$(cat "$full_log")" = "$new_pid"
+    if kill -0 "$new_pid" 2>/dev/null; then
+      echo "full-mode rollback left its new group" >&2
+      exit 1
+    fi
+  fi
+  /bin/kill -- "-$old_pid" 2>/dev/null || true
+  /bin/kill -- "-$new_pid" 2>/dev/null || true
+done
+
 run_signal TERM
 run_signal HUP
 LAUNCHER="$launcher" MODE=register-failure READY_FILE="$tmp/unused" \

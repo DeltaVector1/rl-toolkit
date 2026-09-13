@@ -337,6 +337,20 @@ export REAL_CAT="$real_cat" REAL_SSH="$real_ssh" REAL_AWK="$real_awk"
 start=$(grep -n '^generic_tunnel_ssh_match() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
+# Use real ps padding and a real, isolated group before installing shell
+# mocks. This sleeper is an allowed peer-group member, not an SSH service.
+(
+  setsid sleep 3 >/dev/null 2>&1 &
+  real_group_pid=$!
+  trap 'kill -- "-$real_group_pid" 2>/dev/null || true; wait "$real_group_pid" 2>/dev/null || true' EXIT
+  for _ in $(seq 1 50); do
+    real_group=$(ps -o pgid= -p "$real_group_pid" | tr -d ' ')
+    [ "$real_group" = "$real_group_pid" ] && break
+    sleep 0.01
+  done
+  test "$real_group" = "$real_group_pid"
+  peer_tunnel_group_safe "$real_group_pid"
+)
 tunnel_wait_group_exit_definition=$(declare -f tunnel_wait_group_exit)
 tunnel_wait_group_exit() { return 0; }
 
@@ -540,6 +554,29 @@ unset -f kill
 api_signature='-L 127.0.0.1:18049:127.0.0.1:8000'
 api_child_command="ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ChannelTimeout=*-tcpip=45s -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -L 127.0.0.1:18049:127.0.0.1:8000 root@38.255.28.19"
 api_supervisor_command="nohup bash -c while true; do $api_child_command; sleep 3; done # peer-tunnel-api"
+# Full-mode rollback must use the exact API shape only for the API marker.
+(
+  source <(sed '/^RUN=\${RUN:/,$d' "$script")
+  process_start_time() { printf 'fixture-start\n'; }
+  process_command_line() {
+    case "$1" in
+      4241) printf '%s\n' "$api_supervisor_command" ;;
+      4242) printf '%s\n' "$peer_supervisor_command" ;;
+      *) return 1 ;;
+    esac
+  }
+  peer_cleanup_calls=()
+  peer_kill_owned() {
+    peer_tunnel_supervisor_match "$2" "$3" "$4" || return 1
+    peer_cleanup_calls+=("$3|$4")
+  }
+  repair_register_tunnel peer 4241 peer-tunnel-api
+  repair_register_tunnel peer 4242 peer-tunnel-lora-0
+  repair_failed=1
+  repair_cleanup_created_tunnels
+  test "${peer_cleanup_calls[*]}" = 'api|peer-tunnel-api current|peer-tunnel-lora-0'
+  repair_committed=1
+)
 api_command_file="$tmp/api-command"
 api_candidates="$tmp/api-candidates"
 api_group="$tmp/api-group"
@@ -1668,6 +1705,54 @@ for failure_kind in ss awk; do
   test "$ports_observation_status" -eq 2
 done
 PATH="$tmp/bin:$PATH" china_tunnel_ports_clear 127.0.0.1:18227:127.0.0.1:8100
+# An unknown current owner must not select an old keeper or stop either group.
+for owner_failure in ppid command; do
+  (
+    owner_failure_log="$tmp/owner-$owner_failure-kills"
+    eval "$(declare -f process_command_line | sed '1s/process_command_line/owner_fixture_command_line/')"
+    eval "$(declare -f china_tunnel_supervisor_owns_forwards | sed '1s/china_tunnel_supervisor_owns_forwards/owner_fixture_probe/')"
+    pgrep_matches() { printf '4241\n4240\n'; }
+    process_command_line() {
+      case "$1" in
+        4241) printf '%s\n' "$china_supervisor_command" ;;
+        4240) printf '%s\n' "$old_supervisor" ;;
+        *) owner_fixture_command_line "$@" ;;
+      esac
+    }
+    ps() {
+      if [ "${4:-}" = 4242 ]; then
+        if [ "$owner_failure" = ppid ] && [ "${2:-}" = ppid= ]; then
+          printf '4241\n'
+          return 1
+        elif [ "$owner_failure" = command ] && [ "${2:-}" = args= ]; then
+          printf '%s\n' "$china_exact_command"
+          return 1
+        fi
+      fi
+      command ps "$@"
+    }
+    china_tunnel_supervisor_owns_forwards() {
+      if [ "$3" = old ]; then
+        printf 'old owner selected\n' >>"$owner_failure_log"
+        return 0
+      fi
+      owner_fixture_probe "$@"
+    }
+    china_tunnel_preflight_group() { return 0; }
+    china_tunnel_stop_supervisor() { printf 'stop %s\n' "$1" >>"$owner_failure_log"; }
+    set +e
+    PATH="$tmp/bin:$PATH" china_tunnel_supervisor_owns_forwards 4241 "$china_supervisor_command" current \
+      -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100
+    unknown_owner_status=$?
+    PATH="$tmp/bin:$PATH" china_tunnel_reconcile_connection china-tunnel-lora-0 \
+      -L 127.0.0.1:18100:127.0.0.1:8100 -L 127.0.0.1:18101:127.0.0.1:8100
+    unknown_reconcile_status=$?
+    set -e
+    test "$unknown_owner_status" -eq 2
+    test "$unknown_reconcile_status" -ne 0
+    test ! -s "$owner_failure_log"
+  )
+done
 printf 'LISTEN 0 128 127.0.0.1:18101 0.0.0.0:* users:(("ssh",pid=4243,fd=6))\n' >"$shared_ss"
 export TUNNEL_EXTRA_OWNER_PID=4243
 set +e
