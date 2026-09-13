@@ -3,6 +3,7 @@ import hashlib
 import io
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -482,69 +483,6 @@ class AdapterUpdateTest(unittest.TestCase):
             adapter_server._prune_cache(active, 2)
             self.assertFalse((cache / "step_0").exists())
 
-    def test_stage_log_requires_an_exact_transport_failure(self):
-        good = (
-            "Failed to apply policy update 4\n"
-            "_PersistentTransportError: adapter response ended during read"
-        )
-        self.assertEqual(
-            training_ops._validate_adapter_stage_log(good),
-            "Failed to apply policy update 4",
-        )
-        current = (
-            "Policy update 4 failed on attempt 3/3; stopping\n"
-            "OSError: incomplete adapter transport chunk"
-        )
-        self.assertEqual(
-            training_ops._validate_adapter_stage_log(current),
-            "Policy update 4 failed on attempt 3/3; stopping",
-        )
-        one_attempt = (
-            "Policy update 4 failed on attempt 1/1; stopping\n"
-            "OSError: adapter persistent download retries exhausted"
-        )
-        self.assertEqual(
-            training_ops._validate_adapter_stage_log(one_attempt),
-            "Policy update 4 failed on attempt 1/1; stopping",
-        )
-        with self.assertRaises(training_ops.Refused):
-            training_ops._validate_adapter_stage_log(
-                "Policy update 4 failed on attempt 1/3; retrying\n"
-                "OSError: adapter persistent download retries exhausted"
-            )
-        with self.assertRaises(training_ops.Refused):
-            training_ops._validate_adapter_stage_log(
-                "Failed to apply policy update 4\nadapter request failed"
-            )
-        for transport_error in (
-            "_PersistentTransportError: adapter network request failed",
-            "_PersistentTransportError: adapter network read failed",
-            "_PersistentTransportError: adapter response ended early",
-            "_PersistentTransportError: adapter response read timeout setup failed",
-            "_PersistentTransportError: adapter manifest is missing; transfer mode is unknown",
-            "_PersistentTransportError: adapter persistent request failed",
-            "_PersistentTransportError: adapter response ended during read",
-            "_PersistentTransportError: adapter response body ended early",
-            "_PersistentTransportError: incomplete adapter transport chunk",
-            "_PersistentTransportError: none of 8 adapter source lanes responded",
-            "OSError: adapter persistent download retries exhausted",
-        ):
-            with self.subTest(transport_error=transport_error):
-                self.assertEqual(
-                    training_ops._validate_adapter_stage_log(
-                        "Failed to apply policy update 4\n"
-                        "/stage_lora_adapter\n"
-                        + transport_error
-                    ),
-                    "Failed to apply policy update 4",
-                )
-        with self.assertRaises(training_ops.Refused):
-            training_ops._validate_adapter_stage_log(
-                "Failed to apply policy update 4\n"
-                "/stage_lora_adapter\n"
-                "OSError: adapter checksum mismatch after retry exhaustion"
-            )
-
     def test_transport_failure_classifier_is_exact_and_fail_closed(self):
         accepted = (
             "ConnectionResetError: connection reset by peer",
@@ -597,41 +535,28 @@ class AdapterUpdateTest(unittest.TestCase):
             with self.subTest(rejected=error):
                 self.assertIsNone(training_ops._adapter_transport_failure_reason(error))
 
-    def test_stage_log_transport_evidence_stays_in_latest_update_block(self):
-        earlier_evidence = (
-            "Policy update 3 failed on attempt 2/2; stopping\n"
-            "_PersistentTransportError: adapter response ended during read\n"
-            "Policy update 4 failed on attempt 2/2; stopping\n"
-        )
-        with self.assertRaises(training_ops.Refused):
-            training_ops._validate_adapter_stage_log(earlier_evidence)
-
-        later_evidence = (
-            "Policy update 4 failed on attempt 2/2; stopping\n"
-            "Policy update 5\n"
-            "_PersistentTransportError: adapter response ended during read\n"
-        )
-        with self.assertRaises(training_ops.Refused):
-            training_ops._validate_adapter_stage_log(later_evidence)
-
-        latest_evidence = (
-            "Policy update 4 failed on attempt 2/2; stopping\n"
-            "_PersistentTransportError: adapter response ended during read\n"
-            "Policy update 5\n"
-        )
-        self.assertEqual(
-            training_ops._validate_adapter_stage_log(latest_evidence),
-            "Policy update 4 failed on attempt 2/2; stopping",
-        )
-
-    def test_stage_success_after_failure_refuses_repair(self):
+    def test_stage_evidence_requires_structured_status_over_misleading_logs(self):
+        config = training_ops._adapter_update_config("glm-perf-3")
         log = (
-            "Failed to apply policy update 4\n"
-            "_PersistentTransportError: adapter persistent request failed\n"
-            "Staged policy v4 on every inference host"
+            "Policy update 4 failed on attempt 2/2; stopping\n"
+            "_PersistentTransportError: adapter response ended during read\n"
         )
-        with self.assertRaisesRegex(training_ops.Refused, "already succeeded"):
-            training_ops._validate_adapter_stage_log(log)
+        status_refusals = (
+            "cannot read exact adapter stage status on h200a",
+            "adapter stage status on h200a is stale or mismatched",
+            "adapter stage failure on h200a is not an allowed transfer failure",
+        )
+        for refusal in status_refusals:
+            with self.subTest(refusal=refusal), mock.patch.object(
+                training_ops, "_ssh", return_value=(0, log)
+            ), mock.patch.object(
+                training_ops,
+                "_adapter_stage_status_evidence",
+                side_effect=training_ops.Refused(refusal),
+            ) as status_evidence:
+                with self.assertRaisesRegex(training_ops.Refused, re.escape(refusal)):
+                    training_ops._adapter_stage_evidence("glm-perf-3", config)
+                status_evidence.assert_called_once_with("glm-perf-3", config, log)
 
     def test_terminal_stage_status_accepts_exact_transport_errors(self):
         config = training_ops._adapter_update_config("glm-perf-3")

@@ -3807,41 +3807,6 @@ def _adapter_transport_failure_reason(error: str) -> str | None:
     return None
 
 
-def _validate_adapter_stage_log(log: str) -> str:
-    """Require a current adapter transfer failure, not a generic error."""
-    failures = list(
-        re.finditer(
-            r"(?:Failed to apply policy update \d+|Policy update \d+ failed on attempt (?P<attempt>\d+)/(?P=attempt); stopping)",
-            log,
-        )
-    )
-    if not failures:
-        raise Refused("no failed adapter policy update is present in the orchestrator log")
-    latest_failure = failures[-1]
-    successes = list(re.finditer(r"Staged policy v\d+ on every inference host", log))
-    if successes and successes[-1].start() > latest_failure.start():
-        raise Refused("the latest adapter policy update already succeeded")
-    next_update = re.search(
-        r"(?:Failed to apply policy update \d+|Policy update \d+\b)",
-        log[latest_failure.end() :],
-    )
-    block_end = (
-        latest_failure.end() + next_update.start()
-        if next_update is not None
-        else len(log)
-    )
-    block = log[latest_failure.start() : block_end]
-    transfer_words = ("stage_lora_adapter", "adapter", "lora")
-    if not any(word.lower() in block.lower() for word in transfer_words):
-        raise Refused("latest policy failure has no adapter staging evidence")
-    if not any(
-        _adapter_transport_failure_reason(line) is not None
-        for line in block.splitlines()
-    ):
-        raise Refused("latest adapter failure has no transfer timeout evidence")
-    return latest_failure.group(0)
-
-
 def _adapter_stage_status_script(status_path: str) -> str:
     return f"""python3 - <<'PY'
 import json
@@ -3985,16 +3950,11 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
 
 
 def _adapter_stage_evidence(run: str, config: dict) -> str:
-    code, output = _ssh(
+    _, output = _ssh(
         orchestrator_host,
         f"sudo docker logs --tail 10000 {shlex.quote(orchestrator_container)} 2>&1",
         timeout=180,
     )
-    if not code:
-        try:
-            return _validate_adapter_stage_log(output)
-        except Refused:
-            pass
     return _adapter_stage_status_evidence(run, config, output)
 
 
