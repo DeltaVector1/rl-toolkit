@@ -207,6 +207,31 @@ start=$(grep -n '^generic_tunnel_ssh_match() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
 
+# The launcher preamble supplies these helpers in production. Keep this
+# function-level fixture independent from its remote configuration parser.
+tunnels_only=0
+repair_remaining() {
+  if [ "$tunnels_only" != 1 ]; then
+    printf '2147483647\n'
+    return 0
+  fi
+  remaining=$((tunnel_repair_deadline - SECONDS))
+  [ "$remaining" -gt 0 ] || return 1
+  printf '%s\n' "$remaining"
+}
+repair_timeout() {
+  requested=$1
+  remaining=$(repair_remaining) || return 1
+  [ "$tunnels_only" != 1 ] || [ "$requested" -lt "$remaining" ] && printf '%s\n' "$requested" || printf '%s\n' "$remaining"
+}
+repair_sleep() {
+  duration=$(repair_timeout "$1") || return 1
+  sleep "$duration"
+  repair_remaining >/dev/null
+}
+repair_register_tunnel() { :; }
+repair_fail() { echo "adapter tunnel reconciliation failed: $*" >&2; exit 1; }
+
 lora_source_ports=("${configured_lora_ports[@]}")
 expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
 expected_peer_lines=$((expected_lanes + 1))
@@ -1169,6 +1194,7 @@ if output=$(bash -c '
   secondary_remote_api_port=8000
   secondary_ssh_target=root@202.214.223.66
   secondary_ssh_options=(-o IdentitiesOnly=yes -i /data/trinity/h200_rollout_ed25519 -p 30599)
+  repair_fail() { echo "adapter tunnel reconciliation failed: $*" >&2; exit 1; }
   tunnel() { return 1; }
 '"$secondary_launch_block"'
   printf "%s\n" service-started
@@ -1180,7 +1206,7 @@ if grep -Fq service-started <<<"$output" || ! grep -Fq 'secondary judge tunnel f
   echo "normal secondary tunnel failure reached the service path" >&2
   exit 1
 fi
-tunnels_only_output=$(bash -c '
+if tunnels_only_output=$(bash -c '
   set -u
   secondary_enabled=1
   tunnels_only=1
@@ -1188,11 +1214,18 @@ tunnels_only_output=$(bash -c '
   secondary_remote_api_port=8000
   secondary_ssh_target=root@202.214.223.66
   secondary_ssh_options=(-o IdentitiesOnly=yes -i /data/trinity/h200_rollout_ed25519 -p 30599)
+  repair_fail() { echo "adapter tunnel reconciliation failed: $*" >&2; exit 1; }
   tunnel() { return 1; }
 '"$secondary_launch_block"'
   printf "%s\n" tunnels-only-continued
-')
-grep -Fq tunnels-only-continued <<<"$tunnels_only_output"
+'); then
+  echo "tunnels-only secondary failure was ignored" >&2
+  exit 1
+fi
+if grep -Fq tunnels-only-continued <<<"$tunnels_only_output"; then
+  echo "tunnels-only secondary failure reached the readiness path" >&2
+  exit 1
+fi
 
 cat >"$tmp/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
@@ -1227,6 +1260,22 @@ if PATH="$tmp/bin:$PATH" peer_remote_ports_ready 1; then
 fi
 elapsed=$(( $(date +%s) - started ))
 printf 'hung remote probe wall_seconds=%s\n' "$elapsed"
+test "$elapsed" -le 3
+unset PEER_REMOTE_SLEEP
+
+# A failed probe receives the remaining absolute repair deadline, not its full
+# requested timeout. This keeps one failed remote check inside the outer SSH
+# timeout and prevents nested retry windows from multiplying.
+tunnels_only=1
+tunnel_repair_deadline=$((SECONDS + 2))
+export PEER_REMOTE_SLEEP=20
+started=$SECONDS
+if PATH="$tmp/bin:$PATH" peer_remote_ports_ready 10; then
+  echo "deadline-limited remote probe was accepted" >&2
+  exit 1
+fi
+elapsed=$((SECONDS - started))
+printf 'deadline-limited remote probe elapsed_seconds=%s\n' "$elapsed"
 test "$elapsed" -le 3
 unset PEER_REMOTE_SLEEP
 printf 'peer tunnel uses one API connection and sixty-four bounded two-port lanes\n'

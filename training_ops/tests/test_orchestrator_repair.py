@@ -113,6 +113,36 @@ class OrchestratorRepairTest(unittest.TestCase):
         )
         self.assertIn("TRAINER_ADDRESSES='addr-n82 addr-n76 addr-n77 addr-n78 addr-n80 addr-n83 addr-n84 addr-n85'", script)
         self.assertTrue(script.endswith("--tunnels-only"))
+        self.assertNotIn("--restart-tunnels", script)
+        self.assertIn("TUNNEL_REPAIR_DEADLINE_S=150 timeout --signal=TERM --kill-after=5s 155s", script)
+
+    def test_adapter_tunnels_reset_is_the_explicit_full_reset(self):
+        ssh_calls = []
+
+        def fake_ssh(host, script, timeout=120):
+            ssh_calls.append((host, script, timeout))
+            return 0, "adapter tunnel reconciliation complete\n"
+
+        with mock.patch.object(training_ops, "deploy", return_value=True), mock.patch.object(
+            training_ops, "_ssh", side_effect=fake_ssh
+        ), mock.patch.object(
+            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+        ):
+            result = training_ops._repair_adapter_tunnels("configs/general-agent", reset=True)
+
+        self.assertEqual(result, "adapter tunnel reconciliation complete")
+        self.assertEqual(len(ssh_calls), 1)
+        self.assertTrue(ssh_calls[0][1].endswith("--restart-tunnels --tunnels-only"))
+
+    def test_repair_dispatch_keeps_reset_explicit(self):
+        with mock.patch.object(
+            training_ops, "_repair_adapter_tunnels", return_value="ok"
+        ) as repair_tunnels:
+            self.assertEqual(training_ops.repair("adapter-tunnels:configs/current"), "ok")
+            repair_tunnels.assert_called_once_with("configs/current")
+            repair_tunnels.reset_mock()
+            self.assertEqual(training_ops.repair("adapter-tunnels-reset:configs/current"), "ok")
+            repair_tunnels.assert_called_once_with("configs/current", reset=True)
 
     def test_adapter_tunnels_does_not_fall_back_from_trainer_only_run(self):
         with mock.patch.object(
@@ -141,6 +171,15 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('china_tunnel_remove_all_owned', source)
         self.assertIn('done < <(ps -eo pid=,args=)', source)
         self.assertIn('adapter_tunnel_readiness() {', source)
+        self.assertIn('tunnel_repair_deadline=$((SECONDS + tunnel_repair_deadline_s))', source)
+        self.assertIn('repair_timeout "$probe_seconds"', source)
+        self.assertIn('repair_sleep 1 || return 1', source)
+        self.assertIn('tunnel_repair_deadline_s=${TUNNEL_REPAIR_DEADLINE_S:-150}', source)
+        self.assertIn('adapter_tunnel_exact_snapshot()', source)
+        self.assertIn('repair_register_tunnel', source)
+        self.assertIn('repair_signal() {', source)
+        self.assertIn("trap 'repair_signal' TERM HUP INT", source)
+        self.assertIn('trap \'status=$?; repair_cleanup_created_tunnels; exit "$status"\' EXIT', source)
         readiness_call = source.index('if ! adapter_tunnel_readiness; then')
         self.assertLess(readiness_call, docker_start)
         self.assertLess(mode_start, docker_start)
