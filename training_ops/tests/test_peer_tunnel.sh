@@ -132,7 +132,17 @@ elif [ "${1:-}" = "-o" ] && [ "${2:-}" = "pgid=" ]; then
     echo "$4"
   fi
 elif [ "${1:-}" = "-eo" ]; then
-  [ -n "${PEER_GROUP_COMMANDS:-}" ] && cat "$PEER_GROUP_COMMANDS"
+  if [ -n "${PEER_GROUP_COMMANDS:-}" ]; then
+    cat "$PEER_GROUP_COMMANDS"
+  elif [ "${PEER_STALE_GROUP_ACTIVE:-0}" = 1 ] && [ -r "${PEER_STALE_GROUP_COMMAND:?}" ]; then
+    printf '10000 %s\n' "$(<"$PEER_STALE_GROUP_COMMAND")"
+  elif [ -r "${PEER_TEST_LOG:-}" ]; then
+    while IFS= read -r group_command; do
+      lane=$(sed -n 's/.*# china-tunnel-lora-\([0-9][0-9]*\)[[:space:]]*$/\1/p' <<<"$group_command")
+      [ -n "$lane" ] || continue
+      printf '%s %s\n' "$((10000 + lane))" "$group_command"
+    done <"$PEER_TEST_LOG"
+  fi
 fi
 EOF
 cat >"$tmp/bin/ss" <<'EOF'
@@ -213,6 +223,17 @@ for hostile_target in \
     exit 1
   fi
 done
+for hostile_peer_supervisor in \
+  "${peer_supervisor_command/; sleep 3; done/; evil; sleep 3; done}" \
+  "${peer_supervisor_command/; sleep 3; done/; sleep 3; evil; done}" \
+  "${peer_supervisor_command/#*# peer-tunnel-lora-0/*# peer-tunnel-lora-0 extra}" \
+  "${peer_supervisor_command/while true; do/while false; do}" \
+  "${peer_supervisor_command/while true; do/evil bash -c while true; do}"; do
+  if peer_tunnel_supervisor_match "$hostile_peer_supervisor" current peer-tunnel-lora-0; then
+    echo "peer supervisor accepted injected shell syntax" >&2
+    exit 1
+  fi
+done
 
 # A second launcher invocation finds the exact API and lane signatures.
 PATH="$tmp/bin:$PATH" PEER_TEST_LOG="$log" PEER_QUERY="$query" peer_tunnel
@@ -231,6 +252,17 @@ for hostile_target in \
   hostile_china_supervisor=${china_supervisor_command/china-trainer/$hostile_target}
   if china_tunnel_supervisor_match "$hostile_china_supervisor" current china-tunnel-lora-0; then
     echo "China supervisor accepted hostile target token: $hostile_target" >&2
+    exit 1
+  fi
+done
+for hostile_china_supervisor in \
+  "${china_supervisor_command/; sleep 3; done/; evil; sleep 3; done}" \
+  "${china_supervisor_command/; sleep 3; done/; sleep 3; evil; done}" \
+  "${china_supervisor_command/#*# china-tunnel-lora-0/*# china-tunnel-lora-0 extra}" \
+  "${china_supervisor_command/while true; do/while false; do}" \
+  "${china_supervisor_command/while true; do/evil bash -c while true; do}"; do
+  if china_tunnel_supervisor_match "$hostile_china_supervisor" current china-tunnel-lora-0; then
+    echo "China supervisor accepted injected shell syntax" >&2
     exit 1
   fi
 done
@@ -389,6 +421,7 @@ china_legacy_cleanup_pids=()
 unset -f sleep kill
 
 # A fresh launch creates sixty-four two-forward lanes.
+kill() { return 0; }
 run_china_lanes
 for _ in $(seq 1 50); do
   [ -f "$china_log" ] && [ "$(wc -l <"$china_log")" -eq "$expected_lanes" ] && break
@@ -447,7 +480,7 @@ test "$(grep -F -c -- "-R 127.0.0.1:18103:127.0.0.1:$relay_port" "$log")" -eq 1
 group_commands="$tmp/group-commands"
 kill_log="$tmp/kill-log"
 printf '%s\n' \
-  "1234 bash -c while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19; done # peer-tunnel-lora-0" \
+  "1234 bash -c while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19; sleep 3; done # peer-tunnel-lora-0" \
   "1234 ssh -i /other/key -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port unrelated@peer" >"$group_commands"
 kill() { printf '%s\n' "$*" >>"$KILL_LOG"; }
 export KILL_LOG="$kill_log" PEER_GROUP_COMMANDS="$group_commands"
@@ -455,7 +488,7 @@ export PEER_TEST_PGID_PID=1235 PEER_TEST_PGID=1234
 PATH="$tmp/bin:$PATH"
 export PATH
 peer_kill_owned 1235 \
-  "while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19; done # peer-tunnel-lora-0"
+  "while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port root@38.255.28.19; sleep 3; done # peer-tunnel-lora-0"
 test "$(grep -F -c -- '1235' "$kill_log")" -eq 1
 if grep -Fq -- '-1235' "$kill_log"; then
   echo "unrelated peer group received a group kill" >&2
@@ -470,7 +503,7 @@ unset PEER_TEST_PGID_PID PEER_TEST_PGID
 legacy_group_commands="$tmp/legacy-group-commands"
 legacy_kill_log="$tmp/legacy-kill-log"
 printf '%s\n' \
-  "1234 bash -c while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port wrong@peer; done # peer-tunnel-lora-0" \
+  "1234 bash -c while true; do ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port wrong@peer; sleep 3; done # peer-tunnel-lora-0" \
   "1234 ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -R 127.0.0.1:18100:127.0.0.1:$relay_port -R 127.0.0.1:18101:127.0.0.1:$relay_port wrong@peer" \
   >"$legacy_group_commands"
 kill() { printf '%s\n' "$*" >>"$LEGACY_KILL_LOG"; }
@@ -480,6 +513,37 @@ PATH="$tmp/bin:$PATH" peer_tunnel_remove_legacy
 test "$(grep -F -c -- '-1234' "$legacy_kill_log")" -eq 1
 unset -f kill
 unset LEGACY_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+
+# Group cleanup accepts only an exact owned China supervisor and child.
+china_owned_group="$tmp/china-owned-group"
+china_owned_kill_log="$tmp/china-owned-kill"
+printf '%s\n' \
+  "1234 $china_supervisor_command" \
+  "1234 $china_exact_command" \
+  '1234 sleep 3' >"$china_owned_group"
+kill() { printf '%s\n' "$*" >>"$CHINA_OWNED_KILL_LOG"; return 0; }
+export CHINA_OWNED_KILL_LOG="$china_owned_kill_log" PEER_GROUP_COMMANDS="$china_owned_group"
+export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+PATH="$tmp/bin:$PATH" china_tunnel_stop_supervisor 42 "$china_supervisor_command" \
+  china-tunnel-lora-0 1
+test "$(grep -F -c -- '-- -1234' "$china_owned_kill_log")" -eq 1
+
+china_unrelated_group="$tmp/china-unrelated-group"
+: >"$china_owned_kill_log"
+printf '%s\n' \
+  "1234 $china_supervisor_command" \
+  '1234 ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -L 127.0.0.1:18100:127.0.0.1:8100 unrelated-trainer' \
+  >"$china_unrelated_group"
+export PEER_GROUP_COMMANDS="$china_unrelated_group"
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_stop_supervisor 42 "$china_supervisor_command" \
+  china-tunnel-lora-0 1
+china_unrelated_status=$?
+set -e
+test "$china_unrelated_status" -ne 0
+test ! -s "$china_owned_kill_log"
+unset -f kill
+unset CHINA_OWNED_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
 
 # Readiness accepts a listener only when its SSH child and two-port
 # supervisor both match the configured target.
@@ -549,6 +613,50 @@ for hostile_target in \
     exit 1
   fi
 done
+for hostile_generic_supervisor in \
+  "${secondary_supervisor/; sleep 3; done/; evil; sleep 3; done}" \
+  "${secondary_supervisor/; sleep 3; done/; sleep 3; evil; done}" \
+  "${secondary_supervisor/#*# zmq-tunnel-26407/*# zmq-tunnel-26407 extra}" \
+  "${secondary_supervisor/while true; do/while false; do}" \
+  "${secondary_supervisor/while true; do/evil bash -c while true; do}"; do
+  if generic_tunnel_supervisor_match "$hostile_generic_supervisor" zmq-tunnel-26407 \
+      "$secondary_target" "$secondary_forward" no "${secondary_options[@]}"; then
+    echo "generic supervisor accepted injected shell syntax" >&2
+    exit 1
+  fi
+done
+
+# Generic stale cleanup requires every member of the exact process group.
+generic_owned_group="$tmp/generic-owned-group"
+generic_owned_kill_log="$tmp/generic-owned-kill"
+printf '%s\n' \
+  "1234 $secondary_supervisor" \
+  "1234 $secondary_owner" \
+  '1234 sleep 3' >"$generic_owned_group"
+kill() { printf '%s\n' "$*" >>"$GENERIC_OWNED_KILL_LOG"; return 0; }
+export GENERIC_OWNED_KILL_LOG="$generic_owned_kill_log" PEER_GROUP_COMMANDS="$generic_owned_group"
+export PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+PATH="$tmp/bin:$PATH" generic_tunnel_stop_stale 42 "$secondary_supervisor" \
+  zmq-tunnel-26407 "$secondary_forward"
+test "$(grep -F -c -- '-- -1234' "$generic_owned_kill_log")" -eq 1
+
+generic_unrelated_group="$tmp/generic-unrelated-group"
+: >"$generic_owned_kill_log"
+printf '%s\n' \
+  "1234 $secondary_supervisor" \
+  '1234 ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -L 127.0.0.1:26407:127.0.0.1:8000 unrelated-target' \
+  >"$generic_unrelated_group"
+export PEER_GROUP_COMMANDS="$generic_unrelated_group"
+set +e
+PATH="$tmp/bin:$PATH" generic_tunnel_stop_stale 42 "$secondary_supervisor" \
+  zmq-tunnel-26407 "$secondary_forward"
+generic_unrelated_status=$?
+set -e
+test "$generic_unrelated_status" -ne 0
+test ! -s "$generic_owned_kill_log"
+unset -f kill
+unset GENERIC_OWNED_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+
 if generic_tunnel_ssh_match "${secondary_owner/30599/30598}" "$secondary_target" \
     "$secondary_forward" no "${secondary_options[@]}"; then
   echo "generic tunnel accepted the wrong SSH port" >&2
