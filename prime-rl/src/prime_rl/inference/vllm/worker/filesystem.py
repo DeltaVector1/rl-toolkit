@@ -3396,6 +3396,44 @@ class _PersistentAdapterLanePool:
         raise OSError("adapter persistent download retries exhausted")
 
 
+def _download_persistent_file(
+    source_urls: list[str],
+    destination: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    progress=None,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    per_request_timeout_seconds: float | None = None,
+) -> None:
+    """Download one small adapter file with typed persistent retries."""
+    if not source_urls:
+        raise OSError("adapter download has no source lane")
+    pool = _PersistentAdapterLanePool(source_urls, width=1)
+    parent_fd = _open_directory_nofollow(
+        destination.parent,
+        create=False,
+        label="adapter download parent",
+    )
+    try:
+        pool.download(
+            source_urls,
+            0,
+            destination,
+            parent_fd,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            progress=progress,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            per_request_timeout_seconds=per_request_timeout_seconds,
+        )
+    finally:
+        pool.close()
+        os.close(parent_fd)
+
+
 def _sha256(
     path: Path,
     deadline: float | None = None,
@@ -4843,18 +4881,25 @@ def _stage_chunked_xor_adapter(
     verification_finished = time.monotonic()
 
     if full_zstd:
+        if not isinstance(config_size, int) or config_size < 1:
+            raise OSError("full adapter configuration size is invalid")
         config_transfer_started = time.monotonic()
         with timing_lock:
             if transfer_started is None or config_transfer_started < transfer_started:
                 transfer_started = config_transfer_started
-        download(
-            f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+        config_urls = [
+            f"{lane_url.rstrip('/')}/{_ADAPTER_FILES[0]}"
+            for lane_url in lane_urls
+        ]
+        _download_persistent_file(
+            config_urls,
             config_path,
-            expected_size=(config_size if isinstance(config_size, int) else None),
+            expected_size=config_size,
             expected_sha256=config_sha256,
             progress=report,
             deadline=deadline,
             cancel_event=cancel_event,
+            per_request_timeout_seconds=_configured_chunk_timeout(),
         )
         config_transfer_finished = time.monotonic()
         with timing_lock:

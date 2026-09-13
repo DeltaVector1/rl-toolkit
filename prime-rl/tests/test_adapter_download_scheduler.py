@@ -402,6 +402,156 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
+    def test_persistent_config_retries_404_then_succeeds(self):
+        filesystem = load_filesystem_module()
+        payload = b"config-404"
+
+        def unavailable_once(request, number):
+            if number != 1:
+                return False
+            request.send_response(404)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, unavailable_once
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        filesystem.lane_rotation_delay_seconds = 0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "adapter_config.json"
+                filesystem._download_persistent_file(
+                    [f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json"],
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    per_request_timeout_seconds=1,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertEqual(handler.requests, 2)
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_config_retries_503_then_succeeds(self):
+        filesystem = load_filesystem_module()
+        payload = b"config-503"
+
+        def unavailable_once(request, number):
+            if number != 1:
+                return False
+            request.send_response(503)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, unavailable_once
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        filesystem.lane_rotation_delay_seconds = 0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "adapter_config.json"
+                filesystem._download_persistent_file(
+                    [f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json"],
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    per_request_timeout_seconds=1,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertEqual(handler.requests, 2)
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_config_http500_is_terminal(self):
+        filesystem = load_filesystem_module()
+        payload = b"config-500"
+
+        def server_error(request, number):
+            if number != 1:
+                return False
+            request.send_response(500)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, server_error
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(OSError, "unexpected HTTP status"):
+                    filesystem._download_persistent_file(
+                        [f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json"],
+                        Path(temporary) / "adapter_config.json",
+                        expected_size=len(payload),
+                        expected_sha256=hashlib.sha256(payload).hexdigest(),
+                        per_request_timeout_seconds=1,
+                    )
+                self.assertEqual(handler.requests, 1)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_config_local_write_failure_is_terminal(self):
+        filesystem = load_filesystem_module()
+        payload = b"config-disk"
+        server, thread, handler = self._persistent_server(filesystem, payload)
+        old_fdopen = filesystem.os.fdopen
+
+        class FailingOutput:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.stream.close()
+
+            def write(self, _value):
+                raise OSError("disk full")
+
+        def failing_fdopen(fd, mode, *args, **kwargs):
+            stream = old_fdopen(fd, mode, *args, **kwargs)
+            if mode in {"ab", "wb"}:
+                return FailingOutput(stream)
+            return stream
+
+        filesystem.os.fdopen = failing_fdopen
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    filesystem._download_persistent_file(
+                        [f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json"],
+                        Path(temporary) / "adapter_config.json",
+                        expected_size=len(payload),
+                        expected_sha256=hashlib.sha256(payload).hexdigest(),
+                        per_request_timeout_seconds=1,
+                    )
+                self.assertEqual(handler.requests, 1)
+        finally:
+            filesystem.os.fdopen = old_fdopen
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
     def test_persistent_chunk_rejects_changed_etag_without_retry(self):
         filesystem = load_filesystem_module()
         payload = b"identity-check"
