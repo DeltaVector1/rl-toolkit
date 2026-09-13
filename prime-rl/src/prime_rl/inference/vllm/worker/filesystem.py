@@ -221,6 +221,7 @@ def _write_text_atomic(
     *,
     encoding: str,
     parent_fd: int | None = None,
+    sync: bool = True,
 ) -> None:
     owns_parent_fd = parent_fd is None
     if owns_parent_fd:
@@ -245,7 +246,8 @@ def _write_text_atomic(
         try:
             output.write(value.encode(encoding))
             output.flush()
-            os.fsync(output.fileno())
+            if sync:
+                os.fsync(output.fileno())
         finally:
             output.close()
         try:
@@ -1751,12 +1753,14 @@ def _write_json(
     value: dict[str, object],
     *,
     parent_fd: int | None = None,
+    sync: bool = True,
 ) -> None:
     _write_text_atomic(
         path,
         json.dumps(value, separators=(",", ":")),
         encoding="utf-8",
         parent_fd=parent_fd,
+        sync=sync,
     )
 
 
@@ -2205,7 +2209,7 @@ def _write_stage_status(
             except (OSError, TypeError, ValueError):
                 value.pop("file_stats", None)
     with _JSON_LOCK:
-        _write_json(cache_root / _ADAPTER_STATUS, value, parent_fd=cache_fd)
+        _write_json(cache_root / _ADAPTER_STATUS, value, parent_fd=cache_fd, sync=False)
 
 
 def adapter_stage_status() -> dict[str, object]:
@@ -3239,6 +3243,7 @@ class _PersistentAdapterConnection:
         request_path = parsed.path or "/"
         if parsed.query:
             request_path += f"?{parsed.query}"
+        response = None
         try:
             connection.request(
                 "GET",
@@ -3253,6 +3258,11 @@ class _PersistentAdapterConnection:
             response = connection.getresponse()
             remaining_timeout()
         except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
+            if response is not None:
+                try:
+                    response.close()
+                except OSError:
+                    pass
             self.close()
             raise _PersistentTransportError("adapter persistent request failed") from exc
 
@@ -3262,44 +3272,41 @@ class _PersistentAdapterConnection:
             except OSError:
                 pass
 
-        if response.status in {404, 503}:
-            status = response.status
-            reason = response.reason or "adapter source unavailable"
-            close_response()
-            self.close()
-            raise HTTPError(source_url, status, reason, response.headers, None)
-        if response.status != 206:
-            close_response()
-            self.close()
-            raise _PersistentProtocolError(
-                f"adapter server returned unexpected HTTP status {response.status}"
-            )
+        read_available = getattr(response, "read1", None) or response.read
 
-        expected_length = end - start + 1
-        content_length = response.getheader("Content-Length")
-        if content_length is None or not content_length.isdigit() or int(content_length) != expected_length:
+        try:
+            if response.status in {404, 503}:
+                status = response.status
+                reason = response.reason or "adapter source unavailable"
+                raise HTTPError(source_url, status, reason, response.headers, None)
+            if response.status != 206:
+                raise _PersistentProtocolError(
+                    f"adapter server returned unexpected HTTP status {response.status}"
+                )
+
+            expected_length = end - start + 1
+            content_length = response.getheader("Content-Length")
+            if content_length is None or not content_length.isdigit() or int(content_length) != expected_length:
+                raise _PersistentProtocolError("adapter response Content-Length differs")
+            content_range = response.getheader("Content-Range")
+            expected_range = f"bytes {start}-{end}/{total}"
+            if content_range != expected_range:
+                raise _PersistentProtocolError("adapter response Content-Range differs")
+            etag = response.getheader("ETag")
+            if etag is not None:
+                normalized_etag = etag.strip()
+                if (
+                    len(normalized_etag) < 2
+                    or normalized_etag[0] != '"'
+                    or normalized_etag[-1] != '"'
+                    or expected_sha256 is None
+                    or normalized_etag[1:-1] != expected_sha256
+                ):
+                    raise _PersistentProtocolError("adapter response ETag differs")
+        except BaseException:
             close_response()
             self.close()
-            raise _PersistentProtocolError("adapter response Content-Length differs")
-        content_range = response.getheader("Content-Range")
-        expected_range = f"bytes {start}-{end}/{total}"
-        if content_range != expected_range:
-            close_response()
-            self.close()
-            raise _PersistentProtocolError("adapter response Content-Range differs")
-        etag = response.getheader("ETag")
-        if etag is not None:
-            normalized_etag = etag.strip()
-            if (
-                len(normalized_etag) < 2
-                or normalized_etag[0] != '"'
-                or normalized_etag[-1] != '"'
-                or expected_sha256 is None
-                or normalized_etag[1:-1] != expected_sha256
-            ):
-                close_response()
-                self.close()
-                raise _PersistentProtocolError("adapter response ETag differs")
+            raise
 
         if connection.sock is not None:
             try:
@@ -3322,7 +3329,7 @@ class _PersistentAdapterConnection:
                             "adapter response read timeout setup failed"
                         ) from exc
                 try:
-                    chunk = response.read(min(16 * 1024 * 1024, remaining))
+                    chunk = read_available(min(1024 * 1024, remaining))
                 except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
                     self.close()
                     raise _PersistentTransportError("adapter response ended during read") from exc
@@ -3610,6 +3617,58 @@ def _sha256(
             digest.update(chunk)
     _check_deadline(deadline, cancel_event)
     return digest.hexdigest()
+
+
+def _sha256_region(
+    path: Path,
+    offset: int,
+    size: int,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> str:
+    if offset < 0 or size < 0:
+        raise OSError("adapter output region is invalid")
+    digest = hashlib.sha256()
+    file_descriptor = _open_nofollow(path, os.O_RDONLY, label="adapter output checksum file")
+    try:
+        position = offset
+        remaining = size
+        while remaining:
+            _check_deadline(deadline, cancel_event)
+            chunk = os.pread(file_descriptor, min(16 * 1024 * 1024, remaining), position)
+            if not chunk:
+                raise OSError("adapter output ended before proof region")
+            digest.update(chunk)
+            position += len(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(file_descriptor)
+    _check_deadline(deadline, cancel_event)
+    return digest.hexdigest()
+
+
+def _output_proof_matches(
+    output_path: Path,
+    item: dict[str, object],
+    proof: dict[str, object] | None,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+) -> bool:
+    if proof is None:
+        return False
+    try:
+        return (
+            _sha256_region(
+                output_path,
+                int(item["offset"]),
+                int(item["raw_size"]),
+                deadline,
+                cancel_event,
+            )
+            == proof["output_sha256"]
+        )
+    except (KeyError, FileNotFoundError, OSError):
+        return False
 
 
 def _decode_transport_chunk(payload: bytes, *, codec: str, raw_size: int) -> bytes:
@@ -4008,6 +4067,8 @@ def _stage_chunked_linear_adapter(
     _write_text_atomic(identity_path, transport_identity, encoding="utf-8")
     chunk_root = temporary / "transport-chunks"
     _ensure_directory(chunk_root, "adapter transport chunk directory")
+    output_path = temporary / _ADAPTER_FILES[1]
+    config_path = temporary / _ADAPTER_FILES[0]
     total_wire_bytes = sum(int(item["wire_size"]) for item in chunks) + config_size
     progress_lock = threading.Lock()
     progress_bytes = 0
@@ -4020,7 +4081,10 @@ def _stage_chunked_linear_adapter(
             continue
         done_path = _proof_path(chunk_path, _COMPLETED_SUFFIX)
         wire_ready_path = _proof_path(chunk_path, _WIRE_READY_SUFFIX)
-        done_valid, _ = _proof_identity_matches(done_path, item, completed=True)
+        done_valid, done_proof = _proof_identity_matches(done_path, item, completed=True)
+        done_valid = done_valid and _output_proof_matches(
+            output_path, item, done_proof, deadline, cancel_event
+        )
         wire_ready_valid, _ = _proof_identity_matches(wire_ready_path, item, completed=False)
         if done_valid or wire_ready_valid:
             progress_bytes += int(item["wire_size"])
@@ -4099,8 +4163,6 @@ def _stage_chunked_linear_adapter(
         "source_connections": source_connection_count,
         "responsive_source_connections": len(lane_urls),
     }
-    output_path = temporary / _ADAPTER_FILES[1]
-    config_path = temporary / _ADAPTER_FILES[0]
     config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
     _reject_symlink_path(output_path, "adapter output")
     _reject_symlink_path(config_path, "adapter configuration file")
@@ -4117,7 +4179,7 @@ def _stage_chunked_linear_adapter(
             (_proof_path(chunk_path, _COMPLETED_SUFFIX), True),
             (_proof_path(chunk_path, _WIRE_READY_SUFFIX), False),
         ):
-            proof_valid, _ = _proof_identity_matches(
+            proof_valid, proof = _proof_identity_matches(
                 proof_path, item, completed=completed
             )
             if not proof_valid:
@@ -4128,6 +4190,10 @@ def _stage_chunked_linear_adapter(
                     and _sha256(chunk_path, deadline, cancel_event)
                     == str(item["wire_sha256"])
                 )
+                if reusable and completed:
+                    reusable = _output_proof_matches(
+                        output_path, item, proof, deadline, cancel_event
+                    )
             except (FileNotFoundError, OSError):
                 reusable = False
             if reusable:
@@ -4209,7 +4275,7 @@ def _stage_chunked_linear_adapter(
         _reject_symlink_path(chunk_path, "adapter transport chunk")
         _reject_symlink_path(completed_path, "adapter completed proof")
         _reject_symlink_path(wire_ready_path, "adapter wire proof")
-        completed_valid, _ = _proof_identity_matches(
+        completed_valid, completed_proof = _proof_identity_matches(
             completed_path, item, completed=True
         )
         if completed_valid:
@@ -4217,6 +4283,9 @@ def _stage_chunked_linear_adapter(
                 completed_valid = (
                     _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
                     and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                    and _output_proof_matches(
+                        output_path, item, completed_proof, deadline, cancel_event
+                    )
                 )
             except (FileNotFoundError, OSError):
                 completed_valid = False
@@ -4245,7 +4314,15 @@ def _stage_chunked_linear_adapter(
         if not wire_ready_valid:
             if _path_stat(wire_ready_path, "adapter wire proof") is not None:
                 _discard_proof(wire_ready_path)
+            try:
+                wire_ready_valid = (
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                )
+            except (FileNotFoundError, OSError):
+                wire_ready_valid = False
 
+        if not wire_ready_valid:
             chunk_lane = index % len(lane_urls)
 
             def lane_report(_lane: int, amount: int) -> None:
@@ -4293,6 +4370,7 @@ def _stage_chunked_linear_adapter(
                     "wire_sha256": wire_sha256,
                     "raw_sha256": raw_sha256,
                 },
+                sync=False,
             )
 
     def reconstruct(index: int, item: dict[str, object]) -> None:
@@ -4310,7 +4388,7 @@ def _stage_chunked_linear_adapter(
         raw_sha256 = str(item["raw_sha256"])
         completed_path = _proof_path(chunk_path, _COMPLETED_SUFFIX)
         wire_ready_path = _proof_path(chunk_path, _WIRE_READY_SUFFIX)
-        completed_valid, _ = _proof_identity_matches(
+        completed_valid, completed_proof = _proof_identity_matches(
             completed_path, item, completed=True
         )
         if completed_valid:
@@ -4318,13 +4396,27 @@ def _stage_chunked_linear_adapter(
                 completed_valid = (
                     _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
                     and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                    and _output_proof_matches(
+                        output_path, item, completed_proof, deadline, cancel_event
+                    )
                 )
             except (FileNotFoundError, OSError):
                 completed_valid = False
         if completed_valid:
             _discard_proof(wire_ready_path)
             return
-        if not _proof_identity_matches(wire_ready_path, item, completed=False)[0]:
+        wire_ready_valid, _ = _proof_identity_matches(
+            wire_ready_path, item, completed=False
+        )
+        if not wire_ready_valid:
+            try:
+                wire_ready_valid = (
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                )
+            except (FileNotFoundError, OSError):
+                wire_ready_valid = False
+        if not wire_ready_valid:
             raise OSError("version-two adapter wire proof is missing")
         if (
             _path_regular_size(chunk_path, "adapter transport chunk") != wire_size
@@ -4383,6 +4475,7 @@ def _stage_chunked_linear_adapter(
                 "correction_sha256": correction_sha256,
                 "output_sha256": output_sha256,
             },
+            sync=False,
         )
         # Keep the completed proof visible before removing the earlier proof.
         # This prevents a relay visibility gap between reconstruction and the
@@ -4861,6 +4954,7 @@ def _stage_chunked_xor_adapter(
         else:
             chunk_lane = index % len(lane_urls)
 
+        wire_reusable = False
         if _path_regular_size(completed_path, "adapter completed proof") is not None:
             try:
                 proof = json.loads(
@@ -4888,6 +4982,9 @@ def _stage_chunked_xor_adapter(
                     proof_matches = (
                         _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
                         and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                        and _output_proof_matches(
+                            output_path, item, proof, deadline, cancel_event
+                        )
                     )
                 except (FileNotFoundError, OSError):
                     proof_matches = False
@@ -4897,46 +4994,55 @@ def _stage_chunked_xor_adapter(
                     return
             _unlink_path(completed_path, "adapter completed proof")
 
+        try:
+            wire_reusable = (
+                _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+            )
+        except (FileNotFoundError, OSError):
+            wire_reusable = False
+
         def lane_report(_lane: int, amount: int) -> None:
             report(chunk_lane, amount)
 
-        if persistent_pool is not None:
+        if not wire_reusable and persistent_pool is not None:
             chunk_urls = persistent_pool.urls_for_lane(chunk_lane, name)
-        else:
+        elif not wire_reusable:
             chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
             chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
-        transfer_started_at = time.monotonic()
-        with timing_lock:
-            if transfer_started is None or transfer_started_at < transfer_started:
-                transfer_started = transfer_started_at
-        if persistent_pool is not None:
-            persistent_pool.download(
-                chunk_urls,
-                chunk_lane,
-                chunk_path,
-                chunk_root_fd,
-                expected_size=int(item["wire_size"]),
-                expected_sha256=wire_sha256,
-                progress=lane_report,
-                deadline=deadline,
-                cancel_event=cancel_event,
-                per_request_timeout_seconds=_configured_chunk_timeout(),
-            )
-        else:
-            _download_persistent_file(
-                chunk_urls,
-                chunk_path,
-                expected_size=int(item["wire_size"]),
-                expected_sha256=wire_sha256,
-                progress=lane_report,
-                deadline=deadline,
-                cancel_event=cancel_event,
-                per_request_timeout_seconds=_configured_chunk_timeout(),
-            )
-        transfer_finished_at = time.monotonic()
-        with timing_lock:
-            if transfer_finished is None or transfer_finished_at > transfer_finished:
-                transfer_finished = transfer_finished_at
+        if not wire_reusable:
+            transfer_started_at = time.monotonic()
+            with timing_lock:
+                if transfer_started is None or transfer_started_at < transfer_started:
+                    transfer_started = transfer_started_at
+            if persistent_pool is not None:
+                persistent_pool.download(
+                    chunk_urls,
+                    chunk_lane,
+                    chunk_path,
+                    chunk_root_fd,
+                    expected_size=int(item["wire_size"]),
+                    expected_sha256=wire_sha256,
+                    progress=lane_report,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    per_request_timeout_seconds=_configured_chunk_timeout(),
+                )
+            else:
+                _download_persistent_file(
+                    chunk_urls,
+                    chunk_path,
+                    expected_size=int(item["wire_size"]),
+                    expected_sha256=wire_sha256,
+                    progress=lane_report,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    per_request_timeout_seconds=_configured_chunk_timeout(),
+                )
+            transfer_finished_at = time.monotonic()
+            with timing_lock:
+                if transfer_finished is None or transfer_finished_at > transfer_finished:
+                    transfer_finished = transfer_finished_at
 
         _check_deadline(deadline, cancel_event)
         encoded = _read_bytes_nofollow(chunk_path)
@@ -4980,7 +5086,6 @@ def _stage_chunked_xor_adapter(
             if len(reconstructed) != raw_size:
                 raise OSError("adapter transport reconstructed chunk has the wrong size")
             _pwrite_all(output_fd, reconstructed, offset)
-            os.fsync(output_fd)
         finally:
             os.close(output_fd)
         reconstruction_finished_at = time.monotonic()
@@ -5000,6 +5105,7 @@ def _stage_chunked_xor_adapter(
                 "raw_sha256": raw_sha256,
                 "output_sha256": hashlib.sha256(reconstructed).hexdigest(),
             },
+            sync=False,
         )
 
     chunk_root_fd = _open_directory_nofollow(
@@ -5026,6 +5132,11 @@ def _stage_chunked_xor_adapter(
         os.close(chunk_root_fd)
 
     _reject_symlink_path(output_path, "adapter output")
+    output_fd = _open_nofollow(output_path, os.O_RDONLY)
+    try:
+        os.fsync(output_fd)
+    finally:
+        os.close(output_fd)
     verification_started = time.monotonic()
     if _sha256(output_path, deadline, cancel_event) != target_sha256:
         raise OSError("reconstructed adapter checksum mismatch")

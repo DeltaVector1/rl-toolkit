@@ -48,6 +48,82 @@ def load_filesystem():
 
 
 class LinearAdapterReceiverTest(unittest.TestCase):
+    def test_chunk_proof_write_can_skip_file_sync(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "chunk.done"
+            original_fsync = filesystem.os.fsync
+            sync_calls = []
+            filesystem.os.fsync = lambda descriptor: sync_calls.append(descriptor)
+            try:
+                filesystem._write_json(path, {"state": "done"}, sync=False)
+                self.assertEqual(sync_calls, [])
+                filesystem._write_json(path, {"state": "done"})
+                self.assertEqual(len(sync_calls), 1)
+            finally:
+                filesystem.os.fsync = original_fsync
+
+    def test_output_region_digest_detects_corruption(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "adapter_model.safetensors"
+            path.write_bytes(b"left-regionright-region")
+            expected = hashlib.sha256(b"right-region").hexdigest()
+            self.assertEqual(filesystem._sha256_region(path, 11, 12), expected)
+            path.write_bytes(b"left-regionwrong-region")
+            self.assertNotEqual(filesystem._sha256_region(path, 11, 12), expected)
+
+    def test_persistent_response_closes_on_header_failure(self):
+        filesystem = load_filesystem()
+        closed = []
+
+        class Response:
+            status = 206
+            reason = "partial"
+            headers = {}
+
+            def getheader(self, _name):
+                raise OSError("header read failed")
+
+            def read(self, _size):
+                return b""
+
+            def close(self):
+                closed.append("response")
+
+        response = Response()
+
+        class Connection:
+            sock = None
+
+            def request(self, *_args, **_kwargs):
+                return None
+
+            def getresponse(self):
+                return response
+
+            def close(self):
+                closed.append("connection")
+
+        connection = filesystem._PersistentAdapterLanePool(1)._lanes[0][1]
+        raw_connection = Connection()
+        connection._connection = raw_connection
+        connection._open = lambda *_args, **_kwargs: (
+            raw_connection,
+            types.SimpleNamespace(path="/adapter", query=""),
+        )
+        with self.assertRaisesRegex(OSError, "header read failed"):
+            connection.read_range(
+                "http://source/adapter",
+                start=0,
+                end=3,
+                total=4,
+                expected_sha256="a" * 64,
+                timeout=10,
+                consume=lambda _chunk: None,
+            )
+        self.assertEqual(closed, ["response", "connection"])
+
     def test_verified_base_uses_published_identity_without_hashing_model(self):
         filesystem = load_filesystem()
         base_url = "http://source/step_1"
@@ -488,6 +564,25 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     [call[1]["expected_config_size"] for call in base_calls],
                     [len(config), len(config), len(config), len(config)],
                 )
+                destination = filesystem.adapter_cache_path(source_url)
+                partial = destination.with_name(f"{destination.name}.partial")
+                destination.rename(partial)
+                (partial / "READY").unlink()
+                (partial / "adapter_model.safetensors").write_bytes(b"damaged!")
+                resumed = filesystem._stage_chunked_linear_adapter(
+                    source_url,
+                    transport,
+                    source_manifest,
+                    deadline=None,
+                    status_metadata={
+                        "policy_step": 3,
+                        "stage_timeout_seconds": 300.0,
+                        "acceptance_target_seconds": 300.0,
+                    },
+                )
+                self.assertEqual((resumed / "adapter_model.safetensors").read_bytes(), target)
+                self.assertEqual(chunk_download_calls, 1)
+                self.assertEqual(decode_calls, 3)
         finally:
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)

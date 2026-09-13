@@ -2281,7 +2281,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 self.assertGreaterEqual(filesystem.adapter_stage_status()["elapsed_seconds"], 0.0)
                 resumed = downloaded[len(downloaded_after_failure) :]
                 self.assertFalse(any("chunk-0" in name for name in resumed))
-                self.assertTrue(any("chunk-1" in name for name in resumed))
+                self.assertFalse(any("chunk-1" in name for name in resumed))
         finally:
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)
