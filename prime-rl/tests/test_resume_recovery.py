@@ -2,20 +2,16 @@ import ast
 import asyncio
 import contextlib
 import hashlib
-import importlib.util
 import io
 import json
 import math
 import os
 import re
 import stat
-import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,127 +26,26 @@ WATCHER_PATH = ROOT / "src/prime_rl/orchestrator/watcher.py"
 DISPATCHER_PATH = ROOT / "src/prime_rl/orchestrator/dispatcher.py"
 
 
-class _StubValue:
-    def __call__(self, *_args, **_kwargs):
-        return self
+def load_runtime():
+    """Load the real lifecycle modules from the installed prime-rl package."""
+    from prime_rl.orchestrator import dispatcher, orchestrator, watcher
+    from prime_rl.orchestrator.types import GroupState, InflightRollout, Policy
+    from prime_rl.utils.async_utils import safe_cancel, safe_cancel_all
+    from prime_rl.utils.client import client_identity
+    from prime_rl.utils.logger import get_logger
 
-    def __getattr__(self, _name):
-        return self
-
-    def __iter__(self):
-        return iter(())
-
-
-class _StubModule(types.ModuleType):
-    def __getattr__(self, _name):
-        return _StubValue()
-
-
-def _load_stubbed_source(path, name, names):
-    names = names.split()
-    modules = {module_name: _StubModule(module_name) for module_name in names}
-    for module_name in list(modules):
-        parts = module_name.split(".")
-        for index in range(1, len(parts)):
-            parent = ".".join(parts[:index])
-            modules.setdefault(parent, _StubModule(parent))
-            modules[parent].__path__ = []
-    with patch.dict(sys.modules, modules):
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return module
-
-
-async def _safe_cancel(task):
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
-
-async def _safe_cancel_all(tasks):
-    for task in tasks:
-        task.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-
-def _client_identity(client):
-    return (client.base_url, client.headers.get("X-data-parallel-rank"))
-
-
-@dataclass
-class _RuntimeInflightRollout:
-    kind: str
-    env_name: str
-    group_id: object
-    policy_version: int
-    rollout_count: int
-    client_config: object = None
-    off_policy_steps: int = 0
-    eval_step: int | None = None
-
-
-@dataclass
-class _RuntimeGroupState:
-    kind: str
-    env_name: str
-    task_idx: int
-    rollouts_to_schedule: int
-    target_rollouts: int
-    task: object = None
-    emitted: int = 0
-    eval_step: int | None = None
-    pinned_client: object = None
-    policy_version_at_start: int = 0
-
-
-def load_weight_watcher_runtime():
-    names = """
-        modelexpress modelexpress.p2p_pb2 prime_rl.configs.orchestrator
-        prime_rl.orchestrator.types prime_rl.trainer.rl.broadcast.nixl.model_express
-        prime_rl.utils.async_utils prime_rl.utils.checkpoint_delta prime_rl.utils.client
-        prime_rl.utils.logger prime_rl.utils.pathing prime_rl.utils.utils
-    """
-    return _load_stubbed_source(WATCHER_PATH, "_resume_test_watcher", names)
-
-
-def load_dispatcher_runtime():
-    names = """
-        aiolimiter prime_rl.orchestrator.envs prime_rl.orchestrator.eval_source
-        prime_rl.orchestrator.train_source prime_rl.orchestrator.types
-        prime_rl.utils.async_utils prime_rl.utils.client prime_rl.utils.logger verifiers.v1
-    """
-    module = _load_stubbed_source(DISPATCHER_PATH, "_resume_test_dispatcher", names)
-    module.GroupState = _RuntimeGroupState
-    module.InflightRollout = _RuntimeInflightRollout
-    module.safe_cancel = _safe_cancel
-    module.safe_cancel_all = _safe_cancel_all
-    module.client_identity = _client_identity
-    module.get_logger = lambda: SimpleNamespace(
-        debug=lambda *_args, **_kwargs: None,
-        info=lambda *_args, **_kwargs: None,
-        warning=lambda *_args, **_kwargs: None,
+    return SimpleNamespace(
+        dispatcher=dispatcher,
+        orchestrator=orchestrator,
+        watcher=watcher,
+        GroupState=GroupState,
+        InflightRollout=InflightRollout,
+        Policy=Policy,
+        safe_cancel=safe_cancel,
+        safe_cancel_all=safe_cancel_all,
+        client_identity=client_identity,
+        get_logger=get_logger,
     )
-    return module
-
-
-def load_orchestrator_runtime():
-    names = """
-        modelexpress modelexpress.client prime_rl._compat prime_rl.configs.orchestrator
-        prime_rl.orchestrator.ckpt prime_rl.orchestrator.dispatcher prime_rl.orchestrator.envs
-        prime_rl.orchestrator.eval_sink prime_rl.orchestrator.eval_source prime_rl.orchestrator.filters
-        prime_rl.orchestrator.inference_metrics prime_rl.orchestrator.patches
-        prime_rl.orchestrator.periodic_logger prime_rl.orchestrator.train_sink
-        prime_rl.orchestrator.train_source prime_rl.orchestrator.types
-        prime_rl.orchestrator.utils prime_rl.orchestrator.watcher prime_rl.trainer.model
-        prime_rl.trainer.rl.broadcast.nixl.model_express prime_rl.transport
-        prime_rl.utils.async_utils prime_rl.utils.client prime_rl.utils.config
-        prime_rl.utils.heartbeat prime_rl.utils.logger prime_rl.utils.monitor
-        prime_rl.utils.pathing prime_rl.utils.usage_reporter prime_rl.utils.utils
-        tomli_w verifiers.v1
-    """
-    return _load_stubbed_source(ORCHESTRATOR_PATH, "_resume_test_orchestrator", names)
-
 
 def load_startup_validator(urlopen, validate_manifest, file_records):
     source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
@@ -874,339 +769,250 @@ class ResumeRecoveryTest(unittest.TestCase):
             "unknown",
         )
 
-    async def _run_policy_update_ready_case(self, *, fail_ready):
-        watcher_module = load_weight_watcher_runtime()
-        dispatcher_module = load_dispatcher_runtime()
+    async def _run_real_dispatcher_ready_case(self, *, fail_ready: bool) -> None:
+        """Run the real watcher and dispatcher across a held policy load."""
+        runtime = load_runtime()
+        watcher_module = runtime.watcher
+        dispatcher_module = runtime.dispatcher
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for step in (0, 1):
                 (root / f"step_{step}").mkdir()
                 (root / f"step_{step}" / "STABLE").touch()
+
+            class Pool:
+                model_name = "base-model"
+                adapter_origin_base_urls = None
+
+                def __init__(self):
+                    self.client = SimpleNamespace(base_url="http://inference", headers={})
+                    self.admin_clients = [self.client]
+                    self.train_clients = [self.client]
+                    self.ready_started = asyncio.Event()
+                    self.ready_release = asyncio.Event()
+                    self.updates = []
+
+                async def select_train_client(self, _load):
+                    return self.client
+
+                async def update_weights(self, path, **kwargs):
+                    self.updates.append((path, kwargs))
+                    return []
+
+                def update_model_name(self, name):
+                    self.model_name = name
+
+                async def wait_for_ready(self, _name):
+                    self.ready_started.set()
+                    await self.ready_release.wait()
+                    if fail_ready:
+                        raise RuntimeError("policy v1 is not visible")
+
+            pool = Pool()
+            policy = runtime.Policy(version=0, model_name="base-model")
             config = SimpleNamespace(output_dir=root, max_steps=None)
-            policy = SimpleNamespace(version=0, model_name="base-model")
-            client = SimpleNamespace(base_url="http://inference", headers={})
-            ready_started, ready_release = asyncio.Event(), asyncio.Event()
-            updates = []
-            identity = {
-                "source_url": "http://source/step_1",
-                "target_sha256": "c" * 64,
-                "target_size": 8,
-                "config_sha256": "d" * 64,
-                "config_size": 2,
-            }
+            rollout_models = []
+            first_rollout = asyncio.Event()
+            policy_one_rollout = asyncio.Event()
+            rollout_release = asyncio.Event()
+            next_index = 0
 
-            async def stage(*_args, **_kwargs):
-                return {
-                    "transfer_wall_seconds": 0.0,
-                    "origin_stage_seconds": 0.0,
-                    "peer_stage_seconds": 0.0,
-                    "reconstruction_wall_seconds": 0.0,
-                    "adapter_identity": identity,
-                }
+            class Source:
+                def next_example(self, *_args, **_kwargs):
+                    nonlocal next_index
+                    if next_index >= 2:
+                        return None
+                    task_idx = next_index
+                    next_index += 1
+                    return {"env_name": "train", "task_idx": task_idx}
 
-            async def update_weights(weights_path, **kwargs):
-                updates.append((weights_path, kwargs))
+            async def run(*, model_name, **_kwargs):
+                rollout_models.append(model_name)
+                if model_name == "base-model":
+                    first_rollout.set()
+                if model_name == "adapter-slot1":
+                    policy_one_rollout.set()
+                await rollout_release.wait()
                 return []
 
-            async def wait_for_ready(_name):
-                ready_started.set()
-                await ready_release.wait()
-                if fail_ready:
-                    raise RuntimeError("policy v1 is not visible")
-
-            inference = SimpleNamespace(
-                admin_clients=[client], adapter_origin_base_urls=None,
-                model_name="base-model", update_weights=update_weights,
-                update_model_name=lambda name: setattr(inference, "model_name", name),
-                wait_for_ready=wait_for_ready,
+            env = SimpleNamespace(
+                config=SimpleNamespace(group_size=1),
+                requires_group_scoring=False,
+                sampler=SimpleNamespace(samples_from_live_policy=True, pool=pool),
+                run=run,
             )
-            watcher_module.get_broadcast_dir = lambda path: Path(path)
-            watcher_module.get_step_path = lambda path, step: Path(path) / f"step_{step}"
-            watcher_module.inference_weight_path = lambda _config, path, _lora: f"http://source/{Path(path).name}"
-            watcher_module.adapter_stage_limit_seconds = lambda _step: 1.0
-            watcher_module.stage_lora_adapter = stage
-            watcher_module._write_receivers_ready = lambda *_args, **_kwargs: None
-            watcher_module.urlopen = lambda *_args, **_kwargs: io.BytesIO(
-                json.dumps({"version": 1, "kind": "lora-adapter", "mode": "delta",
-                            "transport": "chunked-shuffled-xor-zstd", "target_step": 1,
-                            "base_step": 0}).encode("utf-8")
+            envs = SimpleNamespace(names={"train"}, get=lambda _name: env)
+            dispatcher = dispatcher_module.RolloutDispatcher(
+                train_envs=envs,
+                eval_envs=None,
+                train_source=Source(),
+                eval_source=None,
+                policy_pool=pool,
+                policy=policy,
+                max_inflight_rollouts=1,
+                tasks_per_minute=None,
+                max_off_policy_steps=1,
             )
-            watcher_module.format_time = lambda value: f"{value:.3f}s"
             watcher = watcher_module.WeightWatcher(
-                config, policy=policy, inference=inference, observers=[], lora_name="adapter",
-                ckpt_step=0, poll_interval=0.001, reconcile_interval=100.0,
+                config,
+                policy=policy,
+                inference=pool,
+                observers=[dispatcher],
+                lora_name="adapter",
+                ckpt_step=0,
+                poll_interval=0.001,
+                reconcile_interval=100.0,
             )
             watcher.bootstrap_staged = True
             watcher.verified_adapter_step = 0
             watcher.verified_adapter_url = "http://source/step_0"
-            pool = SimpleNamespace(train_clients=[])
-            envs = SimpleNamespace(names=set(), get=lambda _name: None)
-            source = SimpleNamespace(next_example=lambda *_args, **_kwargs: None)
-            dispatcher = dispatcher_module.RolloutDispatcher(
-                train_envs=envs, eval_envs=None, train_source=source, eval_source=None,
-                policy_pool=pool, policy=policy, max_inflight_rollouts=1,
-                tasks_per_minute=None, max_off_policy_steps=1,
-            )
-            watcher.observers = [dispatcher]
-            update_task = asyncio.create_task(watcher.apply_policy_update(1))
-            await asyncio.wait_for(ready_started.wait(), 1.0)
-            self.assertEqual(len(updates), 1)
-            self.assertTrue(dispatcher.weight_update_pending)
-            self.assertEqual(dispatcher.policy_group_drain_pending, False)
-            ready_release.set()
-            if fail_ready:
-                with self.assertRaisesRegex(RuntimeError, "policy v1 is not visible"):
-                    await asyncio.wait_for(update_task, 1.0)
-                self.assertTrue(dispatcher.weight_update_pending)
-            else:
-                await asyncio.wait_for(update_task, 1.0)
-                self.assertFalse(dispatcher.weight_update_pending)
-                self.assertEqual(policy.version, 1)
-                self.assertEqual(policy.model_name, "adapter-slot1")
 
-    def test_policy_one_waits_for_ready_before_reopening_rollouts(self):
-        asyncio.run(self._run_policy_update_ready_case(fail_ready=False))
+            async def stage(*_args, **_kwargs):
+                return {
+                    "adapter_identity": {
+                        "source_url": "http://source/step_1",
+                        "target_sha256": "c" * 64,
+                        "target_size": 8,
+                        "config_sha256": "d" * 64,
+                        "config_size": 2,
+                    },
+                    "transfer_wall_seconds": 0.0,
+                    "origin_stage_seconds": 0.0,
+                    "peer_stage_seconds": 0.0,
+                    "reconstruction_wall_seconds": 0.0,
+                }
 
-    def test_policy_one_wait_failure_stays_fail_closed(self):
-        asyncio.run(self._run_policy_update_ready_case(fail_ready=True))
+            async def prewarm(*_args, **_kwargs):
+                return "http://source/step_1/adapter_manifest.json"
 
-    def test_background_dispatch_stays_base_until_verified_bootstrap(self):
-        watcher_module = load_weight_watcher_runtime()
-        dispatcher_module = load_dispatcher_runtime()
-
-        async def run_test():
-            with tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                for step in (0, 1):
-                    (root / f"step_{step}").mkdir()
-                    (root / f"step_{step}" / "STABLE").touch()
-                config = SimpleNamespace(output_dir=root, max_steps=None)
-                policy = SimpleNamespace(version=0, model_name="base-model")
-                client = SimpleNamespace(base_url="http://inference", headers={})
-                stage_started, stage_release = asyncio.Event(), asyncio.Event()
-                stage_returned = asyncio.Event()
-                rollout_started, rollout_release = asyncio.Event(), asyncio.Event()
-                update_called = asyncio.Event()
-                stage_calls, stage_results, rollout_models, updates = [], [], [], []
-                identities = [
-                    {"source_url": f"http://source/step_{step}", "target_sha256": digest * 64,
-                     "target_size": 7 + step, "config_sha256": config_digest * 64, "config_size": 2}
-                    for step, digest, config_digest in ((0, "a", "b"), (1, "c", "d"))
-                ]
-                watcher_holder = {}
-
-                async def update_weights(weights_path, **kwargs):
-                    self.assertTrue(stage_returned.is_set())
-                    updates.append((weights_path, kwargs))
-                    update_called.set()
-                    watcher_holder["watcher"].stopped.set()
-                    return []
-
-                inference = SimpleNamespace(
-                    admin_clients=[client], adapter_origin_base_urls=None,
-                    model_name="base-model", update_weights=update_weights,
-                    update_model_name=lambda name: setattr(inference, "model_name", name),
-                    wait_for_ready=lambda _name: asyncio.sleep(0),
-                )
-
-                async def stage(_clients, path, **kwargs):
-                    stage_calls.append((path, kwargs))
-                    if len(stage_calls) == 1:
-                        self.assertFalse(kwargs["require_delta"])
-                        stage_started.set()
-                        await stage_release.wait()
-                    else:
-                        self.assertTrue(kwargs["require_delta"])
-                    result = {
-                        "transfer_wall_seconds": 0.0,
-                        "origin_stage_seconds": 0.0,
-                        "peer_stage_seconds": 0.0,
-                        "reconstruction_wall_seconds": 0.0,
-                        "adapter_identity": identities[len(stage_calls) - 1],
-                    }
-                    if len(stage_calls) == 1:
-                        stage_returned.set()
-                    stage_results.append(result)
-                    return result
-
-                watcher_module.get_broadcast_dir = lambda path: Path(path)
-                watcher_module.get_step_path = lambda path, step: Path(path) / f"step_{step}"
-                watcher_module.inference_weight_path = lambda _config, path, _lora: f"http://source/{Path(path).name}"
-                watcher_module.get_latest_ckpt_step = lambda _path: 1
-                watcher_module.adapter_stage_limit_seconds = lambda _step: 1.0
-                watcher_module.stage_lora_adapter = stage
-                watcher_module._write_receivers_ready = lambda *_args, **_kwargs: None
-                watcher_module.urlopen = lambda *_args, **_kwargs: io.BytesIO(
-                    json.dumps({"version": 1, "kind": "lora-adapter", "mode": "delta",
-                                "transport": "chunked-shuffled-xor-zstd", "target_step": 1,
-                                "base_step": 0}).encode("utf-8")
-                )
-                watcher_module.format_time = lambda value: f"{value:.3f}s"
-                watcher = watcher_module.WeightWatcher(
-                    config,
-                    policy=policy,
-                    inference=inference,
-                    observers=[],
-                    lora_name="adapter",
-                    ckpt_step=0,
-                    poll_interval=0.001,
-                    reconcile_interval=100.0,
-                )
-                watcher_holder["watcher"] = watcher
-
-                pool = SimpleNamespace(train_clients=[client])
-                pool.select_train_client = lambda _load: asyncio.sleep(0, result=client)
-                async def rollout(*, model_name, **_kwargs):
-                    rollout_models.append(model_name)
-                    rollout_started.set()
-                    await rollout_release.wait()
-                    return []
-                env = SimpleNamespace(
-                    config=SimpleNamespace(group_size=1), requires_group_scoring=False,
-                    sampler=SimpleNamespace(samples_from_live_policy=True, pool=pool), run=rollout,
-                )
-                envs = SimpleNamespace(names={"train"}, get=lambda _name: env)
-                source = SimpleNamespace(used=False)
-                source.next_example = lambda *_args, **_kwargs: (
-                    None if source.used else (setattr(source, "used", True) or {"env_name": "train", "task_idx": 1})
-                )
-
-                dispatcher = dispatcher_module.RolloutDispatcher(
-                    train_envs=envs,
-                    eval_envs=None,
-                    train_source=source,
-                    eval_source=None,
-                    policy_pool=pool,
-                    policy=policy,
-                    max_inflight_rollouts=1,
-                    tasks_per_minute=None,
-                    max_off_policy_steps=1,
-                )
-                watcher_task = asyncio.create_task(watcher.start())
+            watcher._prewarm_adapter_manifest = prewarm
+            with patch.object(watcher_module, "get_broadcast_dir", lambda path: Path(path)), patch.object(
+                watcher_module,
+                "get_step_path",
+                lambda path, step: Path(path) / f"step_{step}",
+            ), patch.object(
+                watcher_module,
+                "inference_weight_path",
+                lambda _config, path, _lora: f"http://source/{Path(path).name}",
+            ), patch.object(watcher_module, "stage_lora_adapter", stage), patch.object(
+                watcher_module, "_write_receivers_ready", lambda *_args, **_kwargs: None
+            ), patch.object(watcher_module, "adapter_stage_limit_seconds", lambda _step: 1.0):
                 dispatcher_task = asyncio.create_task(dispatcher.start())
                 try:
-                    await asyncio.wait_for(stage_started.wait(), 1.0)
-                    await asyncio.wait_for(rollout_started.wait(), 1.0)
+                    await asyncio.wait_for(first_rollout.wait(), 1.0)
+                    update_task = asyncio.create_task(watcher.apply_policy_update(1))
+                    await asyncio.wait_for(pool.ready_started.wait(), 1.0)
+                    await asyncio.sleep(0)
                     self.assertEqual(rollout_models, ["base-model"])
+                    self.assertTrue(dispatcher.weight_update_pending)
                     self.assertEqual(policy.version, 0)
                     self.assertEqual(policy.model_name, "base-model")
-                    self.assertEqual(updates, [])
-                    self.assertEqual(len(stage_calls), 1)
-                    self.assertEqual(stage_calls[0][0], "http://source/step_0")
-                    stage_release.set()
-                    await asyncio.wait_for(update_called.wait(), 1.0)
-                    self.assertEqual(len(stage_calls), 2)
-                    self.assertEqual(stage_calls[1][0], "http://source/step_1")
-                    self.assertEqual(stage_calls[0][1]["require_delta"], False)
-                    self.assertEqual(stage_calls[0][1].get("policy_step"), None)
-                    self.assertEqual(stage_calls[1][1]["policy_step"], 1)
-                    self.assertEqual(stage_results[0]["adapter_identity"], identities[0])
-                    self.assertEqual(updates[0][1]["step"], 1)
-                    self.assertEqual(updates[0][1]["expected_adapter_identity"], identities[1])
-                    self.assertEqual(policy.version, 1)
-                    self.assertEqual(policy.model_name, "adapter-slot1")
-                    self.assertEqual(watcher.verified_adapter_step, 1)
-                    self.assertEqual(watcher.verified_adapter_url, "http://source/step_1")
+                    pool.ready_release.set()
+                    if fail_ready:
+                        with self.assertRaisesRegex(RuntimeError, "policy v1 is not visible"):
+                            await asyncio.wait_for(update_task, 1.0)
+                        await asyncio.sleep(0)
+                        self.assertEqual(rollout_models, ["base-model"])
+                        self.assertTrue(dispatcher.weight_update_pending)
+                    else:
+                        await asyncio.wait_for(update_task, 1.0)
+                        await asyncio.wait_for(policy_one_rollout.wait(), 1.0)
+                        self.assertEqual(rollout_models, ["base-model", "adapter-slot1"])
+                        self.assertFalse(dispatcher.weight_update_pending)
+                        self.assertEqual(policy.version, 1)
+                        self.assertEqual(policy.model_name, "adapter-slot1")
                 finally:
+                    pool.ready_release.set()
                     rollout_release.set()
                     await dispatcher.stop()
-                    await asyncio.wait_for(watcher_task, 1.0)
                     await asyncio.wait_for(dispatcher_task, 1.0)
 
-        asyncio.run(run_test())
+    def test_real_dispatcher_stays_closed_until_policy_one_is_ready(self):
+        asyncio.run(self._run_real_dispatcher_ready_case(fail_ready=False))
 
-    def test_bootstrap_stage_boundary_rejects_invalid_external_stage(self):
-        watcher_module = load_weight_watcher_runtime()
+    def test_real_dispatcher_stays_closed_after_policy_one_ready_failure(self):
+        asyncio.run(self._run_real_dispatcher_ready_case(fail_ready=True))
 
-        async def run_test():
-            with tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                (root / "step_0").mkdir()
-                (root / "step_0" / "STABLE").touch()
-                config = SimpleNamespace(output_dir=root, max_steps=None)
-                policy = SimpleNamespace(version=0, model_name="base-model")
-                inference = SimpleNamespace(admin_clients=[object()], adapter_origin_base_urls=None)
-                watcher_module.get_broadcast_dir = lambda path: Path(path)
-                watcher_module.get_step_path = lambda path, step: Path(path) / f"step_{step}"
-                watcher_module.inference_weight_path = (
-                    lambda _config, path, _lora: f"http://source/{Path(path).name}"
-                )
-                watcher = watcher_module.WeightWatcher(
-                    config,
-                    policy=policy,
-                    inference=inference,
-                    observers=[],
-                    lora_name="adapter",
-                    ckpt_step=0,
-                )
-                for message in ("adapter identity mismatch", "adapter stage is not ready"):
-                    async def rejected_stage(*_args, _message=message, **_kwargs):
-                        raise RuntimeError(_message)
-
-                    watcher_module.stage_lora_adapter = rejected_stage
-                    with self.assertRaisesRegex(RuntimeError, message):
-                        await watcher.stage_bootstrap_adapter()
-                    self.assertFalse(watcher.bootstrap_staged)
-
-        asyncio.run(run_test())
-
-    def test_resume_setup_missing_policy_zero_fails_before_update(self):
-        orchestrator_module = load_orchestrator_runtime()
-        target_url = "http://source/step_1"
-        manifest = {
-            "files": [
-                {"name": "adapter_config.json", "size": 2, "sha256": "b" * 64},
-                {"name": "adapter_model.safetensors", "size": 8, "sha256": "a" * 64},
-            ]
+    def test_restart_resume_uses_saved_stage_and_updates_only_final_policy(self):
+        """A second real Orchestrator instance resumes the saved adapter chain."""
+        runtime = load_runtime()
+        module = runtime.orchestrator
+        target_identity = {
+            "source_url": "http://source/step_1",
+            "target_sha256": "a" * 64,
+            "target_size": 8,
+            "config_sha256": "b" * 64,
+            "config_size": 2,
         }
-        calls = []
+        staged = []
+        updates = []
 
-        class Response(io.BytesIO):
-            def __enter__(self):
-                return self
+        class Pool:
+            model_name = "base-model"
+            adapter_origin_base_urls = None
 
-            def __exit__(self, *_args):
-                self.close()
+            def __init__(self, loaded):
+                self.loaded = loaded
+                self.client = SimpleNamespace(base_url="http://inference", headers={})
+                self.admin_clients = [self.client]
+                self.train_clients = [self.client]
 
-        def fetch(url, timeout):
-            calls.append((url, timeout))
-            return Response(json.dumps(manifest).encode("utf-8"))
+            async def wait_for_ready(self, _name):
+                return None
 
-        inference = SimpleNamespace(
-            model_name="base-model", admin_clients=[object()], adapter_origin_base_urls=None,
-            updates=[], wait_for_ready=lambda _name: asyncio.sleep(0),
-        )
-        async def update_weights(*_args, **_kwargs):
-            inference.updates.append(True)
-            return []
-        inference.update_weights = update_weights
+            async def update_weights(self, path, **kwargs):
+                updates.append((self.loaded, path, kwargs))
+                return []
+
+            def update_model_name(self, name):
+                self.model_name = name
+
+            async def stop(self):
+                return None
+
+        class Env:
+            name = "train"
+            tasks = None
+            num_tasks = 1
+            config = SimpleNamespace(group_size=1, ratio=1.0)
+            sampler = SimpleNamespace(
+                samples_from_live_policy=True,
+                setup=lambda: asyncio.sleep(0),
+                connected_pools=[],
+            )
+            algorithm = SimpleNamespace(setup=lambda: asyncio.sleep(0), connected_pools=[])
 
         class TrainEnvs(list):
-            names = []
+            names = {"train"}
 
             def __init__(self, *_args, **_kwargs):
-                super().__init__()
+                super().__init__([Env()])
 
             async def start(self, **_kwargs):
                 return None
 
-        async def setup_policy_inference_pool(**_kwargs):
-            return None, inference
+            def shutdown(self):
+                return None
 
-        async def loaded_receipt(*_args):
-            return {
-                "source_url": target_url,
-                "target_sha256": "a" * 64,
-                "target_size": 8,
-                "config_sha256": "b" * 64,
-                "config_size": 2,
-            }
+        class Sender:
+            def close(self):
+                return None
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "step_1").mkdir()
-            (root / "step_1" / "STABLE").touch()
-            config = SimpleNamespace(
+        class Monitor:
+            def save_final_summary(self):
+                return None
+
+        class Periodic:
+            async def stop(self):
+                return None
+
+        files = [
+            {"name": "adapter_config.json", "size": 2, "sha256": "b" * 64},
+            {"name": "adapter_model.safetensors", "size": 8, "sha256": "a" * 64},
+        ]
+
+        def config_for(root):
+            return SimpleNamespace(
                 output_dir=root,
                 tokenizer="tokenizer",
                 model=SimpleNamespace(
@@ -1219,13 +1025,9 @@ class ResumeRecoveryTest(unittest.TestCase):
                 eval=None,
                 ckpt=SimpleNamespace(resume_step=1, skip_progress=True, wait_for_weights_timeout=1.0),
                 weight_broadcast=SimpleNamespace(
-                    type="filesystem",
-                    source_url="http://source",
-                    source_dir=root,
-                    timeout=1.0,
+                    type="filesystem", source_url="http://source", source_dir=root, timeout=1.0
                 ),
                 renderer=None,
-                output_dir_name=root.name,
                 wandb=None,
                 swanlab=None,
                 prime_monitor=None,
@@ -1244,167 +1046,122 @@ class ResumeRecoveryTest(unittest.TestCase):
                 max_steps=None,
                 bench=False,
             )
-            instance = orchestrator_module.Orchestrator.__new__(orchestrator_module.Orchestrator)
-            instance.__dict__.update(
-                config=config, progress=SimpleNamespace(step=0), ckpt_manager=object(),
-                policy=SimpleNamespace(version=0, model_name=""), stopped=asyncio.Event(),
-                model_express=None, resume_step=None, resume_policy_step=None, lora_name=None,
-                eval_envs=None,
-            )
-            orchestrator_module.set_default_executor = lambda: None
-            orchestrator_module.to_toml_dict = lambda _config: {}
-            orchestrator_module.setup_tokenizer = lambda _tokenizer: SimpleNamespace(vocab_size=1)
-            orchestrator_module.setup_policy_inference_pool = setup_policy_inference_pool
-            orchestrator_module.setup_monitor = lambda **_kwargs: object()
-            orchestrator_module.setup_filters = lambda *_args, **_kwargs: []
-            orchestrator_module.TrainEnvs = TrainEnvs
-            orchestrator_module.get_log_dir = lambda path: path
-            orchestrator_module.setup_training_batch_sender = lambda *_args: object()
-            orchestrator_module.get_broadcast_dir = lambda path: root
-            orchestrator_module.get_step_path = lambda _path, step: root / f"step_{step}"
-            orchestrator_module.get_all_ckpt_steps = lambda _path: [1]
-            orchestrator_module.get_weight_dir = lambda *_args, **_kwargs: root / "step_1"
-            orchestrator_module.inference_weight_path = (
-                lambda _config, path, _lora: target_url if Path(path).name == "step_1" else str(path)
-            )
-            orchestrator_module.common_loaded_lora_receipt = loaded_receipt
-            orchestrator_module.adapter_stage_limit_seconds = lambda _step: 600.0
-            orchestrator_module.urlopen = fetch
-            orchestrator_module._adapter_file_records = (
-                lambda value: {item["name"]: item for item in value["files"]}
-            )
-            orchestrator_module.validate_adapter_manifest = lambda *_args, **_kwargs: None
-            orchestrator_module.get_logger = lambda: SimpleNamespace(
-                debug=lambda *_args, **_kwargs: None,
-                info=lambda *_args, **_kwargs: None,
-                success=lambda *_args, **_kwargs: None,
-                warning=lambda *_args, **_kwargs: None,
-            )
-            with self.assertRaisesRegex(RuntimeError, "exact predecessor v0 is not STABLE"):
-                asyncio.run(instance.setup())
-        self.assertEqual(inference.updates, [])
-        self.assertEqual(
-            calls,
-            [
-                (target_url + "/adapter_manifest.json", 30),
-                (target_url + "/adapter_manifest.json", 600.0),
-            ],
-        )
 
-    def test_resume_setup_stages_chain_and_updates_final_policy(self):
-        module = load_orchestrator_runtime()
-        target_url = "http://source/step_1"
-        files = [
-            {"name": "adapter_config.json", "size": 2, "sha256": "b" * 64},
-            {"name": "adapter_model.safetensors", "size": 8, "sha256": "a" * 64},
-        ]
-        manifests = {
-            "step_1": {
-                "version": 1, "kind": "lora-adapter", "mode": "delta",
-                "transport": "chunked-shuffled-xor-zstd", "target_step": 1,
-                "base_step": 0, "target_size": 8, "target_sha256": "a" * 64,
-                "config_size": 2, "config_sha256": "b" * 64,
-                "base_size": 8, "base_sha256": "a" * 64,
-                "base_config_sha256": "b" * 64, "files": files,
-            },
-            "step_0": {"version": 1, "kind": "lora-adapter", "mode": "delta",
-                       "transport": "chunked-shuffled-xor-zstd", "target_step": 0,
-                       "base_step": -1, "files": files},
-        }
-        staged, updates, calls = [], [], []
+        async def run_instance(root, loaded):
+            pool = Pool(loaded)
+            ckpt_manager = SimpleNamespace(ckpt_dir=root, load=lambda *_args, **_kwargs: None)
 
-        class Response(io.BytesIO):
-            def __enter__(self):
-                return self
-            def __exit__(self, *_args):
-                self.close()
+            async def stage(_clients, path, **kwargs):
+                step = int(Path(path).name.split("_")[-1])
+                identity = dict(target_identity)
+                identity["source_url"] = f"http://source/step_{step}"
+                staged.append((loaded, step, kwargs))
+                return {
+                    "adapter_identity": identity,
+                    "transfer_wall_seconds": 0.0,
+                    "origin_stage_seconds": 0.0,
+                    "peer_stage_seconds": 0.0,
+                    "reconstruction_wall_seconds": 0.0,
+                }
 
-        def fetch(url, timeout):
-            calls.append((url, timeout))
-            return Response(json.dumps(manifests[Path(url).parent.name]).encode("utf-8"))
+            def save_receivers_ready(step_path, **_kwargs):
+                (Path(step_path) / "receivers-ready.json").write_text(
+                    json.dumps({"step": int(Path(step_path).name.split("_")[-1])}), encoding="utf-8"
+                )
 
-        inference = SimpleNamespace(
-            model_name="base-model", admin_clients=[object()], adapter_origin_base_urls=None,
-            updates=[], wait_for_ready=lambda _name: asyncio.sleep(0),
-            update_model_name=lambda name: setattr(inference, "model_name", name),
-        )
-        async def update_weights(weights_path, **kwargs):
-            updates.append((weights_path, kwargs))
-            return []
-        inference.update_weights = update_weights
+            manifest = {
+                "version": 1,
+                "kind": "lora-adapter",
+                "mode": "delta",
+                "transport": "chunked-shuffled-xor-zstd",
+                "target_step": 1,
+                "base_step": 0,
+                "files": files,
+            }
 
-        class TrainEnvs(list):
-            names = []
-            def __init__(self, *_args, **_kwargs):
-                super().__init__()
-            async def start(self, **_kwargs):
-                return None
+            class Response(io.BytesIO):
+                def __enter__(self):
+                    return self
 
-        async def setup_pool(**_kwargs):
-            return None, inference
-        async def stage(*_args, **kwargs):
-            staged.append((str(_args[1]), kwargs))
-            return {"adapter_identity": {"source_url": str(_args[1])}}
+                def __exit__(self, *_args):
+                    self.close()
 
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            for step in (0, 1):
-                (root / f"step_{step}").mkdir()
-                (root / f"step_{step}" / "STABLE").touch()
-            config = SimpleNamespace(
-                output_dir=root, tokenizer="tokenizer",
-                model=SimpleNamespace(name="base-model", client=SimpleNamespace(base_url=["http://inference"]), lora=SimpleNamespace(name="adapter")),
-                log=SimpleNamespace(level="INFO", json_logging=False, vf_level="WARN", interval=1.0),
-                train=SimpleNamespace(env=[], ratio_stages=None), eval=None,
-                ckpt=SimpleNamespace(resume_step=1, skip_progress=True, wait_for_weights_timeout=1.0),
-                weight_broadcast=SimpleNamespace(type="filesystem", source_url="http://source", source_dir=root, timeout=1.0),
-                renderer=None, wandb=None, swanlab=None, prime_monitor=None, file_monitor=None,
-                heartbeat=None, collect_inference_metrics=False, inference_metrics_roles=[],
-                pre_batch_filters=[], post_batch_filters=[], rollout_transport="memory",
-                max_inflight_rollouts=1, tasks_per_minute=None, max_off_policy_steps=1,
-                batch_size=1, token_batch_size=1, max_steps=None, bench=False,
-            )
-            instance = module.Orchestrator.__new__(module.Orchestrator)
-            instance.__dict__.update(
-                config=config, progress=SimpleNamespace(step=0), ckpt_manager=object(),
-                policy=SimpleNamespace(version=0, model_name=""), stopped=asyncio.Event(),
-                model_express=None, resume_step=None, resume_policy_step=None, lora_name=None,
-                eval_envs=None,
-            )
-            module.set_default_executor = lambda: None
-            module.to_toml_dict = lambda _config: {}
-            module.setup_tokenizer = lambda _name: SimpleNamespace(vocab_size=1)
-            module.setup_policy_inference_pool = setup_pool
-            module.setup_monitor = lambda **_kwargs: object()
-            module.setup_filters = lambda *_args, **_kwargs: []
-            module.TrainEnvs = TrainEnvs
-            module.get_log_dir = lambda path: path
-            module.setup_training_batch_sender = lambda *_args: object()
-            module.get_broadcast_dir = lambda _path: root
-            module.get_step_path = lambda _path, step: root / f"step_{step}"
-            module.get_all_ckpt_steps = lambda _path: [0, 1]
-            module.get_weight_dir = lambda _config, step, **_kwargs: root / f"step_{step}"
-            module.inference_weight_path = lambda _config, path, _lora: f"http://source/{Path(path).name}"
-            module.common_loaded_lora_receipt = lambda *_args: asyncio.sleep(0, result=None)
-            module.adapter_stage_limit_seconds = lambda _step: 600.0
-            module.urlopen = fetch
-            module.stage_lora_adapter = stage
-            module._adapter_file_records = lambda value: {item["name"]: item for item in value["files"]}
-            module.validate_adapter_manifest = lambda *_args, **_kwargs: None
-            module.get_logger = lambda: SimpleNamespace(
-                debug=lambda *_args, **_kwargs: None, info=lambda *_args, **_kwargs: None,
-                success=lambda *_args, **_kwargs: None, warning=lambda *_args, **_kwargs: None,
-            )
-            asyncio.run(instance.setup())
-        self.assertEqual([item[0] for item in staged], ["http://source/step_0", target_url])
-        self.assertEqual([item[1]["policy_step"] for item in staged], [None, 1])
-        self.assertEqual(len(updates), 1)
-        self.assertEqual(updates[0][1]["step"], 1)
-        self.assertEqual(updates[0][1]["expected_adapter_identity"]["source_url"], target_url)
-        self.assertEqual(instance.policy.version, 1)
-        self.assertEqual(instance.policy.model_name, "adapter")
-        self.assertEqual(inference.model_name, "adapter")
-        self.assertEqual(len(calls), 2)
+            def fetch(_url, _timeout):
+                return Response(json.dumps(manifest).encode("utf-8"))
+
+            def loaded_receipt(*_args):
+                return asyncio.sleep(0, result=target_identity if loaded else None)
+
+            patches = [
+                patch.object(module, "setup_logger", lambda *_args, **_kwargs: None),
+                patch.object(module, "intercept_vf_logging", lambda *_args, **_kwargs: None),
+                patch.object(module, "setup_ckpt_manager", lambda *_args: ckpt_manager),
+                patch.object(
+                    module,
+                    "setup_policy_inference_pool",
+                    lambda **_kwargs: asyncio.sleep(0, result=(None, pool)),
+                ),
+                patch.object(module, "setup_tokenizer", lambda _name: SimpleNamespace(vocab_size=1)),
+                patch.object(module, "setup_monitor", lambda **_kwargs: Monitor()),
+                patch.object(module, "setup_filters", lambda *_args, **_kwargs: []),
+                patch.object(module, "TrainEnvs", TrainEnvs),
+                patch.object(
+                    module,
+                    "TrainSink",
+                    lambda *_args, **_kwargs: SimpleNamespace(),
+                ),
+                patch.object(module, "setup_training_batch_sender", lambda *_args: Sender()),
+                patch.object(module, "get_log_dir", lambda path: path),
+                patch.object(module, "to_toml_dict", lambda _config: {}),
+                patch.object(module, "get_broadcast_dir", lambda path: Path(path)),
+                patch.object(module, "get_step_path", lambda path, step: Path(path) / f"step_{step}"),
+                patch.object(module, "get_all_ckpt_steps", lambda _path: [0, 1]),
+                patch.object(module, "get_weight_dir", lambda _config, step, **_kwargs: root / f"step_{step}"),
+                patch.object(
+                    module,
+                    "inference_weight_path",
+                    lambda _config, path, _lora: f"http://source/{Path(path).name}",
+                ),
+                patch.object(module, "_verify_startup_adapter_delta", lambda *_args, **_kwargs: None),
+                patch.object(module, "common_loaded_lora_receipt", loaded_receipt),
+                patch.object(module, "stage_lora_adapter", stage),
+                patch.object(module, "_write_receivers_ready", save_receivers_ready),
+                patch.object(module, "urlopen", fetch),
+                patch.object(
+                    module,
+                    "_adapter_file_records",
+                    lambda value: {item["name"]: item for item in value["files"]},
+                ),
+                patch.object(module, "validate_adapter_manifest", lambda *_args, **_kwargs: None),
+                patch.object(module, "PeriodicLogger", lambda **_kwargs: Periodic()),
+            ]
+            with contextlib.ExitStack() as stack:
+                for item in patches:
+                    stack.enter_context(item)
+                instance = module.Orchestrator(config_for(root))
+                await instance.setup()
+                return instance
+
+        async def run_test():
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for step in (0, 1):
+                    (root / f"step_{step}").mkdir()
+                    (root / f"step_{step}" / "STABLE").touch()
+                first = await run_instance(root, loaded=False)
+                self.assertEqual([step for _loaded, step, _kwargs in staged], [0, 1])
+                self.assertEqual(len(updates), 1)
+                self.assertEqual(updates[0][2]["step"], 1)
+                self.assertTrue((root / "step_1" / "receivers-ready.json").is_file())
+                await first.stop()
+                staged.clear()
+                second = await run_instance(root, loaded=True)
+                self.assertEqual([step for _loaded, step, _kwargs in staged], [1])
+                self.assertEqual(len(updates), 2)
+                self.assertEqual(updates[1][2]["step"], 1)
+                await second.stop()
+
+        asyncio.run(run_test())
 
     def test_server_fallback_stages_in_the_host_process(self):
         source = SERVER_PATH.read_text(encoding="utf-8")
