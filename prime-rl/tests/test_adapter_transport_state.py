@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import socket
 import socketserver
 import signal
 import subprocess
@@ -344,6 +345,16 @@ def load_filesystem_module():
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = previous
+
+
+def load_relay_module():
+    path = ROOT / "src/prime_rl/inference/relay.py"
+    spec = importlib.util.spec_from_file_location("relay_peer_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["relay_peer_test"] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def load_server_stage_method(stage_worker, publish_lock=None):
@@ -1157,13 +1168,117 @@ class AdapterTransportStateTest(unittest.TestCase):
             sidecar = destination / "adapter_model.safetensors.sha256"
             self.assertEqual(sidecar.read_text(encoding="ascii").strip(), hashlib.sha256(model).hexdigest())
             self.assertTrue((destination / "adapter_manifest.json").is_file())
-            self.assertNotIn(
-                "transport",
-                json.loads((destination / "adapter_manifest.json").read_text(encoding="utf-8")),
+            published_manifest = json.loads(
+                (destination / "adapter_manifest.json").read_text(encoding="utf-8")
             )
+            self.assertEqual(published_manifest["transport"], "chunked-full-zstd")
+            self.assertIn("bundle", published_manifest)
             relay_manifest = json.loads((destination / "relay_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(relay_manifest["transport"], "full")
             self.assertIn("adapter_model.safetensors", relay_manifest["files"])
+
+    def test_full_zstd_peer_client_stages_virtual_bundle(self):
+        filesystem = load_filesystem_module()
+        relay = load_relay_module()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_streams = os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS")
+        old_lanes = filesystem._bundle_responsive_source_urls
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            config = b"{}\n"
+            model = b"a" * (1024 * 64)
+            (source / "adapter_config.json").write_bytes(config)
+            (source / "adapter_model.safetensors").write_bytes(model)
+            source_manifest = adapter_delta.publish_adapter_manifest(
+                source,
+                target_step=0,
+                chunk_size=1024,
+                max_workers=4,
+            )
+            self.assertEqual(source_manifest["transport"], "chunked-full-zstd")
+            self.assertEqual(len(source_manifest["chunks"]), 64)
+
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                relay_port = probe.getsockname()[1]
+            source_url = (
+                f"http://127.0.0.1:{relay_port}/glm-1/run_glm-1/broadcasts/step_0"
+            )
+            relay_root = root / "relay-cache"
+            cache = relay_root / hashlib.sha256(source_url.encode()).hexdigest()
+            cache.mkdir(parents=True)
+            (cache / "transport-chunks").mkdir()
+            (cache / "adapter_config.json").write_bytes(config)
+            (cache / "adapter_model.safetensors").write_bytes(model)
+            for item in source_manifest["chunks"]:
+                name = item["file"]
+                (cache / "transport-chunks" / name).write_bytes((source / name).read_bytes())
+            transport = {
+                "mode": "full",
+                "transport": "chunked-full-zstd",
+                "source_manifest": source_manifest,
+                "target_size": len(model),
+                "target_sha256": source_manifest["target_sha256"],
+                "config_size": len(config),
+                "config_sha256": source_manifest["config_sha256"],
+                "chunks": source_manifest["chunks"],
+            }
+            validated_files = {
+                item["name"]: item for item in source_manifest["files"]
+            }
+            filesystem._publish_relay_manifest(
+                cache,
+                source_url,
+                source_manifest,
+                transport,
+                validated_files,
+            )
+            (cache / "READY").write_text("ready\n", encoding="ascii")
+            (relay_root / f".{cache.name}.readers.lock").touch()
+            relay_config = relay.RelayConfig(
+                relay_root,
+                [f"http://127.0.0.1:{relay_port}/glm-1"],
+                relay_port,
+                relay_port,
+            )
+            server = relay.RelayServer(
+                ("127.0.0.1", relay_port), relay.RelayHandler, relay_config
+            )
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            os.environ["PRIME_LORA_CACHE_DIR"] = str(root / "peer-cache")
+            os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "1"
+            filesystem._bundle_responsive_source_urls = lambda source_url, *_args: [
+                f"{source_url}#lane-{index}" for index in range(64)
+            ]
+            try:
+                destination = filesystem.stage_lora_adapter_files(
+                    source_url,
+                    require_bundle=True,
+                )
+            finally:
+                filesystem._bundle_responsive_source_urls = old_lanes
+                if old_cache is None:
+                    os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+                else:
+                    os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+                if old_streams is None:
+                    os.environ.pop("PRIME_LORA_DOWNLOAD_STREAMS", None)
+                else:
+                    os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = old_streams
+                server.shutdown()
+                server_thread.join()
+                server.server_close()
+            self.assertEqual(
+                (destination / "adapter_model.safetensors").read_bytes(), model
+            )
+            published = json.loads(
+                (destination / "adapter_manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(published["transport"], "chunked-full-zstd")
+            self.assertEqual(published["bundle"], source_manifest["bundle"])
 
     def test_full_stage_rejects_corrupt_wire_chunk(self):
         filesystem = load_filesystem_module()
@@ -1371,6 +1486,167 @@ class AdapterTransportStateTest(unittest.TestCase):
             filesystem._relay_manifest_matches = old_relay_match
             filesystem._cleanup_adapter_caches = old_cleanup
             filesystem._bundle_responsive_source_urls = old_lane_sources
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_full_bundle_ready_cache_rejects_stale_bundle_identity(self):
+        filesystem = load_filesystem_module()
+        source_url = "http://127.0.0.1:18100/run/broadcasts/step_0"
+        config = b"{}\n"
+        model = b"model"
+        config_sha = hashlib.sha256(config).hexdigest()
+        model_sha = hashlib.sha256(model).hexdigest()
+        wire = b"wire"
+        wire_sha = hashlib.sha256(wire).hexdigest()
+        new_bundle = {
+            "path": ".adapter-transport-bundle",
+            "size": len(wire),
+            "sha256": hashlib.sha256(wire).hexdigest(),
+        }
+        old_bundle = {**new_bundle, "sha256": "0" * 64}
+        source_manifest = {
+            "version": 1,
+            "kind": "lora-adapter",
+            "mode": "full",
+            "transport": "chunked-full-zstd",
+            "target_step": 0,
+            "files": [
+                {"name": "adapter_config.json", "size": len(config), "sha256": config_sha},
+                {"name": "adapter_model.safetensors", "size": len(model), "sha256": model_sha},
+            ],
+            "bundle": new_bundle,
+            "chunks": [
+                {
+                    "file": "chunk-0",
+                    "offset": 0,
+                    "raw_size": len(model),
+                    "wire_size": len(wire),
+                    "wire_sha256": wire_sha,
+                    "raw_sha256": model_sha,
+                    "codec": "zstd",
+                }
+            ],
+        }
+        transport = {
+            "version": 1,
+            "mode": "full",
+            "transport": "chunked-full-zstd",
+            "source_manifest": source_manifest,
+            "target_sha256": model_sha,
+            "target_size": len(model),
+            "config_sha256": config_sha,
+            "config_size": len(config),
+            "chunks": [
+                {
+                    "file": "chunk-0",
+                    "offset": 0,
+                    "raw_size": len(model),
+                    "wire_size": len(wire),
+                    "wire_sha256": wire_sha,
+                    "raw_sha256": model_sha,
+                }
+            ],
+        }
+        manifest = {
+            "version": 1,
+            "source_url": source_url,
+            "files": {
+                "adapter_config.json": {"size": len(config), "sha256": config_sha},
+                "adapter_model.safetensors": {"size": len(model), "sha256": model_sha},
+            },
+        }
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_reader = filesystem._read_chunked_xor_manifest
+        old_source_manifest = filesystem._source_manifest
+        old_cleanup = filesystem._cleanup_adapter_caches
+        old_stage = filesystem._stage_chunked_xor_adapter
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path(source_url)
+                destination.mkdir(parents=True)
+                (destination / "adapter_config.json").write_bytes(config)
+                (destination / "adapter_model.safetensors").write_bytes(model)
+                (destination / "READY").write_text("ready\n", encoding="ascii")
+                (destination / "transport-chunks").mkdir()
+                (destination / "transport-chunks" / "chunk-0").write_bytes(wire)
+                adapter_manifest_path = destination / "adapter_manifest.json"
+                adapter_manifest_path.write_text(json.dumps(source_manifest), encoding="utf-8")
+                relay_files = {
+                    "adapter_manifest.json": {
+                        "path": "adapter_manifest.json",
+                        "size": adapter_manifest_path.stat().st_size,
+                        "sha256": hashlib.sha256(adapter_manifest_path.read_bytes()).hexdigest(),
+                    },
+                    "adapter_config.json": {
+                        "path": "adapter_config.json",
+                        "size": len(config),
+                        "sha256": config_sha,
+                    },
+                    "adapter_model.safetensors": {
+                        "path": "adapter_model.safetensors",
+                        "size": len(model),
+                        "sha256": model_sha,
+                    },
+                    "chunk-0": {
+                        "path": "transport-chunks/chunk-0",
+                        "size": len(wire),
+                        "sha256": wire_sha,
+                    },
+                }
+                (destination / "relay_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "source_url": source_url,
+                            "transport": "full",
+                            "files": relay_files,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                self.assertTrue(filesystem._relay_manifest_matches(destination, source_url, transport))
+                stale_transport = json.loads(json.dumps(transport))
+                stale_transport["source_manifest"]["bundle"]["sha256"] = "0" * 64
+                self.assertFalse(
+                    filesystem._relay_manifest_matches(destination, source_url, stale_transport)
+                )
+                (destination / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                (destination / "transport.json").write_text(
+                    json.dumps(
+                        {
+                            "mode": "full",
+                            "transport": "chunked-full-zstd",
+                            "source_url": source_url,
+                            "target_sha256": model_sha,
+                            "bundle": {**old_bundle, "url": f"{source_url}/.adapter-transport-bundle"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                filesystem._read_chunked_xor_manifest = lambda *_args, **_kwargs: transport
+                filesystem._source_manifest = lambda *_args, **_kwargs: manifest
+                filesystem._cleanup_adapter_caches = lambda *_args, **_kwargs: True
+                calls = []
+
+                def stage_again(*args, **kwargs):
+                    calls.append((args, kwargs))
+                    return destination
+
+                filesystem._stage_chunked_xor_adapter = stage_again
+                result = filesystem.stage_lora_adapter_files(
+                    source_url,
+                    require_bundle=True,
+                )
+                self.assertEqual(result, destination)
+                self.assertEqual(len(calls), 1)
+        finally:
+            filesystem._read_chunked_xor_manifest = old_reader
+            filesystem._source_manifest = old_source_manifest
+            filesystem._cleanup_adapter_caches = old_cleanup
+            filesystem._stage_chunked_xor_adapter = old_stage
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)
             else:

@@ -256,6 +256,9 @@ class DownloadSchedulerTest(unittest.TestCase):
                     raise filesystem.URLError("connection reset")
                 return super().read(amount)
 
+            def read1(self, amount=-1):
+                return self.read(amount)
+
             def __enter__(self):
                 return self
 
@@ -308,6 +311,152 @@ class DownloadSchedulerTest(unittest.TestCase):
         self.assertEqual(calls[0][1:], (0, len(payload) - 1))
         self.assertEqual(calls[1][1:], (3, len(payload) - 1))
         self.assertEqual(calls[0][0], calls[1][0])
+
+    def test_bundle_lane_uses_incremental_reads_for_slow_stream(self):
+        filesystem = load_filesystem_module()
+        payload = b"abcdefgh"
+        digest = hashlib.sha256(payload).hexdigest()
+        item = {
+            "file": "chunk-0",
+            "offset": 0,
+            "bundle_offset": 0,
+            "raw_size": len(payload),
+            "wire_size": len(payload),
+            "wire_sha256": digest,
+            "raw_sha256": digest,
+        }
+        bundle = {"size": len(payload), "sha256": digest}
+        lane = {
+            "url": "http://source:18100/.adapter-transport-bundle",
+            "start": 0,
+            "end": len(payload) - 1,
+            "wire_bytes": len(payload),
+            "chunks": [item["file"]],
+        }
+        calls = []
+        clock = [0.0]
+
+        class Response:
+            status = 206
+
+            def __init__(self):
+                self.position = 0
+                self.headers = {
+                    "Content-Length": str(len(payload)),
+                    "Content-Range": f"bytes 0-{len(payload) - 1}/{len(payload)}",
+                    "ETag": f'"{digest}"',
+                }
+
+            def read1(self, _amount):
+                clock[0] += 6
+                value = payload[self.position : self.position + 1]
+                self.position += len(value)
+                return value
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, timeout))
+            return Response()
+
+        def is_completed(_index, _item, path):
+            return path.with_name(f"{path.name}.done").exists()
+
+        def process_chunk(_index, _item):
+            (root / "chunk-0.done").write_text("done\n", encoding="ascii")
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_monotonic = filesystem.time.monotonic
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.monotonic = lambda: clock[0]
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                filesystem._download_bundle_lane(
+                    bundle,
+                    lane,
+                    [item],
+                    root,
+                    is_completed=is_completed,
+                    process_chunk=process_chunk,
+                    deadline=120.0,
+                )
+                self.assertEqual((root / "chunk-0").read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.monotonic = old_monotonic
+        self.assertGreater(clock[0], filesystem._ADAPTER_LANE_TIMEOUT_S)
+        self.assertLessEqual(calls[0][1], filesystem._ADAPTER_LANE_TIMEOUT_S)
+
+    def test_bundle_lane_stalled_stream_hits_deadline(self):
+        filesystem = load_filesystem_module()
+        payload = b"stall"
+        digest = hashlib.sha256(payload).hexdigest()
+        item = {
+            "file": "chunk-0",
+            "offset": 0,
+            "bundle_offset": 0,
+            "raw_size": len(payload),
+            "wire_size": len(payload),
+            "wire_sha256": digest,
+            "raw_sha256": digest,
+        }
+        lane = {
+            "url": "http://source:18100/.adapter-transport-bundle",
+            "start": 0,
+            "end": len(payload) - 1,
+            "wire_bytes": len(payload),
+            "chunks": [item["file"]],
+        }
+        clock = [0.0]
+        calls = []
+
+        class Response:
+            status = 206
+            headers = {
+                "Content-Length": str(len(payload)),
+                "Content-Range": f"bytes 0-{len(payload) - 1}/{len(payload)}",
+                "ETag": f'"{digest}"',
+            }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read1(self, _amount):
+                clock[0] += 46
+                raise TimeoutError("stalled stream")
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, timeout))
+            return Response()
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_monotonic = filesystem.time.monotonic
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.monotonic = lambda: clock[0]
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaises(TimeoutError):
+                    filesystem._download_bundle_lane(
+                        {"size": len(payload), "sha256": digest},
+                        lane,
+                        [item],
+                        Path(temporary),
+                        is_completed=lambda *_args: False,
+                        process_chunk=lambda *_args: None,
+                        deadline=45.0,
+                    )
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.monotonic = old_monotonic
+        self.assertEqual(len(calls), 1)
 
     def test_bundle_lanes_open_one_distinct_range_each(self):
         filesystem = load_filesystem_module()

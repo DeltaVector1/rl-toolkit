@@ -1904,8 +1904,6 @@ def _publish_relay_manifest(
         relay_source_manifest = source_manifest
         if mode == "full" and transport_name == _ADAPTER_FULL_TRANSPORT:
             relay_source_manifest = dict(source_manifest)
-            for key in ("transport", "chunk_count", "encoded_size"):
-                relay_source_manifest.pop(key, None)
             if not has_bundle:
                 relay_source_manifest.pop("chunks", None)
         _write_json(adapter_manifest_path, relay_source_manifest, parent_fd=directory_fd)
@@ -2103,19 +2101,50 @@ def _relay_manifest_matches(
     config_sha256 = transport.get("config_sha256")
     target_size = transport.get("target_size")
     target_sha256 = transport.get("target_sha256")
+    source_manifest = transport.get("source_manifest")
+    bundle_manifest = None
     if mode == "delta":
         adapter_specs = {
             _ADAPTER_FILES[0]: (config_size, config_sha256),
             _ADAPTER_FILES[1]: (target_size, target_sha256),
         }
     elif mode == "full":
-        source_manifest = transport.get("source_manifest")
         source_files = source_manifest.get("files") if isinstance(source_manifest, dict) else None
         adapter_specs = {}
         if isinstance(source_files, list):
             for item in source_files:
                 if isinstance(item, dict) and isinstance(item.get("name"), str):
                     adapter_specs[item["name"]] = (item.get("size"), item.get("sha256"))
+        bundle_manifest = source_manifest.get("bundle") if isinstance(source_manifest, dict) else None
+        if bundle_manifest is not None:
+            if (
+                not isinstance(bundle_manifest, dict)
+                or bundle_manifest.get("path") != _ADAPTER_BUNDLE_PATH
+                or type(bundle_manifest.get("size")) is not int
+                or bundle_manifest["size"] <= 0
+                or not isinstance(bundle_manifest.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", bundle_manifest["sha256"]) is None
+            ):
+                return False
+            try:
+                local_manifest = json.loads(
+                    _read_text_nofollow(
+                        _ADAPTER_MANIFEST,
+                        encoding="utf-8",
+                        dir_fd=directory_fd,
+                        max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                    )
+                )
+            except (FileNotFoundError, OSError, ValueError):
+                return False
+            local_bundle = local_manifest.get("bundle") if isinstance(local_manifest, dict) else None
+            if (
+                not isinstance(local_manifest, dict)
+                or local_manifest.get("transport") != _ADAPTER_FULL_TRANSPORT
+                or not isinstance(local_bundle, dict)
+                or any(local_bundle.get(key) != bundle_manifest.get(key) for key in ("path", "size", "sha256"))
+            ):
+                return False
     else:
         return False
     for filename, (size, digest) in adapter_specs.items():
@@ -2125,10 +2154,11 @@ def _relay_manifest_matches(
     if set(expected) != set(_ADAPTER_FILES) | {_ADAPTER_MANIFEST}:
         return False
 
-    chunks = transport.get("chunks") if mode == "delta" else None
-    if mode == "delta":
+    chunks = transport.get("chunks") if mode == "delta" or bundle_manifest is not None else None
+    if chunks is not None:
         if not isinstance(chunks, list) or not chunks:
             return False
+        total_wire_size = 0
         for item in chunks:
             if not isinstance(item, dict):
                 return False
@@ -2148,6 +2178,27 @@ def _relay_manifest_matches(
             ):
                 return False
             expected[filename] = (f"transport-chunks/{filename}", size, digest)
+            total_wire_size += size
+        if bundle_manifest is not None:
+            if total_wire_size != bundle_manifest["size"]:
+                return False
+            local_chunks = local_manifest.get("chunks")
+            if not isinstance(local_chunks, list) or len(local_chunks) != len(chunks):
+                return False
+            if not all(isinstance(item, dict) for item in local_chunks):
+                return False
+            fields = ("file", "offset", "raw_size", "wire_size", "wire_sha256", "raw_sha256")
+            try:
+                local_chunks = sorted(local_chunks, key=lambda item: int(item.get("offset", -1)))
+            except (TypeError, ValueError):
+                return False
+            for remote_item, local_item in zip(
+                chunks,
+                local_chunks,
+                strict=True,
+            ):
+                if any(local_item.get(field) != remote_item.get(field) for field in fields):
+                    return False
     if set(files) != set(expected):
         return False
     for filename, (relative, size, digest) in expected.items():
@@ -3158,10 +3209,13 @@ def _download_bundle_lane(
         raise OSError("adapter bundle lane range differs from its chunks")
 
     def read_exact(response, amount: int, output=None) -> None:
+        read_available = getattr(response, "read1", None)
+        if read_available is None:
+            read_available = response.read
         while amount:
             _check_deadline(deadline, cancel_event)
             try:
-                data = response.read(min(16 * 1024 * 1024, amount))
+                data = read_available(min(256 * 1024, amount))
             except (OSError, TimeoutError, URLError) as exc:
                 raise _BundleNetworkError("adapter bundle lane response ended") from exc
             if not data:
@@ -3201,12 +3255,11 @@ def _download_bundle_lane(
             raise OSError("adapter bundle resume offset is outside its lane")
         request = urllib.request.Request(url, headers={"Range": f"bytes={request_start}-{end}"})
         try:
-            timeout = _configured_chunk_timeout()
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("adapter delta staging exceeded its time limit")
-                timeout = min(timeout, remaining)
+            timeout = _request_timeout(
+                deadline,
+                cancel_event,
+                maximum=_ADAPTER_LANE_TIMEOUT_S,
+            )
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 if response.status != 206:
                     raise OSError("adapter bundle server did not honor byte range")
@@ -5600,9 +5653,29 @@ def stage_lora_adapter_files(
                     )
                 except (FileNotFoundError, OSError, ValueError):
                     local_manifest = None
+                bundle_proof = None
+                if bundle is not None:
+                    try:
+                        _reject_symlink_path(destination / "transport.json", "adapter transport record")
+                        bundle_proof = json.loads(
+                            _read_text_nofollow(
+                                destination / "transport.json",
+                                encoding="utf-8",
+                                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                            )
+                        )
+                    except (FileNotFoundError, OSError, ValueError):
+                        bundle_proof = None
                 if (
                     local_manifest == manifest
                     and isinstance(transport, dict)
+                    and (
+                        bundle is None
+                        or (
+                            isinstance(bundle_proof, dict)
+                            and _bundle_identity_matches(bundle_proof.get("bundle"), bundle)
+                        )
+                    )
                     and _relay_manifest_matches(destination, source_url, transport)
                     and _full_cache_matches_manifest(destination, files)
                 ):
