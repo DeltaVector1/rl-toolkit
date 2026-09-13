@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -486,6 +487,128 @@ def _safe_request_path(handler: SimpleHTTPRequestHandler) -> tuple[Path, tuple[s
     return path, pieces
 
 
+class _VirtualBundle:
+    """Read existing encoded chunks as one range-readable stream."""
+
+    def __init__(self, chunks: list[tuple[Path, int]], start: int):
+        self._chunks = chunks
+        self._source = None
+        self._chunk_index = 0
+        self._chunk_offset = 0
+        self._remaining = sum(size for _path, size in chunks) - start
+        for index, (_path, size) in enumerate(chunks):
+            if start < size:
+                self._chunk_index = index
+                self._chunk_offset = start
+                break
+            start -= size
+        else:
+            self._chunk_index = len(chunks)
+
+    def read(self, limit: int) -> bytes:
+        if limit <= 0 or self._remaining <= 0:
+            return b""
+        output = bytearray()
+        while len(output) < limit and self._remaining:
+            if self._source is None:
+                path, size = self._chunks[self._chunk_index]
+                try:
+                    self._source = os.fdopen(
+                        os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)),
+                        "rb",
+                    )
+                    self._source.seek(self._chunk_offset)
+                except OSError as exc:
+                    raise UpgradeError(f"cannot read bundle chunk {path.name}") from exc
+            count = min(limit - len(output), self._remaining)
+            chunk = self._source.read(count)
+            if not chunk:
+                self.close()
+                raise UpgradeError("bundle chunk ended before its declared size")
+            output.extend(chunk)
+            self._remaining -= len(chunk)
+            self._chunk_offset += len(chunk)
+            if self._chunk_offset == self._chunks[self._chunk_index][1]:
+                self._source.close()
+                self._source = None
+                self._chunk_index += 1
+                self._chunk_offset = 0
+        return bytes(output)
+
+    def close(self) -> None:
+        if self._source is not None:
+            self._source.close()
+            self._source = None
+
+
+def _virtual_bundle(path: Path, pieces: tuple[str, ...]) -> tuple[_VirtualBundle, int, str] | None:
+    if not pieces or pieces[-1] != ".adapter-transport-bundle":
+        return None
+    directory = path.parent
+    stable_path = directory / stable_name
+    if stable_path.is_symlink() or not stable_path.is_file():
+        raise UpgradeError("adapter bundle step is not stable")
+    manifest_path = directory / adapter_manifest_name
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise UpgradeError("adapter bundle manifest is missing")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise UpgradeError("adapter bundle manifest is invalid") from exc
+    bundle = manifest.get("bundle") if isinstance(manifest, dict) else None
+    if not isinstance(bundle, dict):
+        raise UpgradeError("adapter bundle is not published")
+    size = bundle.get("size")
+    digest = bundle.get("sha256")
+    if (
+        bundle.get("path") != pieces[-1]
+        or type(size) is not int
+        or size <= 0
+        or not isinstance(digest, str)
+        or digest_pattern.fullmatch(digest) is None
+    ):
+        raise UpgradeError("adapter bundle identity is invalid")
+    raw_chunks = manifest.get("chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks:
+        raise UpgradeError("adapter bundle has no chunks")
+    raw_chunks = sorted(
+        raw_chunks,
+        key=lambda item: item.get("offset")
+        if isinstance(item, dict) and type(item.get("offset")) is int
+        else -1,
+    )
+    chunks: list[tuple[Path, int]] = []
+    total = 0
+    for item in raw_chunks:
+        if not isinstance(item, dict):
+            raise UpgradeError("adapter bundle chunk identity is invalid")
+        name = item.get("file")
+        wire_size = item.get("wire_size")
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or name in {adapter_config_name, adapter_weights_name, adapter_manifest_name}
+            or type(wire_size) is not int
+            or wire_size <= 0
+            or not isinstance(item.get("wire_sha256"), str)
+            or digest_pattern.fullmatch(item["wire_sha256"]) is None
+            or item.get("offset") != total
+        ):
+            raise UpgradeError("adapter bundle chunk identity is invalid")
+        chunk_path = directory / name
+        try:
+            entry = os.stat(chunk_path, follow_symlinks=False)
+        except OSError as exc:
+            raise UpgradeError(f"adapter bundle chunk is missing: {name}") from exc
+        if not stat.S_ISREG(entry.st_mode) or entry.st_size != wire_size:
+            raise UpgradeError(f"adapter bundle chunk size differs: {name}")
+        chunks.append((chunk_path, wire_size))
+        total += wire_size
+    if total != size:
+        raise UpgradeError("adapter bundle size differs from its chunks")
+    return _VirtualBundle(chunks, 0), size, digest
+
+
 class RangeHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, upgrade_path=None, source_base_url=None, **kwargs):
         self.upgrade_path = upgrade_path
@@ -521,10 +644,43 @@ class RangeHandler(SimpleHTTPRequestHandler):
         return path
 
     def send_head(self):
+        self.__dict__.pop("remaining", None)
         source = None
         try:
             _request_path, pieces = _safe_request_path(self)
             path = self._maybe_upgrade()
+            virtual = _virtual_bundle(path, pieces)
+            if virtual is not None:
+                _bundle_source, size, digest = virtual
+                start, end = 0, size - 1
+                if value := self.headers.get("Range"):
+                    try:
+                        start_text, end_text = value.removeprefix("bytes=").split("-", 1)
+                        start = int(start_text)
+                        end = min(int(end_text), end) if end_text else end
+                        if start > end or start < 0:
+                            raise ValueError
+                    except ValueError:
+                        _bundle_source.close()
+                        self.send_error(416)
+                        return None
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                else:
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("ETag", f'"{digest}"')
+                self.end_headers()
+                if self.command == "HEAD":
+                    _bundle_source.close()
+                    return None
+                if start:
+                    _bundle_source.close()
+                    _bundle_source = _VirtualBundle(virtual[0]._chunks, start)
+                self.remaining = end - start + 1
+                return _bundle_source
             prefix = self.upgrade_path
             step_path = None
             step = None

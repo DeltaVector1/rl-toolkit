@@ -33,6 +33,68 @@ class QuietAdapterHandler(adapter_server.RangeHandler):
 
 
 class AdapterServerTest(unittest.TestCase):
+    def test_virtual_bundle_reads_existing_chunks_with_ranges(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            step = root / "step_1"
+            step.mkdir()
+            (step / "STABLE").write_text("stable\n", encoding="ascii")
+            chunks = [b"first-wire", b"second-wire"]
+            chunk_records = []
+            for index, payload in enumerate(chunks):
+                name = f"adapter_model.safetensors.transport-delta-{index:06d}"
+                (step / name).write_bytes(payload)
+                chunk_records.append(
+                    {
+                        "file": name,
+                        "offset": sum(len(item) for item in chunks[:index]),
+                        "raw_size": len(payload),
+                        "wire_size": len(payload),
+                        "wire_sha256": hashlib.sha256(payload).hexdigest(),
+                        "raw_sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                )
+            bundle = b"".join(chunks)
+            manifest = {
+                "version": 1,
+                "kind": "lora-adapter",
+                "mode": "delta",
+                "target_step": 1,
+                "transport": "chunked-shuffled-xor-zstd",
+                "bundle": {
+                    "path": ".adapter-transport-bundle",
+                    "size": len(bundle),
+                    "sha256": hashlib.sha256(bundle).hexdigest(),
+                },
+                "chunks": chunk_records,
+            }
+            (step / "adapter_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                functools.partial(QuietAdapterHandler, directory=str(root)),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            url = (
+                f"http://127.0.0.1:{server.server_port}/step_1/"
+                ".adapter-transport-bundle"
+            )
+            try:
+                request = urllib.request.Request(url, headers={"Range": "bytes=3-14"})
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 206)
+                    self.assertEqual(response.headers["Content-Range"], "bytes 3-14/21")
+                    self.assertEqual(response.headers["ETag"], f'"{hashlib.sha256(bundle).hexdigest()}"')
+                    self.assertEqual(response.read(), bundle[3:15])
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    self.assertEqual(response.read(), bundle)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
     def test_chunk_requests_cache_identity_until_same_size_weight_rewrite(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

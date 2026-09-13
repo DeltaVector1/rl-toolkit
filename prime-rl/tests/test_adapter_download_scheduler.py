@@ -3,6 +3,7 @@ import inspect
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -55,6 +56,78 @@ def load_filesystem_module():
 
 
 class DownloadSchedulerTest(unittest.TestCase):
+    def test_bundle_identity_is_explicit(self):
+        filesystem = load_filesystem_module()
+        with self.assertRaisesRegex(OSError, "not published"):
+            filesystem._bundle_identity(
+                "http://source/step_1",
+                {"source_manifest": {}, "chunks": []},
+            )
+
+    def test_bundle_range_resume_and_wire_identity(self):
+        filesystem = load_filesystem_module()
+        payload = b"prefix-wire-suffix"
+        item_payload = payload[7:16]
+        item = {
+            "bundle_offset": 7,
+            "wire_size": len(item_payload),
+            "wire_sha256": hashlib.sha256(item_payload).hexdigest(),
+        }
+
+        class Response(io.BytesIO):
+            status = 206
+
+            def __init__(self, value, start, end):
+                super().__init__(value)
+                self.headers = {
+                    "Content-Length": str(end - start + 1),
+                    "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                    "ETag": f'"{hashlib.sha256(payload).hexdigest()}"',
+                }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        calls = []
+
+        def fake_urlopen(request, timeout):
+            start, end = (int(part) for part in request.headers["Range"].removeprefix("bytes=").split("-"))
+            calls.append((start, end, timeout))
+            return Response(payload[start : end + 1], start, end)
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        filesystem.urllib.request.urlopen = fake_urlopen
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunk_root = root / "chunks"
+                chunk_root.mkdir()
+                destination = chunk_root / "chunk"
+                destination.write_bytes(item_payload[:3])
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunk_root, create=False, label="test bundle chunks"
+                )
+                try:
+                    filesystem._download_bundle_range(
+                        {
+                            "url": "http://bundle/step",
+                            "size": len(payload),
+                            "sha256": hashlib.sha256(payload).hexdigest(),
+                        },
+                        item,
+                        destination,
+                        parent_fd,
+                    )
+                finally:
+                    os.close(parent_fd)
+                self.assertEqual(destination.read_bytes(), item_payload)
+                self.assertEqual(calls[0][:2], (10, 15))
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+
     def test_download_keeps_public_signature(self):
         filesystem = load_filesystem_module()
         signature = str(inspect.signature(filesystem.download)).replace("pathlib._local.Path", "pathlib.Path")
