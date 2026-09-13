@@ -742,6 +742,159 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             filesystem._decode_linear_transport_chunk = old_decode
             filesystem._delta_stage_timeout_s = old_timeout
 
+    def test_linear_receiver_caps_download_workers_to_responsive_lanes(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/step_2"
+        target = b"target!!"
+        base = b"\x00" * len(target)
+        config = b"{}\n"
+        wires = (b"wire", b"data")
+
+        def digest(value):
+            return hashlib.sha256(value).hexdigest()
+
+        chunks = [
+            {
+                "file": f"chunk-{index}",
+                "offset": index * 4,
+                "data_offset": 2,
+                "raw_size": 4,
+                "wire_size": len(wire),
+                "wire_sha256": digest(wire),
+                "raw_sha256": digest(b""),
+                "codec": "zstd",
+            }
+            for index, wire in enumerate(wires)
+        ]
+        transport = {
+            "version": 2,
+            "mode": "delta",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+            "source_manifest": {
+                "version": 2,
+                "kind": "lora-adapter",
+                "mode": "delta",
+                "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+                "files": [],
+            },
+            "base_url": "http://source/step_1",
+            "base_sha256": digest(base),
+            "base_size": len(base),
+            "base_config_sha256": digest(config),
+            "base_config_size": len(config),
+            "base2_url": "http://source/step_0",
+            "base2_sha256": digest(base),
+            "base2_size": len(base),
+            "base2_config_sha256": digest(config),
+            "base2_config_size": len(config),
+            "target_sha256": digest(target),
+            "target_size": len(target),
+            "config_sha256": digest(config),
+            "config_size": len(config),
+            "chunks": chunks,
+        }
+        source_manifest = {
+            "version": 1,
+            "source_url": source_url,
+            "files": {
+                "adapter_config.json": {"size": len(config), "sha256": digest(config)},
+                "adapter_model.safetensors": {
+                    "size": len(target),
+                    "sha256": digest(target),
+                },
+            },
+        }
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_download = filesystem._download_persistent_file
+        old_lanes = filesystem._responsive_adapter_source_urls
+        old_streams = filesystem._configured_download_streams
+        old_base = filesystem._verified_adapter_base
+        old_decode = filesystem._decode_linear_transport_chunk
+        old_executor = filesystem.ThreadPoolExecutor
+        old_timeout = filesystem._delta_stage_timeout_s
+        workers = []
+        real_executor = filesystem.ThreadPoolExecutor
+
+        class RecordingExecutor:
+            def __init__(self, max_workers):
+                workers.append(max_workers)
+                self.executor = real_executor(max_workers=max_workers)
+
+            def submit(self, *args, **kwargs):
+                return self.executor.submit(*args, **kwargs)
+
+            def shutdown(self, *args, **kwargs):
+                return self.executor.shutdown(*args, **kwargs)
+
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                base_paths = {
+                    "http://source/step_1": Path(temporary) / "base1",
+                    "http://source/step_0": Path(temporary) / "base2",
+                }
+                for path in base_paths.values():
+                    path.mkdir()
+                    (path / "adapter_model.safetensors").write_bytes(base)
+                    (path / "adapter_config.json").write_bytes(config)
+                    (path / "READY").write_text("ready\n", encoding="utf-8")
+
+                def fake_download(_source, destination, **kwargs):
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if "adapter_config.json" in destination.name:
+                        value = config
+                    else:
+                        index = int(destination.name.split("chunk-", 1)[1].split(".", 1)[0])
+                        value = wires[index]
+                    destination.write_bytes(value)
+                    if kwargs.get("progress"):
+                        kwargs["progress"](0, len(value))
+
+                filesystem._download_persistent_file = fake_download
+                filesystem._responsive_adapter_source_urls = (
+                    lambda *_args, **_kwargs: (["http://lane"], 3)
+                )
+                filesystem._configured_download_streams = lambda: 8
+                filesystem._verified_adapter_base = (
+                    lambda url, *_args, **_kwargs: (
+                        base_paths[url] / "adapter_model.safetensors",
+                        base_paths[url] / "adapter_config.json",
+                    )
+                )
+                filesystem._decode_linear_transport_chunk = (
+                    lambda _base2, _base1, _payload, *, offset, **_kwargs: (
+                        target[offset : offset + 4],
+                        digest(b""),
+                    )
+                )
+                filesystem.ThreadPoolExecutor = RecordingExecutor
+                filesystem._delta_stage_timeout_s = lambda: 30.0
+                result = filesystem._stage_chunked_linear_adapter(
+                    source_url,
+                    transport,
+                    source_manifest,
+                    status_metadata={
+                        "policy_step": 3,
+                        "stage_timeout_seconds": 300.0,
+                        "acceptance_target_seconds": 300.0,
+                    },
+                )
+                self.assertTrue((result / "READY").is_file())
+                self.assertEqual((result / "adapter_model.safetensors").read_bytes(), target)
+                self.assertEqual(workers, [2, 1])
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._download_persistent_file = old_download
+            filesystem._responsive_adapter_source_urls = old_lanes
+            filesystem._configured_download_streams = old_streams
+            filesystem._verified_adapter_base = old_base
+            filesystem._decode_linear_transport_chunk = old_decode
+            filesystem.ThreadPoolExecutor = old_executor
+            filesystem._delta_stage_timeout_s = old_timeout
+
     def test_receiver_rejects_symlinked_partial_before_external_write(self):
         filesystem = load_filesystem()
         source_url = "http://source/step_2"

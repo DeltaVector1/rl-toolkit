@@ -3457,6 +3457,8 @@ class _PersistentAdapterLanePool:
             if deadline is not None
             else _ADAPTER_LANE_RETRIES
         )
+        bad_sources: set[str] = set()
+        checksum_error: OSError | None = None
         with lock:
             for attempt in range(attempt_limit):
                 _check_deadline(deadline, cancel_event)
@@ -3480,7 +3482,14 @@ class _PersistentAdapterLanePool:
                     os.unlink(destination.name, dir_fd=parent_fd)
                     present = 0
 
-                source_url = source_urls[attempt % len(source_urls)]
+                available_sources = [
+                    source for source in source_urls if source not in bad_sources
+                ]
+                if not available_sources:
+                    # Every lane has returned bad bytes. Keep the bounded retry
+                    # policy, but allow a transiently repaired lane to recover.
+                    available_sources = source_urls
+                source_url = available_sources[attempt % len(available_sources)]
                 if per_request_timeout_seconds is None:
                     timeout = _request_timeout(deadline, cancel_event)
                 else:
@@ -3565,8 +3574,16 @@ class _PersistentAdapterLanePool:
                         cancel_event,
                         parent_fd=parent_fd,
                     ) != expected_sha256:
+                        # A complete response with a bad digest is an integrity
+                        # failure, not a transport failure. Close this lane,
+                        # discard this exact partial, and rotate to another
+                        # lane. Never resume from corrupt bytes.
                         connection.close()
-                        raise OSError("adapter transport chunk checksum mismatch")
+                        os.unlink(destination.name, dir_fd=parent_fd)
+                        bad_sources.add(source_url)
+                        checksum_error = OSError(
+                            "adapter transport chunk checksum mismatch"
+                        )
                     else:
                         return
 
@@ -3586,6 +3603,8 @@ class _PersistentAdapterLanePool:
                     time.sleep(sleep_for)
                 else:
                     cancel_event.wait(sleep_for)
+        if checksum_error is not None:
+            raise checksum_error
         raise OSError("adapter persistent download retries exhausted")
 
 
@@ -4543,6 +4562,7 @@ def _stage_chunked_linear_adapter(
         _discard_proof(wire_ready_path)
 
     download_streams = _configured_download_streams()
+    download_width = min(download_streams, len(lane_urls), len(chunks))
     reconstruct_executor = ThreadPoolExecutor(
         max_workers=min(len(chunks), _PREDICTIVE_RECONSTRUCT_WORKERS)
     )
@@ -4555,7 +4575,7 @@ def _stage_chunked_linear_adapter(
         with reconstruct_futures_lock:
             reconstruct_futures.append(future)
 
-    download_executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
+    download_executor = ThreadPoolExecutor(max_workers=download_width)
     download_futures = [
         download_executor.submit(fetch_and_reconstruct, index, item)
         for index, item in enumerate(chunks)
