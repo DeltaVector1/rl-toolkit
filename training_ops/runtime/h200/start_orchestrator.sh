@@ -3222,7 +3222,12 @@ done
 if [ "$tunnels_only" = 0 ]; then
   echo "China adapter forwards ${lora_source_ports[0]}-${lora_source_ports[-1]} in $china_lane_number SSH lanes"
 fi
-peer_tunnel || repair_fail "peer tunnel reconciliation failed"
+if ! peer_tunnel; then
+  # Keep established China and peer lanes available when one peer lane fails.
+  # The EXIT rollback still handles unregistered and starting processes.
+  repair_created_tunnels=()
+  repair_fail "peer tunnel reconciliation failed"
+fi
 if [ "$secondary_enabled" = 1 ]; then
   if [ "$tunnels_only" = 1 ]; then
     tunnel "$secondary_local_api_port" "127.0.0.1:$secondary_remote_api_port" \
