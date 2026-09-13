@@ -196,8 +196,9 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('repair_signal() {', source)
         self.assertIn("trap 'repair_signal' TERM HUP INT", source)
         self.assertIn('if ! repair_cleanup_created_tunnels; then status=125; fi', source)
-        final_start = source.index('if ! adapter_tunnel_local_snapshot ||')
-        final_block = source[final_start:source.index('fi', final_start) + 2]
+        readiness_function = source.index('adapter_tunnel_readiness()')
+        final_start = source.index('for _ in $(seq 1 10); do', readiness_function)
+        final_block = source[final_start:source.index('echo "adapter tunnel final local/remote snapshots failed"', final_start)]
         self.assertEqual(final_block.count('adapter_tunnel_local_snapshot'), 2)
         self.assertEqual(final_block.count('adapter_tunnel_remote_snapshot'), 2)
         self.assertLess(

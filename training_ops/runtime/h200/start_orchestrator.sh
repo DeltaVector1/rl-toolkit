@@ -558,6 +558,25 @@ repair_cleanup_created_tunnels() {
   [ "$rollback_failed" = 0 ]
 }
 
+repair_preserve_created_tunnels() {
+  local item pid start_time created_item created_pid created_start matched
+  local -a preserved_starting=()
+  for item in "${repair_starting_tunnels[@]}"; do
+    IFS='|' read -r pid start_time _ <<<"$item"
+    matched=0
+    for created_item in "${repair_created_tunnels[@]}"; do
+      IFS='|' read -r _ created_pid _ _ created_start <<<"$created_item"
+      if [ "$pid" = "$created_pid" ] && [ "$start_time" = "$created_start" ]; then
+        matched=1
+        break
+      fi
+    done
+    [ "$matched" = 1 ] || preserved_starting+=("$item")
+  done
+  repair_starting_tunnels=("${preserved_starting[@]}")
+  repair_created_tunnels=()
+}
+
 trap 'status=$?; if [ "$status" -ne 0 ]; then repair_failed=1; fi; if [ "$repair_committed" = 0 ]; then if ! repair_cleanup_created_tunnels; then status=125; fi; if ! repair_cleanup_unregistered_tunnels; then status=125; fi; if ! repair_cleanup_starting_tunnels; then status=125; fi; fi; if ! repair_release_lock; then status=125; fi; exit "$status"' EXIT
 trap 'repair_signal' TERM HUP INT
 
@@ -1818,7 +1837,6 @@ peer_tunnel_remove_orphan_children() {
 peer_remote_ports_ready() {
   local probe_seconds=${1:-10} peer_target verified_ports probe_output probe_status
   peer_missing_remote_ports=
-  peer_tunnel_children_unchanged || return 1
   probe_seconds=$(repair_timeout "$probe_seconds") || return 1
   peer_target=$(printf '%q' "$peer_ssh_user@$peer_host")
   probe_output=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
@@ -3177,13 +3195,17 @@ adapter_tunnel_readiness() {
     echo "adapter tunnel reconciliation did not establish all remote reverse forwards" >&2
     return 1
   fi
-  if ! adapter_tunnel_local_snapshot || \
-      ! adapter_tunnel_remote_snapshot || \
-      ! adapter_tunnel_local_snapshot || \
-      ! adapter_tunnel_remote_snapshot; then
-    echo "adapter tunnel final local/remote snapshots failed" >&2
-    return 1
-  fi
+  for _ in $(seq 1 10); do
+    if adapter_tunnel_local_snapshot && \
+        adapter_tunnel_remote_snapshot && \
+        adapter_tunnel_local_snapshot && \
+        adapter_tunnel_remote_snapshot; then
+      return 0
+    fi
+    repair_sleep 1 || return 1
+  done
+  echo "adapter tunnel final local/remote snapshots failed" >&2
+  return 1
 }
 
 china_legacy_cleanup_required=0
@@ -3225,7 +3247,7 @@ fi
 if ! peer_tunnel; then
   # Keep established China and peer lanes available when one peer lane fails.
   # The EXIT rollback still handles unregistered and starting processes.
-  repair_created_tunnels=()
+  repair_preserve_created_tunnels
   repair_fail "peer tunnel reconciliation failed"
 fi
 if [ "$secondary_enabled" = 1 ]; then
