@@ -913,18 +913,34 @@ unset PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
 # Readiness rejects two exact same-marker supervisors even when one owns both listeners.
 duplicate_command="$tmp/duplicate-command"
 printf '%s\n' "$china_supervisor_command" >"$duplicate_command"
+duplicate_log="$tmp/duplicate-log"
+printf '%s\n' "$china_supervisor_command" "$china_supervisor_command" >"$duplicate_log"
 printf 'LISTEN 0 128 127.0.0.1:18100 0.0.0.0:* users:(("ssh",pid=30000,fd=5))\n' >"$tmp/duplicate-ss"
 printf 'LISTEN 0 128 127.0.0.1:18101 0.0.0.0:* users:(("ssh",pid=30001,fd=6))\n' >>"$tmp/duplicate-ss"
 lora_source_ports=(18100 18101)
-export PEER_DUPLICATE_MARKER=china-tunnel-lora-0 PEER_DUPLICATE_COMMAND="$duplicate_command"
+export PEER_TEST_LOG="$duplicate_log" PEER_DUPLICATE_MARKER=china-tunnel-lora-0 \
+  PEER_DUPLICATE_COMMAND="$duplicate_command"
 export TUNNEL_OWNER_PPID=10000 TUNNEL_SS_OUTPUT="$tmp/duplicate-ss" PEER_STALE_LISTENERS_ACTIVE=1
 set +e
 PATH="$tmp/bin:$PATH" china_tunnel_supervisors_ready
 duplicate_ready_status=$?
 set -e
 test "$duplicate_ready_status" -ne 0
-unset PEER_DUPLICATE_MARKER PEER_DUPLICATE_COMMAND TUNNEL_OWNER_PPID \
+unset PEER_TEST_LOG PEER_DUPLICATE_MARKER PEER_DUPLICATE_COMMAND TUNNEL_OWNER_PPID \
   TUNNEL_SS_OUTPUT PEER_STALE_LISTENERS_ACTIVE
+
+# Readiness rejects one lane plus an otherwise valid out-of-range marker.
+extra_marker_log="$tmp/extra-marker-log"
+extra_marker_command="${china_supervisor_command%# china-tunnel-lora-0}# china-tunnel-lora-64"
+printf '%s\n' "$china_supervisor_command" "$extra_marker_command" >"$extra_marker_log"
+lora_source_ports=(18100 18101)
+export PEER_TEST_LOG="$extra_marker_log"
+set +e
+PATH="$tmp/bin:$PATH" china_tunnel_supervisors_ready
+extra_marker_status=$?
+set -e
+test "$extra_marker_status" -ne 0
+unset PEER_TEST_LOG
 lora_source_ports=("${configured_lora_ports[@]}")
 
 # Both source listeners must belong to one SSH child PID, not two split children.
