@@ -23,6 +23,8 @@ repair_unidentified_tunnels=()
 repair_committed=0
 repair_launch_active=0
 repair_pending_signal=0
+peer_readiness_failure=
+peer_phase_failure=
 repair_lock_held=0
 repair_lock_file=${ADAPTER_TUNNEL_LOCK_FILE:-/tmp/prime-rl-adapter-tunnel-repair.lock}
 if [ "$tunnels_only" = 1 ]; then
@@ -2875,27 +2877,41 @@ china_tunnel_connection() {
 }
 
 peer_tunnel() {
-  local peer_keep_current peer_orphans_clear
+  local peer_keep_current peer_orphans_clear phase_start
   peer_keep_current=$peer_enabled
   [ "${restart_tunnels:-0}" = 1 ] && peer_keep_current=0
-  peer_tunnel_remove_legacy "$peer_keep_current" || return 1
+  phase_start=$SECONDS
+  peer_tunnel_remove_legacy "$peer_keep_current" || {
+    echo "peer phase=legacy stage=remove elapsed=$((SECONDS - phase_start))" >&2
+    return 1
+  }
   peer_orphans_clear=0
   for _ in $(seq 1 10); do
-    repair_remaining >/dev/null || return 1
+    repair_remaining >/dev/null || {
+      echo "peer phase=orphan stage=deadline elapsed=$((SECONDS - phase_start))" >&2
+      return 1
+    }
     if peer_tunnel_remove_orphan_children; then
       peer_orphans_clear=1
       break
     fi
-    repair_sleep 1 || return 1
+    repair_sleep 1 || {
+      echo "peer phase=orphan stage=wait elapsed=$((SECONDS - phase_start))" >&2
+      return 1
+    }
   done
   if [ "$peer_orphans_clear" != 1 ]; then
     echo "old peer tunnel connections did not stop" >&2
+    echo "peer phase=orphan stage=clear elapsed=$((SECONDS - phase_start))" >&2
     return 1
   fi
   [ "$peer_enabled" = 1 ] || return 0
   peer_tunnel_connection "api" \
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
-    -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" || return 1
+    -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" || {
+      echo "peer phase=api stage=connection elapsed=$((SECONDS - phase_start))" >&2
+      return 1
+    }
 
   # Keep each SSH connection to two source ports so all configured source listeners
   # have independent bounded workers.
@@ -2910,9 +2926,12 @@ peer_tunnel() {
         -R "127.0.0.1:$lora_source_port:127.0.0.1:$relay_port"
       )
     done
-    peer_tunnel_connection "lora-$lane_number" \
+    if ! peer_tunnel_connection "lora-$lane_number" \
       "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:$relay_port" \
-      "${lane_forwards[@]}" || return 1
+      "${lane_forwards[@]}"; then
+      echo "peer phase=lane lane=$lane_number ports=${lane_ports[0]}-${lane_ports[-1]} stage=connection elapsed=$((SECONDS - phase_start))" >&2
+      return 1
+    fi
     lane_start=$((lane_start + peer_lane_size))
     lane_number=$((lane_number + 1))
     [ "$lane_start" -lt "${#lora_source_ports[@]}" ] && sleep 0.1
@@ -3157,13 +3176,14 @@ adapter_tunnel_exact_snapshot() {
 }
 
 adapter_tunnel_readiness() {
-  local tunnels_ready=0 readiness_port="" listener_status=0 remote_ready=1
-  for _ in $(seq 1 30); do
+  local tunnels_ready=0 readiness_port="" listener_status=0 remote_ready=1 attempt
+  for attempt in $(seq 1 30); do
     repair_remaining >/dev/null || return 1
     tunnels_ready=0
     china_tunnel_supervisors_ready && china_source_ports_ready 10 && tunnels_ready=1
     if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ]; then
       peer_tunnel_supervisors_ready || {
+        peer_readiness_failure="supervisor inventory/identity attempt $attempt"
         tunnels_ready=0
         readiness_port=peer
       }
@@ -3205,7 +3225,7 @@ adapter_tunnel_readiness() {
   fi
   if [ "$peer_enabled" = 1 ]; then
     remote_ready=0
-    for _ in $(seq 1 10); do
+    for attempt in $(seq 1 10); do
       repair_remaining >/dev/null || return 1
       if peer_remote_ports_ready 10; then
         sleep 0.2
@@ -3214,18 +3234,31 @@ adapter_tunnel_readiness() {
           if peer_tunnel_current_children_ready; then
             remote_ready=1
             break
+          else
+            peer_readiness_failure="post-probe child check attempt $attempt"
           fi
+        else
+          peer_readiness_failure="E2E probe pass2 attempt $attempt"
         fi
+      else
+        peer_readiness_failure="E2E probe pass1 attempt $attempt"
       fi
       if [ -n "${peer_missing_remote_ports:-}" ]; then
-        peer_repair_missing_remote_lanes || return 1
-        peer_tunnel_supervisors_ready || return 1
+        peer_repair_missing_remote_lanes || {
+          peer_readiness_failure="port repair attempt $attempt"
+          return 1
+        }
+        peer_tunnel_supervisors_ready || {
+          peer_readiness_failure="supervisor inventory/identity after port repair attempt $attempt"
+          return 1
+        }
       fi
       repair_sleep 1 || return 1
     done
   fi
   if [ "$remote_ready" != 1 ]; then
-    echo "adapter tunnel reconciliation did not establish all remote reverse forwards" >&2
+    echo "adapter tunnel reconciliation did not establish all remote reverse forwards" \
+      "(${peer_readiness_failure:-unknown stage})" >&2
     return 1
   fi
   for _ in $(seq 1 10); do
@@ -3235,6 +3268,7 @@ adapter_tunnel_readiness() {
         adapter_tunnel_remote_snapshot; then
       return 0
     fi
+    peer_readiness_failure="final local/remote snapshot attempt $_"
     repair_sleep 1 || return 1
   done
   echo "adapter tunnel final local/remote snapshots failed" >&2
