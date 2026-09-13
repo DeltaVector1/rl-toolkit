@@ -482,15 +482,18 @@ class AdapterUpdateTest(unittest.TestCase):
             adapter_server._prune_cache(active, 2)
             self.assertFalse((cache / "step_0").exists())
 
-    def test_stage_log_requires_a_transfer_timeout(self):
-        good = "Failed to apply policy update 4\nReadTimeout /stage_lora_adapter"
+    def test_stage_log_requires_an_exact_transport_failure(self):
+        good = (
+            "Failed to apply policy update 4\n"
+            "_PersistentTransportError: adapter response ended during read"
+        )
         self.assertEqual(
             training_ops._validate_adapter_stage_log(good),
             "Failed to apply policy update 4",
         )
         current = (
             "Policy update 4 failed on attempt 3/3; stopping\n"
-            "TimeoutError: adapter delta staging exceeded its time limit"
+            "OSError: incomplete adapter transport chunk"
         )
         self.assertEqual(
             training_ops._validate_adapter_stage_log(current),
@@ -498,7 +501,7 @@ class AdapterUpdateTest(unittest.TestCase):
         )
         one_attempt = (
             "Policy update 4 failed on attempt 1/1; stopping\n"
-            "TimeoutError: adapter delta staging exceeded its time limit"
+            "OSError: adapter persistent download retries exhausted"
         )
         self.assertEqual(
             training_ops._validate_adapter_stage_log(one_attempt),
@@ -507,17 +510,18 @@ class AdapterUpdateTest(unittest.TestCase):
         with self.assertRaises(training_ops.Refused):
             training_ops._validate_adapter_stage_log(
                 "Policy update 4 failed on attempt 1/3; retrying\n"
-                "TimeoutError: adapter delta staging exceeded its time limit"
+                "OSError: adapter persistent download retries exhausted"
             )
         with self.assertRaises(training_ops.Refused):
             training_ops._validate_adapter_stage_log(
                 "Failed to apply policy update 4\nadapter request failed"
             )
         for transport_error in (
-            "ConnectionResetError: connection reset by peer",
-            "ConnectionRefusedError: connection refused",
-            "OSError: adapter manifest request failed with HTTP status 503",
-            "OSError: adapter source retry budget exhausted",
+            "_PersistentTransportError: adapter persistent request failed",
+            "_PersistentTransportError: adapter response ended during read",
+            "_PersistentTransportError: adapter response body ended early",
+            "_PersistentTransportError: incomplete adapter transport chunk",
+            "_PersistentTransportError: none of 8 adapter source lanes responded",
             "OSError: adapter persistent download retries exhausted",
         ):
             with self.subTest(transport_error=transport_error):
@@ -536,15 +540,63 @@ class AdapterUpdateTest(unittest.TestCase):
                 "OSError: adapter checksum mismatch after retry exhaustion"
             )
 
+    def test_transport_failure_classifier_is_exact_and_fail_closed(self):
+        accepted = (
+            "ConnectionResetError: connection reset by peer",
+            "ConnectionResetError: [Errno 104] connection reset by peer",
+            "ConnectionRefusedError: connection refused",
+            "RemoteDisconnected: remote end closed connection without response",
+            "BrokenPipeError: [Errno 32] broken pipe",
+            "TimeoutError: adapter delta staging exceeded its time limit",
+            "TimeoutError: adapter persistent request exceeded its stage time limit",
+            "TimeoutError: adapter download exceeded its time limit",
+            "OSError: adapter manifest request failed with HTTP status 500",
+            "OSError: adapter persistent request failed",
+            "adapter persistent request failed",
+            "_PersistentTransportError: adapter response ended during read",
+            "OSError: adapter response body ended early",
+            "incomplete adapter transport chunk",
+            "_PersistentTransportError: none of 8 adapter source lanes responded",
+            "OSError: adapter persistent download retries exhausted",
+        )
+        rejected = (
+            "OSError: adapter persistent request failed while reading the cache",
+            "OSError: adapter response body ended early; checksum differs",
+            "OSError: adapter checksum mismatch",
+            "OSError: adapter digest differs",
+            "OSError: adapter identity is invalid",
+            "OSError: adapter semantic validation failed",
+            "OSError: adapter cache lock is busy",
+            "OSError: adapter manifest race",
+            "OSError: incomplete adapter file",
+            "OSError: adapter invalid proof",
+            "OSError: adapter response body is too short",
+            "OSError: adapter manifest request failed with HTTP status 429",
+            "OSError: adapter manifest request failed with HTTP status 503",
+            "OSError: adapter source returned HTTP status 503",
+            "OSError: adapter source retry budget exhausted",
+            "stage timeout: adapter delta staging exceeded its time limit",
+            "adapter request failed; ConnectionResetError: connection reset by peer",
+            "adapter manifest request failed with HTTP status 500",
+            "OSError: adapter manifest request failed with HTTP status 500; cache lock held",
+        )
+        for error in accepted:
+            with self.subTest(accepted=error):
+                self.assertIsNotNone(training_ops._adapter_transport_failure_reason(error))
+        for error in rejected:
+            with self.subTest(rejected=error):
+                self.assertIsNone(training_ops._adapter_transport_failure_reason(error))
+
     def test_stage_success_after_failure_refuses_repair(self):
         log = (
-            "Failed to apply policy update 4\nReadTimeout stage_lora_adapter\n"
+            "Failed to apply policy update 4\n"
+            "_PersistentTransportError: adapter persistent request failed\n"
             "Staged policy v4 on every inference host"
         )
         with self.assertRaisesRegex(training_ops.Refused, "already succeeded"):
             training_ops._validate_adapter_stage_log(log)
 
-    def test_terminal_stage_status_accepts_exact_timeout_and_manifest_500(self):
+    def test_terminal_stage_status_accepts_exact_transport_errors(self):
         config = training_ops._adapter_update_config("glm-perf-3")
         broadcast = training_ops.AdapterBroadcast(
             path="/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3/broadcasts/step_6",
@@ -563,7 +615,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "stage_timeout_seconds": 300,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 298.297,
-            "error": "TimeoutError: adapter delta staging exceeded its time limit",
+            "error": "_PersistentTransportError: adapter response ended during read",
         }
         manifest_500 = {
             "status": "failed",
@@ -573,7 +625,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "stage_timeout_seconds": 300,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 299.102,
-            "error": "OSError: adapter manifest request failed with HTTP status 500",
+            "error": "OSError: adapter persistent download retries exhausted",
         }
         results = {
             "h200a": (0, json.dumps(timeout)),
@@ -586,8 +638,8 @@ class AdapterUpdateTest(unittest.TestCase):
         ), mock.patch.object(training_ops, "_fan", return_value=results):
             evidence = training_ops._adapter_stage_status_evidence("glm-perf-3", config, "")
         self.assertIn(
-            "policy update 6 failed on h200a (TimeoutError: adapter delta staging exceeded its time limit), "
-            "h200b (OSError: adapter manifest request failed with HTTP status 500)",
+            "policy update 6 failed on h200a (_PersistentTransportError: adapter response ended during read), "
+            "h200b (OSError: adapter persistent download retries exhausted)",
             evidence,
         )
 
@@ -607,7 +659,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "stage_timeout_seconds": 600,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 600.0,
-            "error": "TimeoutError: adapter delta staging exceeded its time limit",
+            "error": "_PersistentTransportError: adapter persistent request failed",
         }
         with mock.patch.object(
             training_ops,
@@ -650,7 +702,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "stage_timeout_seconds": 300,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 298.297,
-            "error": "TimeoutError: adapter delta staging exceeded its time limit",
+            "error": "_PersistentTransportError: adapter persistent request failed",
         }
 
         def check(records, pattern, log=""):

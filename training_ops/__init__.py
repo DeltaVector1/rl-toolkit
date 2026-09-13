@@ -3739,33 +3739,60 @@ def _adapter_transport_failure_reason(error: str) -> str | None:
     message = error.strip().lower()
     if re.search(r"\b(?:checksum|sha256|digest|identity|semantic)\b", message):
         return None
-    if re.search(
-        r"connection\s*(?:reset|refused|aborted)|"
-        r"remote end closed|broken pipe",
-        message,
-    ):
-        return "connection reset/refused"
-    if re.search(
-        r"(?:http(?:error| status)?|status(?:[_ ]code)?)[^0-9]{0,12}503\b|"
-        r"\b503\s+(?:service unavailable|temporarily unavailable)",
-        message,
-    ):
-        return "HTTP 503"
-    if re.search(
-        r"\badapter persistent download retries exhausted\b|"
-        r"(?:retry|attempt).*(?:exhaust|budget|bounded)|"
-        r"(?:exhaust|budget|bounded).*(?:retry|attempt)|"
-        r"attempt\s+\d+\s*/\s*\d+\s*;?\s*(?:stopping|exhausted)",
-        message,
-    ):
-        return "bounded retry exhaustion"
-    if re.search(r"timeout(?:error)?|timed out|time limit", message):
-        return "timeout"
-    if re.fullmatch(
-        r"(?:oserror: )?adapter manifest request failed with http status 500",
-        message,
-    ):
-        return "manifest HTTP 500"
+    prefix = r"(?:oserror|_persistenttransporterror): "
+    typed_failures = (
+        (
+            r"connectionreseterror: (?:\[errno [0-9]+\] )?connection reset by peer",
+            "connection reset",
+        ),
+        (
+            r"connectionrefusederror: (?:\[errno [0-9]+\] )?connection refused",
+            "connection refused",
+        ),
+        (
+            r"connectionabortederror: (?:\[errno [0-9]+\] )?"
+            r"(?:software caused connection abort|connection aborted)",
+            "connection aborted",
+        ),
+        (
+            r"remotedisconnected: remote end closed connection without response",
+            "remote end closed",
+        ),
+        (
+            r"brokenpipeerror: (?:\[errno [0-9]+\] )?broken pipe",
+            "broken pipe",
+        ),
+        (
+            r"timeouterror: adapter (?:delta staging exceeded its time limit|"
+            r"persistent request exceeded its stage time limit|"
+            r"download exceeded its time limit)",
+            "timeout",
+        ),
+        (
+            r"oserror: adapter manifest request failed with http status 500",
+            "manifest HTTP 500",
+        ),
+    )
+    exact_failures = (
+        (r"adapter persistent request failed", "persistent request failed"),
+        (r"adapter response ended during read", "response ended during read"),
+        (r"adapter response body ended early", "response body ended early"),
+        (r"incomplete adapter transport chunk", "incomplete transport chunk"),
+        (
+            r"none of [1-9][0-9]* adapter source lanes responded",
+            "no adapter source lanes responded",
+        ),
+        (
+            r"adapter persistent download retries exhausted",
+            "persistent download retries exhausted",
+        ),
+    )
+    for pattern, reason in typed_failures:
+        if re.fullmatch(pattern, message):
+            return reason
+    for pattern, reason in exact_failures:
+        if re.fullmatch(rf"(?:{prefix})?{pattern}", message):
+            return reason
     return None
 
 
@@ -3787,7 +3814,10 @@ def _validate_adapter_stage_log(log: str) -> str:
     transfer_words = ("stage_lora_adapter", "adapter", "lora")
     if not any(word.lower() in window.lower() for word in transfer_words):
         raise Refused("latest policy failure has no adapter staging evidence")
-    if _adapter_transport_failure_reason(window) is None:
+    if not any(
+        _adapter_transport_failure_reason(line) is not None
+        for line in window.splitlines()
+    ):
         raise Refused("latest adapter failure has no transfer timeout evidence")
     return latest_failure.group(0)
 
