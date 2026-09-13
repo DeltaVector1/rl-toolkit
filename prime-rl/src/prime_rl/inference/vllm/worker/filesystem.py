@@ -6114,21 +6114,6 @@ def stage_lora_adapter_files(
             if (
                 isinstance(transport, dict)
                 and transport.get("mode") == "full"
-                and transport.get("transport") == _ADAPTER_FULL_TRANSPORT
-            ):
-                return _stage_chunked_xor_adapter(
-                    source_url,
-                    transport,
-                    manifest,
-                    deadline=operation_deadline,
-                    cancel_event=cancel_event,
-                    committed_event=committed_event,
-                    status_metadata=status_metadata,
-                )
-
-            if (
-                isinstance(transport, dict)
-                and transport.get("mode") == "full"
                 and _reuse_full_adapter_cache(
                     source_url,
                     destination,
@@ -6162,6 +6147,21 @@ def stage_lora_adapter_files(
                         },
                     )
                     return destination
+
+            if (
+                isinstance(transport, dict)
+                and transport.get("mode") == "full"
+                and transport.get("transport") == _ADAPTER_FULL_TRANSPORT
+            ):
+                return _stage_chunked_xor_adapter(
+                    source_url,
+                    transport,
+                    manifest,
+                    deadline=operation_deadline,
+                    cancel_event=cancel_event,
+                    committed_event=committed_event,
+                    status_metadata=status_metadata,
+                )
 
             total_bytes = sum(int(item["size"]) for item in files.values())
             _preflight_full_adapter_download_space(

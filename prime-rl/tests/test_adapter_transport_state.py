@@ -1548,7 +1548,11 @@ class AdapterTransportStateTest(unittest.TestCase):
                 with mock.patch.object(
                     filesystem,
                     "_read_chunked_xor_manifest",
-                    return_value={"mode": "full", "source_manifest": transport_manifest},
+                    return_value={
+                        "mode": "full",
+                        "transport": "chunked-full-zstd",
+                        "source_manifest": transport_manifest,
+                    },
                 ), mock.patch.object(
                     filesystem, "_source_manifest", return_value=new_manifest
                 ), mock.patch.object(
