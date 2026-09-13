@@ -82,19 +82,10 @@ if [ "${MODE:-signal}" = register-failure ]; then
   repair_register_tunnel generic "$pid" failed-marker 127.0.0.1:29500:target:22
   status=$?
   set -e
-  test "$status" -ne 0
-  for _ in $(seq 1 20); do
-    state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
-    case "$state" in ''|Z*) break ;; esac
-    sleep 0.05
-  done
-  state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
-  case "$state" in ''|Z*) ;; *)
-    echo "registration failure left an unregistered process" >&2
-    kill "$pid" 2>/dev/null || true
-    exit 1
-    ;;
-  esac
+  test "$status" -eq 125
+  test "${#repair_unidentified_tunnels[@]}" -eq 1
+  test "${#repair_unregistered_tunnels[@]}" -eq 0
+  command kill -0 "$pid"
   exit 0
 fi
 
@@ -215,8 +206,8 @@ run_register_failure() {
         bash "$fixture"
       status=$?
       set -e
-      test "$status" -ne 0
-      test "$(cat "$tmp/kill-attempts")" -ge 2
+      test "$status" -eq 125
+      test ! -e "$tmp/kill-attempts"
       ;;
     register-reused)
       LAUNCHER="$launcher" MODE="$mode" FAILURE_PID_FILE="$failure_file" \
@@ -274,6 +265,9 @@ china_tunnel_supervisor_match() { [ "$1" = 'sleep 1000' ] && [ "$3" = "$fixture_
 generic_tunnel_stop_stale() { fixture_stop "$1"; }
 peer_kill_owned() { fixture_stop "$1"; }
 china_tunnel_stop_supervisor() { fixture_stop "$1"; }
+repair_started_command_matches() {
+  [ "$2" = 'sleep 1000' ] && [ "$3" = "$fixture_marker" ] && [ "$5" = 'exec sleep 1000' ]
+}
 case "$boundary_kind" in
   generic) fixture_marker=zmq-tunnel-29500 ;;
   peer) fixture_marker=peer-tunnel-lora-0 ;;
@@ -281,13 +275,27 @@ case "$boundary_kind" in
 esac
 case "$boundary_point" in
   before) interrupt_command='repair_launch_active=1' ;;
-  spawned|failed) interrupt_command='launch_pid=$!' ;;
+  spawned|transition|failed) interrupt_command='launch_pid=$!' ;;
   registered) interrupt_command='repair_launch_active=0' ;;
   after) interrupt_command='return "$launch_status"' ;;
 esac
 if [ "$boundary_point" = failed ]; then
   # Model a failed registration that has safely stopped its unregistered child.
-  repair_register_tunnel() { fixture_stop "$2" || return 1; return 1; }
+  repair_register_tunnel() {
+    for _ in $(seq 1 100); do
+      [ "$(process_command_line "$2")" = 'sleep 1000' ] && break
+      sleep 0.01
+    done
+    fixture_stop "$2" || return 1
+    return 1
+  }
+fi
+if [ "$boundary_point" = transition ]; then
+  setsid() {
+    : >"$boundary_ready.transition"
+    while [ ! -e "$boundary_ready.release" ]; do :; done
+    exec setsid "$@"
+  }
 fi
 boundary_hook() {
   [ "$1" = "$interrupt_command" ] || return 0
@@ -295,12 +303,17 @@ boundary_hook() {
   if [ "$boundary_point" != before ]; then
     new_pid=$!
     printf '%s\n' "$new_pid" >>"$boundary_ready"
-    for _ in $(seq 1 50); do
-      [ "$(process_command_line "$new_pid")" = 'sleep 1000' ] && break
-      sleep 0.01
-    done
+    if [ "$boundary_point" = transition ]; then
+      for _ in $(seq 1 100); do
+        [ -e "$boundary_ready.transition" ] && break
+        sleep 0.01
+      done
+      test -e "$boundary_ready.transition" || exit 1
+      [ "$(process_command_line "$new_pid")" != 'sleep 1000' ] || exit 1
+    fi
   fi
   kill -s "$boundary_signal" "$BASHPID"
+  [ "$boundary_point" != transition ] || : >"$boundary_ready.release"
 }
 set -T
 trap 'boundary_hook "$BASH_COMMAND"' DEBUG
@@ -309,7 +322,7 @@ exit 9
 EOF
 for boundary_kind in generic peer china; do
   for boundary_signal in TERM HUP INT; do
-    for boundary_point in before spawned registered after failed; do
+    for boundary_point in before spawned transition registered after failed; do
       boundary_ready="$tmp/ready-boundary-$boundary_kind-$boundary_signal-$boundary_point"
       boundary_log="$tmp/boundary-$boundary_kind-$boundary_signal-$boundary_point-log"
       set +e
@@ -336,6 +349,154 @@ for boundary_kind in generic peer china; do
       /bin/kill -- "-$old_pid" 2>/dev/null || true
     done
   done
+done
+
+# Resume after SIGSTOP failures only when a fresh start-time check succeeds.
+stop_fixture="$tmp/stop-fault-fixture.sh"
+cat >"$stop_fixture" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+source <(sed '/^RUN=\${RUN:/,$d' "$launcher")
+sleep 1000 &
+pid=$!
+trap 'command kill -KILL "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+start_time=$(process_start_time "$pid") || exit 1
+eval "$(declare -f process_start_time | sed '1s/process_start_time/fault_real_start_time/')"
+stopped=0
+continued=0
+kill() {
+  if [ "${1:-}" = -STOP ]; then
+    command kill "$@" || return 1
+    stopped=1
+  elif [ "${1:-}" = -KILL ] && [ "$stop_fault" = kill ]; then
+    return 1
+  else
+    [ "${1:-}" != -CONT ] || continued=1
+    command kill "$@"
+  fi
+}
+process_start_time() {
+  case "$stopped:$stop_fault" in
+    1:start) return 1 ;;
+    1:empty) return 0 ;;
+    1:mismatch) printf '%s\n' "$((start_time + 1))"; return 0 ;;
+  esac
+  fault_real_start_time "$@"
+}
+ps() {
+  if [ "$stopped" = 1 ]; then
+    case "$stop_fault:${2:-}" in
+      stat:stat=|sid:sid=|pgid:pgid=|children:ppid=) return 1 ;;
+      child:ppid=) printf '%s\n' "$pid"; return 0 ;;
+    esac
+  fi
+  command ps "$@"
+}
+set +e
+repair_stop_starting_tunnel "$pid" "$start_time"
+stop_status=$?
+set -e
+test "$stop_status" -ne 0
+command kill -0 "$pid"
+case "$stop_fault" in
+  start|empty|mismatch)
+    test "$continued" -eq 0
+    exit 0
+    ;;
+esac
+test "$continued" -eq 1
+for _ in $(seq 1 50); do
+  state=$(command ps -o stat= -p "$pid" | tr -d ' ')
+  case "$state" in T*) sleep 0.01 ;; *) break ;; esac
+done
+case "$state" in ''|T*|Z*) exit 1 ;; esac
+EOF
+for stop_fault in stat start empty mismatch sid pgid children child kill; do
+  launcher="$launcher" stop_fault="$stop_fault" bash "$stop_fixture"
+done
+
+# A pending signal cannot turn a missing initial identity into a group kill.
+baseline_fixture="$tmp/baseline-failure-fixture.sh"
+cat >"$baseline_fixture" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+source <(sed '/^RUN=\${RUN:/,$d' "$launcher")
+setsid sleep 1000 >/dev/null 2>&1 &
+pid=$!
+printf '%s\n' "$pid" >"$baseline_ready"
+repair_launch_active=1
+tunnels_only=1
+tunnel_repair_deadline=$((SECONDS + 1))
+process_start_time() { printf 'read\n' >>"$baseline_reads"; return 1; }
+kill() { printf '%s\n' "$*" >>"$baseline_kills"; return 1; }
+command kill -TERM "$$"
+repair_register_tunnel generic "$pid" baseline-marker fixture-forward expected-command
+test "$?" -eq 125 || exit 1
+test "${#repair_unidentified_tunnels[@]}" -eq 1 || exit 1
+test "${#repair_unregistered_tunnels[@]}" -eq 0 || exit 1
+repair_launch_active=0
+repair_signal
+EOF
+baseline_ready="$tmp/baseline-ready"
+baseline_reads="$tmp/baseline-reads"
+baseline_kills="$tmp/baseline-kills"
+set +e
+baseline_output=$(launcher="$launcher" baseline_ready="$baseline_ready" \
+  baseline_reads="$baseline_reads" baseline_kills="$baseline_kills" \
+  bash "$baseline_fixture" 2>&1)
+baseline_status=$?
+set -e
+read -r baseline_pid <"$baseline_ready"
+test "$baseline_status" -eq 125
+test "$(wc -l <"$baseline_reads")" -gt 1
+test ! -e "$baseline_kills"
+[[ "$baseline_output" == *"unresolved unidentified tunnel PID $baseline_pid marker baseline-marker; no signal sent"* ]]
+command kill -0 "$baseline_pid"
+/bin/kill -- "-$baseline_pid" 2>/dev/null || /bin/kill "$baseline_pid" 2>/dev/null || true
+
+# A failed startup stop retains its PID/start record for the real EXIT retry.
+retry_fixture="$tmp/start-retry-fixture.sh"
+cat >"$retry_fixture" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+source <(sed '/^RUN=\${RUN:/,$d' "$launcher")
+setsid sleep 1000 >/dev/null 2>&1 &
+pid=$!
+printf '%s\n' "$pid" >"$retry_ready"
+start_time=$(process_start_time "$pid") || exit 1
+eval "$(declare -f repair_stop_starting_tunnel | sed '1s/repair_stop_starting_tunnel/retry_real_stop/')"
+repair_wait_started_tunnel() { return 1; }
+stop_calls=0
+repair_stop_starting_tunnel() {
+  [ "$1" = "$pid" ] && [ "$2" = "$start_time" ] || return 1
+  stop_calls=$((stop_calls + 1))
+  printf '%s\n' "$stop_calls" >>"$retry_log"
+  [ "$retry_mode" = once ] && [ "$stop_calls" -gt 1 ] || return 1
+  retry_real_stop "$@"
+}
+repair_register_tunnel generic "$pid" retry-marker fixture-forward expected-command
+test "$?" -eq 125 || exit 1
+test "${#repair_starting_tunnels[@]}" -eq 1 || exit 1
+repair_signal
+EOF
+for retry_mode in once persistent; do
+  retry_ready="$tmp/ready-retry-$retry_mode"
+  retry_log="$tmp/retry-$retry_mode-log"
+  set +e
+  retry_output=$(launcher="$launcher" retry_mode="$retry_mode" retry_ready="$retry_ready" \
+    retry_log="$retry_log" bash "$retry_fixture" 2>&1)
+  retry_status=$?
+  set -e
+  read -r retry_pid <"$retry_ready"
+  test "$(cat "$retry_log")" = $'1\n2'
+  if [ "$retry_mode" = persistent ]; then
+    test "$retry_status" -eq 125
+    [[ "$retry_output" == *"unresolved starting tunnel PID $retry_pid marker retry-marker"* ]]
+    /bin/kill -- "-$retry_pid" 2>/dev/null || /bin/kill "$retry_pid" 2>/dev/null || true
+  else
+    test "$retry_status" -eq 124
+    if kill -0 "$retry_pid" 2>/dev/null; then exit 1; fi
+  fi
 done
 
 # Full-mode transactions use real local process groups and the production

@@ -18,6 +18,8 @@ tunnel_repair_deadline=0
 repair_failed=0
 repair_created_tunnels=()
 repair_unregistered_tunnels=()
+repair_starting_tunnels=()
+repair_unidentified_tunnels=()
 repair_committed=0
 repair_launch_active=0
 repair_pending_signal=0
@@ -114,7 +116,7 @@ repair_launch_tunnel() {
   repair_launch_active=1
   setsid nohup bash -c "$command_line" >/dev/null 2>&1 < /dev/null 8>&- &
   launch_pid=$!
-  if repair_register_tunnel "$kind" "$launch_pid" "$marker" "$forward"; then
+  if repair_register_tunnel "$kind" "$launch_pid" "$marker" "$forward" "$command_line"; then
     launch_status=0
   else
     launch_status=$?
@@ -251,17 +253,145 @@ repair_stop_unregistered_tunnel() {
 }
 
 repair_register_tunnel() {
-  local kind=$1 pid=$2 marker=$3 forward=${4:-} start_time
-  start_time=$(process_start_time "$2") || {
-    echo "could not record adapter tunnel process identity for $3" >&2
-    if ! repair_stop_unregistered_tunnel "$kind" "$pid" "$marker" "$forward"; then
-      echo "could not stop unregistered adapter tunnel for $marker" >&2
-      repair_unregistered_tunnels+=("$kind|$pid|$marker|$forward")
+  local kind=$1 pid=$2 marker=$3 forward=${4:-} expected_command=${5:-} start_time= observed_start
+  for _ in $(seq 1 100); do
+    if observed_start=$(process_start_time "$pid") && [ -n "$observed_start" ]; then
+      start_time=$observed_start
+      break
     fi
+    if [ ! -e "/proc/$pid" ]; then
+      repair_failed=1
+      return 1
+    fi
+    [ "$repair_launch_active" = 1 ] || break
+    repair_remaining >/dev/null || break
+    sleep 0.05
+  done
+  if [ -z "$start_time" ]; then
+    echo "unidentified starting tunnel PID $pid marker $marker; no signal sent" >&2
+    repair_unidentified_tunnels+=("$pid|$marker")
     repair_failed=1
+    return 125
+  fi
+  if [ -n "$expected_command" ]; then
+    repair_starting_tunnels+=("$pid|$start_time|$marker")
+    if ! repair_wait_started_tunnel "$kind" "$pid" "$marker" "$forward" "$start_time" "$expected_command"; then
+      repair_failed=1
+      repair_stop_starting_tunnel "$pid" "$start_time" || {
+        echo "could not safely stop starting tunnel PID $pid marker $marker" >&2
+        return 125
+      }
+      repair_starting_tunnels=()
+      return 1
+    fi
+  fi
+  repair_created_tunnels+=("$kind|$pid|$marker|$forward|$start_time")
+  [ -z "$expected_command" ] || repair_starting_tunnels=()
+}
+
+repair_cleanup_starting_tunnels() {
+  local item pid start_time marker failed=0
+  for item in "${repair_unidentified_tunnels[@]}"; do
+    IFS='|' read -r pid marker <<<"$item"
+    if [ -e "/proc/$pid" ]; then
+      echo "unresolved unidentified tunnel PID $pid marker $marker; no signal sent" >&2
+      failed=1
+    fi
+  done
+  for item in "${repair_starting_tunnels[@]}"; do
+    IFS='|' read -r pid start_time marker <<<"$item"
+    if ! repair_stop_starting_tunnel "$pid" "$start_time"; then
+      echo "unresolved starting tunnel PID $pid marker $marker" >&2
+      failed=1
+    fi
+  done
+  [ "$failed" = 0 ]
+}
+
+repair_started_command_matches() {
+  local kind=$1 command_line=$2 marker=$3 forward=$4 expected=$5 shape=current actual_ssh expected_ssh
+  case "$command_line" in 'bash -c '*) ;; *) return 1 ;; esac
+  case "$kind" in
+    generic) generic_tunnel_stale_supervisor_match "$command_line" "$marker" "$forward" || return 1 ;;
+    peer)
+      [ "$marker" != peer-tunnel-api ] || shape=api
+      peer_tunnel_supervisor_match "$command_line" "$shape" "$marker" || return 1
+      ;;
+    china) china_tunnel_supervisor_match "$command_line" current "$marker" || return 1 ;;
+    *) return 1 ;;
+  esac
+  actual_ssh=$(tunnel_supervisor_ssh_command "$command_line" "$marker") || return 1
+  expected_ssh=$(tunnel_supervisor_ssh_command "bash -c $expected" "$marker") || return 1
+  [ "$actual_ssh" = "$expected_ssh" ]
+}
+
+repair_wait_started_tunnel() {
+  local kind=$1 pid=$2 marker=$3 forward=$4 start_time=$5 expected=$6
+  local command_line current_start pgid startup_deadline=$((SECONDS + 10))
+  while [ "$SECONDS" -lt "$startup_deadline" ]; do
+    repair_remaining >/dev/null || return 1
+    repair_direct_child_owned "$pid" || return 1
+    current_start=$(process_start_time "$pid") || return 1
+    [ "$current_start" = "$start_time" ] || return 1
+    command_line=$(process_command_line "$pid") || return 1
+    pgid=$(ps -o pgid= -p "$pid" | tr -d ' ') || return 1
+    if [ "$pgid" = "$pid" ] &&
+        repair_started_command_matches "$kind" "$command_line" "$marker" "$forward" "$expected"; then
+      process_identity_matches "$pid" "$pid" "$start_time" "$command_line" || return 1
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
+repair_stop_starting_tunnel() {
+  local pid=$1 start_time=$2 command_line pgid current_start
+  [ -e "/proc/$pid" ] || return 0
+  repair_direct_child_owned "$pid" || return 1
+  pgid=$(ps -o pgid= -p "$pid" | tr -d ' ') || return 1
+  command_line=$(process_command_line "$pid") || return 1
+  process_identity_matches "$pid" "$pgid" "$start_time" "$command_line" || return 1
+  kill -STOP "$pid" || return 1
+  if repair_kill_stopped_tunnel "$pid" "$start_time"; then
+    return 0
+  fi
+  # Resume after a failed stop only while the same identity is still proven.
+  [ -e "/proc/$pid" ] || return 0
+  current_start=$(process_start_time "$pid") || return 1
+  [ "$current_start" = "$start_time" ] || return 1
+  kill -CONT "$pid" 2>/dev/null || {
+    [ ! -e "/proc/$pid" ] && return 0
     return 1
   }
-  repair_created_tunnels+=("$kind|$pid|$marker|$forward|$start_time")
+  return 1
+}
+
+repair_kill_stopped_tunnel() {
+  local pid=$1 start_time=$2 current_start pgid sid process_output children state
+  for _ in $(seq 1 40); do
+    state=$(ps -o stat= -p "$pid" | tr -d ' ') || return 1
+    case "$state" in T*) break ;; Z*) return 0 ;; esac
+    sleep 0.01
+  done
+  case "$state" in T*) ;; *) return 1 ;; esac
+  current_start=$(process_start_time "$pid") || return 1
+  [ "$current_start" = "$start_time" ] || return 1
+  sid=$(ps -o sid= -p "$pid" | tr -d ' ') || return 1
+  pgid=$(ps -o pgid= -p "$pid" | tr -d ' ') || return 1
+  if [ "$sid" = "$pid" ] && [ "$pgid" = "$pid" ]; then
+    kill -KILL -- "-$pid" || return 1
+  else
+    process_output=$(ps -eo ppid=) || return 1
+    children=$(awk -v parent="$pid" '$1 == parent {print}' <<<"$process_output") || return 1
+    [ -z "$children" ] || return 1
+    kill -KILL "$pid" || return 1
+  fi
+  for _ in $(seq 1 40); do
+    [ -e "/proc/$pid" ] || return 0
+    sleep 0.05
+  done
+  return 1
 }
 
 repair_cleanup_unregistered_tunnels() {
@@ -342,7 +472,7 @@ repair_cleanup_created_tunnels() {
   [ "$rollback_failed" = 0 ]
 }
 
-trap 'status=$?; if [ "$status" -ne 0 ]; then repair_failed=1; fi; if [ "$repair_committed" = 0 ]; then if ! repair_cleanup_created_tunnels; then status=125; fi; if ! repair_cleanup_unregistered_tunnels; then status=125; fi; fi; if ! repair_release_lock; then status=125; fi; exit "$status"' EXIT
+trap 'status=$?; if [ "$status" -ne 0 ]; then repair_failed=1; fi; if [ "$repair_committed" = 0 ]; then if ! repair_cleanup_created_tunnels; then status=125; fi; if ! repair_cleanup_unregistered_tunnels; then status=125; fi; if ! repair_cleanup_starting_tunnels; then status=125; fi; fi; if ! repair_release_lock; then status=125; fi; exit "$status"' EXIT
 trap 'repair_signal' TERM HUP INT
 
 RUN=${RUN:?set RUN}
