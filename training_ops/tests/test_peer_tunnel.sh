@@ -352,6 +352,7 @@ write_child_cmdline() {
     -o ExitOnForwardFailure=yes \
     -o ServerAliveInterval=10 \
     -o ServerAliveCountMax=3 \
+    -o 'ChannelTimeout=*-tcpip=45s' \
     -o TCPKeepAlive=yes \
     -o IPQoS=none \
     -o Compression=no \
