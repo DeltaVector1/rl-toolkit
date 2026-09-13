@@ -1505,8 +1505,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertIn("delta adapter transport is required", worker_source)
         self.assertIn('chunk_urls = [f"{lane_url.rstrip(\'/\')}/{name}" for lane_url in lane_urls]', worker_source)
         self.assertIn("chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]", worker_source)
-        self.assertIn("source_urls=chunk_urls", worker_source)
-        self.assertIn("parallel_ranges=False", worker_source)
+        self.assertIn("_download_persistent_file(\n                chunk_urls", worker_source)
         self.assertIn("executor.shutdown(wait=True, cancel_futures=True)", worker_source)
         self.assertIn("_cleanup_delta_stage_artifacts(", worker_source)
         self.assertIn("preserve_partial=_preserve_adapter_stage_partial(exc)", worker_source)
@@ -2133,7 +2132,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         old_decode = filesystem._decode_transport_chunk
         old_raw_digest = filesystem._transport_raw_sha256
         old_xor = filesystem._xor_bytes
-        old_download = filesystem.download
+        old_persistent_file = filesystem._download_persistent_file
         old_cleanup = filesystem._cleanup_delta_stage_artifacts
         downloaded = []
         fail_second_chunk = True
@@ -2145,8 +2144,6 @@ class AdapterTransportStateTest(unittest.TestCase):
 
         def fake_download(_source, destination, **kwargs):
             nonlocal fail_second_chunk
-            if "chunk-" in destination.name:
-                self.assertFalse(kwargs.get("parallel_ranges", True))
             downloaded.append(destination.name)
             payload = config
             if "chunk-0" in destination.name:
@@ -2171,7 +2168,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         filesystem._decode_transport_chunk = lambda payload, **_kwargs: payload
         filesystem._transport_raw_sha256 = lambda payload, **_kwargs: hashlib.sha256(payload).hexdigest()
         filesystem._xor_bytes = lambda _base, payload: payload
-        filesystem.download = fake_download
+        filesystem._download_persistent_file = fake_download
         filesystem._cleanup_delta_stage_artifacts = record_cleanup
         try:
             with tempfile.TemporaryDirectory() as temporary:
@@ -2216,7 +2213,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             filesystem._decode_transport_chunk = old_decode
             filesystem._transport_raw_sha256 = old_raw_digest
             filesystem._xor_bytes = old_xor
-            filesystem.download = old_download
+            filesystem._download_persistent_file = old_persistent_file
             filesystem._cleanup_delta_stage_artifacts = old_cleanup
             base_directory.cleanup()
 

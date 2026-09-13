@@ -3007,6 +3007,10 @@ class _PersistentProtocolError(OSError):
     """A response violated the adapter transport contract."""
 
 
+class _PersistentLocalError(OSError):
+    """A local adapter destination failed and must not be retried."""
+
+
 class _PersistentAdapterConnection:
     """One private HTTP connection that is used by one adapter lane at a time."""
 
@@ -3194,6 +3198,13 @@ class _PersistentAdapterConnection:
                     raise _PersistentProtocolError("adapter response body is too long")
                 try:
                     consume(chunk)
+                except OSError as exc:
+                    self.close()
+                    if isinstance(exc, (TimeoutError, socket.timeout)):
+                        raise
+                    raise _PersistentLocalError(
+                        f"adapter local destination write failed: {exc}"
+                    ) from exc
                 except BaseException:
                     self.close()
                     raise
@@ -3352,6 +3363,9 @@ class _PersistentAdapterLanePool:
                     if attempt + 1 == attempt_limit:
                         raise
                 except _PersistentProtocolError:
+                    connection.close()
+                    raise
+                except _PersistentLocalError:
                     connection.close()
                     raise
                 else:
@@ -3997,15 +4011,19 @@ def _stage_chunked_linear_adapter(
     # never observe a relay index that points at an unfinished config file.
     with reconstruct_lock:
         transfer_started = time.monotonic()
-    download(
-        f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+    config_urls = [
+        f"{lane_url.rstrip('/')}/{_ADAPTER_FILES[0]}"
+        for lane_url in lane_urls
+    ]
+    _download_persistent_file(
+        config_urls,
         config_incoming_path,
         expected_size=config_size,
         expected_sha256=config_sha256,
         progress=report,
         deadline=deadline,
         cancel_event=cancel_event,
-        retry_http_statuses={404, 503},
+        per_request_timeout_seconds=_configured_chunk_timeout(),
     )
     with reconstruct_lock:
         transfer_finished = time.monotonic()
@@ -4103,18 +4121,15 @@ def _stage_chunked_linear_adapter(
             with reconstruct_lock:
                 if transfer_started is None or transfer_started_at < transfer_started:
                     transfer_started = transfer_started_at
-            download(
-                chunk_urls[0],
+            _download_persistent_file(
+                chunk_urls,
                 incoming_path,
                 expected_size=wire_size,
                 expected_sha256=wire_sha256,
                 progress=lane_report,
-                source_urls=chunk_urls,
-                parallel_ranges=False,
                 deadline=deadline,
                 cancel_event=cancel_event,
                 per_request_timeout_seconds=_configured_chunk_timeout(),
-                retry_http_statuses={404, 503},
             )
             transfer_finished_at = time.monotonic()
             with reconstruct_lock:
@@ -4648,15 +4663,19 @@ def _stage_chunked_xor_adapter(
         with timing_lock:
             if transfer_started is None or config_transfer_started < transfer_started:
                 transfer_started = config_transfer_started
-        download(
-            f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+        config_urls = [
+            f"{lane_url.rstrip('/')}/{_ADAPTER_FILES[0]}"
+            for lane_url in lane_urls
+        ]
+        _download_persistent_file(
+            config_urls,
             config_path,
-            expected_size=(config_size if isinstance(config_size, int) else None),
+            expected_size=config_size,
             expected_sha256=config_sha256,
             progress=report,
             deadline=deadline,
             cancel_event=cancel_event,
-            retry_http_statuses={404, 503},
+            per_request_timeout_seconds=_configured_chunk_timeout(),
         )
         config_transfer_finished = time.monotonic()
         with timing_lock:
@@ -4767,18 +4786,15 @@ def _stage_chunked_xor_adapter(
                 per_request_timeout_seconds=_configured_chunk_timeout(),
             )
         else:
-            download(
-                chunk_urls[0],
+            _download_persistent_file(
+                chunk_urls,
                 chunk_path,
                 expected_size=int(item["wire_size"]),
                 expected_sha256=wire_sha256,
                 progress=lane_report,
-                source_urls=chunk_urls,
-                parallel_ranges=False,
                 deadline=deadline,
                 cancel_event=cancel_event,
                 per_request_timeout_seconds=_configured_chunk_timeout(),
-                retry_http_statuses={404, 503},
             )
         transfer_finished_at = time.monotonic()
         with timing_lock:

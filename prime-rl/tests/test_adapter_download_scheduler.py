@@ -1,3 +1,4 @@
+import errno
 import hashlib
 import http.server
 import inspect
@@ -526,7 +527,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 self.stream.close()
 
             def write(self, _value):
-                raise OSError("disk full")
+                raise OSError(errno.ENOSPC, "No space left on device")
 
         def failing_fdopen(fd, mode, *args, **kwargs):
             stream = old_fdopen(fd, mode, *args, **kwargs)
@@ -537,7 +538,7 @@ class DownloadSchedulerTest(unittest.TestCase):
         filesystem.os.fdopen = failing_fdopen
         try:
             with tempfile.TemporaryDirectory() as temporary:
-                with self.assertRaisesRegex(OSError, "disk full"):
+                with self.assertRaisesRegex(OSError, "No space left"):
                     filesystem._download_persistent_file(
                         [f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json"],
                         Path(temporary) / "adapter_config.json",
@@ -548,6 +549,56 @@ class DownloadSchedulerTest(unittest.TestCase):
                 self.assertEqual(handler.requests, 1)
         finally:
             filesystem.os.fdopen = old_fdopen
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_delta_chunk_network_reset_resumes_verified_bytes(self):
+        filesystem = load_filesystem_module()
+        payload = b"delta-reset-resume"
+        ranges = []
+
+        def reset_once(request, number):
+            ranges.append(request.headers["Range"])
+            if number != 1:
+                return False
+            request.send_response(206)
+            request.send_header("Content-Length", str(len(payload)))
+            request.send_header(
+                "Content-Range", f"bytes 0-{len(payload) - 1}/{len(payload)}"
+            )
+            request.send_header("ETag", f'"{hashlib.sha256(payload).hexdigest()}"')
+            request.end_headers()
+            request.wfile.write(payload[:4])
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, reset_once
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        filesystem.lane_rotation_delay_seconds = 0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "chunk-0"
+                filesystem._download_persistent_file(
+                    [f"http://127.0.0.1:{server.server_address[1]}/chunk-0"],
+                    destination,
+                    expected_size=len(payload),
+                    expected_sha256=hashlib.sha256(payload).hexdigest(),
+                    per_request_timeout_seconds=1,
+                )
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertEqual(handler.requests, 2)
+                self.assertEqual(
+                    ranges,
+                    [
+                        f"bytes=0-{len(payload) - 1}",
+                        f"bytes=4-{len(payload) - 1}",
+                    ],
+                )
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()

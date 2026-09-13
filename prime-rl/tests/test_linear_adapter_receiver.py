@@ -367,7 +367,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             },
         }
         old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
-        old_download = filesystem.download
+        old_persistent_file = filesystem._download_persistent_file
         old_lanes = filesystem._adapter_source_urls
         old_streams = filesystem._configured_download_streams
         old_base = filesystem._verified_adapter_base
@@ -413,7 +413,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     base_calls.append((url, _kwargs))
                     return base_paths[url] / "adapter_model.safetensors", base_paths[url] / "adapter_config.json"
 
-                filesystem.download = fake_download
+                filesystem._download_persistent_file = fake_download
                 filesystem._adapter_source_urls = lambda _source: ["http://lane"]
                 filesystem._configured_download_streams = lambda: 1
                 filesystem._verified_adapter_base = fake_base
@@ -493,7 +493,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)
             else:
                 os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
-            filesystem.download = old_download
+            filesystem._download_persistent_file = old_persistent_file
             filesystem._adapter_source_urls = old_lanes
             filesystem._configured_download_streams = old_streams
             filesystem._verified_adapter_base = old_base
