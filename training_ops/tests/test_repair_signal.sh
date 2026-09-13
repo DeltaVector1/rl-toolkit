@@ -357,6 +357,7 @@ cat >"$orphan_fixture" <<'EOF'
 set -uo pipefail
 source <(sed '/^RUN=\${RUN:/,$d' "$launcher")
 launch_command='sleep 1000 & wait'
+source <(sed -n '/^tunnel_channel_timeout_normalize() {/,/^}/p' "$launcher")
 if [ "$orphan_mode" = turnover ]; then
   launch_command='sleep 1000 & first=$!; trap '\''kill "$first"; wait "$first"; sleep 1000 &'\'' USR1; wait; wait'
 fi
@@ -428,6 +429,79 @@ for orphan_kind in generic peer china; do
   for orphan_mode in success registration turnover unbound unknown ps-error awk-error; do
     launcher="$launcher" orphan_kind="$orphan_kind" orphan_mode="$orphan_mode" bash "$orphan_fixture"
   done
+done
+
+command_fixture="$tmp/starting-command-fixture.sh"
+cat >"$command_fixture" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+source <(sed '/^RUN=\${RUN:/,$d' "$launcher")
+source <(sed -n '/^tunnel_channel_timeout_normalize() {/,/^}/p; /^tunnel_supervisor_ssh_command() {/,/^}/p; /^china_tunnel_proxy_ssh_command() {/,/^}/p' "$launcher")
+kind=peer
+route=infinity
+actual_ssh='ssh -NT -o ChannelTimeout=*-tcpip=45s'
+proxy_ssh='ssh -W [fixture.test]:22'
+case "$command_mode" in
+  escaped-near) actual_ssh='ssh -NT -o ChannelTimeout=*-tcpip=46s' ;;
+  proxy-success|proxy-near) kind=china ;;
+esac
+[ "$command_mode" != proxy-near ] || proxy_ssh='ssh -W [near.test]:22'
+expected='while true; do ssh -NT -o ChannelTimeout=\*-tcpip=45s infinity; sleep 3; done # cmd-marker'
+launch_command='bash -c '\''exec -a "$1" sleep infinity'\'' fixture "$actual_ssh" &'
+case "$command_mode" in proxy-*) launch_command+=' bash -c '\''exec -a "$1" sleep infinity'\'' fixture "$proxy_ssh" &' ;; esac
+launch_command+=' wait'
+export actual_ssh proxy_ssh
+setsid bash -c "$launch_command" >/dev/null 2>&1 &
+pid=$!
+trap 'command kill -KILL -- "-$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+for _ in $(seq 1 100); do
+  children=$(command ps -eo ppid=,args= | awk -v parent="$pid" '$1 == parent && $2 == "ssh" {count++} END {print count+0}')
+  wanted=1
+  case "$command_mode" in proxy-*) wanted=2 ;; esac
+  [ "$children" -eq "$wanted" ] && break
+  sleep 0.01
+done
+test "$children" -eq "$wanted" || exit 1
+start_time=$(process_start_time "$pid") || exit 1
+repair_started_command_matches() {
+  [ "$1" = "$kind" ] && [ "$2" = "bash -c $launch_command" ] && [ "$3" = cmd-marker ] && [ "$5" = "$expected" ]
+}
+ssh() {
+  [ "$*" = '-G infinity' ] || return 1
+  printf 'hostname fixture.test\nport 22\nproxyjump infinity\n'
+}
+signals=0
+kill() { signals=$((signals + 1)); command kill "$@"; }
+if [ "$command_mode" = capture-empty ]; then
+  ps() {
+    [ "$*" != '-eo pid=,ppid=,pgid=,sid=,stat=,args=' ] || return 0
+    command ps "$@"
+  }
+fi
+repair_starting_group "$pid" "$start_time" "$expected" cmd-marker '' capture "$kind" fixture-forward "$route"
+status=$?
+case "$command_mode" in
+  capture-empty)
+    test "$status" -ne 0 && test "$signals" -eq 0 || exit 1
+    repair_register_tunnel "$kind" "$pid" cmd-marker fixture-forward "$expected"
+    test "$?" -ne 0 || exit 1
+    test "${#repair_created_tunnels[@]}" -eq 0 || exit 1
+    ;;
+  escaped-success|proxy-success)
+    test "$status" -eq 0 || exit 1
+    bound=$repair_starting_members
+    test -n "$bound" || exit 1
+    command kill -KILL "$pid"
+    wait "$pid" 2>/dev/null || true
+    repair_starting_tunnels=("$pid|$start_time|cmd-marker|$kind|fixture-forward|$expected|$bound|$route")
+    repair_cleanup_starting_tunnels || exit 1
+    test "$signals" -eq 1 || exit 1
+    ;;
+  *) test "$status" -ne 0 && test "$signals" -eq 0 || exit 1 ;;
+esac
+EOF
+for command_mode in escaped-success escaped-near proxy-success proxy-near proxy-kind capture-empty; do
+  launcher="$launcher" command_mode="$command_mode" bash "$command_fixture"
 done
 
 # Resume after SIGSTOP failures only when a fresh start-time check succeeds.
