@@ -660,7 +660,9 @@ def _replace_regular_from_dirs(
             dir_fd=destination_dir,
         )
         try:
-            temp_identity = _stat_identity_from_stat(os.fstat(temp_fd))
+            temp_stat = os.fstat(temp_fd)
+            temp_identity = _stat_identity_from_stat(temp_stat)
+            stable_temp_identity = _stable_rename_identity(temp_stat)
         finally:
             os.close(temp_fd)
         source_identity_after_link = _stat_identity_from_stat(os.fstat(source_fd))
@@ -676,8 +678,30 @@ def _replace_regular_from_dirs(
         os.replace(temp_name, destination_name, src_dir_fd=destination_dir, dst_dir_fd=destination_dir)
         destination_replaced = True
         destination_stat = os.stat(destination_name, dir_fd=destination_dir, follow_symlinks=False)
-        if stat.S_ISLNK(destination_stat.st_mode) or _stat_identity_from_stat(destination_stat) != temp_identity:
+        if stat.S_ISLNK(destination_stat.st_mode) or _stable_rename_identity(destination_stat) != stable_temp_identity:
             raise OSError("adapter publication destination identity differs")
+        published_fd = os.open(
+            destination_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=destination_dir,
+        )
+        try:
+            published_stat = os.fstat(published_fd)
+            if _stable_rename_identity(published_stat) != stable_temp_identity:
+                raise OSError("adapter publication destination identity differs")
+            try:
+                published_digest = _sha256_fd(
+                    published_fd,
+                    "adapter publication destination",
+                )
+            except UpgradeError as exc:
+                raise OSError(
+                    "adapter publication destination checksum cannot be read"
+                ) from exc
+            if published_digest != baseline_digest:
+                raise OSError("adapter publication destination checksum differs")
+        finally:
+            os.close(published_fd)
         if destination_exists and backup_name:
             os.unlink(backup_name, dir_fd=destination_dir)
         temp_name = ""

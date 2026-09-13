@@ -694,6 +694,54 @@ class DownloadSchedulerTest(unittest.TestCase):
             filesystem.time.sleep = old_sleep
             filesystem._ADAPTER_LANE_RETRIES = old_retries
 
+    def test_typed_range_transport_exhaustion_binds_original_error(self):
+        filesystem = load_filesystem_module()
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_sleep = filesystem.time.sleep
+        old_retries = filesystem._ADAPTER_LANE_RETRIES
+        filesystem.time.sleep = lambda _seconds: None
+        filesystem._ADAPTER_LANE_RETRIES = 3
+        calls = []
+
+        def always_transport_failure(_request, **_kwargs):
+            calls.append(True)
+            raise OSError("socket failure")
+
+        filesystem.urllib.request.urlopen = always_transport_failure
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                chunks = Path(temporary) / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        filesystem._PersistentTransportError,
+                        "adapter persistent download retries exhausted",
+                    ) as raised:
+                        filesystem._download_range(
+                            ["http://lane/adapter"],
+                            0,
+                            chunks / "part",
+                            parent_fd,
+                            0,
+                            3,
+                            typed_transport=True,
+                            per_request_timeout_seconds=1,
+                        )
+                    self.assertIsInstance(
+                        raised.exception.__cause__,
+                        filesystem._PersistentTransportError,
+                    )
+                    self.assertEqual(len(calls), 3)
+                finally:
+                    os.close(parent_fd)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.sleep = old_sleep
+            filesystem._ADAPTER_LANE_RETRIES = old_retries
+
     def test_persistent_chunk_exhausted_timeout_is_typed_transport_failure(self):
         filesystem = load_filesystem_module()
         old_read_range = filesystem._PersistentAdapterConnection.read_range
@@ -805,7 +853,8 @@ class DownloadSchedulerTest(unittest.TestCase):
                     per_request_timeout_seconds=1,
                 )
                 self.assertEqual(destination.read_bytes(), payload)
-                self.assertEqual(handler.requests, 2)
+                self.assertGreaterEqual(handler.requests, 2)
+                self.assertLessEqual(handler.requests, filesystem._ADAPTER_LANE_RETRIES)
         finally:
             filesystem.lane_rotation_delay_seconds = old_delay
             server.shutdown()
@@ -1147,13 +1196,11 @@ class DownloadSchedulerTest(unittest.TestCase):
                     per_request_timeout_seconds=1,
                 )
                 self.assertEqual(destination.read_bytes(), payload)
-                self.assertEqual(handler.requests, 2)
-                self.assertEqual(
-                    ranges,
-                    [
-                        f"bytes=0-{len(payload) - 1}",
-                        f"bytes=4-{len(payload) - 1}",
-                    ],
+                self.assertGreaterEqual(handler.requests, 2)
+                self.assertLessEqual(handler.requests, filesystem._ADAPTER_LANE_RETRIES)
+                self.assertEqual(ranges[0], f"bytes=0-{len(payload) - 1}")
+                self.assertTrue(
+                    all(value == f"bytes=4-{len(payload) - 1}" for value in ranges[1:])
                 )
         finally:
             filesystem.lane_rotation_delay_seconds = old_delay

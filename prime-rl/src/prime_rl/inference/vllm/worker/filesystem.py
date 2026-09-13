@@ -3054,7 +3054,7 @@ def _download_range(
             if entry_stat is None or entry_stat.st_size != size:
                 raise OSError(f"incomplete adapter range: {destination.name}")
             return
-        except _PersistentTransportError:
+        except _PersistentTransportError as exc:
             if not typed_transport:
                 raise
             if not _adapter_retry_wait(
@@ -3064,6 +3064,10 @@ def _download_range(
                 deadline,
                 cancel_event,
             ):
+                if typed_transport:
+                    raise _PersistentTransportError(
+                        "adapter persistent download retries exhausted"
+                    ) from exc
                 raise
         except HTTPError as exc:
             if typed_transport and not _retryable_adapter_http_status(exc.code):

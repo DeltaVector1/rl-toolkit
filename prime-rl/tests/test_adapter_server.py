@@ -656,6 +656,73 @@ class AdapterServerTest(unittest.TestCase):
             self.assertTrue(destination.is_dir())
             self.assertEqual(destination.stat().st_ino, identity[1])
 
+    def test_regular_file_rename_ignores_ctime_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "pending" / "chunk"
+            destination = root / "cache" / "chunk"
+            source.parent.mkdir(parents=True)
+            destination.parent.mkdir()
+            source.write_bytes(b"new-data")
+            identity = adapter_server._stat_identity(source)
+            digest = hashlib.sha256(b"new-data").hexdigest()
+            original_replace = adapter_server.os.replace
+
+            def replace_and_change_ctime(*args, **kwargs):
+                result = original_replace(*args, **kwargs)
+                link = destination.with_name(".ctime-link")
+                os.link(destination, link)
+                link.unlink()
+                return result
+
+            adapter_server.os.replace = replace_and_change_ctime
+            try:
+                adapter_server._replace_from_dirs(
+                    source,
+                    destination,
+                    identity,
+                    digest,
+                )
+            finally:
+                adapter_server.os.replace = original_replace
+            self.assertEqual(destination.read_bytes(), b"new-data")
+            self.assertEqual(destination.stat().st_ino, identity[1])
+
+    def test_regular_file_rename_rejects_published_content_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "pending" / "chunk"
+            destination = root / "cache" / "chunk"
+            source.parent.mkdir(parents=True)
+            destination.parent.mkdir()
+            source.write_bytes(b"new-data")
+            destination.write_bytes(b"old-data")
+            identity = adapter_server._stat_identity(source)
+            digest = hashlib.sha256(b"new-data").hexdigest()
+            original_replace = adapter_server.os.replace
+            replacements = 0
+
+            def replace_then_mutate(*args, **kwargs):
+                nonlocal replacements
+                result = original_replace(*args, **kwargs)
+                replacements += 1
+                if replacements == 1:
+                    destination.write_bytes(b"raced!!!")
+                return result
+
+            adapter_server.os.replace = replace_then_mutate
+            try:
+                with self.assertRaises(adapter_server.UpgradeError):
+                    adapter_server._replace_from_dirs(
+                        source,
+                        destination,
+                        identity,
+                        digest,
+                    )
+            finally:
+                adapter_server.os.replace = original_replace
+            self.assertEqual(destination.read_bytes(), b"old-data")
+
     def test_existing_v2_manifest_with_missing_chunk_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             step = Path(temporary) / "step_2"
