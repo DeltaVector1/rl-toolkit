@@ -454,70 +454,64 @@ class AdapterServerTest(unittest.TestCase):
             source.parent.mkdir()
             destination.parent.mkdir()
             source.write_bytes(b"before")
+            destination.write_bytes(b"old-target")
+            manifest = destination.parent / adapter_server.adapter_manifest_name
+            manifest.write_text("old-manifest\n", encoding="utf-8")
+            old_manifest = manifest.read_bytes()
             identity = adapter_server._stat_identity(source)
-            original_replace = adapter_server.os.replace
+            digest = hashlib.sha256(b"before").hexdigest()
+            original_link = adapter_server.os.link
+            link_calls = 0
 
-            def replace_after_mutation(*args, **kwargs):
-                source.write_bytes(b"raced!!")
-                return original_replace(*args, **kwargs)
-
-            adapter_server.os.replace = replace_after_mutation
-            try:
-                with self.assertRaises(adapter_server.UpgradeError):
-                    adapter_server._replace_from_dirs(source, destination, identity)
-            finally:
-                adapter_server.os.replace = original_replace
-            self.assertEqual(destination.read_bytes(), b"raced!!")
-
-    def test_atomic_replace_accepts_directory_ctime_change(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "build" / "step_2"
-            destination = root / "target" / "step_2"
-            source.mkdir(parents=True, mode=0o700)
-            destination.parent.mkdir()
-            identity = adapter_server._directory_identity(source)
-            original_replace = adapter_server.os.replace
-
-            def replace_and_change_ctime(*args, **kwargs):
-                result = original_replace(*args, **kwargs)
-                os.chmod(destination, 0o700)
+            def link_after_source_swap(*args, **kwargs):
+                nonlocal link_calls
+                link_calls += 1
+                result = original_link(*args, **kwargs)
+                if link_calls == 2:
+                    source.write_bytes(b"raced!")
                 return result
 
-            adapter_server.os.replace = replace_and_change_ctime
+            adapter_server.os.link = link_after_source_swap
             try:
-                adapter_server._replace_from_dirs(source, destination, identity)
+                with self.assertRaises(adapter_server.UpgradeError):
+                    adapter_server._replace_from_dirs(source, destination, identity, digest)
             finally:
-                adapter_server.os.replace = original_replace
-            self.assertTrue(destination.is_dir())
-            self.assertEqual(destination.stat().st_ino, identity[1])
+                adapter_server.os.link = original_link
+            self.assertEqual(destination.read_bytes(), b"old-target")
+            self.assertEqual(manifest.read_bytes(), old_manifest)
 
-    def test_atomic_replace_rejects_file_replacement_race(self):
+    def test_directory_candidate_race_preserves_old_tree(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / "build" / "chunk"
-            replacement = root / "build" / "replacement"
-            destination = root / "target" / "chunk"
-            source.parent.mkdir()
-            destination.parent.mkdir()
-            source.write_bytes(b"before")
-            replacement.write_bytes(b"replacement")
-            identity = adapter_server._stat_identity(source)
-            original_replace = adapter_server.os.replace
+            source = root / "pending" / "step_1"
+            destination = root / "cache" / "step_1"
+            source.mkdir(parents=True)
+            destination.mkdir(parents=True)
+            (source / "value").write_bytes(b"new-tree")
+            (destination / "value").write_bytes(b"old-tree")
+            manifest = destination / adapter_server.adapter_manifest_name
+            manifest.write_text("old-manifest\n", encoding="utf-8")
+            old_manifest = manifest.read_bytes()
+            identity = adapter_server._directory_identity(source)
+            calls = 0
 
-            def replace_after_swap(*args, **kwargs):
-                original_replace(replacement, source)
-                return original_replace(*args, **kwargs)
+            def validate(candidate):
+                nonlocal calls
+                calls += 1
+                if (candidate / "value").read_bytes() != b"new-tree":
+                    raise OSError("candidate changed")
+                if calls == 1:
+                    (candidate / "value").write_bytes(b"raced-tree")
 
-            adapter_server.os.replace = replace_after_swap
-            try:
-                with self.assertRaisesRegex(
-                    adapter_server.UpgradeError, "cannot publish adapter file"
-                ):
-                    adapter_server._replace_from_dirs(source, destination, identity)
-            finally:
-                adapter_server.os.replace = original_replace
-            self.assertEqual(destination.read_bytes(), b"replacement")
+            with self.assertRaises(adapter_server.UpgradeError):
+                adapter_server._replace_from_dirs(
+                    source,
+                    destination,
+                    identity,
+                    directory_validator=validate,
+                )
+            self.assertEqual((destination / "value").read_bytes(), b"old-tree")
+            self.assertEqual(manifest.read_bytes(), old_manifest)
 
     def test_existing_v2_manifest_with_missing_chunk_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

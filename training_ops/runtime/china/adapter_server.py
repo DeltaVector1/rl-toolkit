@@ -36,7 +36,7 @@ class UpgradeError(RuntimeError):
 
 
 _identity_cache: dict[
-    tuple[Path, bool, bool, tuple[tuple[int, int, int, int, int], ...]],
+    tuple[int, bool, bool, tuple[tuple[int, int, int, int, int], ...]],
     dict[str, object],
 ] = {}
 _identity_lock = Lock()
@@ -183,21 +183,6 @@ def _directory_identity(path: Path) -> tuple[int, int, int, int, int]:
     return _stat_identity_from_stat(stat_result)
 
 
-def _stable_rename_identity(stat_result: os.stat_result) -> tuple[int, ...]:
-    file_type = stat.S_IFMT(stat_result.st_mode)
-    if stat.S_ISDIR(stat_result.st_mode):
-        return stat_result.st_dev, stat_result.st_ino, file_type
-    if stat.S_ISREG(stat_result.st_mode):
-        return (
-            stat_result.st_dev,
-            stat_result.st_ino,
-            stat_result.st_size,
-            stat_result.st_mtime_ns,
-            file_type,
-        )
-    return stat_result.st_dev, stat_result.st_ino, file_type
-
-
 def _fd_stat_identity(fd: int) -> tuple[int, int, int, int, int]:
     try:
         return _stat_identity_from_stat(os.fstat(fd))
@@ -313,7 +298,7 @@ def _identity_from_published_directory(
         stat_paths.append(directory / stable_name)
         stat_paths.extend(predictive_chunk_paths)
     cache_key = (
-        directory.resolve(),
+        step,
         cache,
         verify_weights,
         tuple(_stat_identity(path) for path in stat_paths),
@@ -452,10 +437,11 @@ def _replace_from_dirs(
     source: Path,
     destination: Path,
     expected_identity: tuple[int, int, int, int, int] | None = None,
+    expected_digest: str | None = None,
+    directory_validator=None,
 ) -> None:
     directory_flag = getattr(os, "O_DIRECTORY", 0)
     flags = os.O_RDONLY | directory_flag | getattr(os, "O_NOFOLLOW", 0)
-    source_fd = None
     try:
         source_dir = os.open(source.parent, flags)
         destination_dir = os.open(destination.parent, flags)
@@ -466,48 +452,255 @@ def _replace_from_dirs(
             pass
         raise UpgradeError("cannot open adapter publication directory") from exc
     try:
-        source_path_stat = os.stat(source.name, dir_fd=source_dir, follow_symlinks=False)
-        if stat.S_ISLNK(source_path_stat.st_mode):
-            raise OSError("adapter publication source is a symlink")
-        if not (
-            stat.S_ISDIR(source_path_stat.st_mode)
-            or stat.S_ISREG(source_path_stat.st_mode)
-        ):
-            raise OSError("adapter publication source is not a regular file or directory")
+        source_stat = os.stat(source.name, dir_fd=source_dir, follow_symlinks=False)
+        if stat.S_ISDIR(source_stat.st_mode):
+            _replace_directory_from_dirs(
+                source_dir,
+                destination_dir,
+                source.name,
+                destination.name,
+                expected_identity,
+                directory_validator,
+                destination.parent,
+            )
+        elif stat.S_ISREG(source_stat.st_mode):
+            _replace_regular_from_dirs(
+                source_dir,
+                destination_dir,
+                source.name,
+                destination.name,
+                expected_identity,
+                expected_digest,
+            )
+        else:
+            raise OSError("adapter publication source is not regular")
+    except OSError as exc:
+        raise UpgradeError("cannot publish adapter file") from exc
+    finally:
+        os.close(source_dir)
+        os.close(destination_dir)
+
+
+def _replace_directory_from_dirs(
+    source_dir: int,
+    destination_dir: int,
+    source_name: str,
+    destination_name: str,
+    expected_identity: tuple[int, int, int, int, int] | None,
+    validator,
+    destination_parent: Path,
+) -> None:
+    source_stat = os.stat(source_name, dir_fd=source_dir, follow_symlinks=False)
+    source_identity = _stat_identity_from_stat(source_stat)
+    if expected_identity is not None and source_identity != expected_identity:
+        raise OSError("adapter publication source changed")
+    candidate_name = f".{destination_name}.candidate-{os.getpid()}-{time.time_ns()}"
+    backup_name = f".{destination_name}.backup-{os.getpid()}-{time.time_ns()}"
+    candidate_path = destination_parent / candidate_name
+    destination_exists = False
+    destination_replaced = False
+    try:
+        os.replace(
+            source_name,
+            candidate_name,
+            src_dir_fd=source_dir,
+            dst_dir_fd=destination_dir,
+        )
+        candidate_stat = os.stat(candidate_name, dir_fd=destination_dir, follow_symlinks=False)
+        if _stat_identity_from_stat(candidate_stat) != source_identity:
+            raise OSError("adapter publication candidate identity differs")
+        if validator is not None:
+            validator(candidate_path)
+            validator(candidate_path)
+        candidate_stat = os.stat(candidate_name, dir_fd=destination_dir, follow_symlinks=False)
+        if _stat_identity_from_stat(candidate_stat) != source_identity:
+            raise OSError("adapter publication candidate changed")
+        try:
+            old_stat = os.stat(destination_name, dir_fd=destination_dir, follow_symlinks=False)
+        except FileNotFoundError:
+            old_stat = None
+        if old_stat is not None:
+            if not stat.S_ISDIR(old_stat.st_mode):
+                raise OSError("adapter publication destination is not a directory")
+            destination_exists = True
+            os.replace(
+                destination_name,
+                backup_name,
+                src_dir_fd=destination_dir,
+                dst_dir_fd=destination_dir,
+            )
+        os.replace(
+            candidate_name,
+            destination_name,
+            src_dir_fd=destination_dir,
+            dst_dir_fd=destination_dir,
+        )
+        destination_replaced = True
+        destination_stat = os.stat(destination_name, dir_fd=destination_dir, follow_symlinks=False)
+        if _stat_identity_from_stat(destination_stat) != source_identity:
+            raise OSError("adapter publication destination identity differs")
+        if destination_exists:
+            shutil.rmtree(destination_parent / backup_name)
+            backup_name = ""
+    except OSError:
+        try:
+            if destination_exists and backup_name:
+                os.replace(
+                    backup_name,
+                    destination_name,
+                    src_dir_fd=destination_dir,
+                    dst_dir_fd=destination_dir,
+                )
+                backup_name = ""
+            elif destination_replaced:
+                os.unlink(destination_name, dir_fd=destination_dir)
+        except (FileNotFoundError, OSError):
+            pass
+        raise
+    finally:
+        try:
+            candidate_stat = os.stat(candidate_name, dir_fd=destination_dir, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISDIR(candidate_stat.st_mode):
+                shutil.rmtree(candidate_path)
+            else:
+                os.unlink(candidate_path)
+        if backup_name:
+            try:
+                shutil.rmtree(destination_parent / backup_name)
+            except FileNotFoundError:
+                pass
+
+
+def _replace_regular_from_dirs(
+    source_dir: int,
+    destination_dir: int,
+    source_name: str,
+    destination_name: str,
+    expected_identity: tuple[int, int, int, int, int] | None,
+    expected_digest: str | None,
+) -> None:
+    source_fd = destination_fd = backup_fd = None
+    temp_name = f".{destination_name}.publish-{os.getpid()}-{time.time_ns()}"
+    backup_name = f".{destination_name}.backup-{os.getpid()}-{time.time_ns()}"
+    destination_exists = False
+    destination_replaced = False
+    try:
         source_fd = os.open(
-            source.name,
+            source_name,
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=source_dir,
         )
         source_stat = os.fstat(source_fd)
-        if _stat_identity_from_stat(source_path_stat) != _stat_identity_from_stat(source_stat):
-            raise OSError("adapter publication source changed")
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise OSError("adapter publication source is not regular")
         source_identity = _stat_identity_from_stat(source_stat)
         if expected_identity is not None and source_identity != expected_identity:
             raise OSError("adapter publication source changed")
-        stable_source_identity = _stable_rename_identity(source_stat)
-        os.replace(
-            source.name,
-            destination.name,
+        baseline_digest = expected_digest
+        if baseline_digest is None:
+            baseline_digest = _sha256_fd(source_fd, "adapter publication source")
+            if _stat_identity_from_stat(os.fstat(source_fd)) != source_identity:
+                raise OSError("adapter publication source changed")
+        try:
+            destination_fd = os.open(
+                destination_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=destination_dir,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            destination_stat = os.fstat(destination_fd)
+            if not stat.S_ISREG(destination_stat.st_mode):
+                raise OSError("adapter publication destination is not regular")
+            destination_exists = True
+            os.link(
+                destination_name,
+                backup_name,
+                src_dir_fd=destination_dir,
+                dst_dir_fd=destination_dir,
+                follow_symlinks=False,
+            )
+            backup_fd = os.open(
+                backup_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=destination_dir,
+            )
+            if _stat_identity_from_stat(os.fstat(backup_fd)) != _stat_identity_from_stat(destination_stat):
+                raise OSError("adapter publication backup identity differs")
+        os.link(
+            source_name,
+            temp_name,
             src_dir_fd=source_dir,
             dst_dir_fd=destination_dir,
-        )
-        if _stable_rename_identity(os.fstat(source_fd)) != stable_source_identity:
-            raise OSError("adapter publication source changed")
-        destination_stat = os.stat(
-            destination.name,
-            dir_fd=destination_dir,
             follow_symlinks=False,
         )
-        if stat.S_ISLNK(destination_stat.st_mode) or _stable_rename_identity(destination_stat) != stable_source_identity:
+        temp_fd = os.open(
+            temp_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=destination_dir,
+        )
+        try:
+            temp_identity = _stat_identity_from_stat(os.fstat(temp_fd))
+        finally:
+            os.close(temp_fd)
+        source_identity_after_link = _stat_identity_from_stat(os.fstat(source_fd))
+        if temp_identity != source_identity_after_link:
+            raise OSError("adapter publication source changed")
+        if expected_identity is not None and source_identity_after_link[:4] != expected_identity[:4]:
+            raise OSError("adapter publication source changed")
+        actual_digest = _sha256_fd(source_fd, "adapter publication source")
+        if _stat_identity_from_stat(os.fstat(source_fd)) != source_identity_after_link:
+            raise OSError("adapter publication source changed")
+        if actual_digest != baseline_digest:
+            raise OSError("adapter publication source checksum differs")
+        os.replace(temp_name, destination_name, src_dir_fd=destination_dir, dst_dir_fd=destination_dir)
+        destination_replaced = True
+        destination_stat = os.stat(destination_name, dir_fd=destination_dir, follow_symlinks=False)
+        if stat.S_ISLNK(destination_stat.st_mode) or _stat_identity_from_stat(destination_stat) != temp_identity:
             raise OSError("adapter publication destination identity differs")
-    except OSError as exc:
-        raise UpgradeError("cannot publish adapter file") from exc
+        if destination_exists and backup_name:
+            os.unlink(backup_name, dir_fd=destination_dir)
+        temp_name = ""
+        backup_name = ""
+    except OSError:
+        if temp_name:
+            try:
+                os.unlink(temp_name, dir_fd=destination_dir)
+            except FileNotFoundError:
+                pass
+        if destination_exists and backup_name:
+            try:
+                os.replace(
+                    backup_name,
+                    destination_name,
+                    src_dir_fd=destination_dir,
+                    dst_dir_fd=destination_dir,
+                )
+                backup_name = ""
+            except OSError:
+                try:
+                    os.unlink(destination_name, dir_fd=destination_dir)
+                except FileNotFoundError:
+                    pass
+        elif destination_replaced:
+            try:
+                os.unlink(destination_name, dir_fd=destination_dir)
+            except FileNotFoundError:
+                pass
+        raise
     finally:
-        if source_fd is not None:
-            os.close(source_fd)
-        os.close(source_dir)
-        os.close(destination_dir)
+        for fd in (source_fd, destination_fd, backup_fd):
+            if fd is not None:
+                os.close(fd)
+        if backup_name:
+            try:
+                os.unlink(backup_name, dir_fd=destination_dir)
+            except FileNotFoundError:
+                pass
 
 
 def _remove_leftover(path: Path) -> None:
@@ -591,6 +784,13 @@ def _prepare_cache(
     _fsync_directory(pending)
 
 
+def _validate_cache_candidate(
+    candidate: Path, step: int, expected_identity: dict[str, object]
+) -> None:
+    if _identity_from_published_directory(candidate, step, cache=True) != expected_identity:
+        raise UpgradeError("adapter cache changed during publication")
+
+
 def _promote_cache(active_run: Path, pending: Path, newest_step: int) -> None:
     root = active_run / cache_name
     if root.is_symlink() or (root.exists() and not root.is_dir()):
@@ -609,11 +809,18 @@ def _promote_cache(active_run: Path, pending: Path, newest_step: int) -> None:
                 raise UpgradeError(f"adapter cache step {step} identity differs")
         prepared[step] = source, destination, identity
 
-    for source, destination, _identity in prepared.values():
+    for step, (source, destination, _identity) in prepared.items():
         if destination.exists():
             shutil.rmtree(source)
         else:
-            _replace_from_dirs(source, destination, _directory_identity(source))
+            _replace_from_dirs(
+                source,
+                destination,
+                _directory_identity(source),
+                directory_validator=lambda candidate, step=step, identity=_identity: _validate_cache_candidate(
+                    candidate, step, identity
+                ),
+            )
         _chmod_private_entry(destination)
         _fsync_directory(root)
 
@@ -657,6 +864,7 @@ def _install_predictive_manifest(
     chunk_names: list[str] = []
     seen_chunks: set[str] = set()
     validated_identities: dict[str, tuple[int, int, int, int, int]] = {}
+    validated_digests: dict[str, str] = {}
     for item in manifest["chunks"]:
         if not isinstance(item, dict) or not isinstance(item.get("file"), str):
             raise UpgradeError("predictive manifest contains an invalid chunk")
@@ -684,6 +892,7 @@ def _install_predictive_manifest(
         if _sha256(chunk) != wire_sha256:
             raise UpgradeError(f"predictive manifest chunk checksum differs: {name}")
         validated_identities[name] = _stat_identity(chunk)
+        validated_digests[name] = wire_sha256
         seen_chunks.add(name)
         chunk_names.append(name)
     target_manifest = target / adapter_manifest_name
@@ -701,6 +910,8 @@ def _install_predictive_manifest(
         raise UpgradeError("predictive manifest files are not regular files")
     validated_identities[adapter_digest_name] = _stat_identity(build_digest)
     validated_identities[adapter_manifest_name] = _stat_identity(build_manifest)
+    validated_digests[adapter_digest_name] = _sha256(build_digest)
+    validated_digests[adapter_manifest_name] = _sha256(build_manifest)
     for artifact in build.iterdir():
         if artifact.is_symlink() or not artifact.is_file():
             raise UpgradeError("predictive build contains a non-regular artifact")
@@ -718,10 +929,25 @@ def _install_predictive_manifest(
             if old_chunk.is_file():
                 stale_chunks.append(old_chunk)
     for name in chunk_names:
-        _replace_from_dirs(build / name, target / name, validated_identities[name])
-    _replace_from_dirs(build_digest, target_digest, validated_identities[adapter_digest_name])
+        _replace_from_dirs(
+            build / name,
+            target / name,
+            validated_identities[name],
+            validated_digests[name],
+        )
+    _replace_from_dirs(
+        build_digest,
+        target_digest,
+        validated_identities[adapter_digest_name],
+        validated_digests[adapter_digest_name],
+    )
     _fsync_directory(target)
-    _replace_from_dirs(build_manifest, target_manifest, validated_identities[adapter_manifest_name])
+    _replace_from_dirs(
+        build_manifest,
+        target_manifest,
+        validated_identities[adapter_manifest_name],
+        validated_digests[adapter_manifest_name],
+    )
     _fsync_directory(target)
     for name in (adapter_config_name, adapter_weights_name):
         for old_chunk in target.glob(f"{name}.transport-delta-*"):
