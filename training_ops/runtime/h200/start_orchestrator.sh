@@ -20,6 +20,7 @@ repair_cleanup_spent_us=0
 repair_cleanup_active_us=0
 repair_cleanup_completed=0
 repair_cleanup_limit_us=20000000
+repair_exit_cleanup_limit_us=20000000
 repair_stage=initialization
 repair_started_seconds=$SECONDS
 repair_failed=0
@@ -46,9 +47,10 @@ if [ "$tunnels_only" = 1 ]; then
   tunnel_repair_deadline=$((SECONDS + tunnel_repair_deadline_s))
   repair_total_deadline=$tunnel_repair_deadline
   repair_reserve_seconds=$((tunnel_repair_deadline_s / 5))
-  [ "$repair_reserve_seconds" -le 20 ] || repair_reserve_seconds=20
+  [ "$repair_reserve_seconds" -le 30 ] || repair_reserve_seconds=30
   tunnel_repair_deadline=$((tunnel_repair_deadline - repair_reserve_seconds))
   repair_cleanup_limit_us=$(((tunnel_repair_deadline_s - repair_reserve_seconds) * 1000000))
+  repair_exit_cleanup_limit_us=$((repair_reserve_seconds * 1000000))
 fi
 
 repair_cleanup_remaining() {
@@ -684,7 +686,7 @@ repair_exit() {
     repair_cleanup_spent_us=0
     repair_cleanup_active_us=0
     repair_cleanup_completed=0
-    repair_cleanup_limit_us=20000000
+    repair_cleanup_limit_us=${repair_exit_cleanup_limit_us:-20000000}
     if repair_cleanup_call repair_cleanup_all; then
       cleanup_result=passed
     else
@@ -2184,6 +2186,7 @@ peer_tunnel_remove_orphan_api_listener() {
 }
 
 peer_tunnel_remove_duplicate_api_supervisors() {
+  local keep_current=${1:-1}
   local owner_pid= owner_child= pid matching_pids listener output variant
   output=$(ss -H -ltnp) || return 1
   listener=$(awk -v port=":$peer_api_port" '$4 ~ port "$" {print; exit}' <<<"$output")
@@ -2203,8 +2206,10 @@ peer_tunnel_remove_duplicate_api_supervisors() {
   while read -r pid; do
     [ -n "$pid" ] || continue
     peer_tunnel_api_pid_match "$pid" supervisor || return 1
-    [ "$pid" = "$owner_pid" ] && [ "$peer_api_variant" = current ] && continue
+    [ "$keep_current" = 1 ] && [ "$pid" = "$owner_pid" ] && \
+      [ "$peer_api_variant" = current ] && continue
     peer_tunnel_api_stop_group "$pid" "$peer_api_variant" || return 1
+    [ "$pid" != "$owner_pid" ] || owner_pid=
   done <<<"$matching_pids"
   if [ -n "$owner_pid" ] && ! peer_tunnel_api_pid_match "$owner_pid" supervisor current; then
     for _ in $(seq 1 10); do
@@ -3393,7 +3398,7 @@ peer_tunnel() {
   fi
   [ "$peer_enabled" = 1 ] || return 0
   repair_stage=peer-api
-  peer_tunnel_remove_duplicate_api_supervisors || {
+  peer_tunnel_remove_duplicate_api_supervisors "$peer_keep_current" || {
     echo "peer phase=api stage=duplicate-cleanup elapsed=$((SECONDS - phase_start))" >&2
     return 1
   }

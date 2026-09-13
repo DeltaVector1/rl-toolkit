@@ -729,6 +729,11 @@ unset PEER_TEST_LOG PEER_QUERY PEER_CHILDREN_OUTPUT PEER_GROUP_COMMANDS
     if [ "$variant" = current ]; then
       test "${stopped[*]}" = 2001
       test "$listener_live" = 1
+
+      stopped=(); listener_live=1
+      peer_tunnel_remove_duplicate_api_supervisors 0
+      test "${stopped[*]}" = '1001 2001'
+      test "$listener_live" = 0
     else
       test "${stopped[*]}" = '1001 2001'
       test "$listener_live" = 0
