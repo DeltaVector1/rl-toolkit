@@ -4370,13 +4370,20 @@ def repair(what: str) -> str:
         return _repair_orchestrator()
     if what == "adapter-tunnels":
         return _repair_adapter_tunnels()
+    if what == "adapter-tunnels-reset":
+        return _repair_adapter_tunnels(reset=True)
     if what.startswith("adapter-tunnels:"):
         config_dir = what.split(":", 1)[1]
         if not config_dir:
             raise Refused("adapter-tunnels requires a run config directory")
         return _repair_adapter_tunnels(config_dir)
+    if what.startswith("adapter-tunnels-reset:"):
+        config_dir = what.split(":", 1)[1]
+        if not config_dir:
+            raise Refused("adapter-tunnels-reset requires a run config directory")
+        return _repair_adapter_tunnels(config_dir, reset=True)
     raise Refused(
-        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, or adapter-tunnels[:config-dir]."
+        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, adapter-tunnels[:config-dir], or adapter-tunnels-reset[:config-dir]."
     )
 
 
@@ -4724,7 +4731,7 @@ def _repair_orchestrator() -> str:
     return result
 
 
-def _repair_adapter_tunnels(config_dir: str | None = None) -> str:
+def _repair_adapter_tunnels(config_dir: str | None = None, *, reset: bool = False) -> str:
     """Reconcile the configured adapter tunnels without starting services."""
     if config_dir:
         profile = _config_dir(config_dir, require_orchestrator=True)
@@ -4755,12 +4762,14 @@ def _repair_adapter_tunnels(config_dir: str | None = None) -> str:
         nodes=[orchestrator_host],
     ):
         raise RuntimeError("adapter tunnel launcher deployment failed")
+    tunnel_mode = "--restart-tunnels --tunnels-only" if reset else "--tunnels-only"
     command = (
         f"RUN={shlex.quote(run)} RUN_NAME={shlex.quote(run_name)} "
         f"ORCH_CONFIG={shlex.quote(f'{remote_repo}/{orchestrator_config}')} "
         f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
         f"TRAINER_CT={shlex.quote(trainer_container)} ORCH_CT={shlex.quote(orchestrator_container)} "
-        f"bash {shlex.quote(orchestrator_launcher)} --restart-tunnels --tunnels-only"
+        f"TUNNEL_REPAIR_DEADLINE_S=150 timeout --signal=TERM --kill-after=5s 155s "
+        f"bash {shlex.quote(orchestrator_launcher)} {tunnel_mode}"
     )
     code, output = _ssh(orchestrator_host, command, timeout=180)
     if code:
