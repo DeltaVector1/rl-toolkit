@@ -53,6 +53,19 @@ mkdir -p "$tmp/bin"
 real_cat=$(command -v cat)
 real_ssh=$(command -v ssh)
 real_awk=$(command -v awk)
+export test_real_readlink=$(command -v readlink)
+cat >"$tmp/bin/readlink" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+pid=${1#/proc/}
+pid=${pid%/exe}
+if [ -n "${CHINA_PROC_FIXTURES:-}" ] && [ -s "$CHINA_PROC_FIXTURES/$pid" ]; then
+  printf '/usr/bin/ssh\n'
+else
+  exec "$test_real_readlink" "$@"
+fi
+EOF
+chmod +x "$tmp/bin/readlink"
 cat >"$tmp/bin/cat" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -132,6 +145,10 @@ cat >"$tmp/bin/ps" <<'EOF'
 set -euo pipefail
 if [ "${PEER_PS_FAILURE:-0}" = 1 ]; then
   echo "ps fixture failure" >&2
+  exit 1
+fi
+if [ -n "${peer_ps_partial_output:-}" ] && [ "${2:-}" = "${peer_ps_partial_fields:-}" ]; then
+  cat "$peer_ps_partial_output"
   exit 1
 fi
 if [ "${1:-}" = "-o" ] && [ "${2:-}" = "args=" ]; then
@@ -294,6 +311,7 @@ cat >"$tmp/bin/ssh" <<'EOF'
 set -euo pipefail
 if [ "${1:-}" = -G ] && [ -n "${SSH_G_OUTPUT:-}" ]; then
   cat "$SSH_G_OUTPUT"
+  exit "${ssh_g_status:-0}"
 else
   exec "$REAL_SSH" "$@"
 fi
@@ -303,6 +321,10 @@ cat >"$tmp/bin/awk" <<'EOF'
 set -euo pipefail
 if [ "${PEER_AWK_FAILURE:-0}" = 1 ]; then
   echo "awk fixture failure" >&2
+  exit 2
+fi
+if [ "${peer_awk_partial_failure:-0}" = 1 ]; then
+  "$REAL_AWK" "$@"
   exit 2
 fi
 exec "$REAL_AWK" "$@"
@@ -1028,6 +1050,52 @@ test ! -s "$peer_stale_evil_kill_log"
 unset -f kill
 unset PEER_STALE_EVIL_KILL_LOG PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
 
+# A valid partial process list or filtered group is not a complete ownership
+# proof. Test both group functions and verify that neither kill path mutates.
+partial_group="$tmp/partial-peer-group"
+partial_kills="$tmp/partial-peer-kills"
+printf '%s\n' "1234 $peer_supervisor_command" "1234 $peer_exact_command" \
+  '1234 sleep 3' >"$partial_group"
+export PEER_GROUP_COMMANDS="$partial_group" PEER_TEST_PGID_PID=42 PEER_TEST_PGID=1234
+PATH="$tmp/bin:$PATH" peer_tunnel_group_safe 1234
+PATH="$tmp/bin:$PATH" peer_tunnel_stale_group_safe 1234 "$peer_supervisor_command" cleanup peer-tunnel-lora-0
+for partial_source in ps awk; do
+  (
+    if [ "$partial_source" = ps ]; then
+      export peer_ps_partial_output="$partial_group" peer_ps_partial_fields=pgid=,args=
+    else
+      export peer_awk_partial_failure=1
+    fi
+    kill() { printf '%s\n' "$*" >>"$partial_kills"; }
+    set +e
+    PATH="$tmp/bin:$PATH" peer_tunnel_group_safe 1234
+    group_status=$?
+    PATH="$tmp/bin:$PATH" peer_tunnel_stale_group_safe 1234 "$peer_supervisor_command" cleanup peer-tunnel-lora-0
+    stale_status=$?
+    PATH="$tmp/bin:$PATH" peer_kill_owned 42 "$peer_supervisor_command"
+    kill_status=$?
+    PATH="$tmp/bin:$PATH" peer_kill_owned 42 "$peer_supervisor_command" cleanup peer-tunnel-lora-0
+    stale_kill_status=$?
+    set -e
+    test "$group_status" -ne 0
+    test "$stale_status" -ne 0
+    test "$kill_status" -ne 0
+    test "$stale_kill_status" -ne 0
+    test ! -s "$partial_kills"
+  )
+done
+unset PEER_GROUP_COMMANDS PEER_TEST_PGID_PID PEER_TEST_PGID
+
+partial_children="$tmp/partial-peer-children"
+printf '4242 4241 %s\n' "$peer_exact_command" >"$partial_children"
+set +e
+PATH="$tmp/bin:$PATH" peer_ps_partial_output="$partial_children" peer_ps_partial_fields=pid=,ppid=,args= \
+  peer_tunnel_supervisor_child_identity 4241 current peer-tunnel-lora-0 \
+  -R 127.0.0.1:18100:127.0.0.1:"$relay_port" -R 127.0.0.1:18101:127.0.0.1:"$relay_port"
+partial_child_status=$?
+set -e
+test "$partial_child_status" -ne 0
+
 # The supervisor command escapes the wildcard for its shell, while its SSH
 # child has the literal wildcard.  Only that exact timeout argument is
 # normalized for group comparison.
@@ -1251,6 +1319,14 @@ proxy_route="$tmp/proxy-route"
 printf '%s\n' 'hostname 10.92.20.82' 'port 22' 'proxyjump china-jump' >"$proxy_route"
 trainer_ssh_target=china-proxy
 export SSH_G_OUTPUT="$proxy_route"
+(
+  china_tunnel_proxy_target=
+  set +e
+  PATH="$tmp/bin:$PATH" ssh_g_status=2 china_tunnel_proxy_ssh_command
+  partial_route_status=$?
+  set -e
+  test "$partial_route_status" -eq 2
+)
 proxy_exact_command=${china_exact_command/china-trainer/china-proxy}
 proxy_supervisor="bash -c while true; do $proxy_exact_command; sleep 3; done # china-tunnel-lora-0"
 proxy_child='ssh -W [10.92.20.82]:22 china-jump'
