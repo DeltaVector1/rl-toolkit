@@ -78,6 +78,10 @@ repair_cleanup_call() {
   repair_cleanup_spent_us=$(( ${repair_cleanup_spent_us:-0} + finished - repair_cleanup_active_us ))
   repair_cleanup_active_us=0
   repair_cleanup_completed=$(( ${repair_cleanup_completed:-0} + 1 ))
+  repair_cleanup_remaining || {
+    echo "tunnel cleanup time limit reached: stage=$stage completed=$repair_cleanup_completed" >&2
+    return 1
+  }
   return "$status"
 }
 
@@ -301,6 +305,7 @@ repair_stop_unregistered_tunnel_inner() {
         case "$?" in 1) return 0 ;; *) return 1 ;; esac
       fi
       sleep 0.1
+      repair_cleanup_remaining || return 1
     done
     return 1
   fi
@@ -434,6 +439,7 @@ repair_stop_starting_group() {
     remaining=$(awk -v group="$pid" '$1 == group && $2 !~ /^Z/ {print}' <<<"$output") || return 1
     [ -n "$remaining" ] || return 0
     sleep 0.05
+    repair_cleanup_remaining || return 1
   done
   return 1
 }
@@ -526,6 +532,7 @@ repair_kill_stopped_tunnel() {
     state=$(ps -o stat= -p "$pid" | tr -d ' ') || return 1
     case "$state" in T*) break ;; Z*) return 0 ;; esac
     sleep 0.01
+    repair_cleanup_remaining || return 1
   done
   case "$state" in T*) ;; *) return 1 ;; esac
   current_start=$(process_start_time "$pid") || return 1
@@ -544,6 +551,7 @@ repair_kill_stopped_tunnel() {
     repair_cleanup_remaining || return 1
     [ -e "/proc/$pid" ] || return 0
     sleep 0.05
+    repair_cleanup_remaining || return 1
   done
   return 1
 }
@@ -679,6 +687,7 @@ repair_exit() {
       cleanup_result=passed
     else
       cleanup_result=failed
+      # Incomplete cleanup takes priority; cause_status keeps the first failure.
       status=125
     fi
   fi
@@ -1153,6 +1162,7 @@ tunnel_wait_group_exit() {
       process_output=$(tunnel_live_group "$pgid") || return 1
       [ -n "$process_output" ] || return 0
       sleep 0.25
+      repair_cleanup_remaining || return 1
     done
     [ "$phase" = term ] || break
     if ! tunnel_stop_identity_matches "$pgid"; then
@@ -2152,6 +2162,7 @@ peer_tunnel_remove_orphan_api_listener() {
   for _ in $(seq 1 10); do
     ss -H -ltnp 2>/dev/null | awk -v port=":$peer_api_port" '$4 ~ port "$" {found=1} END {exit found}' && return 0
     sleep 0.1
+    repair_cleanup_remaining || return 1
   done
   return 1
 }

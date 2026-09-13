@@ -969,6 +969,45 @@ echo "$repair_cleanup_completed"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "4\n")
 
+    def test_cleanup_call_rejects_success_returned_after_deadline(self):
+        result = self.shell(["repair_cleanup_remaining", "repair_cleanup_call"], '''
+repair_total_deadline=0; repair_cleanup_limit_us=10000
+repair_cleanup_spent_us=0; repair_cleanup_active_us=0; repair_cleanup_completed=0
+late_success() { sleep 0.03; return 0; }
+repair_cleanup_call late_success
+''')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("time limit reached: stage=late_success", result.stderr)
+
+    def test_incomplete_cleanup_reports_125_within_real_twenty_second_limit(self):
+        functions = ("repair_cleanup_remaining", "repair_cleanup_call", "tunnel_wait_group_exit", "repair_exit")
+        program = "\n".join(self.function(name) for name in functions) + '''
+repair_total_deadline=0; repair_cleanup_limit_us=20000000
+repair_cleanup_spent_us=0; repair_cleanup_active_us=0; repair_cleanup_completed=0
+repair_stage=remote-readiness; repair_started_seconds=$SECONDS; repair_committed=0
+tunnel_live_group() { echo '4242 1'; }
+tunnel_stop_identity_matches() { return 0; }
+kill() { return 0; }
+repair_cleanup_all() {
+  local status=0
+  for group in 4242 4243 4244; do
+    tunnel_wait_group_exit "$group" || status=1
+  done
+  return "$status"
+}
+repair_release_lock() { return 0; }
+repair_exit 7
+'''
+        started = time.monotonic()
+        result = subprocess.run(["bash", "-uc", program], text=True, capture_output=True, timeout=21)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 20)
+        self.assertLessEqual(elapsed, 20.5)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn("cause_status=7 stage=remote-readiness", result.stderr)
+        self.assertIn("cleanup=failed", result.stderr)
+        print(f"ordinary cleanup deadline: {elapsed:.3f}s, status125, cause_status7")
+
     def test_exit_keeps_original_failure_stage_and_cleanup_result(self):
         for cleanup_status, status, label in ((0, 1, "passed"), (1, 125, "failed")):
             result = self.shell(["repair_exit"], f'''
