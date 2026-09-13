@@ -45,21 +45,22 @@ if [ "$tunnels_only" = 1 ]; then
   }
   tunnel_repair_deadline=$((SECONDS + tunnel_repair_deadline_s))
   repair_total_deadline=$tunnel_repair_deadline
-  if [ "$restart_tunnels" = 1 ]; then
-    repair_cleanup_limit_us=$((tunnel_repair_deadline_s * 1000000))
-  fi
   repair_reserve_seconds=$((tunnel_repair_deadline_s / 5))
   [ "$repair_reserve_seconds" -le 20 ] || repair_reserve_seconds=20
   tunnel_repair_deadline=$((tunnel_repair_deadline - repair_reserve_seconds))
+  repair_cleanup_limit_us=$(((tunnel_repair_deadline_s - repair_reserve_seconds) * 1000000))
 fi
 
 repair_cleanup_remaining() {
-  local now=${EPOCHREALTIME/./} used=${repair_cleanup_spent_us:-0}
+  local now=${EPOCHREALTIME/./} used=${repair_cleanup_spent_us:-0} deadline=${repair_total_deadline:-0}
   if [ "${repair_cleanup_active_us:-0}" -gt 0 ]; then
     used=$((used + now - repair_cleanup_active_us))
   fi
   [ "$used" -lt "${repair_cleanup_limit_us:-20000000}" ] || return 1
-  [ "${repair_total_deadline:-0}" = 0 ] || [ "$SECONDS" -lt "$repair_total_deadline" ]
+  if [ "${repair_stage:-}" != cleanup ] && [ "${tunnel_repair_deadline:-0}" -gt 0 ]; then
+    deadline=$tunnel_repair_deadline
+  fi
+  [ "$deadline" = 0 ] || [ "$SECONDS" -lt "$deadline" ]
 }
 
 repair_cleanup_call() {
@@ -672,17 +673,18 @@ repair_cleanup_all() {
 }
 
 repair_exit() {
-  local status=$1 cause_status=$1 failure_stage=${repair_stage:-unknown} cleanup_result=not-needed cleanup_limit
+  local status=$1 cause_status=$1 failure_stage=${repair_stage:-unknown} cleanup_result=not-needed
+  local migration_stops=${repair_cleanup_completed:-0} rollback_stops=0
   if [ "$status" -ne 0 ]; then repair_failed=1; fi
   if [ "$repair_committed" = 0 ]; then
     if [ "$status" -ne 0 ]; then
       echo "adapter tunnel exit status=$status stage=$failure_stage elapsed=$((SECONDS - repair_started_seconds))s cleanup=starting" >&2
     fi
     repair_stage=cleanup
-    cleanup_limit=$(( ${repair_cleanup_spent_us:-0} + 20000000 ))
-    if [ "$cleanup_limit" -lt "${repair_cleanup_limit_us:-20000000}" ]; then
-      repair_cleanup_limit_us=$cleanup_limit
-    fi
+    repair_cleanup_spent_us=0
+    repair_cleanup_active_us=0
+    repair_cleanup_completed=0
+    repair_cleanup_limit_us=20000000
     if repair_cleanup_call repair_cleanup_all; then
       cleanup_result=passed
     else
@@ -690,10 +692,11 @@ repair_exit() {
       # Incomplete cleanup takes priority; cause_status keeps the first failure.
       status=125
     fi
+    rollback_stops=$repair_cleanup_completed
   fi
   if ! repair_release_lock; then status=125; cleanup_result=failed; fi
   if [ "$status" -ne 0 ]; then
-    echo "adapter tunnel exit status=$status cause_status=$cause_status stage=$failure_stage elapsed=$((SECONDS - repair_started_seconds))s cleanup=$cleanup_result" >&2
+    echo "adapter tunnel exit status=$status cause_status=$cause_status stage=$failure_stage elapsed=$((SECONDS - repair_started_seconds))s cleanup=$cleanup_result migration_stops=$migration_stops rollback_stops=$rollback_stops" >&2
   fi
   exit "$status"
 }

@@ -983,7 +983,7 @@ repair_cleanup_call late_success
         functions = ("repair_cleanup_remaining", "repair_cleanup_call", "tunnel_wait_group_exit", "repair_exit")
         program = "\n".join(self.function(name) for name in functions) + '''
 repair_total_deadline=0; repair_cleanup_limit_us=20000000
-repair_cleanup_spent_us=0; repair_cleanup_active_us=0; repair_cleanup_completed=0
+repair_cleanup_spent_us=30000000; repair_cleanup_active_us=0; repair_cleanup_completed=64
 repair_stage=remote-readiness; repair_started_seconds=$SECONDS; repair_committed=0
 tunnel_live_group() { echo '4242 1'; }
 tunnel_stop_identity_matches() { return 0; }
@@ -1006,6 +1006,7 @@ repair_exit 7
         self.assertEqual(result.returncode, 125, result.stderr)
         self.assertIn("cause_status=7 stage=remote-readiness", result.stderr)
         self.assertIn("cleanup=failed", result.stderr)
+        self.assertIn("migration_stops=64 rollback_stops=1", result.stderr)
         print(f"ordinary cleanup deadline: {elapsed:.3f}s, status125, cause_status7")
 
     def test_exit_keeps_original_failure_stage_and_cleanup_result(self):
@@ -1031,7 +1032,7 @@ repair_exit 1
         preamble = self.source.split("\nrepair_cleanup_remaining() {", 1)[0]
         result = subprocess.run(["bash", "-uc", preamble + '\necho "$tunnel_repair_deadline:$repair_total_deadline:$repair_cleanup_limit_us"', "bash", "--tunnels-only", "--restart-tunnels"], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "130:150:150000000\n")
+        self.assertEqual(result.stdout, "130:150:130000000\n")
 
     def test_reset_exit_caps_rollback_at_twenty_seconds(self):
         result = self.shell(["repair_exit"], '''
@@ -1042,7 +1043,55 @@ repair_release_lock() { return 0; }
 repair_exit 1
 ''')
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(result.stdout, "50000000\n")
+        self.assertEqual(result.stdout, "20000000\n")
+
+    def test_normal_migration_can_use_work_budget_without_using_rollback_budget(self):
+        result = self.shell(["repair_cleanup_remaining", "repair_cleanup_call", "repair_exit"], '''
+repair_stage=peer-legacy; repair_started_seconds=$SECONDS; repair_committed=0
+tunnel_repair_deadline=$((SECONDS+130)); repair_total_deadline=$((SECONDS+150))
+repair_cleanup_limit_us=130000000; repair_cleanup_spent_us=30000000
+repair_cleanup_active_us=0; repair_cleanup_completed=63
+stop_group() { sleep 0.01; }
+repair_cleanup_call stop_group || exit 9
+repair_cleanup_all() {
+  [ "$repair_cleanup_spent_us" = 0 ] && [ "$repair_cleanup_completed" = 0 ] || return 1
+  [ "$repair_cleanup_limit_us" = 20000000 ] || return 1
+  sleep 0.01
+}
+repair_release_lock() { return 0; }
+repair_exit 7
+''')
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertIn("cleanup=passed migration_stops=64 rollback_stops=1", result.stderr)
+
+    def test_rollback_respects_real_remaining_total_time(self):
+        program = "\n".join(self.function(name) for name in ("repair_cleanup_remaining", "repair_cleanup_call", "repair_exit")) + '''
+SECONDS=148; repair_started_seconds=0; repair_total_deadline=150; tunnel_repair_deadline=130
+repair_stage=local-readiness; repair_committed=0
+repair_cleanup_spent_us=30000000; repair_cleanup_completed=64; repair_cleanup_active_us=0
+repair_cleanup_limit_us=130000000
+repair_cleanup_all() {
+  while repair_cleanup_remaining; do sleep 0.05; done
+  return 1
+}
+repair_release_lock() { return 0; }
+repair_exit 7
+'''
+        started = time.monotonic()
+        result = subprocess.run(["bash", "-uc", program], text=True, capture_output=True, timeout=3)
+        elapsed = time.monotonic() - started
+        self.assertLessEqual(elapsed, 2.5)
+        self.assertGreater(elapsed, 1)
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn("elapsed=150s", result.stderr)
+        self.assertIn("migration_stops=64 rollback_stops=1", result.stderr)
+        print(f"rollback with two seconds left: {elapsed:.3f}s, total clock150s")
+
+    def test_non_tunnels_mode_keeps_bounded_cleanup(self):
+        preamble = self.source.split("\nrepair_cleanup_remaining() {", 1)[0]
+        result = subprocess.run(["bash", "-uc", preamble + '\necho "$repair_total_deadline:$repair_cleanup_limit_us"'], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "0:20000000\n")
 
     def test_api_loss_during_readiness_repairs_once_and_rechecks(self):
         for failed_check in ("listener", "supervisor"):

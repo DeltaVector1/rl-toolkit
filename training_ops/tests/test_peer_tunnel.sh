@@ -1696,8 +1696,9 @@ test "$(grep -F -c -- '-- -1234' "$SLEEP_KILL_LOG")" -eq 1
   repair_cleanup_spent_us=0
   repair_cleanup_active_us=0
   repair_cleanup_completed=0
+  tunnel_repair_deadline=$((SECONDS + 130))
   repair_total_deadline=$((SECONDS + 150))
-  repair_cleanup_limit_us=150000000
+  repair_cleanup_limit_us=130000000
   reset_started=$SECONDS
   : >"$SLEEP_KILL_LOG"
   for group in {1..128}; do
@@ -2152,6 +2153,12 @@ test "$generic_lock_status" -ne 0 || {
   echo "generic reconcile ignored a held adapter lock" >&2
   exit 1
 }
+tunnel_repair_deadline=0
+repair_total_deadline=0
+repair_cleanup_spent_us=0
+repair_cleanup_active_us=0
+repair_cleanup_completed=0
+repair_cleanup_limit_us=20000000
 
 # Generic stale cleanup requires every member of the exact process group.
 eval "$tunnel_wait_group_exit_definition"
