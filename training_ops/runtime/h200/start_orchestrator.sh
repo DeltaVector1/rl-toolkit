@@ -1249,7 +1249,7 @@ peer_tunnel_api_listener_owner() {
   case "$owner_ppid" in ''|*[!0-9]*|1) return 2 ;; esac
   supervisor_command=$(ps -o args= -p "$owner_ppid" 2>/dev/null) || return 2
   [ -n "$supervisor_command" ] || return 2
-  peer_tunnel_api_supervisor_variant_match "$supervisor_command" peer-tunnel-api \
+  peer_tunnel_supervisor_forwards_match "$supervisor_command" api peer-tunnel-api \
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" || return 2
   owner_start=$(process_start_time "$owner_ppid") || return 2
   [ -n "$owner_start" ] || return 2
@@ -1276,6 +1276,10 @@ peer_tunnel_connection() {
     -i "$peer_ssh_identity"
     -p "$peer_ssh_port"
   )
+  if [ "$connection_name" = api ]; then
+    peer_tunnel_api_args current
+    ssh_args=("${peer_api_args[@]:1:${#peer_api_args[@]}-4}")
+  fi
   local forward_text ssh_text peer_target marker pid command_line final_command
   local matching_pids matching_count keep_index=0 owner_index=-1 final_count owner_status final_pid child_status
   local listener_status listener_owner_pid= listener_owner_start= current_owner_start
@@ -1598,6 +1602,10 @@ peer_tunnel_stale_group_safe() {
 
 peer_tunnel_ssh_args_match() {
   local command_line=$1 shape=$2
+  if [ "$shape" = api ]; then
+    peer_tunnel_api_variant_match "$command_line" current
+    return $?
+  fi
   local index forward_count forward_start target_index remaining
   local -a command_args expected_args
   command_line=$(tunnel_channel_timeout_normalize "$command_line") || return 1
@@ -1638,37 +1646,82 @@ peer_tunnel_ssh_args_match() {
   [ "$forward_count" -eq "$(grep -o -- '-[LR] ' <<<"$command_line" | wc -l)" ]
 }
 
+peer_tunnel_api_args() {
+  case "$1" in
+    current)
+      peer_api_args=(ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30
+        -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+        -o 'ChannelTimeout=*-tcpip=45s' -o TCPKeepAlive=yes -o IPQoS=none
+        -o Compression=no -i "$peer_ssh_identity" -p "$peer_ssh_port"
+        -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" "$peer_ssh_user@$peer_host") ;;
+    compression)
+      peer_api_args=(ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30
+        -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+        -o 'ChannelTimeout=*-tcpip=45s' -o TCPKeepAlive=yes -o IPQoS=none
+        -i "$peer_ssh_identity" -p "$peer_ssh_port"
+        -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" "$peer_ssh_user@$peer_host") ;;
+    channel-compression)
+      peer_api_args=(ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30
+        -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+        -o TCPKeepAlive=yes -o IPQoS=none -i "$peer_ssh_identity" -p "$peer_ssh_port"
+        -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" "$peer_ssh_user@$peer_host") ;;
+    *) return 1 ;;
+  esac
+}
+
+peer_tunnel_api_payload() {
+  peer_tunnel_api_args "$1" || return 1
+  local ssh_text
+  printf -v ssh_text ' %q' "${peer_api_args[@]:1}"
+  printf 'while true; do\n      ssh%s\n      sleep 3\n    done # peer-tunnel-api' "$ssh_text"
+}
+
 peer_tunnel_api_variant_match() {
-  local command_line=$1 expected option index match
-  local -a args expected_args
+  local command_line=$1 variant expected
   command_line=$(tunnel_channel_timeout_normalize "$command_line") || return 1
-  read -r -a args <<<"$command_line"
-  expected_args=(ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30
-    -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3
-    -o 'ChannelTimeout=*-tcpip=45s' -o TCPKeepAlive=yes -o IPQoS=none
-    -o Compression=no -i "$peer_ssh_identity" -p "$peer_ssh_port")
-  for option in current compression channel-compression; do
-    local -a candidate=("${expected_args[@]}")
-    [ "$option" = compression ] || [ "$option" = channel-compression ] && candidate=(${candidate[@]/-o Compression=no/})
-    [ "$option" = channel-compression ] && candidate=(${candidate[@]/-o 'ChannelTimeout=*-tcpip=45s'/})
-    [ "${#args[@]}" -ge "$(( ${#candidate[@]} + 3 ))" ] || continue
-    match=1
-    for index in "${!candidate[@]}"; do
-      [ "${args[index]}" = "${candidate[index]}" ] || { match=0; break; }
-    done
-    [ "$match" = 1 ] || continue
-    [ "${args[-1]}" = "$peer_ssh_user@$peer_host" ] || continue
-    return 0
+  for variant in ${2:-current compression channel-compression}; do
+    peer_tunnel_api_args "$variant" || return 1
+    expected="${peer_api_args[*]}"
+    [ "$command_line" != "$expected" ] || return 0
   done
   return 1
 }
 
 peer_tunnel_api_supervisor_variant_match() {
-  local command_line=$1 marker=$2 forward=$3 ssh_command
-  peer_tunnel_marker_match "$command_line" "$marker" || return 1
-  ssh_command=$(tunnel_supervisor_ssh_command "$command_line" "$marker") || return 1
-  peer_tunnel_api_variant_match "$ssh_command" || return 1
-  tunnel_command_has "$command_line" "$forward"
+  local command_line=$1 marker=$2 forward=$3 variant payload
+  [ "$marker" = peer-tunnel-api ] || return 1
+  [ "$forward" = "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" ] || return 1
+  for variant in current compression channel-compression; do
+    payload=$(peer_tunnel_api_payload "$variant") || return 1
+    [ "$command_line" != "bash -c $payload" ] || return 0
+  done
+  return 1
+}
+
+peer_tunnel_api_read_args() {
+  mapfile -d '' -t peer_api_actual <"/proc/$1/cmdline" || return 1
+  [ "${#peer_api_actual[@]}" -gt 0 ]
+}
+
+peer_tunnel_api_pid_match() {
+  local pid=$1 kind=$2 variant index equal payload
+  peer_tunnel_api_read_args "$pid" || return 1
+  for variant in ${3:-current compression channel-compression}; do
+    peer_tunnel_api_args "$variant" || return 1
+    if [ "$kind" = supervisor ]; then
+      payload=$(peer_tunnel_api_payload "$variant") || return 1
+      peer_api_args=(bash -c "$payload")
+    fi
+    [ "${#peer_api_actual[@]}" -eq "${#peer_api_args[@]}" ] || continue
+    equal=1
+    for index in "${!peer_api_args[@]}"; do
+      [ "${peer_api_actual[index]}" = "${peer_api_args[index]}" ] || { equal=0; break; }
+    done
+    [ "$equal" = 1 ] || continue
+    peer_api_variant=$variant
+    return 0
+  done
+  return 1
 }
 
 peer_tunnel_supervisor_child_identity() {
@@ -1895,21 +1948,22 @@ peer_tunnel_remove_orphan_children() {
 }
 
 peer_tunnel_remove_orphan_api_listener() {
-  local listener pid ppid command_line supervisor_command start_time current_start
+  local listener pid ppid start_time
   listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":$peer_api_port" '$4 ~ port "$" {print; exit}') || return 1
   [ -n "$listener" ] || return 0
   pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  command_line=$(process_command_line "$pid") || return 1
-  peer_tunnel_api_variant_match "$command_line" || return 1
+  peer_tunnel_api_pid_match "$pid" child || return 1
   ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
-  if [ "$ppid" != 1 ] && supervisor_command=$(process_command_line "$ppid" 2>/dev/null); then
-    peer_tunnel_api_supervisor_variant_match "$supervisor_command" peer-tunnel-api \
-      "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" && return 0
+  if [ "$ppid" != 1 ]; then
+    peer_tunnel_api_pid_match "$pid" child current || return 1
+    peer_tunnel_api_pid_match "$ppid" supervisor current || return 1
+    return 0
   fi
   start_time=$(process_start_time "$pid") || return 1
-  current_start=$start_time
-  [ "$current_start" = "$(process_start_time "$pid")" ] || return 1
+  peer_tunnel_api_pid_match "$pid" child || return 1
+  [ "$start_time" = "$(process_start_time "$pid")" ] || return 1
+  [ "$(ps -o ppid= -p "$pid" | tr -d ' ')" = 1 ] || return 1
   kill "$pid" 2>/dev/null || return 1
   for _ in $(seq 1 10); do
     ss -H -ltnp 2>/dev/null | awk -v port=":$peer_api_port" '$4 ~ port "$" {found=1} END {exit found}' && return 0
@@ -1919,23 +1973,68 @@ peer_tunnel_remove_orphan_api_listener() {
 }
 
 peer_tunnel_remove_duplicate_api_supervisors() {
-  local listener_status=0 owner_pid= marker=peer-tunnel-api pid command_line matching_pids
-  peer_tunnel_api_listener_owner || listener_status=$?
-  case "$listener_status" in
-    0) owner_pid=$peer_api_listener_owner_pid ;;
-    1) ;;
-    *) return 0 ;;
-  esac
-  matching_pids=$(pgrep_matches "$marker") || return 1
+  local owner_pid= owner_child= pid matching_pids listener output variant
+  output=$(ss -H -ltnp) || return 1
+  listener=$(awk -v port=":$peer_api_port" '$4 ~ port "$" {print; exit}' <<<"$output")
+  if [ -n "$listener" ]; then
+    owner_child=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
+    case "$owner_child" in ''|*[!0-9]*) return 1 ;; esac
+    peer_tunnel_api_pid_match "$owner_child" child || return 1
+    variant=$peer_api_variant
+    owner_pid=$(ps -o ppid= -p "$owner_child" | tr -d ' ') || return 1
+    if [ "$owner_pid" != 1 ]; then
+      peer_tunnel_api_pid_match "$owner_pid" supervisor "$variant" || return 1
+    else
+      owner_pid=
+    fi
+  fi
+  matching_pids=$(pgrep_matches peer-tunnel-api) || return 1
   while read -r pid; do
     [ -n "$pid" ] || continue
-    command_line=$(process_command_line "$pid") || return 1
-    peer_tunnel_api_supervisor_variant_match "$command_line" "$marker" \
-      "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" || continue
-    [ "$pid" = "$owner_pid" ] && continue
-    peer_kill_owned "$pid" "$command_line" api "$marker" \
-      "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" || return 1
+    peer_tunnel_api_pid_match "$pid" supervisor || return 1
+    [ "$pid" = "$owner_pid" ] && [ "$peer_api_variant" = current ] && continue
+    peer_tunnel_api_stop_group "$pid" "$peer_api_variant" || return 1
   done <<<"$matching_pids"
+  if [ -n "$owner_pid" ] && ! peer_tunnel_api_pid_match "$owner_pid" supervisor current; then
+    for _ in $(seq 1 10); do
+      output=$(ss -H -ltnp) || return 1
+      if ! awk -v port=":$peer_api_port" '$4 ~ port "$" {found=1} END {exit !found}' <<<"$output"; then
+        return 0
+      fi
+      repair_sleep 0.1 || return 1
+    done
+    return 1
+  fi
+}
+
+peer_tunnel_api_stop_group() {
+  local pid=$1 variant=$2 pgid start member member_group member_parent output count
+  pgid=$(ps -o pgid= -p "$pid" | tr -d ' ') || return 1
+  [ "$pgid" = "$pid" ] && [ "$pgid" -gt 1 ] && [ "$pgid" != "$$" ] || return 1
+  start=$(process_start_time "$pid") || return 1
+  for _ in 1 2; do
+    peer_tunnel_api_pid_match "$pid" supervisor "$variant" || return 1
+    [ "$(process_start_time "$pid")" = "$start" ] || return 1
+    output=$(ps -eo pid=,ppid=,pgid=) || return 1
+    count=0
+    while read -r member member_parent member_group; do
+      [ "$member_group" = "$pgid" ] || continue
+      count=$((count + 1))
+      [ "$member" = "$pid" ] && continue
+      [ "$member_parent" = "$pid" ] || return 1
+      peer_tunnel_api_read_args "$member" || return 1
+      if [ "${#peer_api_actual[@]}" = 2 ] && [ "${peer_api_actual[0]}" = sleep ] && [ "${peer_api_actual[1]}" = 3 ]; then
+        continue
+      fi
+      peer_tunnel_api_pid_match "$member" child "$variant" || return 1
+    done <<<"$output"
+    [ "$count" -ge 1 ] || return 1
+  done
+  peer_tunnel_api_pid_match "$pid" supervisor "$variant" || return 1
+  [ "$(process_start_time "$pid")" = "$start" ] || return 1
+  [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pgid" ] || return 1
+  kill -- "-$pgid" || return 1
+  tunnel_wait_group_exit "$pgid"
 }
 
 peer_remote_ports_ready() {

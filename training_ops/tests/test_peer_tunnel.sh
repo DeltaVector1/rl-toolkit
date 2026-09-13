@@ -355,6 +355,10 @@ start=$(grep -n '^generic_tunnel_ssh_match() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
 source <(sed -n '/^repair_launch_tunnel() {/,/^}/p' "$script")
+api_reconcile_definition=$(declare -f peer_tunnel_remove_duplicate_api_supervisors)
+# The process-free lane tests do not provide /proc. Test API migration with
+# exact NUL process fixtures below instead.
+peer_tunnel_remove_duplicate_api_supervisors() { :; }
 # Use real ps padding and a real, isolated group before installing shell
 # mocks. This sleeper is an allowed peer-group member, not an SSH service.
 (
@@ -626,8 +630,102 @@ unset PEER_TEST_LOG PEER_QUERY PEER_CHILDREN_OUTPUT PEER_GROUP_COMMANDS
 
 # API reconciliation keeps the one supervisor whose exact SSH child owns the
 # listener, and removes the other two exact candidates.
+(
+  peer_tunnel_api_read_args() { mapfile -d '' -t peer_api_actual <"$tmp/api-argv-$1"; }
+  for variant in current compression channel-compression; do
+    args=(ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30
+      -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+    [ "$variant" = channel-compression ] || args+=(-o 'ChannelTimeout=*-tcpip=45s')
+    args+=(-o TCPKeepAlive=yes -o IPQoS=none)
+    [ "$variant" != current ] || args+=(-o Compression=no)
+    args+=(-i /data/trinity/h200_rollout_ed25519 -p 20099
+      -L 127.0.0.1:18049:127.0.0.1:8000 root@38.255.28.19)
+    printf '%s\0' "${args[@]}" >"$tmp/api-argv-1"
+    peer_tunnel_api_pid_match 1 child
+    test "$peer_api_variant" = "$variant"
+    printf -v quoted ' %q' "${args[@]:1}"
+    payload="while true; do
+      ssh$quoted
+      sleep 3
+    done # peer-tunnel-api"
+    printf '%s\0' bash -c "$payload" >"$tmp/api-argv-2"
+    peer_tunnel_api_pid_match 2 supervisor
+    test "$peer_api_variant" = "$variant"
+    peer_tunnel_api_supervisor_variant_match "bash -c $payload" peer-tunnel-api \
+      '-L 127.0.0.1:18049:127.0.0.1:8000'
+    for fault in extra reordered missing target port key forward boundary; do
+      bad=("${args[@]}")
+      case "$fault" in
+        extra) bad=(${args[@]:0:1} -v "${args[@]:1}") ;;
+        reordered) bad[3]=IdentitiesOnly=yes; bad[5]=BatchMode=yes ;;
+        missing) bad=("${args[@]:0:2}" "${args[@]:4}") ;;
+        target) bad[-1]=root@other.invalid ;;
+        port) bad[${#bad[@]}-4]=22 ;;
+        key) bad[${#bad[@]}-6]=/tmp/other-key ;;
+        forward) bad[-2]=127.0.0.1:18049:127.0.0.1:9999 ;;
+        boundary) bad=("ssh -NT" "${args[@]:2}") ;;
+      esac
+      printf '%s\0' "${bad[@]}" >"$tmp/api-argv-3"
+      if peer_tunnel_api_pid_match 3 child; then
+        echo "accepted bad API argv: $variant $fault" >&2; exit 1
+      fi
+    done
+    printf '%s\0' bash -c "echo spoof; $payload" >"$tmp/api-argv-3"
+    if peer_tunnel_api_pid_match 3 supervisor; then exit 1; fi
+    printf '%s\0' bash -c "$payload" extra >"$tmp/api-argv-3"
+    if peer_tunnel_api_pid_match 3 supervisor; then exit 1; fi
+  done
+  eval "$api_reconcile_definition"
+  process_start_time() { printf 'start-%s\n' "$1"; }
+  repair_sleep() { :; }
+  tunnel_wait_group_exit() { test "$stopped_group" = "$1"; }
+  pgrep_matches() { printf '%s\n' 1001 2001; }
+  ps() {
+    case "$*" in
+      '-o ppid= -p 1002') echo 1001 ;;
+      '-o pgid= -p 1001') echo 1001 ;;
+      '-o pgid= -p 2001') echo 2001 ;;
+      '-eo pid=,ppid=,pgid=')
+        printf '%s\n' '1001 1 1001' '1002 1001 1001' '2001 1 2001' '2002 2001 2001'
+        [ "$foreign_member" = 0 ] || echo '1003 1001 1001'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  ss() {
+    if [ "$listener_live" = 1 ]; then
+      printf '%s\n' 'LISTEN 0 128 127.0.0.1:18049 0.0.0.0:* users:(("ssh",pid=1002,fd=5))'
+    fi
+  }
+  kill() {
+    stopped_group=${2#-}
+    stopped+=("$stopped_group")
+    [ "$stopped_group" != 1001 ] || listener_live=0
+  }
+  printf '%s\0' sleep 3 >"$tmp/api-argv-2002"
+  printf '%s\0' unrelated >"$tmp/api-argv-1003"
+  for variant in current compression channel-compression; do
+    peer_tunnel_api_args "$variant"
+    printf '%s\0' "${peer_api_args[@]}" >"$tmp/api-argv-1002"
+    payload=$(peer_tunnel_api_payload "$variant")
+    printf '%s\0' bash -c "$payload" >"$tmp/api-argv-1001"
+    printf '%s\0' bash -c "$payload" >"$tmp/api-argv-2001"
+    stopped=(); listener_live=1; foreign_member=0
+    peer_tunnel_remove_duplicate_api_supervisors
+    if [ "$variant" = current ]; then
+      test "${stopped[*]}" = 2001
+      test "$listener_live" = 1
+    else
+      test "${stopped[*]}" = '1001 2001'
+      test "$listener_live" = 0
+      stopped=(); listener_live=1; foreign_member=1
+      if peer_tunnel_remove_duplicate_api_supervisors; then exit 1; fi
+      test "${#stopped[@]}" = 0
+    fi
+  done
+)
 api_signature='-L 127.0.0.1:18049:127.0.0.1:8000'
-api_child_command="ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ChannelTimeout=*-tcpip=45s -o TCPKeepAlive=yes -o IPQoS=none -i /data/trinity/h200_rollout_ed25519 -p 20099 -L 127.0.0.1:18049:127.0.0.1:8000 root@38.255.28.19"
+api_child_command="ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ChannelTimeout=*-tcpip=45s -o TCPKeepAlive=yes -o IPQoS=none -o Compression=no -i /data/trinity/h200_rollout_ed25519 -p 20099 -L 127.0.0.1:18049:127.0.0.1:8000 root@38.255.28.19"
 api_supervisor_command="nohup bash -c while true; do $api_child_command; sleep 3; done # peer-tunnel-api"
 # Full-mode rollback must use the exact API shape only for the API marker.
 (
