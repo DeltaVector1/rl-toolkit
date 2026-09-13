@@ -13,11 +13,13 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,14 +30,30 @@ WATCHER_PATH = ROOT / "src/prime_rl/orchestrator/watcher.py"
 DISPATCHER_PATH = ROOT / "src/prime_rl/orchestrator/dispatcher.py"
 
 
+class _StubValue:
+    def __call__(self, *_args, **_kwargs):
+        return self
+
+    def __getattr__(self, _name):
+        return self
+
+    def __iter__(self):
+        return iter(())
+
+
+class _StubModule(types.ModuleType):
+    def __getattr__(self, _name):
+        return _StubValue()
+
+
 def _load_stubbed_source(path, name, names):
     names = names.split()
-    modules = {module_name: MagicMock(name=module_name) for module_name in names}
+    modules = {module_name: _StubModule(module_name) for module_name in names}
     for module_name in list(modules):
         parts = module_name.split(".")
         for index in range(1, len(parts)):
             parent = ".".join(parts[:index])
-            modules.setdefault(parent, MagicMock(name=parent))
+            modules.setdefault(parent, _StubModule(parent))
             modules[parent].__path__ = []
     with patch.dict(sys.modules, modules):
         spec = importlib.util.spec_from_file_location(name, path)
@@ -56,18 +74,34 @@ async def _safe_cancel_all(tasks):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-class _RuntimeRecord:
-    def __init__(self, **values):
-        self.task = None
-        self.rollouts_to_schedule = 0
-        self.target_rollouts = 0
-        self.eval_step = None
-        self.policy_version_at_start = 0
-        self.pinned_client = None
-        self.emitted = 0
-        self.client_config = None
-        self.off_policy_steps = 0
-        self.__dict__.update(values)
+def _client_identity(client):
+    return (client.base_url, client.headers.get("X-data-parallel-rank"))
+
+
+@dataclass
+class _RuntimeInflightRollout:
+    kind: str
+    env_name: str
+    group_id: object
+    policy_version: int
+    rollout_count: int
+    client_config: object = None
+    off_policy_steps: int = 0
+    eval_step: int | None = None
+
+
+@dataclass
+class _RuntimeGroupState:
+    kind: str
+    env_name: str
+    task_idx: int
+    rollouts_to_schedule: int
+    target_rollouts: int
+    task: object = None
+    emitted: int = 0
+    eval_step: int | None = None
+    pinned_client: object = None
+    policy_version_at_start: int = 0
 
 
 def load_weight_watcher_runtime():
@@ -87,11 +121,11 @@ def load_dispatcher_runtime():
         prime_rl.utils.async_utils prime_rl.utils.client prime_rl.utils.logger verifiers.v1
     """
     module = _load_stubbed_source(DISPATCHER_PATH, "_resume_test_dispatcher", names)
-    module.GroupState = _RuntimeRecord
-    module.InflightRollout = _RuntimeRecord
+    module.GroupState = _RuntimeGroupState
+    module.InflightRollout = _RuntimeInflightRollout
     module.safe_cancel = _safe_cancel
     module.safe_cancel_all = _safe_cancel_all
-    module.client_identity = lambda client: (client.base_url, None)
+    module.client_identity = _client_identity
     module.get_logger = lambda: SimpleNamespace(
         debug=lambda *_args, **_kwargs: None,
         info=lambda *_args, **_kwargs: None,
@@ -840,20 +874,101 @@ class ResumeRecoveryTest(unittest.TestCase):
             "unknown",
         )
 
-    def test_startup_stages_once_per_host_before_loading(self):
-        source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
-        setup = ast.get_source_segment(
-            source,
-            next(
-                node
-                for node in ast.walk(ast.parse(source))
-                if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
-            ),
-        )
-        stage_at = setup.index("await stage_lora_adapter(")
-        update_at = setup.index("await self.policy_inference.update_weights(", stage_at)
-        self.assertLess(stage_at, update_at)
-        self.assertIn("prefetched=prefetched", setup[update_at:])
+    async def _run_policy_update_ready_case(self, *, fail_ready):
+        watcher_module = load_weight_watcher_runtime()
+        dispatcher_module = load_dispatcher_runtime()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for step in (0, 1):
+                (root / f"step_{step}").mkdir()
+                (root / f"step_{step}" / "STABLE").touch()
+            config = SimpleNamespace(output_dir=root, max_steps=None)
+            policy = SimpleNamespace(version=0, model_name="base-model")
+            client = SimpleNamespace(base_url="http://inference", headers={})
+            ready_started, ready_release = asyncio.Event(), asyncio.Event()
+            updates = []
+            identity = {
+                "source_url": "http://source/step_1",
+                "target_sha256": "c" * 64,
+                "target_size": 8,
+                "config_sha256": "d" * 64,
+                "config_size": 2,
+            }
+
+            async def stage(*_args, **_kwargs):
+                return {
+                    "transfer_wall_seconds": 0.0,
+                    "origin_stage_seconds": 0.0,
+                    "peer_stage_seconds": 0.0,
+                    "reconstruction_wall_seconds": 0.0,
+                    "adapter_identity": identity,
+                }
+
+            async def update_weights(weights_path, **kwargs):
+                updates.append((weights_path, kwargs))
+                return []
+
+            async def wait_for_ready(_name):
+                ready_started.set()
+                await ready_release.wait()
+                if fail_ready:
+                    raise RuntimeError("policy v1 is not visible")
+
+            inference = SimpleNamespace(
+                admin_clients=[client], adapter_origin_base_urls=None,
+                model_name="base-model", update_weights=update_weights,
+                update_model_name=lambda name: setattr(inference, "model_name", name),
+                wait_for_ready=wait_for_ready,
+            )
+            watcher_module.get_broadcast_dir = lambda path: Path(path)
+            watcher_module.get_step_path = lambda path, step: Path(path) / f"step_{step}"
+            watcher_module.inference_weight_path = lambda _config, path, _lora: f"http://source/{Path(path).name}"
+            watcher_module.adapter_stage_limit_seconds = lambda _step: 1.0
+            watcher_module.stage_lora_adapter = stage
+            watcher_module._write_receivers_ready = lambda *_args, **_kwargs: None
+            watcher_module.urlopen = lambda *_args, **_kwargs: io.BytesIO(
+                json.dumps({"version": 1, "kind": "lora-adapter", "mode": "delta",
+                            "transport": "chunked-shuffled-xor-zstd", "target_step": 1,
+                            "base_step": 0}).encode("utf-8")
+            )
+            watcher_module.format_time = lambda value: f"{value:.3f}s"
+            watcher = watcher_module.WeightWatcher(
+                config, policy=policy, inference=inference, observers=[], lora_name="adapter",
+                ckpt_step=0, poll_interval=0.001, reconcile_interval=100.0,
+            )
+            watcher.bootstrap_staged = True
+            watcher.verified_adapter_step = 0
+            watcher.verified_adapter_url = "http://source/step_0"
+            pool = SimpleNamespace(train_clients=[])
+            envs = SimpleNamespace(names=set(), get=lambda _name: None)
+            source = SimpleNamespace(next_example=lambda *_args, **_kwargs: None)
+            dispatcher = dispatcher_module.RolloutDispatcher(
+                train_envs=envs, eval_envs=None, train_source=source, eval_source=None,
+                policy_pool=pool, policy=policy, max_inflight_rollouts=1,
+                tasks_per_minute=None, max_off_policy_steps=1,
+            )
+            watcher.observers = [dispatcher]
+            update_task = asyncio.create_task(watcher.apply_policy_update(1))
+            await asyncio.wait_for(ready_started.wait(), 1.0)
+            self.assertEqual(len(updates), 1)
+            self.assertTrue(dispatcher.weight_update_pending)
+            self.assertEqual(dispatcher.policy_group_drain_pending, False)
+            ready_release.set()
+            if fail_ready:
+                with self.assertRaisesRegex(RuntimeError, "policy v1 is not visible"):
+                    await asyncio.wait_for(update_task, 1.0)
+                self.assertTrue(dispatcher.weight_update_pending)
+            else:
+                await asyncio.wait_for(update_task, 1.0)
+                self.assertFalse(dispatcher.weight_update_pending)
+                self.assertEqual(policy.version, 1)
+                self.assertEqual(policy.model_name, "adapter-slot1")
+
+    def test_policy_one_waits_for_ready_before_reopening_rollouts(self):
+        asyncio.run(self._run_policy_update_ready_case(fail_ready=False))
+
+    def test_policy_one_wait_failure_stays_fail_closed(self):
+        asyncio.run(self._run_policy_update_ready_case(fail_ready=True))
 
     def test_background_dispatch_stays_base_until_verified_bootstrap(self):
         watcher_module = load_weight_watcher_runtime()
@@ -867,7 +982,7 @@ class ResumeRecoveryTest(unittest.TestCase):
                     (root / f"step_{step}" / "STABLE").touch()
                 config = SimpleNamespace(output_dir=root, max_steps=None)
                 policy = SimpleNamespace(version=0, model_name="base-model")
-                client = SimpleNamespace(base_url="http://inference")
+                client = SimpleNamespace(base_url="http://inference", headers={})
                 stage_started, stage_release = asyncio.Event(), asyncio.Event()
                 stage_returned = asyncio.Event()
                 rollout_started, rollout_release = asyncio.Event(), asyncio.Event()
@@ -1134,6 +1249,7 @@ class ResumeRecoveryTest(unittest.TestCase):
                 config=config, progress=SimpleNamespace(step=0), ckpt_manager=object(),
                 policy=SimpleNamespace(version=0, model_name=""), stopped=asyncio.Event(),
                 model_express=None, resume_step=None, resume_policy_step=None, lora_name=None,
+                eval_envs=None,
             )
             orchestrator_module.set_default_executor = lambda: None
             orchestrator_module.to_toml_dict = lambda _config: {}
@@ -1175,25 +1291,120 @@ class ResumeRecoveryTest(unittest.TestCase):
             ],
         )
 
-    def test_filesystem_lora_resume_stages_saved_policies_and_loads_only_the_last(self):
-        source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
-        setup = ast.get_source_segment(
-            source,
-            next(
-                node
-                for node in ast.walk(ast.parse(source))
-                if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
-            ),
+    def test_resume_setup_stages_chain_and_updates_final_policy(self):
+        module = load_orchestrator_runtime()
+        target_url = "http://source/step_1"
+        files = [
+            {"name": "adapter_config.json", "size": 2, "sha256": "b" * 64},
+            {"name": "adapter_model.safetensors", "size": 8, "sha256": "a" * 64},
+        ]
+        manifests = {
+            "step_1": {
+                "version": 1, "kind": "lora-adapter", "mode": "delta",
+                "transport": "chunked-shuffled-xor-zstd", "target_step": 1,
+                "base_step": 0, "target_size": 8, "target_sha256": "a" * 64,
+                "config_size": 2, "config_sha256": "b" * 64,
+                "base_size": 8, "base_sha256": "a" * 64,
+                "base_config_sha256": "b" * 64, "files": files,
+            },
+            "step_0": {"version": 1, "kind": "lora-adapter", "mode": "delta",
+                       "transport": "chunked-shuffled-xor-zstd", "target_step": 0,
+                       "base_step": -1, "files": files},
+        }
+        staged, updates, calls = [], [], []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                self.close()
+
+        def fetch(url, timeout):
+            calls.append((url, timeout))
+            return Response(json.dumps(manifests[Path(url).parent.name]).encode("utf-8"))
+
+        inference = SimpleNamespace(
+            model_name="base-model", admin_clients=[object()], adapter_origin_base_urls=None,
+            updates=[], wait_for_ready=lambda _name: asyncio.sleep(0),
+            update_model_name=lambda name: setattr(inference, "model_name", name),
         )
-        self.assertIn("for step in get_all_ckpt_steps(broadcast_dir)", setup)
-        self.assertIn('get_step_path(broadcast_dir, step) / "STABLE"', setup)
-        self.assertIn("saved adapter chain is incomplete", setup)
-        self.assertIn("for sync_version in sync_versions", setup)
-        self.assertIn("if sync_version != final_sync_version", setup)
-        self.assertLess(
-            setup.index("if sync_version != final_sync_version"),
-            setup.index("await self.policy_inference.update_weights("),
-        )
+        async def update_weights(weights_path, **kwargs):
+            updates.append((weights_path, kwargs))
+            return []
+        inference.update_weights = update_weights
+
+        class TrainEnvs(list):
+            names = []
+            def __init__(self, *_args, **_kwargs):
+                super().__init__()
+            async def start(self, **_kwargs):
+                return None
+
+        async def setup_pool(**_kwargs):
+            return None, inference
+        async def stage(*_args, **kwargs):
+            staged.append((str(_args[1]), kwargs))
+            return {"adapter_identity": {"source_url": str(_args[1])}}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for step in (0, 1):
+                (root / f"step_{step}").mkdir()
+                (root / f"step_{step}" / "STABLE").touch()
+            config = SimpleNamespace(
+                output_dir=root, tokenizer="tokenizer",
+                model=SimpleNamespace(name="base-model", client=SimpleNamespace(base_url=["http://inference"]), lora=SimpleNamespace(name="adapter")),
+                log=SimpleNamespace(level="INFO", json_logging=False, vf_level="WARN", interval=1.0),
+                train=SimpleNamespace(env=[], ratio_stages=None), eval=None,
+                ckpt=SimpleNamespace(resume_step=1, skip_progress=True, wait_for_weights_timeout=1.0),
+                weight_broadcast=SimpleNamespace(type="filesystem", source_url="http://source", source_dir=root, timeout=1.0),
+                renderer=None, wandb=None, swanlab=None, prime_monitor=None, file_monitor=None,
+                heartbeat=None, collect_inference_metrics=False, inference_metrics_roles=[],
+                pre_batch_filters=[], post_batch_filters=[], rollout_transport="memory",
+                max_inflight_rollouts=1, tasks_per_minute=None, max_off_policy_steps=1,
+                batch_size=1, token_batch_size=1, max_steps=None, bench=False,
+            )
+            instance = module.Orchestrator.__new__(module.Orchestrator)
+            instance.__dict__.update(
+                config=config, progress=SimpleNamespace(step=0), ckpt_manager=object(),
+                policy=SimpleNamespace(version=0, model_name=""), stopped=asyncio.Event(),
+                model_express=None, resume_step=None, resume_policy_step=None, lora_name=None,
+                eval_envs=None,
+            )
+            module.set_default_executor = lambda: None
+            module.to_toml_dict = lambda _config: {}
+            module.setup_tokenizer = lambda _name: SimpleNamespace(vocab_size=1)
+            module.setup_policy_inference_pool = setup_pool
+            module.setup_monitor = lambda **_kwargs: object()
+            module.setup_filters = lambda *_args, **_kwargs: []
+            module.TrainEnvs = TrainEnvs
+            module.get_log_dir = lambda path: path
+            module.setup_training_batch_sender = lambda *_args: object()
+            module.get_broadcast_dir = lambda _path: root
+            module.get_step_path = lambda _path, step: root / f"step_{step}"
+            module.get_all_ckpt_steps = lambda _path: [0, 1]
+            module.get_weight_dir = lambda _config, step, **_kwargs: root / f"step_{step}"
+            module.inference_weight_path = lambda _config, path, _lora: f"http://source/{Path(path).name}"
+            module.common_loaded_lora_receipt = lambda *_args: asyncio.sleep(0, result=None)
+            module.adapter_stage_limit_seconds = lambda _step: 600.0
+            module.urlopen = fetch
+            module.stage_lora_adapter = stage
+            module._adapter_file_records = lambda value: {item["name"]: item for item in value["files"]}
+            module.validate_adapter_manifest = lambda *_args, **_kwargs: None
+            module.get_logger = lambda: SimpleNamespace(
+                debug=lambda *_args, **_kwargs: None, info=lambda *_args, **_kwargs: None,
+                success=lambda *_args, **_kwargs: None, warning=lambda *_args, **_kwargs: None,
+            )
+            asyncio.run(instance.setup())
+        self.assertEqual([item[0] for item in staged], ["http://source/step_0", target_url])
+        self.assertEqual([item[1]["policy_step"] for item in staged], [None, 1])
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0][1]["step"], 1)
+        self.assertEqual(updates[0][1]["expected_adapter_identity"]["source_url"], target_url)
+        self.assertEqual(instance.policy.version, 1)
+        self.assertEqual(instance.policy.model_name, "adapter")
+        self.assertEqual(inference.model_name, "adapter")
+        self.assertEqual(len(calls), 2)
 
     def test_server_fallback_stages_in_the_host_process(self):
         source = SERVER_PATH.read_text(encoding="utf-8")
