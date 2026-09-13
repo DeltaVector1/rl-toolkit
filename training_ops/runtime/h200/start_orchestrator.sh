@@ -19,6 +19,8 @@ repair_failed=0
 repair_created_tunnels=()
 repair_unregistered_tunnels=()
 repair_committed=0
+repair_launch_active=0
+repair_pending_signal=0
 repair_lock_held=0
 repair_lock_file=${ADAPTER_TUNNEL_LOCK_FILE:-/tmp/prime-rl-adapter-tunnel-repair.lock}
 if [ "$tunnels_only" = 1 ]; then
@@ -99,8 +101,27 @@ repair_release_lock() {
 
 repair_signal() {
   repair_failed=1
+  if [ "$repair_launch_active" = 1 ]; then
+    repair_pending_signal=1
+    return 0
+  fi
   trap - TERM HUP INT
   exit 124
+}
+
+repair_launch_tunnel() {
+  local kind=$1 marker=$2 forward=$3 command_line=$4 launch_pid launch_status
+  repair_launch_active=1
+  setsid nohup bash -c "$command_line" >/dev/null 2>&1 < /dev/null 8>&- &
+  launch_pid=$!
+  if repair_register_tunnel "$kind" "$launch_pid" "$marker" "$forward"; then
+    launch_status=0
+  else
+    launch_status=$?
+  fi
+  repair_launch_active=0
+  [ "${repair_pending_signal:-0}" = 0 ] || repair_signal
+  return "$launch_status"
 }
 
 process_start_time() {
@@ -854,14 +875,13 @@ tunnel_inner() { # local_port  target_host:port  ssh_target  [compress]
       return 0
     fi
   fi
-  setsid nohup bash -c "while true; do
+  repair_launch_tunnel generic "$marker" "$forward" "while true; do
       ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitOnForwardFailure=yes \
           -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes \
           -o IPQoS=none -o Compression=$comp$ssh_text \
           -L 127.0.0.1:$lp:$tgt $via
       sleep 3
-    done # $marker" >/dev/null 2>&1 < /dev/null 8>&- &
-  repair_register_tunnel generic "$!" "$marker" "$forward" || return 1
+    done # $marker" || return 1
   for _ in $(seq 1 30); do
     repair_remaining >/dev/null || return 1
     if generic_tunnel_listener_ready "$lp" "$marker" "$via" "$forward" "$comp" \
@@ -1127,11 +1147,10 @@ peer_tunnel_connection() {
       return 0
     fi
   fi
-  setsid nohup bash -c "while true; do
+  repair_launch_tunnel peer "$marker" "" "while true; do
       ssh$ssh_text$forward_text $peer_target
       sleep 3
-    done # $marker" >/dev/null 2>&1 < /dev/null 8>&- &
-  repair_register_tunnel peer "$!" "$marker" || return 1
+    done # $marker" || return 1
 }
 
 peer_tunnel_forward_shape() {
@@ -2496,11 +2515,10 @@ china_tunnel_connection() {
       return 1
     fi
   fi
-  setsid nohup bash -c "while true; do
+  repair_launch_tunnel china "$marker" "" "while true; do
       ssh$ssh_text$forward_text $target
       sleep 3
-    done # $marker" >/dev/null 2>&1 < /dev/null 8>&- &
-  repair_register_tunnel china "$!" "$marker" || return 1
+    done # $marker" || return 1
 }
 
 peer_tunnel() {
