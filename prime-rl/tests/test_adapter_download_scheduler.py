@@ -9,6 +9,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,13 +65,10 @@ class DownloadSchedulerTest(unittest.TestCase):
                 {"source_manifest": {}, "chunks": []},
             )
 
-    def test_bundle_identity_preserves_query_and_retries_url_error(self):
+    def test_bundle_identity_preserves_query(self):
         filesystem = load_filesystem_module()
         payload = b"bundle-wire"
-        item = {
-            "wire_size": len(payload),
-            "wire_sha256": hashlib.sha256(payload).hexdigest(),
-        }
+        item = {"wire_size": len(payload)}
         transport = {
             "source_manifest": {
                 "bundle": {
@@ -90,16 +88,98 @@ class DownloadSchedulerTest(unittest.TestCase):
             "http://source/step_1/.adapter-transport-bundle?token=abc",
         )
 
+    def test_bundle_lane_plan_uses_first_64_sources_and_exact_ranges(self):
+        filesystem = load_filesystem_module()
+        ports = list(range(18100, 18164, 2)) + list(range(18101, 18165, 2))
+        source_urls = [f"http://source:{port}/step_1?token=abc" for port in ports]
+        chunks = []
+        bundle_offset = 0
+        for index in range(1834):
+            wire_size = 100 + (index % 17)
+            chunks.append(
+                {
+                    "file": f"chunk-{index:04d}",
+                    "offset": index * 4096,
+                    "bundle_offset": bundle_offset,
+                    "wire_size": wire_size,
+                }
+            )
+            bundle_offset += wire_size
+        plan = filesystem._bundle_lane_plan(
+            {"size": bundle_offset},
+            chunks,
+            source_urls,
+        )
+        self.assertEqual(plan["lane_count"], 64)
+        self.assertEqual(len(plan["lanes"]), 64)
+        self.assertEqual(
+            [urlsplit(url).port for url in (lane["url"] for lane in plan["lanes"])],
+            ports[:64],
+        )
+        self.assertTrue(all("?token=abc" in lane["url"] for lane in plan["lanes"]))
+        planned_files = [name for lane in plan["lanes"] for name in lane["chunks"]]
+        self.assertEqual(planned_files, [item["file"] for item in chunks])
+        expected_start = 0
+        for lane in plan["lanes"]:
+            self.assertEqual(lane["start"], expected_start)
+            self.assertEqual(lane["end"] - lane["start"] + 1, lane["wire_bytes"])
+            expected_start = lane["end"] + 1
+        self.assertEqual(expected_start, bundle_offset)
+
+    def test_bundle_lane_reset_resumes_and_preserves_hashes(self):
+        filesystem = load_filesystem_module()
+        pieces = [b"wire-a", b"wire-bb", b"wire-ccc"]
+        payload = b"".join(pieces)
+        chunks = []
+        offset = 0
+        raw_offset = 0
+        for index, piece in enumerate(pieces):
+            chunks.append(
+                {
+                    "file": f"chunk-{index}",
+                    "offset": raw_offset,
+                    "bundle_offset": offset,
+                    "raw_size": len(piece),
+                    "wire_size": len(piece),
+                    "wire_sha256": hashlib.sha256(piece).hexdigest(),
+                    "raw_sha256": hashlib.sha256(piece).hexdigest(),
+                }
+            )
+            offset += len(piece)
+            raw_offset += len(piece)
+        bundle = {
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        lane = {
+            "url": "http://source:18100/.adapter-transport-bundle?token=abc",
+            "start": 0,
+            "end": len(payload) - 1,
+            "wire_bytes": len(payload),
+            "chunks": [item["file"] for item in chunks],
+        }
+        calls = []
+
         class Response(io.BytesIO):
             status = 206
 
-            def __init__(self, value):
+            def __init__(self, value, start, end, reset=False):
                 super().__init__(value)
+                self._reset = reset
+                self._returned = False
                 self.headers = {
-                    "Content-Length": str(len(value)),
-                    "Content-Range": f"bytes 0-{len(value) - 1}/{len(payload)}",
+                    "Content-Length": str(end - start + 1),
+                    "Content-Range": f"bytes {start}-{end}/{len(payload)}",
                     "ETag": f'"{hashlib.sha256(payload).hexdigest()}"',
                 }
+
+            def read(self, amount=-1):
+                if self._reset and not self._returned:
+                    self._returned = True
+                    return super().read(3)
+                if self._reset:
+                    raise filesystem.URLError("connection reset")
+                return super().read(amount)
 
             def __enter__(self):
                 return self
@@ -107,13 +187,25 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        calls = []
-
         def fake_urlopen(request, timeout):
-            calls.append(request.full_url)
-            if len(calls) == 1:
-                raise filesystem.URLError("connection reset")
-            return Response(payload)
+            del timeout
+            start, end = (
+                int(part)
+                for part in request.headers["Range"].removeprefix("bytes=").split("-")
+            )
+            calls.append((request.full_url, start, end))
+            return Response(payload[start : end + 1], start, end, reset=len(calls) == 1)
+
+        def is_completed(_index, item, path):
+            return path.with_name(f"{path.name}.done").exists()
+
+        def process_chunk(_index, item):
+            path = root / item["file"]
+            encoded = path.read_bytes()
+            self.assertEqual(hashlib.sha256(encoded).hexdigest(), item["wire_sha256"])
+            path.with_name(f"{path.name}.done").write_text(
+                json.dumps({"output_sha256": hashlib.sha256(encoded).hexdigest()})
+            )
 
         old_urlopen = filesystem.urllib.request.urlopen
         old_sleep = filesystem.time.sleep
@@ -122,36 +214,44 @@ class DownloadSchedulerTest(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                chunk_root = root / "chunks"
-                chunk_root.mkdir()
-                destination = chunk_root / "chunk"
-                parent_fd = filesystem._open_directory_nofollow(
-                    chunk_root, create=False, label="test bundle chunks"
+                filesystem._download_bundle_lane(
+                    bundle,
+                    lane,
+                    chunks,
+                    root,
+                    is_completed=is_completed,
+                    process_chunk=process_chunk,
                 )
-                try:
-                    filesystem._download_bundle_range(
-                        bundle,
-                        item,
-                        destination,
-                        parent_fd,
-                    )
-                finally:
-                    os.close(parent_fd)
-                self.assertEqual(destination.read_bytes(), payload)
+                self.assertEqual(
+                    b"".join((root / item["file"]).read_bytes() for item in chunks),
+                    payload,
+                )
+                filesystem._verify_bundle_chunks(bundle, chunks, root)
         finally:
             filesystem.urllib.request.urlopen = old_urlopen
             filesystem.time.sleep = old_sleep
-        self.assertEqual(calls, [bundle["url"], bundle["url"]])
+        self.assertEqual(calls[0][1:], (0, len(payload) - 1))
+        self.assertEqual(calls[1][1:], (3, len(payload) - 1))
+        self.assertEqual(calls[0][0], calls[1][0])
 
-    def test_bundle_range_resume_and_wire_identity(self):
+    def test_bundle_lanes_open_one_distinct_range_each(self):
         filesystem = load_filesystem_module()
-        payload = b"prefix-wire-suffix"
-        item_payload = payload[7:16]
-        item = {
-            "bundle_offset": 7,
-            "wire_size": len(item_payload),
-            "wire_sha256": hashlib.sha256(item_payload).hexdigest(),
-        }
+        payload = bytes(range(64))
+        source_urls = [f"http://source:{18100 + index}/step_1?token=abc" for index in range(64)]
+        chunks = [
+            {
+                "file": f"chunk-{index}",
+                "offset": index,
+                "bundle_offset": index,
+                "wire_size": 1,
+                "wire_sha256": hashlib.sha256(bytes([index])).hexdigest(),
+                "raw_sha256": hashlib.sha256(bytes([index])).hexdigest(),
+            }
+            for index in range(64)
+        ]
+        bundle = {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+        plan = filesystem._bundle_lane_plan(bundle, chunks, source_urls)
+        calls = []
 
         class Response(io.BytesIO):
             status = 206
@@ -170,42 +270,90 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        calls = []
-
         def fake_urlopen(request, timeout):
-            start, end = (int(part) for part in request.headers["Range"].removeprefix("bytes=").split("-"))
-            calls.append((start, end, timeout))
+            del timeout
+            start, end = (
+                int(part)
+                for part in request.headers["Range"].removeprefix("bytes=").split("-")
+            )
+            calls.append((request.full_url, start, end))
             return Response(payload[start : end + 1], start, end)
+
+        def is_completed(_index, _item, path):
+            return path.with_name(f"{path.name}.done").exists()
+
+        def process_chunk(_index, item):
+            path = root / item["file"]
+            path.with_name(f"{path.name}.done").write_text(
+                json.dumps({"output_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+            )
 
         old_urlopen = filesystem.urllib.request.urlopen
         filesystem.urllib.request.urlopen = fake_urlopen
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
-                chunk_root = root / "chunks"
-                chunk_root.mkdir()
-                destination = chunk_root / "chunk"
-                destination.write_bytes(item_payload[:3])
-                parent_fd = filesystem._open_directory_nofollow(
-                    chunk_root, create=False, label="test bundle chunks"
-                )
-                try:
-                    filesystem._download_bundle_range(
-                        {
-                            "url": "http://bundle/step",
-                            "size": len(payload),
-                            "sha256": hashlib.sha256(payload).hexdigest(),
-                        },
-                        item,
-                        destination,
-                        parent_fd,
+                for lane_index, lane in enumerate(plan["lanes"]):
+                    filesystem._download_bundle_lane(
+                        bundle,
+                        lane,
+                        chunks,
+                        root,
+                        is_completed=is_completed,
+                        process_chunk=process_chunk,
+                        lane_index=lane_index,
                     )
-                finally:
-                    os.close(parent_fd)
-                self.assertEqual(destination.read_bytes(), item_payload)
-                self.assertEqual(calls[0][:2], (10, 15))
+                self.assertEqual([call[0] for call in calls], [lane["url"] for lane in plan["lanes"]])
+                self.assertEqual([(call[1], call[2]) for call in calls], [(lane["start"], lane["end"]) for lane in plan["lanes"]])
+                self.assertEqual(b"".join((root / item["file"]).read_bytes() for item in chunks), payload)
         finally:
             filesystem.urllib.request.urlopen = old_urlopen
+
+    def test_bundle_lane_rejects_non_range_response(self):
+        filesystem = load_filesystem_module()
+        piece = b"wire"
+        item = {
+            "file": "chunk",
+            "offset": 0,
+            "bundle_offset": 0,
+            "wire_size": len(piece),
+            "wire_sha256": hashlib.sha256(piece).hexdigest(),
+        }
+        lane = {
+            "url": "http://source:18100/.adapter-transport-bundle",
+            "start": 0,
+            "end": len(piece) - 1,
+            "wire_bytes": len(piece),
+            "chunks": ["chunk"],
+        }
+
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        calls = []
+        old_urlopen = filesystem.urllib.request.urlopen
+        filesystem.urllib.request.urlopen = lambda request, timeout: (calls.append(request), Response())[-1]
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(OSError, "did not honor"):
+                    filesystem._download_bundle_lane(
+                        {"size": len(piece), "sha256": hashlib.sha256(piece).hexdigest()},
+                        lane,
+                        [item],
+                        Path(temporary),
+                        is_completed=lambda *_args: False,
+                        process_chunk=lambda *_args: None,
+                    )
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+        self.assertEqual(len(calls), 1)
 
     def test_download_keeps_public_signature(self):
         filesystem = load_filesystem_module()
@@ -504,7 +652,7 @@ class DownloadSchedulerTest(unittest.TestCase):
         terminal = (
             OSError("generic metadata failure"),
             OSError("connection reset by peer"),
-            filesystem.URLError("connection reset by peer"),
+            filesystem.URLError("adapter checksum mismatch"),
             filesystem.HTTPError("http://lane/manifest", 500, "server error", None, None),
             OSError("adapter checksum mismatch"),
             OSError("adapter identity differs"),

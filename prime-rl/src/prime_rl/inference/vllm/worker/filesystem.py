@@ -50,6 +50,7 @@ _ADAPTER_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
 _ADAPTER_FULL_TRANSPORT = "chunked-full-zstd"
 _ADAPTER_LINEAR_TRANSPORT = "chunked-bf16-linear-zigzag-sparse-zstd"
 _ADAPTER_BUNDLE_PATH = ".adapter-transport-bundle"
+_ADAPTER_BUNDLE_MAX_LANES = 64
 _ADAPTER_KNOWN_TRANSPORTS = {_ADAPTER_DELTA_TRANSPORT, _ADAPTER_LINEAR_TRANSPORT}
 _ADAPTER_KNOWN_CHUNK_CODECS = {"zstd"}
 _ADAPTER_MAX_CHUNKS = 65536
@@ -1131,7 +1132,7 @@ def _is_retryable_metadata_error(exception: BaseException) -> bool:
         reason = exception.reason
         if isinstance(reason, BaseException):
             return _is_retryable_metadata_error(reason)
-        return False
+        return True
     return False
 
 
@@ -2985,126 +2986,227 @@ class _BundleNetworkError(OSError):
     """A bundle response failed before its requested bytes arrived."""
 
 
-def _download_bundle_range(
+def _bundle_lane_plan(
     bundle: dict[str, object],
-    item: dict[str, object],
-    destination: Path,
-    parent_fd: int,
+    chunks: list[dict[str, object]],
+    source_urls: list[str],
+) -> dict[str, object]:
+    """Partition sorted virtual-bundle chunks into balanced contiguous lanes."""
+    if not source_urls or not chunks or any(not isinstance(url, str) for url in source_urls):
+        raise OSError("adapter bundle has no source lanes or chunks")
+    ordered = sorted(chunks, key=lambda item: int(item.get("offset", -1)))
+    lane_count = min(_ADAPTER_BUNDLE_MAX_LANES, len(source_urls), len(ordered))
+    if lane_count <= 0:
+        raise OSError("adapter bundle has no usable source lanes")
+    if len(set(source_urls[:lane_count])) != lane_count:
+        raise OSError("adapter bundle source lanes are not independent")
+    prefix = [0]
+    expected_start = 0
+    for item in ordered:
+        wire_size = item.get("wire_size")
+        start = item.get("bundle_offset")
+        if (
+            not isinstance(item.get("file"), str)
+            or type(wire_size) is not int
+            or wire_size <= 0
+            or type(start) is not int
+            or start < 0
+        ):
+            raise OSError("adapter bundle lane identity is invalid")
+        if start != expected_start:
+            raise OSError("adapter bundle chunks are not contiguous")
+        expected_start += wire_size
+        prefix.append(prefix[-1] + wire_size)
+    bundle_size = bundle.get("size")
+    if type(bundle_size) is not int or prefix[-1] != bundle_size:
+        raise OSError("adapter bundle lane size differs from its chunks")
+
+    lanes: list[dict[str, object]] = []
+    begin = 0
+    total = prefix[-1]
+    for lane_index in range(lane_count):
+        lanes_left = lane_count - lane_index
+        if lane_index == lane_count - 1:
+            end = len(ordered)
+        else:
+            max_end = len(ordered) - (lanes_left - 1)
+            target = total * (lane_index + 1) / lane_count
+            end = begin + 1
+            while end < max_end and prefix[end] < target:
+                end += 1
+            if end > begin + 1 and abs(prefix[end - 1] - target) <= abs(prefix[end] - target):
+                end -= 1
+        lane_chunks = ordered[begin:end]
+        lane_start = int(lane_chunks[0]["bundle_offset"])
+        lane_end = lane_start + sum(int(item["wire_size"]) for item in lane_chunks) - 1
+        lanes.append(
+            {
+                "url": _adapter_url_entry(source_urls[lane_index], _ADAPTER_BUNDLE_PATH),
+                "start": lane_start,
+                "end": lane_end,
+                "wire_bytes": lane_end - lane_start + 1,
+                "chunks": [str(item["file"]) for item in lane_chunks],
+            }
+        )
+        begin = end
+    if begin != len(ordered):
+        raise OSError("adapter bundle lane plan does not cover every chunk")
+    return {"version": 1, "lane_count": lane_count, "lanes": lanes}
+
+
+def _download_bundle_lane(
+    bundle: dict[str, object],
+    lane: dict[str, object],
+    chunks: list[dict[str, object]],
+    chunk_root: Path,
     *,
+    is_completed,
+    process_chunk,
     progress=None,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
+    lane_index: int = 0,
 ) -> None:
-    """Resume one chunk from the virtual bundle with typed retries only."""
-    bundle_url = bundle.get("url")
-    bundle_size = bundle.get("size")
-    bundle_digest = bundle.get("sha256")
-    start = item.get("bundle_offset")
-    wire_size = item.get("wire_size")
-    expected_digest = item.get("wire_sha256")
-    if (
-        not isinstance(bundle_url, str)
-        or type(bundle_size) is not int
-        or not isinstance(bundle_digest, str)
-        or type(start) is not int
-        or type(wire_size) is not int
-        or wire_size <= 0
-        or type(expected_digest) is not str
-        or start < 0
-        or start + wire_size > bundle_size
-    ):
-        raise OSError("adapter bundle range identity is invalid")
-    attempt_limit = max(_ADAPTER_LANE_RETRIES, 64)
-    for attempt in range(attempt_limit):
+    """Stream one contiguous lane into its existing chunk files."""
+    url, start, end, names = (lane.get(key) for key in ("url", "start", "end", "chunks"))
+    size, digest = bundle.get("size"), bundle.get("sha256")
+    if not isinstance(url, str) or type(start) is not int or type(end) is not int:
+        raise OSError("adapter bundle lane identity is invalid")
+    if start < 0 or end < start or type(size) is not int or end >= size:
+        raise OSError("adapter bundle lane identity is invalid")
+    if not isinstance(digest, str) or not isinstance(names, list) or not names:
+        raise OSError("adapter bundle lane identity is invalid")
+    if any(not isinstance(item, dict) for item in chunks):
+        raise OSError("adapter bundle chunk identity is invalid")
+    by_name = {item.get("file"): (index, item) for index, item in enumerate(chunks)}
+    if len(by_name) != len(chunks) or any(not isinstance(name, str) for name in by_name):
+        raise OSError("adapter bundle chunk identity is invalid")
+    lane_items = []
+    expected = start
+    for name in names:
+        if name not in by_name:
+            raise OSError("adapter bundle lane chunk is not in the manifest")
+        index, item = by_name[name]
+        offset, wire_size = item.get("bundle_offset"), item.get("wire_size")
+        if type(offset) is not int or type(wire_size) is not int or wire_size <= 0 or offset != expected:
+            raise OSError("adapter bundle lane chunks are not contiguous")
+        path = chunk_root / Path(name).name
+        if path.name != name:
+            raise OSError("adapter bundle chunk path is invalid")
+        _reject_symlink_path(path, "adapter transport chunk")
+        lane_items.append((index, item, path))
+        expected += wire_size
+    if expected != end + 1:
+        raise OSError("adapter bundle lane range differs from its chunks")
+
+    def read_exact(response, amount: int, output=None) -> None:
+        while amount:
+            _check_deadline(deadline, cancel_event)
+            try:
+                data = response.read(min(16 * 1024 * 1024, amount))
+            except (OSError, TimeoutError, URLError) as exc:
+                raise _BundleNetworkError("adapter bundle lane response ended") from exc
+            if not data:
+                raise _BundleNetworkError("adapter bundle lane response ended early")
+            if len(data) > amount:
+                raise OSError("adapter bundle lane response exceeded its range")
+            if output is not None:
+                output.write(data)
+            amount -= len(data)
+            if progress is not None:
+                progress(lane_index, len(data))
+
+    for attempt in range(max(_ADAPTER_LANE_RETRIES, 64)):
         _check_deadline(deadline, cancel_event)
-        entry_stat = _stat_regular_entry(parent_fd, destination.name, "adapter bundle chunk")
-        present = entry_stat.st_size if entry_stat is not None else 0
-        if present > wire_size:
-            os.unlink(destination.name, dir_fd=parent_fd)
-            present = 0
-        elif present == wire_size:
-            if _sha256(destination, deadline, cancel_event, parent_fd=parent_fd) != expected_digest:
-                raise OSError("adapter bundle chunk checksum mismatch")
+        states, first_position = {}, None
+        for position, (index, item, path) in enumerate(lane_items):
+            if is_completed(index, item, path):
+                continue
+            wire_size = int(item["wire_size"])
+            present = _path_regular_size(path, "adapter transport chunk") or 0
+            if present > wire_size:
+                _unlink_path(path, "adapter transport chunk")
+                present = 0
+            if present == wire_size:
+                process_chunk(index, item)
+                if not is_completed(index, item, path):
+                    raise OSError("adapter bundle chunk was not completed")
+                continue
+            states[index] = present
+            if first_position is None:
+                first_position = position
+        if first_position is None:
             return
-        request_start = start + present
-        request_end = start + wire_size - 1
-        request = urllib.request.Request(
-            bundle_url,
-            headers={"Range": f"bytes={request_start}-{request_end}"},
-        )
+        _, first_item, _ = lane_items[first_position]
+        request_start = int(first_item["bundle_offset"]) + states[lane_items[first_position][0]]
+        if request_start > end:
+            raise OSError("adapter bundle resume offset is outside its lane")
+        request = urllib.request.Request(url, headers={"Range": f"bytes={request_start}-{end}"})
         try:
-            timeout = _chunk_request_timeout(
-                deadline,
-                attempt,
-                _configured_chunk_timeout(),
-                cancel_event,
-            )
+            timeout = _configured_chunk_timeout()
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("adapter delta staging exceeded its time limit")
+                timeout = min(timeout, remaining)
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 if response.status != 206:
                     raise OSError("adapter bundle server did not honor byte range")
-                expected_length = request_end - request_start + 1
-                if response.headers.get("Content-Length") != str(expected_length):
+                length = end - request_start + 1
+                if response.headers.get("Content-Length") != str(length):
                     raise OSError("adapter bundle response Content-Length differs")
-                if response.headers.get("Content-Range") != (
-                    f"bytes {request_start}-{request_end}/{bundle_size}"
-                ):
+                if response.headers.get("Content-Range") != f"bytes {request_start}-{end}/{size}":
                     raise OSError("adapter bundle response Content-Range differs")
                 etag = response.headers.get("ETag")
-                if etag is not None and etag.strip() != f'"{bundle_digest}"':
+                if etag is not None and etag.strip() != f'"{digest}"':
                     raise OSError("adapter bundle response ETag differs")
-                with os.fdopen(
-                    _open_nofollow(
-                        destination.name,
-                        os.O_WRONLY | os.O_CREAT | (os.O_APPEND if present else os.O_TRUNC),
-                        dir_fd=parent_fd,
-                        label="adapter bundle chunk",
-                    ),
-                    "ab" if present else "wb",
-                ) as output:
-                    received = 0
-                    while received < expected_length:
-                        _check_deadline(deadline, cancel_event)
-                        try:
-                            chunk = response.read(min(16 * 1024 * 1024, expected_length - received))
-                        except (OSError, TimeoutError, URLError) as exc:
-                            raise _BundleNetworkError("adapter bundle response ended") from exc
-                        if not chunk:
-                            raise _BundleNetworkError("adapter bundle response ended early")
-                        output.write(chunk)
-                        received += len(chunk)
-                        if progress is not None:
-                            progress(0, len(chunk))
+                for position, (index, item, path) in enumerate(lane_items):
+                    if position < first_position:
+                        continue
+                    wire_size = int(item["wire_size"])
+                    if is_completed(index, item, path):
+                        read_exact(response, wire_size)
+                        continue
+                    present = states.get(index, 0)
+                    _reject_symlink_path(path, "adapter transport chunk")
+                    with os.fdopen(
+                        _open_nofollow(
+                            path,
+                            os.O_WRONLY | os.O_CREAT | (os.O_APPEND if present else os.O_TRUNC),
+                            label="adapter transport chunk",
+                        ),
+                        "ab" if present else "wb",
+                    ) as output:
+                        if present and position != first_position:
+                            read_exact(response, present)
+                        read_exact(response, wire_size - present, output)
+                    if _path_regular_size(path, "adapter transport chunk") != wire_size:
+                        raise _BundleNetworkError("incomplete adapter bundle chunk")
+                    process_chunk(index, item)
         except HTTPError as exc:
             if exc.code not in {404, 503}:
                 raise
         except _BundleNetworkError:
             pass
-        except URLError:
-            pass
+        except URLError as exc:
+            if not _is_retryable_metadata_error(exc):
+                raise
         except (TimeoutError, socket.timeout, ConnectionError):
             pass
         else:
-            entry_stat = _stat_regular_entry(parent_fd, destination.name, "adapter bundle chunk")
-            if entry_stat is None or entry_stat.st_size != wire_size:
-                raise _BundleNetworkError("incomplete adapter bundle chunk")
-            if _sha256(destination, deadline, cancel_event, parent_fd=parent_fd) != expected_digest:
-                raise OSError("adapter bundle chunk checksum mismatch")
-            return
-        if attempt + 1 == attempt_limit:
-            raise OSError("adapter bundle range retries exhausted")
+            if all(is_completed(index, item, path) for index, item, path in lane_items):
+                return
+            raise OSError("adapter bundle lane did not complete its chunks")
+        if attempt + 1 == max(_ADAPTER_LANE_RETRIES, 64):
+            raise OSError("adapter bundle lane retries exhausted")
         _check_deadline(deadline, cancel_event)
         _check_cancelled(cancel_event)
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
             raise TimeoutError("adapter delta staging exceeded its time limit")
-        sleep_for = 1.0
-        if remaining is not None:
-            sleep_for = min(sleep_for, remaining)
-        if cancel_event is None:
-            time.sleep(sleep_for)
-        else:
-            cancel_event.wait(sleep_for)
-    raise OSError("adapter bundle range retries exhausted")
+        sleep_for = 1.0 if remaining is None else min(1.0, remaining)
+        (time.sleep(sleep_for) if cancel_event is None else cancel_event.wait(sleep_for))
+    raise OSError("adapter bundle lane retries exhausted")
 
 
 def _verify_bundle_chunks(
@@ -3126,10 +3228,20 @@ def _verify_bundle_chunks(
         if not isinstance(name, str):
             raise OSError("adapter bundle chunk identity is invalid")
         path = chunk_root / name
+        wire_size = item.get("wire_size")
+        expected_wire = item.get("wire_sha256")
+        if type(wire_size) is not int or wire_size <= 0 or not isinstance(expected_wire, str):
+            raise OSError("adapter bundle chunk identity is invalid")
+        if _path_regular_size(path, "adapter bundle chunk") != wire_size:
+            raise OSError("adapter bundle chunk size differs")
+        wire_digest = hashlib.sha256()
         with os.fdopen(_open_nofollow(path, os.O_RDONLY, label="adapter bundle chunk"), "rb") as source:
             while chunk := source.read(16 * 1024 * 1024):
                 _check_deadline(deadline, cancel_event)
                 digest.update(chunk)
+                wire_digest.update(chunk)
+        if wire_digest.hexdigest() != expected_wire:
+            raise OSError("adapter bundle chunk checksum mismatch")
     if digest.hexdigest() != expected:
         raise OSError("adapter bundle checksum mismatch")
 
@@ -4222,6 +4334,15 @@ def _stage_chunked_xor_adapter(
     chunks = transport["chunks"]
     assert isinstance(chunks, list)
     chunks = sorted(chunks, key=lambda item: int(item["offset"]))
+    bundle_lane_urls = None
+    if bundle is not None:
+        responsive_urls, _responsive_count = _responsive_adapter_source_urls(
+            source_url,
+            deadline,
+            cancel_event,
+        )
+        bundle_lane_urls = responsive_urls[:_ADAPTER_BUNDLE_MAX_LANES]
+        bundle["lane_plan"] = _bundle_lane_plan(bundle, chunks, bundle_lane_urls)
     transport_identity = json.dumps(transport, sort_keys=True, separators=(",", ":"))
     identity_path = temporary / "transport-manifest.json"
     _reset_staging_directory_identity(
@@ -4320,7 +4441,15 @@ def _stage_chunked_xor_adapter(
             cancel_event,
         )
     else:
-        lane_urls, source_connection_count = [bundle["url"]], 1
+        lane_plan = bundle.get("lane_plan")
+        if (
+            not isinstance(lane_plan, dict)
+            or not isinstance(lane_plan.get("lanes"), list)
+            or not lane_plan["lanes"]
+        ):
+            raise OSError("adapter bundle lane plan is unavailable")
+        lane_urls = [lane["url"] for lane in lane_plan["lanes"]]
+        source_connection_count = len(lane_urls)
     status_metadata = {
         **(status_metadata or {}),
         "source_connections": source_connection_count,
@@ -4381,7 +4510,45 @@ def _stage_chunked_xor_adapter(
         )
         _write_marker(temporary / _RELAYING_MARKER, "relaying\n")
 
-    def fetch(index: int, item: dict[str, object]) -> None:
+    def chunk_completed(index: int, item: dict[str, object], chunk_path: Path) -> bool:
+        del index
+        name = item["file"]
+        offset = int(item["offset"])
+        raw_size = int(item["raw_size"])
+        wire_size = int(item["wire_size"])
+        wire_sha256 = str(item["wire_sha256"])
+        raw_sha256 = str(item["raw_sha256"])
+        completed_path = chunk_path.with_name(f"{chunk_path.name}.done")
+        _reject_symlink_path(completed_path, "adapter completed proof")
+        if _path_regular_size(completed_path, "adapter completed proof") is None:
+            return False
+        try:
+            proof = json.loads(
+                _read_text_nofollow(
+                    completed_path,
+                    encoding="utf-8",
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
+            )
+        except (OSError, ValueError):
+            _unlink_path(completed_path, "adapter completed proof")
+            return False
+        if (
+            isinstance(proof, dict)
+            and proof.get("file") == name
+            and proof.get("offset") == offset
+            and proof.get("raw_size") == raw_size
+            and proof.get("wire_size") == wire_size
+            and proof.get("wire_sha256") == wire_sha256
+            and proof.get("raw_sha256") == raw_sha256
+            and isinstance(proof.get("output_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", proof["output_sha256"]) is not None
+        ):
+            return True
+        _unlink_path(completed_path, "adapter completed proof")
+        return False
+
+    def fetch(index: int, item: dict[str, object], *, wire_ready: bool = False) -> None:
         nonlocal transfer_started, transfer_finished
         nonlocal reconstruction_started, reconstruction_finished
         nonlocal reconstruction_worker_seconds
@@ -4398,47 +4565,24 @@ def _stage_chunked_xor_adapter(
         wire_sha256 = str(item["wire_sha256"])
         raw_sha256 = str(item["raw_sha256"])
         completed_path = chunk_path.with_name(f"{chunk_path.name}.done")
-        _reject_symlink_path(completed_path, "adapter completed proof")
+        if chunk_completed(index, item, chunk_path):
+            # The final file checksum validates all resumed regions together.
+            return
 
-        if _path_regular_size(completed_path, "adapter completed proof") is not None:
-            try:
-                proof = json.loads(
-                    _read_text_nofollow(
-                        completed_path,
-                        encoding="utf-8",
-                        max_bytes=_ADAPTER_METADATA_MAX_BYTES,
-                    )
-                )
-                proof_matches = (
-                    isinstance(proof, dict)
-                    and proof.get("file") == name
-                    and proof.get("offset") == offset
-                    and proof.get("raw_size") == raw_size
-                    and proof.get("wire_size") == wire_size
-                    and proof.get("wire_sha256") == wire_sha256
-                    and proof.get("raw_sha256") == raw_sha256
-                    and isinstance(proof.get("output_sha256"), str)
-                    and re.fullmatch(r"[0-9a-f]{64}", proof["output_sha256"]) is not None
-                )
-            except (OSError, ValueError):
-                proof_matches = False
-            if proof_matches:
-                # The final file checksum validates all resumed regions together.
-                return
-            _unlink_path(completed_path, "adapter completed proof")
+        if not wire_ready:
+            chunk_lane = index % len(lane_urls)
 
-        chunk_lane = index % len(lane_urls)
+            def lane_report(_lane: int, amount: int) -> None:
+                report(chunk_lane, amount)
 
-        def lane_report(_lane: int, amount: int) -> None:
-            report(chunk_lane, amount)
-
-        chunk_urls = [_adapter_url_entry(lane_url, name) for lane_url in lane_urls]
-        chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
-        transfer_started_at = time.monotonic()
-        with timing_lock:
-            if transfer_started is None or transfer_started_at < transfer_started:
-                transfer_started = transfer_started_at
-        if bundle is None:
+            chunk_urls = [_adapter_url_entry(lane_url, name) for lane_url in lane_urls]
+            chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
+            transfer_started_at = time.monotonic()
+            with timing_lock:
+                if transfer_started is None or transfer_started_at < transfer_started:
+                    transfer_started = transfer_started_at
+            if bundle is not None:
+                raise OSError("bundle chunks must be streamed by their lane")
             download(
                 chunk_urls[0],
                 chunk_path,
@@ -4452,31 +4596,18 @@ def _stage_chunked_xor_adapter(
                 per_request_timeout_seconds=_configured_chunk_timeout(),
                 retry_http_statuses=({404, 503} if not full_zstd else None),
             )
+            transfer_finished_at = time.monotonic()
+            with timing_lock:
+                if transfer_finished is None or transfer_finished_at > transfer_finished:
+                    transfer_finished = transfer_finished_at
         else:
-            chunk_root_fd = _open_directory_nofollow(
-                chunk_root,
-                create=False,
-                label="adapter transport chunk directory",
-            )
-            try:
-                _download_bundle_range(
-                    bundle,
-                    item,
-                    chunk_path,
-                    chunk_root_fd,
-                    progress=lane_report,
-                    deadline=deadline,
-                    cancel_event=cancel_event,
-                )
-            finally:
-                os.close(chunk_root_fd)
-        transfer_finished_at = time.monotonic()
-        with timing_lock:
-            if transfer_finished is None or transfer_finished_at > transfer_finished:
-                transfer_finished = transfer_finished_at
+            if _path_regular_size(chunk_path, "adapter transport chunk") != wire_size:
+                raise OSError("adapter bundle chunk size changed before processing")
+            if _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
+                raise OSError("adapter bundle chunk checksum mismatch")
 
         _check_deadline(deadline, cancel_event)
-        encoded = _read_bytes_nofollow(chunk_path)
+        encoded = _read_bytes_nofollow(chunk_path, max_bytes=wire_size)
         if len(encoded) != wire_size:
             raise OSError("adapter transport chunk size changed")
         _check_deadline(deadline, cancel_event)
@@ -4539,10 +4670,43 @@ def _stage_chunked_xor_adapter(
             },
         )
 
-    download_streams = _configured_download_streams()
-    executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
-    futures = [executor.submit(fetch, index, item) for index, item in enumerate(chunks)]
+    if bundle is None:
+        download_streams = _configured_download_streams()
+        executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
+        futures = [executor.submit(fetch, index, item) for index, item in enumerate(chunks)]
+    else:
+        with timing_lock:
+            if transfer_started is None:
+                transfer_started = time.monotonic()
+        lane_plan = bundle.get("lane_plan")
+        if not isinstance(lane_plan, dict) or not isinstance(lane_plan.get("lanes"), list):
+            raise OSError("adapter bundle lane plan is unavailable")
+
+        def process_lane_chunk(index: int, item: dict[str, object]) -> None:
+            fetch(index, item, wire_ready=True)
+
+        lanes = lane_plan["lanes"]
+        executor = ThreadPoolExecutor(max_workers=len(lanes))
+        futures = [
+            executor.submit(
+                _download_bundle_lane,
+                bundle,
+                lane,
+                chunks,
+                chunk_root,
+                is_completed=chunk_completed,
+                process_chunk=process_lane_chunk,
+                progress=report,
+                deadline=deadline,
+                cancel_event=cancel_event,
+                lane_index=index,
+            )
+            for index, lane in enumerate(lanes)
+        ]
     _wait_for_futures(executor, futures, deadline, cancel_event)
+    if bundle is not None:
+        with timing_lock:
+            transfer_finished = time.monotonic()
 
     if bundle is not None:
         _verify_bundle_chunks(
