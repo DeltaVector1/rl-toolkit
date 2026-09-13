@@ -389,7 +389,7 @@ tunnel_wait_group_exit() { return 0; }
 
 # Interrupt the real readiness commit sequence at every state change. Before
 # commit, rollback must retain both records. After commit it must not run.
-commit_block=$(sed -n '/^if ! adapter_tunnel_readiness;/,/^repair_release_lock .*repair_fail/p' "$script")
+commit_block=$(sed -n '/^repair_committed=1$/,/^repair_release_lock .*repair_fail/p' "$script")
 for interrupt_command in 'repair_committed=1' 'repair_created_tunnels=()' \
     'repair_unregistered_tunnels=()' repair_release_lock; do
   set +e
@@ -398,7 +398,6 @@ for interrupt_command in 'repair_committed=1' 'repair_created_tunnels=()' \
     repair_created_tunnels=(created)
     repair_unregistered_tunnels=(unregistered)
     repair_lock_held=1
-    adapter_tunnel_readiness() { return 0; }
     repair_cleanup_created_tunnels() { printf 'created:%s\n' "${#repair_created_tunnels[@]}"; }
     repair_cleanup_unregistered_tunnels() { printf 'unregistered:%s\n' "${#repair_unregistered_tunnels[@]}"; }
     repair_release_lock() { printf 'lock:%s\n' "$repair_lock_held"; repair_lock_held=0; }

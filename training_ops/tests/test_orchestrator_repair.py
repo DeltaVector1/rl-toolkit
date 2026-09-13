@@ -206,6 +206,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('adapter_tunnel_exact_snapshot()', source)
         self.assertIn('adapter_tunnel_local_snapshot()', source)
         self.assertIn('adapter_tunnel_remote_snapshot()', source)
+        self.assertIn('adapter_tunnel_stability_snapshot()', source)
         self.assertIn('rollback_failed=0', source)
         self.assertIn('status=125', source)
         self.assertIn('process_start_time()', source)
@@ -221,17 +222,9 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn('if ! repair_cleanup_created_tunnels; then status=125; fi', source)
         readiness_function = source.index('adapter_tunnel_readiness()')
         final_start = source.index('for _ in $(seq 1 10); do', readiness_function)
-        final_block = source[final_start:source.index('echo "adapter tunnel final local/remote snapshots failed"', final_start)]
-        self.assertEqual(final_block.count('adapter_tunnel_local_snapshot'), 2)
-        self.assertEqual(final_block.count('adapter_tunnel_remote_snapshot'), 2)
-        self.assertLess(
-            final_block.index('adapter_tunnel_local_snapshot'),
-            final_block.index('adapter_tunnel_remote_snapshot'),
-        )
-        self.assertLess(
-            final_block.index('adapter_tunnel_remote_snapshot'),
-            final_block.rindex('adapter_tunnel_local_snapshot'),
-        )
+        final_block = source[final_start:source.index('echo "adapter tunnel final stability check failed"', final_start)]
+        self.assertEqual(final_block.count('adapter_tunnel_stability_snapshot'), 1)
+        self.assertNotIn('adapter_tunnel_local_snapshot', final_block)
         readiness_call = source.index('if ! adapter_tunnel_readiness; then')
         self.assertLess(readiness_call, docker_start)
         self.assertLess(mode_start, docker_start)
@@ -1109,6 +1102,7 @@ peer_remote_ports_ready() {{ return 0; }}
 peer_tunnel_current_children_ready() {{ return 0; }}
 adapter_tunnel_local_snapshot() {{ return 0; }}
 adapter_tunnel_remote_snapshot() {{ return 0; }}
+adapter_tunnel_stability_snapshot() {{ return 0; }}
 adapter_tunnel_readiness || exit 1
 echo "$repaired:$checks"
 ''')

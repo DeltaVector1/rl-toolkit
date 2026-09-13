@@ -693,8 +693,7 @@ case "$full_mode" in
   fail) exit 7 ;;
   signal) repair_signal ;;
   committed)
-    adapter_tunnel_readiness() { return 0; }
-    eval "$(sed -n '/^if ! adapter_tunnel_readiness;/,/^repair_release_lock .*repair_fail/p' "$launcher")"
+    eval "$(sed -n '/^repair_committed=1$/,/^repair_release_lock .*repair_fail/p' "$launcher")"
     test "${#repair_created_tunnels[@]}" -eq 0 || exit 1
     exit 7
     ;;

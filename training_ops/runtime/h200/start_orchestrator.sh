@@ -1917,7 +1917,11 @@ peer_tunnel_supervisor_child_identity() {
   local -a forwards=("$@")
   local child_pid child_ppid child_command child_count=0 direct_ssh_count=0
   local expected_start process_output
-  process_output=$(ps -eo pid=,ppid=,args=) || return 2
+  if [ "${peer_process_snapshot_active:-0}" = 1 ]; then
+    process_output=$peer_process_snapshot
+  else
+    process_output=$(ps -eo pid=,ppid=,args=) || return 2
+  fi
   while read -r child_pid child_ppid child_command; do
     [ "$child_ppid" = "$supervisor_pid" ] || continue
     case "$child_command" in
@@ -1942,6 +1946,9 @@ peer_tunnel_wait_child_identity() {
   shift 3
   local child_status
   for _ in $(seq 1 10); do
+    if [ "${peer_process_snapshot_active:-0}" = 1 ]; then
+      peer_process_snapshot=$(ps -eo pid=,ppid=,args=) || return 2
+    fi
     peer_snapshot_child_pid=
     peer_snapshot_child_command=
     peer_snapshot_child_start=
@@ -2590,7 +2597,12 @@ china_tunnel_group_safe() {
   local group_seen=0 supervisor_seen=0 direct_seen=0 proxy_seen=0 sleep_seen=0
   local expected_ssh proxy_ssh normalized_command
   local group_listing
-  group_listing=$(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[[:space:]]*[0-9]+[[:space:]]+/, ""); print}' | sed -E 's/[[:space:]]+$//') || return 1
+  if [ "${tunnel_group_process_snapshot_active:-0}" = 1 ]; then
+    group_listing=$(awk -v group="$pgid" '$1 == group {sub(/^[[:space:]]*[0-9]+[[:space:]]+/, ""); print}' \
+      <<<"$tunnel_group_process_snapshot" | sed -E 's/[[:space:]]+$//') || return 1
+  else
+    group_listing=$(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[[:space:]]*[0-9]+[[:space:]]+/, ""); print}' | sed -E 's/[[:space:]]+$//') || return 1
+  fi
   expected_ssh=
   if proxy_ssh=$(china_tunnel_proxy_ssh_command); then
     :
@@ -2651,7 +2663,12 @@ china_tunnel_stale_group_safe() {
   if ! china_tunnel_ssh_args_match "$expected_ssh" cleanup; then
     china_tunnel_known_old_ssh_args_match "$expected_ssh" cleanup || return 1
   fi
-  group_listing=$(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[[:space:]]*[0-9]+[[:space:]]+/, ""); print}' | sed -E 's/[[:space:]]+$//') || return 1
+  if [ "${tunnel_group_process_snapshot_active:-0}" = 1 ]; then
+    group_listing=$(awk -v group="$pgid" '$1 == group {sub(/^[[:space:]]*[0-9]+[[:space:]]+/, ""); print}' \
+      <<<"$tunnel_group_process_snapshot" | sed -E 's/[[:space:]]+$//') || return 1
+  else
+    group_listing=$(ps -eo pgid=,args= | awk -v group="$pgid" '$1 == group {sub(/^[[:space:]]*[0-9]+[[:space:]]+/, ""); print}' | sed -E 's/[[:space:]]+$//') || return 1
+  fi
   while IFS= read -r group_command; do
     [ -n "$group_command" ] || continue
     group_seen=1
@@ -2752,11 +2769,15 @@ china_tunnel_supervisor_owns_forwards() {
   else
     china_tunnel_known_old_ssh_args_match "$ssh_command" current || return 1
   fi
+  if [ "${china_listener_snapshot_active:-0}" = 1 ]; then
+    listener_output=$china_listener_snapshot
+  else
+    listener_output=$(ss -H -ltnp 2>/dev/null) || return 2
+  fi
   for forward in "${forward_specs[@]}"; do
     tunnel_command_has "$supervisor_command" "$forward" || return 1
     source_port=${forward#127.0.0.1:}
     source_port=${source_port%%:*}
-    listener_output=$(ss -H -ltnp 2>/dev/null) || return 2
     listener=$(awk -v port=":$source_port" '$4 ~ port "$" {print; exit}' <<<"$listener_output") || return 2
     [ -n "$listener" ] || return 1
     child_pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener") || return 2
@@ -3091,6 +3112,18 @@ china_tunnel_remove_legacy() {
   local lora_source_port pattern pid command_line cleanup_port matching_pids
   local grouped_legacy stale
   local -a cleanup_ports=()
+  if [ -z "$only_marker" ]; then
+    local process_output marker
+    process_output=$(ps -eo pid=,args=) || return 1
+    while read -r pid command_line; do
+      repair_remaining >/dev/null || return 1
+      marker=$(sed -n 's/.*# \(china-tunnel-lora-[0-9][0-9]*\)$/\1/p' <<<"$command_line")
+      [ -n "$marker" ] || continue
+      china_tunnel_grouped_legacy_match "$command_line" || continue
+      china_tunnel_stop_supervisor "$pid" "$command_line" "$marker" 1 || return 1
+    done <<<"$process_output"
+    return 0
+  fi
   for cleanup_port in "${@:2}"; do
     case "$cleanup_port" in
       127.0.0.1:*:127.0.0.1:*)
@@ -3408,7 +3441,11 @@ supervisor_lane_inventory_ready() {
     peer) prefix=peer-tunnel-lora; match_function=peer_tunnel_supervisor_match ;;
     *) return 1 ;;
   esac
-  process_output=$(ps -eo pid=,args=) || return 1
+  if [ "${supervisor_process_snapshot_active:-0}" = 1 ]; then
+    process_output=$supervisor_process_snapshot
+  else
+    process_output=$(ps -eo pid=,args=) || return 1
+  fi
   while read -r pid command_line; do
     if [[ "$command_line" =~ \#\ ($prefix-[^[:space:]]+)[[:space:]]*$ ]]; then
       marker=${BASH_REMATCH[1]}
@@ -3434,6 +3471,13 @@ china_tunnel_supervisors_ready() {
   local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
   local marker ready lora_source_port matching_pid matching_command match_count invalid matching_pids
   local expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
+  local supervisor_process_snapshot tunnel_group_process_snapshot
+  local china_listener_snapshot
+  local supervisor_process_snapshot_active=1 tunnel_group_process_snapshot_active=1
+  local china_listener_snapshot_active=1
+  supervisor_process_snapshot=$(ps -eo pid=,args=) || return 1
+  tunnel_group_process_snapshot=$(ps -eo pgid=,args=) || return 1
+  china_listener_snapshot=$(ss -H -ltnp 2>/dev/null) || return 1
   supervisor_lane_inventory_ready china "$expected_lanes" || return 1
   china_tunnel_preflight_pgids=()
   while [ "$lane_start" -lt "${#lora_source_ports[@]}" ]; do
@@ -3447,7 +3491,8 @@ china_tunnel_supervisors_ready() {
     matching_pid=
     match_count=0
     invalid=0
-    matching_pids=$(pgrep_matches "$marker") || return 1
+    matching_pids=$(awk -v suffix="# $marker" 'index($0, suffix) {print $1}' \
+      <<<"$supervisor_process_snapshot") || return 1
     while read -r pid; do
       [ -n "$pid" ] || continue
       command_line=$(process_command_line "$pid")
@@ -3481,7 +3526,12 @@ peer_tunnel_lane_supervisor() {
   local matching_pids pid command_line matching_count=0
   peer_ready_pid=
   peer_ready_command=
-  matching_pids=$(pgrep_matches "$marker") || return 1
+  if [ "${peer_process_snapshot_active:-0}" = 1 ]; then
+    matching_pids=$(awk -v suffix="# $marker" 'index($0, suffix) {print $1}' \
+      <<<"$peer_process_snapshot") || return 1
+  else
+    matching_pids=$(pgrep_matches "$marker") || return 1
+  fi
   while read -r pid; do
     [ -n "$pid" ] || continue
     command_line=$(process_command_line "$pid") || return 1
@@ -3497,7 +3547,12 @@ peer_tunnel_lane_supervisor() {
 peer_tunnel_supervisors_ready() {
   local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
   local marker lora_source_port matching_pid matching_command supervisor_start child_status
+  local allow_repair=${1:-1}
+  local supervisor_process_snapshot peer_process_snapshot
+  local supervisor_process_snapshot_active=1 peer_process_snapshot_active=1
   [ "$peer_enabled" = 1 ] || return 0
+  supervisor_process_snapshot=$(ps -eo pid=,args=) || return 1
+  peer_process_snapshot=$(ps -eo pid=,ppid=,args=) || return 1
   local expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
   peer_supervisor_pids=()
   peer_supervisor_starts=()
@@ -3521,9 +3576,12 @@ peer_tunnel_supervisors_ready() {
     else
       child_status=$?
       [ "$child_status" -eq 2 ] || return 1
+      [ "$allow_repair" = 1 ] || return 1
       peer_tunnel_connection "lora-$lane_number" \
         "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:$relay_port" \
         "${lane_forwards[@]}" || return 1
+      supervisor_process_snapshot=$(ps -eo pid=,args=) || return 1
+      peer_process_snapshot=$(ps -eo pid=,ppid=,args=) || return 1
       peer_tunnel_lane_supervisor "$marker" "${lane_forwards[@]}" || return 1
       matching_pid=$peer_ready_pid
       matching_command=$peer_ready_command
@@ -3541,6 +3599,7 @@ peer_tunnel_supervisors_ready() {
     fi
     if [ "$child_status" -ne 0 ]; then
       [ "$child_status" -eq 1 ] || return 1
+      [ "$allow_repair" = 1 ] || return 1
       if peer_tunnel_wait_child_identity "$matching_pid" current "$marker" \
           "${lane_forwards[@]}"; then
         child_status=0
@@ -3550,6 +3609,8 @@ peer_tunnel_supervisors_ready() {
         peer_tunnel_connection "lora-$lane_number" \
           "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:$relay_port" \
           "${lane_forwards[@]}" || return 1
+        supervisor_process_snapshot=$(ps -eo pid=,args=) || return 1
+        peer_process_snapshot=$(ps -eo pid=,ppid=,args=) || return 1
         peer_tunnel_lane_supervisor "$marker" "${lane_forwards[@]}" || return 1
         matching_pid=$peer_ready_pid
         matching_command=$peer_ready_command
@@ -3604,10 +3665,11 @@ peer_tunnel_api_supervisor_ready() {
 }
 
 adapter_tunnel_local_snapshot() {
+  local allow_peer_repair=${1:-1}
   repair_remaining >/dev/null || return 1
   china_tunnel_supervisors_ready || return 1
   if [ "$peer_enabled" = 1 ]; then
-    peer_tunnel_supervisors_ready || return 1
+    peer_tunnel_supervisors_ready "$allow_peer_repair" || return 1
     tunnel_listener_ready "$peer_api_port" peer-tunnel-api \
       "$peer_ssh_user@$peer_host" 1 \
       -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" || return 1
@@ -3627,17 +3689,31 @@ adapter_tunnel_remote_snapshot() {
 }
 
 adapter_tunnel_exact_snapshot() {
-  adapter_tunnel_local_snapshot || return 1
+  adapter_tunnel_local_snapshot 0 || return 1
   adapter_tunnel_remote_snapshot || return 1
+}
+
+adapter_tunnel_stability_snapshot() {
+  peer_tunnel_supervisors_unchanged || return 1
+  peer_tunnel_children_unchanged || return 1
+  if [ "$peer_enabled" = 1 ]; then
+    peer_tunnel_api_listener_owner || return 1
+  fi
+  if [ "$secondary_enabled" = 1 ]; then
+    generic_tunnel_listener_ready "$secondary_local_api_port" \
+      "zmq-tunnel-$secondary_local_api_port" "$secondary_ssh_target" \
+      "127.0.0.1:$secondary_local_api_port:127.0.0.1:$secondary_remote_api_port" \
+      no "${secondary_ssh_options[@]}" || return 1
+  fi
+  adapter_tunnel_remote_snapshot
 }
 
 adapter_tunnel_readiness() {
   local tunnels_ready=0 readiness_port="" listener_status=0 remote_ready=1 attempt api_repair_attempted=0
   for attempt in $(seq 1 30); do
-    repair_stage=local-china-readiness
+    repair_stage=local-peer-readiness
     repair_remaining >/dev/null || return 1
-    tunnels_ready=0
-    china_tunnel_supervisors_ready && tunnels_ready=1
+    tunnels_ready=1
     if [ "$tunnels_ready" = 1 ] && [ "$peer_enabled" = 1 ]; then
       repair_stage=local-peer-readiness
       peer_tunnel_supervisors_ready || {
@@ -3735,18 +3811,15 @@ adapter_tunnel_readiness() {
     return 1
   fi
   for _ in $(seq 1 10); do
-    repair_stage=final-snapshot
-    if adapter_tunnel_local_snapshot && \
-        adapter_tunnel_remote_snapshot && \
-        adapter_tunnel_local_snapshot && \
-        adapter_tunnel_remote_snapshot; then
+    repair_stage=final-stability
+    if adapter_tunnel_stability_snapshot; then
       return 0
     fi
     peer_readiness_failure="final local/remote snapshot attempt $_"
     echo "adapter tunnel retry stage=$repair_stage attempt=$_" >&2
     repair_sleep 1 || return 1
   done
-  echo "adapter tunnel final local/remote snapshots failed" >&2
+  echo "adapter tunnel final stability check failed" >&2
   return 1
 }
 
@@ -3806,6 +3879,26 @@ china_legacy_cleanup_pgids=()
 china_legacy_cleanup_orphan_pids=()
 china_legacy_cleanup_ports=()
 repair_acquire_lock || repair_fail "could not acquire adapter tunnel repair lock"
+tunnels_prevalidated=0
+if [ "$restart_tunnels" = 0 ]; then
+  repair_stage=existing-local
+  if adapter_tunnel_local_snapshot 0; then
+    repair_stage=existing-source
+    if china_source_ports_ready; then
+      repair_stage=existing-remote
+      if adapter_tunnel_remote_snapshot; then
+        repair_stage=existing-stability
+        if repair_sleep 0.2 && adapter_tunnel_stability_snapshot; then
+          tunnels_prevalidated=1
+        fi
+      fi
+    fi
+  fi
+  if [ "$tunnels_prevalidated" != 1 ]; then
+    echo "existing adapter tunnel check failed at $repair_stage; running bounded repair" >&2
+  fi
+fi
+if [ "$tunnels_prevalidated" != 1 ]; then
 repair_stage=china-legacy
 if [ "$restart_tunnels" = 1 ]; then
   china_tunnel_remove_all_owned || repair_fail "full reset cleanup failed"
@@ -3862,6 +3955,7 @@ if [ "$secondary_enabled" = 1 ]; then
 fi
 if ! adapter_tunnel_readiness; then
   repair_fail "exact tunnel readiness checks failed"
+fi
 fi
 repair_committed=1
 repair_created_tunnels=()
