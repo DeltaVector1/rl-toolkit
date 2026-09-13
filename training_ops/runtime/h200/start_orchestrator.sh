@@ -1226,7 +1226,7 @@ peer_tunnel_listener_owner() {
   case "$owner_pid" in ''|*[!0-9]*) return 2 ;; esac
   owner_command=$(ps -o args= -p "$owner_pid" 2>/dev/null) || return 2
   [ -n "$owner_command" ] || return 2
-  peer_tunnel_ssh_args_match "$owner_command" api || return 2
+  peer_tunnel_api_variant_match "$owner_command" || return 2
   owner_ppid=$(ps -o ppid= -p "$owner_pid" 2>/dev/null | tr -d ' ') || return 2
   [ "$owner_ppid" = "$candidate_pid" ] || return 1
   peer_tunnel_supervisor_forwards_match "$expected_command" api peer-tunnel-api \
@@ -1249,7 +1249,7 @@ peer_tunnel_api_listener_owner() {
   case "$owner_ppid" in ''|*[!0-9]*|1) return 2 ;; esac
   supervisor_command=$(ps -o args= -p "$owner_ppid" 2>/dev/null) || return 2
   [ -n "$supervisor_command" ] || return 2
-  peer_tunnel_supervisor_forwards_match "$supervisor_command" api peer-tunnel-api \
+  peer_tunnel_api_supervisor_variant_match "$supervisor_command" peer-tunnel-api \
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" || return 2
   owner_start=$(process_start_time "$owner_ppid") || return 2
   [ -n "$owner_start" ] || return 2
@@ -1638,6 +1638,26 @@ peer_tunnel_ssh_args_match() {
   [ "$forward_count" -eq "$(grep -o -- '-[LR] ' <<<"$command_line" | wc -l)" ]
 }
 
+peer_tunnel_api_variant_match() {
+  local command_line=$1 variant
+  peer_tunnel_ssh_args_match "$command_line" api && return 0
+  for variant in compression channel-compression; do
+    command_line=$1
+    [ "$variant" = compression ] && command_line=$(sed "s| $peer_ssh_user@$peer_host$| -o Compression=no $peer_ssh_user@$peer_host|" <<<"$command_line")
+    [ "$variant" = channel-compression ] && command_line=$(sed "s|^ssh -NT|ssh -NT -o ChannelTimeout=*-tcpip=45s -o Compression=no|" <<<"$command_line")
+    peer_tunnel_ssh_args_match "$command_line" api && return 0
+  done
+  return 1
+}
+
+peer_tunnel_api_supervisor_variant_match() {
+  local command_line=$1 marker=$2 forward=$3 ssh_command
+  peer_tunnel_marker_match "$command_line" "$marker" || return 1
+  ssh_command=$(tunnel_supervisor_ssh_command "$command_line" "$marker") || return 1
+  peer_tunnel_api_variant_match "$ssh_command" || return 1
+  tunnel_command_has "$command_line" "$forward"
+}
+
 peer_tunnel_supervisor_child_identity() {
   local supervisor_pid=$1 shape=$2 marker=$3
   shift 3
@@ -1897,7 +1917,7 @@ peer_tunnel_remove_duplicate_api_supervisors() {
   while read -r pid; do
     [ -n "$pid" ] || continue
     command_line=$(process_command_line "$pid") || return 1
-    peer_tunnel_supervisor_forwards_match "$command_line" api "$marker" \
+    peer_tunnel_api_supervisor_variant_match "$command_line" "$marker" \
       "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" || continue
     [ "$pid" = "$owner_pid" ] && continue
     peer_kill_owned "$pid" "$command_line" api "$marker" \
