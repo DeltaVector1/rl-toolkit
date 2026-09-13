@@ -66,6 +66,7 @@ _ADAPTER_MARKER_MAX_BYTES = 4 * 1024
 _ADAPTER_CLEANUP_ENTRY_LIMIT = 256
 _ADAPTER_DIRECTORY_ENTRY_LIMIT = 8192
 _ADAPTER_CLEANUP_CANDIDATE_LIMIT = 64
+persistent_read_timeout_seconds = 5.0
 lane_rotation_delay_seconds = 0.1
 _JSON_LOCK = threading.Lock()
 _adapter_stage_publish_lock = threading.Lock()
@@ -3062,6 +3063,16 @@ class _PersistentAdapterConnection:
                 self.close()
                 raise _PersistentProtocolError("adapter response ETag differs")
 
+        if connection.sock is not None:
+            try:
+                connection.sock.settimeout(
+                    min(timeout, persistent_read_timeout_seconds)
+                )
+            except OSError as exc:
+                self.close()
+                raise _PersistentTransportError(
+                    "adapter response read timeout setup failed"
+                ) from exc
         remaining = expected_length
         try:
             while remaining:

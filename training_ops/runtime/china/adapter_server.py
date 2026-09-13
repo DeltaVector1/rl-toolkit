@@ -531,6 +531,7 @@ class RangeHandler(SimpleHTTPRequestHandler):
         return path
 
     def send_head(self):
+        self.__dict__.pop("remaining", None)
         source = None
         try:
             _request_path, pieces = _safe_request_path(self)
@@ -574,12 +575,6 @@ class RangeHandler(SimpleHTTPRequestHandler):
         if os.path.isdir(path):
             return super().send_head()
         size = os.fstat(source.fileno()).st_size
-        try:
-            etag = f'"{_sha256_fd(source.fileno(), path.name)}"'
-        except UpgradeError as exc:
-            source.close()
-            self.send_error(500, str(exc))
-            return None
         start, end = 0, size - 1
         if value := self.headers.get("Range"):
             try:
@@ -599,7 +594,6 @@ class RangeHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", self.guess_type(path))
         self.send_header("Content-Length", str(end - start + 1))
         self.send_header("Accept-Ranges", "bytes")
-        self.send_header("ETag", etag)
         self.send_header("Last-Modified", self.date_time_string(os.fstat(source.fileno()).st_mtime))
         self.end_headers()
         source.seek(start)

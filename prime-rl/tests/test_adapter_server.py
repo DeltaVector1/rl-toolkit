@@ -1,5 +1,6 @@
 import functools
 import hashlib
+import http.client
 import http.server
 import importlib.util
 import json
@@ -55,10 +56,6 @@ class AdapterServerTest(unittest.TestCase):
                     self.assertEqual(response.version, 11)
                     self.assertEqual(response.headers["Content-Length"], "7")
                     self.assertEqual(response.headers["Content-Range"], "bytes 2-8/20")
-                    self.assertEqual(
-                        response.headers["ETag"],
-                        f'"{hashlib.sha256(payload).hexdigest()}"',
-                    )
                     self.assertEqual(response.read(), payload[2:9])
 
                 connection = socket.create_connection(
@@ -74,6 +71,64 @@ class AdapterServerTest(unittest.TestCase):
                 finally:
                     connection.close()
             finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_persistent_socket_head_then_directory_body_is_framed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "directory"
+            directory.mkdir()
+            (directory / "entry.txt").write_text("directory entry\n", encoding="utf-8")
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                functools.partial(QuietAdapterHandler, directory=str(root)),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            try:
+                connection.request("HEAD", "/directory/")
+                head = connection.getresponse()
+                declared = int(head.getheader("Content-Length"))
+                self.assertEqual(head.read(), b"")
+                connection.request("GET", "/directory/")
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(len(body), declared)
+            finally:
+                connection.close()
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
+    def test_persistent_socket_file_then_directory_body_is_framed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "file.txt").write_text("file body\n", encoding="utf-8")
+            directory = root / "directory"
+            directory.mkdir()
+            (directory / "entry.txt").write_text("directory entry\n", encoding="utf-8")
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                functools.partial(QuietAdapterHandler, directory=str(root)),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+            try:
+                connection.request("GET", "/file.txt")
+                file_response = connection.getresponse()
+                self.assertEqual(file_response.read(), b"file body\n")
+                connection.request("GET", "/directory/")
+                response = connection.getresponse()
+                body = response.read()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(len(body), int(response.getheader("Content-Length")))
+            finally:
+                connection.close()
                 server.shutdown()
                 thread.join(timeout=5)
                 server.server_close()
