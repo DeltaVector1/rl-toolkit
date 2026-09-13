@@ -71,6 +71,7 @@ _ADAPTER_MARKER_MAX_BYTES = 4 * 1024
 _ADAPTER_CLEANUP_ENTRY_LIMIT = 256
 _ADAPTER_DIRECTORY_ENTRY_LIMIT = 8192
 _ADAPTER_CLEANUP_CANDIDATE_LIMIT = 64
+_RETRYABLE_ADAPTER_HTTP_STATUSES = frozenset({404, 429, *range(500, 600)})
 persistent_connection_idle_seconds = 30.0
 lane_rotation_delay_seconds = 0.1
 _JSON_LOCK = threading.Lock()
@@ -1225,7 +1226,7 @@ def _responsive_adapter_source_urls(
                 status = int(response.status)
                 if 200 <= status < 400:
                     return True
-                if status in {404, 503}:
+                if status in _RETRYABLE_ADAPTER_HTTP_STATUSES:
                     return False
                 raise OSError(f"adapter source probe returned HTTP status {status}")
         except HTTPError as exc:
@@ -1245,7 +1246,9 @@ def _responsive_adapter_source_urls(
     _check_deadline(deadline, cancel_event)
     responsive = [url for url, ready in zip(source_urls, results, strict=True) if ready]
     if not responsive:
-        raise OSError(f"none of {len(source_urls)} adapter source lanes responded")
+        raise _PersistentTransportError(
+            f"none of {len(source_urls)} adapter source lanes responded"
+        )
     return responsive, len(source_urls)
 
 
@@ -1337,8 +1340,10 @@ def _read_chunked_v1_manifest(
             )
         )
     except HTTPError as exc:
-        if exc.code in {404, 503}:
-            raise OSError("adapter manifest is missing; transfer mode is unknown") from exc
+        if _retryable_adapter_http_status(exc.code):
+            raise _PersistentTransportError(
+                "adapter manifest is missing; transfer mode is unknown"
+            ) from exc
         raise
     if not isinstance(value, dict) or value.get("version") != 1:
         raise OSError("invalid adapter transport manifest")
@@ -1487,8 +1492,10 @@ def _read_chunked_linear_manifest(
             )
         )
     except HTTPError as exc:
-        if exc.code in {404, 503}:
-            raise OSError("adapter manifest is missing; transfer mode is unknown") from exc
+        if _retryable_adapter_http_status(exc.code):
+            raise _PersistentTransportError(
+                "adapter manifest is missing; transfer mode is unknown"
+            ) from exc
         raise
     if not isinstance(value, dict) or value.get("version") != 2:
         raise OSError("invalid version-two adapter transport manifest")
@@ -1716,8 +1723,10 @@ def _read_chunked_xor_manifest(
             )
         )
     except HTTPError as exc:
-        if exc.code in {404, 503}:
-            raise OSError("adapter manifest is missing; transfer mode is unknown") from exc
+        if _retryable_adapter_http_status(exc.code):
+            raise _PersistentTransportError(
+                "adapter manifest is missing; transfer mode is unknown"
+            ) from exc
         raise OSError(f"adapter manifest request failed with HTTP status {exc.code}") from exc
     if not isinstance(raw, dict):
         raise OSError("invalid adapter transport manifest")
@@ -2881,6 +2890,7 @@ def _reuse_full_adapter_cache(
                     with _adapter_stage_publish_lock:
                         _check_cancelled(cancel_event)
                         _write_text_atomic(temporary / "READY", "ready\n", encoding="ascii")
+                        _fsync_directory(temporary)
                         with os.fdopen(
                             _open_nofollow(
                                 _adapter_reader_lock(destination),
@@ -3106,7 +3116,7 @@ class _PersistentLocalError(OSError):
 
 def _retryable_adapter_http_status(status: int) -> bool:
     """Return whether a temporary adapter HTTP response can be retried."""
-    return status == 404 or status == 429 or 500 <= status <= 599
+    return status in _RETRYABLE_ADAPTER_HTTP_STATUSES
 
 
 def _adapter_urlopen(request, timeout: float):
@@ -4610,6 +4620,7 @@ def _stage_chunked_linear_adapter(
         _unlink_path(temporary / _RELAYING_MARKER, "adapter relaying marker")
         ready = temporary / "READY"
         _write_text_atomic(ready, "ready\n", encoding="utf-8")
+        _fsync_directory(temporary)
         with os.fdopen(
             _open_nofollow(_adapter_reader_lock(destination), os.O_RDWR | os.O_CREAT),
             "a+",
@@ -5220,6 +5231,7 @@ def _stage_chunked_xor_adapter(
             )
             _unlink_path(temporary / _RELAYING_MARKER, "adapter relaying marker")
         _write_text_atomic(ready, "ready\n", encoding="utf-8")
+        _fsync_directory(temporary)
         with os.fdopen(
             _open_nofollow(_adapter_reader_lock(destination), os.O_RDWR | os.O_CREAT),
             "a+",
@@ -5534,7 +5546,7 @@ def _download_with_parent(
                     raise
                 sleep_for = (
                     1.0
-                    if exc.code in {404, 503}
+                    if _retryable_adapter_http_status(exc.code)
                     else (
                         lane_rotation_delay_seconds
                         if len(source_urls) > 1
@@ -6176,7 +6188,6 @@ def stage_lora_adapter_files(
                         per_request_timeout_seconds=_configured_chunk_timeout(),
                         stream_cap=full_download_streams,
                         parent_fd=temporary_fd,
-                        retry_http_statuses={404, 503},
                         typed_transport=True,
                     )
                     if expected_sha256 is None:
@@ -6231,6 +6242,7 @@ def stage_lora_adapter_files(
                 ready = temporary / "READY"
                 _check_cancelled(cancel_event)
                 _write_text_atomic(ready, "ready\n", encoding="utf-8")
+                _fsync_directory(temporary)
 
                 # Keep the exclusive lease through both renames. This removes the
                 # short missing-path window between retiring the old directory and

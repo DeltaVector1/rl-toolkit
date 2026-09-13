@@ -1443,6 +1443,50 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("checksum mismatch")))
         self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("path is a symbolic link")))
 
+        old_reader = filesystem._read_source_text
+        try:
+            for reader in (
+                filesystem._read_chunked_v1_manifest,
+                filesystem._read_chunked_linear_manifest,
+                filesystem._read_chunked_xor_manifest,
+            ):
+                for status in (404, 429, 500, 503, 504):
+                    def unavailable(*_args, status=status, **_kwargs):
+                        raise filesystem.HTTPError(
+                            "http://relay/manifest", status, "temporary", None, None
+                        )
+
+                    filesystem._read_source_text = unavailable
+                    with self.subTest(reader=reader.__name__, status=status):
+                        with self.assertRaises(filesystem._PersistentTransportError) as raised:
+                            reader("http://relay/step_2")
+                        self.assertTrue(
+                            filesystem._preserve_adapter_stage_partial(raised.exception)
+                        )
+        finally:
+            filesystem._read_source_text = old_reader
+
+    def test_all_unresponsive_lanes_keep_partial_data_retryable(self):
+        filesystem = load_filesystem_module()
+        old_lanes = filesystem._adapter_source_urls
+        old_urlopen = filesystem.urllib.request.urlopen
+
+        def unavailable(*_args, **_kwargs):
+            raise filesystem.HTTPError("http://relay/config", 503, "starting", None, None)
+
+        filesystem._adapter_source_urls = lambda _source: [
+            "http://relay/lane-a",
+            "http://relay/lane-b",
+        ]
+        filesystem.urllib.request.urlopen = unavailable
+        try:
+            with self.assertRaises(filesystem._PersistentTransportError) as raised:
+                filesystem._responsive_adapter_source_urls("http://relay/step_2", None, None)
+            self.assertTrue(filesystem._preserve_adapter_stage_partial(raised.exception))
+        finally:
+            filesystem._adapter_source_urls = old_lanes
+            filesystem.urllib.request.urlopen = old_urlopen
+
     def test_relay_unavailable_is_temporary_for_both_delta_versions(self):
         filesystem = load_filesystem_module()
         old_reader = filesystem._read_source_text

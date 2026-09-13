@@ -176,7 +176,6 @@ class DownloadSchedulerTest(unittest.TestCase):
                 deadline=time.monotonic() + deadline_seconds,
                 per_request_timeout_seconds=per_request_timeout_seconds,
                 cancel_event=cancel_event,
-                retry_http_statuses={404, 503},
                 typed_transport=True,
                 parent_fd=parent_fd,
             )
@@ -2076,7 +2075,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                     parallel_ranges=False,
                     deadline=100.0,
                     per_request_timeout_seconds=15.0,
-                    retry_http_statuses={404, 503},
+                    retry_http_statuses=filesystem._RETRYABLE_ADAPTER_HTTP_STATUSES,
                 )
                 self.assertEqual(destination.read_bytes(), payload)
         finally:

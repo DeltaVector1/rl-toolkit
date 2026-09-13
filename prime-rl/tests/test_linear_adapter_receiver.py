@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -49,6 +50,39 @@ def load_filesystem():
 
 
 class LinearAdapterReceiverTest(unittest.TestCase):
+    def test_publish_sync_order_is_staging_then_parent(self):
+        source = (ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py").read_text(
+            encoding="utf-8"
+        )
+        staging_syncs = [
+            match.start()
+            for match in re.finditer(r"_fsync_directory\(temporary\)", source)
+        ]
+        publishes = [
+            match.start()
+            for match in re.finditer(
+                r'_replace_paths\(temporary, destination, "adapter (?:publish|cache reuse)"\)',
+                source,
+            )
+        ]
+        retires = [
+            match.start()
+            for match in re.finditer(
+                r'_replace_paths\(destination, retired, "retired adapter"\)',
+                source,
+            )
+        ]
+        self.assertEqual(len(staging_syncs), 4)
+        self.assertEqual(len(publishes), 4)
+        self.assertEqual(len(retires), 4)
+        for staging_sync, retire, publish in zip(staging_syncs, retires, publishes):
+            self.assertLess(staging_sync, retire)
+            self.assertLess(retire, publish)
+            self.assertIn(
+                "_fsync_directory(destination.parent)",
+                source[publish : publish + 200],
+            )
+
     def test_chunk_proof_write_can_skip_file_sync(self):
         filesystem = load_filesystem()
         with tempfile.TemporaryDirectory() as temporary:
