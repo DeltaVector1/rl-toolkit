@@ -351,6 +351,85 @@ for boundary_kind in generic peer china; do
   done
 done
 
+orphan_fixture="$tmp/orphan-start-fixture.sh"
+cat >"$orphan_fixture" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+source <(sed '/^RUN=\${RUN:/,$d' "$launcher")
+launch_command='sleep 1000 & wait'
+if [ "$orphan_mode" = turnover ]; then
+  launch_command='sleep 1000 & first=$!; trap '\''kill "$first"; wait "$first"; sleep 1000 &'\'' USR1; wait; wait'
+fi
+setsid bash -c "$launch_command" >/dev/null 2>&1 &
+pid=$!
+setsid sleep 1000 >/dev/null 2>&1 &
+other_pid=$!
+trap 'command kill -KILL -- "-$pid" "-$other_pid" 2>/dev/null || true; wait "$pid" "$other_pid" 2>/dev/null || true' EXIT
+for _ in $(seq 1 100); do
+  child=$(command ps -eo pid=,ppid=,args= | awk -v parent="$pid" '$2 == parent && $3 == "sleep" {print $1}')
+  [ -n "$child" ] && break
+  sleep 0.01
+done
+test -n "$child" || exit 1
+start_time=$(process_start_time "$pid") || exit 1
+tunnel_supervisor_ssh_command() { printf 'sleep 1000\n'; }
+repair_started_command_matches() {
+  [ "$1" = "$orphan_kind" ] && [ "$2" = "bash -c $launch_command" ] &&
+    [ "$3" = orphan-marker ] && [ "$4" = fixture-forward ] && [ "$5" = expected ]
+}
+if repair_starting_group "$pid" "$start_time" expected orphan-marker '' capture "$orphan_kind" wrong-forward; then
+  exit 1
+fi
+repair_starting_group "$pid" "$start_time" expected orphan-marker '' capture "$orphan_kind" fixture-forward || exit 1
+bound=$repair_starting_members
+test -n "$bound" || exit 1
+if [ "$orphan_mode" = turnover ]; then
+  first_child=$child
+  command kill -USR1 "$pid"
+  for _ in $(seq 1 100); do
+    child=$(command ps -eo pid=,ppid=,args= | awk -v parent="$pid" '$2 == parent && $3 == "sleep" {print $1}')
+    [ -n "$child" ] && [ "$child" != "$first_child" ] && break
+    sleep 0.01
+  done
+  test -n "$child" && test "$child" != "$first_child" || exit 1
+fi
+command kill -KILL "$pid"
+wait "$pid" 2>/dev/null || true
+test ! -e "/proc/$pid" || exit 1
+signals=0
+kill() { signals=$((signals + 1)); command kill "$@"; }
+case "$orphan_mode" in
+  registration)
+    repair_register_tunnel "$orphan_kind" "$pid" orphan-marker fixture-forward expected
+    test "$?" -eq 125 || exit 1
+    test "${#repair_starting_tunnels[@]}" -eq 1 || exit 1
+    test "$signals" -eq 0 || exit 1
+    bound=
+    ;;
+  unbound) bound="$other_pid:$(process_start_time "$other_pid")," ;;
+  unknown) tunnel_supervisor_ssh_command() { printf 'sleep 999\n'; } ;;
+  ps-error) ps() { command ps "$@"; return 1; } ;;
+  awk-error) awk() { command awk "$@"; return 2; } ;;
+esac
+repair_starting_tunnels=("$pid|$start_time|orphan-marker|$orphan_kind|fixture-forward|expected|$bound")
+repair_cleanup_starting_tunnels
+status=$?
+if [ "$orphan_mode" = success ]; then
+  test "$status" -eq 0 && test "$signals" -eq 1 || exit 1
+  state=$(command ps -o stat= -p "$child" | tr -d ' ')
+  case "$state" in ''|Z*) ;; *) exit 1 ;; esac
+else
+  test "$status" -ne 0 && test "$signals" -eq 0 || exit 1
+  command kill -0 "$child" || exit 1
+fi
+command kill -0 "$other_pid" || exit 1
+EOF
+for orphan_kind in generic peer china; do
+  for orphan_mode in success registration turnover unbound unknown ps-error awk-error; do
+    launcher="$launcher" orphan_kind="$orphan_kind" orphan_mode="$orphan_mode" bash "$orphan_fixture"
+  done
+done
+
 # Resume after SIGSTOP failures only when a fresh start-time check succeeds.
 stop_fixture="$tmp/stop-fault-fixture.sh"
 cat >"$stop_fixture" <<'EOF'
