@@ -644,6 +644,56 @@ class DownloadSchedulerTest(unittest.TestCase):
             filesystem.time.sleep = old_sleep
             filesystem._ADAPTER_LANE_RETRIES = old_retries
 
+    def test_typed_sequential_transport_exhaustion_binds_original_error(self):
+        filesystem = load_filesystem_module()
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_sleep = filesystem.time.sleep
+        old_retries = filesystem._ADAPTER_LANE_RETRIES
+        filesystem.time.sleep = lambda _seconds: None
+        filesystem._ADAPTER_LANE_RETRIES = 3
+        calls = []
+
+        def always_transport_failure(_request, **_kwargs):
+            calls.append(True)
+            raise filesystem._PersistentTransportError(
+                "adapter network request failed"
+            )
+
+        filesystem.urllib.request.urlopen = always_transport_failure
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                destination = Path(temporary) / "adapter"
+                parent_fd = filesystem._open_directory_nofollow(
+                    Path(temporary), create=False, label="test download parent"
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        filesystem._PersistentTransportError,
+                        "adapter persistent download retries exhausted",
+                    ) as raised:
+                        filesystem._download_with_parent(
+                            "http://lane/adapter",
+                            destination,
+                            expected_size=4,
+                            expected_sha256=hashlib.sha256(b"data").hexdigest(),
+                            source_urls=["http://lane/adapter"],
+                            parallel_ranges=False,
+                            per_request_timeout_seconds=1,
+                            typed_transport=True,
+                            parent_fd=parent_fd,
+                        )
+                    self.assertIsInstance(
+                        raised.exception.__cause__,
+                        filesystem._PersistentTransportError,
+                    )
+                    self.assertEqual(len(calls), 3)
+                finally:
+                    os.close(parent_fd)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.sleep = old_sleep
+            filesystem._ADAPTER_LANE_RETRIES = old_retries
+
     def test_persistent_chunk_exhausted_timeout_is_typed_transport_failure(self):
         filesystem = load_filesystem_module()
         old_read_range = filesystem._PersistentAdapterConnection.read_range

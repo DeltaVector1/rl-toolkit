@@ -5541,7 +5541,7 @@ def _download_with_parent(
                     os.unlink(destination.name, dir_fd=parent_fd)
                     raise OSError(f"adapter checksum mismatch: {destination.name}")
                 return
-            except _PersistentTransportError:
+            except _PersistentTransportError as exc:
                 if not typed_transport:
                     raise
                 _check_deadline(deadline, cancel_event)
