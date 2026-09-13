@@ -21,6 +21,30 @@ ROOT = Path(__file__).resolve().parents[1]
 CLIENT_PATH = ROOT / "src/prime_rl/utils/client.py"
 ORCHESTRATOR_PATH = ROOT / "src/prime_rl/orchestrator/orchestrator.py"
 SERVER_PATH = ROOT / "src/prime_rl/inference/vllm/server.py"
+WATCHER_PATH = ROOT / "src/prime_rl/orchestrator/watcher.py"
+
+
+def load_weight_watcher_class():
+    source = WATCHER_PATH.read_text(encoding="utf-8")
+    class_node = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ClassDef) and node.name == "WeightWatcher"
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__",
+                names=[ast.alias(name="annotations")],
+                level=0,
+            ),
+            class_node,
+        ],
+        type_ignores=[],
+    )
+    namespace = {"asyncio": asyncio, "time": time}
+    exec(compile(ast.fix_missing_locations(module), str(WATCHER_PATH), "exec"), namespace)
+    return namespace["WeightWatcher"], namespace
 
 
 def load_startup_validator(urlopen, validate_manifest, file_records):
@@ -657,6 +681,39 @@ class ResumeRecoveryTest(unittest.TestCase):
                     [(target_url + "/adapter_manifest.json", expected_limit)],
                 )
 
+    def test_resume_nonzero_without_exact_base_ready_fails_closed(self):
+        target_url = "http://source/step_1"
+        calls = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fetch(url, timeout):
+            calls.append((url, timeout))
+            return Response(json.dumps({"version": 1}).encode("utf-8"))
+
+        validator = load_startup_validator(
+            fetch,
+            lambda *_args, **_kwargs: None,
+            lambda _value: {},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "step_1").mkdir()
+            with self.assertRaisesRegex(RuntimeError, "exact predecessor v0 is not STABLE"):
+                validator(
+                    SimpleNamespace(output_dir=root),
+                    "adapter",
+                    1,
+                    root / "step_1",
+                    target_url,
+                )
+        self.assertEqual(calls, [(target_url + "/adapter_manifest.json", 600.0)])
+
     def test_resume_uses_the_per_step_phase_budget(self):
         tree = ast.parse(CLIENT_PATH.read_text(encoding="utf-8"))
         values = {}
@@ -759,6 +816,107 @@ class ResumeRecoveryTest(unittest.TestCase):
         update_at = setup.index("await self.policy_inference.update_weights(", stage_at)
         self.assertLess(stage_at, update_at)
         self.assertIn("prefetched=prefetched", setup[update_at:])
+
+    def test_policy_update_waits_for_verified_policy_zero_stage(self):
+        watcher_type, namespace = load_weight_watcher_class()
+        source_url = "http://source/step_0"
+        identity = {
+            "source_url": source_url,
+            "target_sha256": "a" * 64,
+            "target_size": 7,
+            "config_sha256": "b" * 64,
+            "config_size": 2,
+        }
+        updates = []
+        stage_result = {
+            "status": "ready",
+            "adapter_identity": identity,
+        }
+
+        async def run_test():
+            with tempfile.TemporaryDirectory() as temporary:
+                output_dir = Path(temporary)
+                (output_dir / "step_0").mkdir()
+                (output_dir / "step_0" / "STABLE").touch()
+                config = SimpleNamespace(output_dir=output_dir, max_steps=None)
+                policy = SimpleNamespace(version=0, model_name="base-model")
+                inference = SimpleNamespace(
+                    admin_clients=[object()],
+                    adapter_origin_base_urls=None,
+                )
+
+                namespace["get_broadcast_dir"] = lambda path: Path(path)
+                namespace["get_step_path"] = lambda path, step: Path(path) / f"step_{step}"
+                namespace["inference_weight_path"] = (
+                    lambda _config, path, _lora: f"http://source/{Path(path).name}"
+                )
+                namespace["get_latest_ckpt_step"] = lambda _path: 1
+                namespace["adapter_stage_limit_seconds"] = lambda _step: 1.0
+                namespace["format_time"] = lambda value: f"{value:.3f}s"
+                namespace["get_logger"] = lambda: SimpleNamespace(info=lambda *_args: None)
+
+                async def run_once(_name, operation, *, attempts=3):
+                    return await operation()
+
+                namespace["_run_with_retries"] = run_once
+                stage_started = asyncio.Event()
+                stage_release = asyncio.Event()
+                stage_returned = False
+
+                async def delayed_stage(_clients, path, **kwargs):
+                    nonlocal stage_returned
+                    self.assertEqual(path, source_url)
+                    self.assertFalse(kwargs["require_delta"])
+                    stage_started.set()
+                    await stage_release.wait()
+                    stage_returned = True
+                    return stage_result
+
+                namespace["stage_lora_adapter"] = delayed_stage
+                watcher = watcher_type(
+                    config,
+                    policy=policy,
+                    inference=inference,
+                    observers=[],
+                    lora_name="adapter",
+                    ckpt_step=0,
+                    poll_interval=0.001,
+                    reconcile_interval=100.0,
+                )
+
+                async def fake_apply(next_step, _deadline=None):
+                    self.assertTrue(stage_returned)
+                    self.assertTrue(watcher.bootstrap_staged)
+                    self.assertEqual(watcher.verified_adapter_step, 0)
+                    self.assertEqual(watcher.verified_adapter_url, source_url)
+                    self.assertEqual(policy.version, 0)
+                    self.assertEqual(policy.model_name, "base-model")
+                    self.assertEqual(stage_result["status"], "ready")
+                    self.assertEqual(stage_result["adapter_identity"], identity)
+                    updates.append(next_step)
+                    watcher.stopped.set()
+
+                watcher.apply_policy_update = fake_apply
+                watcher_task = asyncio.create_task(watcher.start())
+                await asyncio.wait_for(stage_started.wait(), 1.0)
+
+                dispatcher_progress = asyncio.Event()
+
+                async def dispatcher_work():
+                    dispatcher_progress.set()
+
+                await asyncio.create_task(dispatcher_work())
+                self.assertTrue(dispatcher_progress.is_set())
+                self.assertEqual(policy.version, 0)
+                self.assertEqual(policy.model_name, "base-model")
+                self.assertFalse(watcher.bootstrap_staged)
+                self.assertEqual(updates, [])
+
+                stage_release.set()
+                await asyncio.wait_for(watcher_task, 1.0)
+                self.assertEqual(updates, [1])
+
+        asyncio.run(run_test())
 
     def test_filesystem_lora_resume_stages_saved_policies_and_loads_only_the_last(self):
         source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
