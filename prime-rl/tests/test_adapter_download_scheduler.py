@@ -192,6 +192,75 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
+    def test_persistent_chunk_attempt_deadline_stops_trickle_and_rotates(self):
+        filesystem = load_filesystem_module()
+        payload = b"trickle-body"
+
+        def trickle_once(request, number):
+            if number != 1:
+                return False
+            start, end = map(
+                int,
+                request.headers["Range"].removeprefix("bytes=").split("-", 1),
+            )
+            body = payload[start : end + 1]
+            request.send_response(206)
+            request.send_header("Content-Length", str(len(body)))
+            request.send_header(
+                "Content-Range", f"bytes {start}-{end}/{len(payload)}"
+            )
+            request.end_headers()
+            for value in body:
+                try:
+                    request.wfile.write(bytes((value,)))
+                    request.wfile.flush()
+                except OSError:
+                    return True
+                time.sleep(0.05)
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, trickle_once
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        filesystem.lane_rotation_delay_seconds = 0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                started = time.monotonic()
+                try:
+                    pool.download(
+                        [
+                            f"http://127.0.0.1:{server.server_address[1]}/slow",
+                            f"http://127.0.0.1:{server.server_address[1]}/fast",
+                        ],
+                        0,
+                        chunks / "trickle",
+                        parent_fd,
+                        expected_size=len(payload),
+                        expected_sha256=hashlib.sha256(payload).hexdigest(),
+                        per_request_timeout_seconds=0.2,
+                    )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                elapsed = time.monotonic() - started
+                self.assertEqual((chunks / "trickle").read_bytes(), payload)
+                self.assertEqual(handler.requests, 2)
+                self.assertGreaterEqual(elapsed, 0.15)
+                self.assertLess(elapsed, 0.8)
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
     def test_persistent_chunk_retries_only_404_and_503(self):
         filesystem = load_filesystem_module()
         payload = b"status-retry"
