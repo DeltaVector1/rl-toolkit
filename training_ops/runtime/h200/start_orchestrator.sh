@@ -172,7 +172,7 @@ repair_stop_unregistered_tunnel() {
   case "$process_status" in
     0) [ -n "$command_line" ] || return 1 ;;
     2) return 0 ;;
-    *) return 1 ;;
+    *) return 0 ;;
   esac
   case "$kind" in
     generic)
@@ -1885,6 +1885,26 @@ peer_tunnel_remove_orphan_api_listener() {
   return 1
 }
 
+peer_tunnel_remove_duplicate_api_supervisors() {
+  local listener_status=0 owner_pid= marker=peer-tunnel-api pid command_line matching_pids
+  peer_tunnel_api_listener_owner || listener_status=$?
+  case "$listener_status" in
+    0) owner_pid=$peer_api_listener_owner_pid ;;
+    1) ;;
+    *) return 0 ;;
+  esac
+  matching_pids=$(pgrep_matches "$marker") || return 1
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    command_line=$(process_command_line "$pid") || return 1
+    peer_tunnel_supervisor_forwards_match "$command_line" api "$marker" \
+      "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" || continue
+    [ "$pid" = "$owner_pid" ] && continue
+    peer_kill_owned "$pid" "$command_line" api "$marker" \
+      "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" || return 1
+  done <<<"$matching_pids"
+}
+
 peer_remote_ports_ready() {
   local probe_seconds=${1:-10} peer_target verified_ports probe_output probe_status
   peer_missing_remote_ports=
@@ -2930,6 +2950,10 @@ peer_tunnel() {
     return 1
   fi
   [ "$peer_enabled" = 1 ] || return 0
+  peer_tunnel_remove_duplicate_api_supervisors || {
+    echo "peer phase=api stage=duplicate-cleanup elapsed=$((SECONDS - phase_start))" >&2
+    return 1
+  }
   peer_tunnel_remove_orphan_api_listener || {
     echo "peer phase=api stage=orphan-listener elapsed=$((SECONDS - phase_start))" >&2
     return 1
