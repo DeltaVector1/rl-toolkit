@@ -2924,6 +2924,7 @@ def _download_range(
     cancel_event: threading.Event | None = None,
     typed_transport: bool = False,
     retry_http_statuses: set[int] | None = None,
+    per_request_timeout_seconds: float | None = None,
 ) -> None:
     """Download one inclusive byte range and resume its local part file."""
     destination_name = destination.name
@@ -2935,6 +2936,17 @@ def _download_range(
     )
     for attempt in range(attempt_limit):
         _check_deadline(deadline, cancel_event)
+        attempt_deadline = deadline
+        if per_request_timeout_seconds is not None:
+            active_timeout = _chunk_request_timeout(
+                deadline,
+                attempt,
+                per_request_timeout_seconds,
+                cancel_event,
+            )
+            attempt_deadline = time.monotonic() + active_timeout
+            if deadline is not None:
+                attempt_deadline = min(attempt_deadline, deadline)
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
             entry_stat = _stat_regular_entry(parent_fd, destination_name, "adapter range file")
@@ -2948,12 +2960,21 @@ def _download_range(
                 source_url,
                 headers={"Range": f"bytes={start + present}-{end}"},
             )
+            request_timeout = (
+                _request_timeout(deadline, cancel_event)
+                if per_request_timeout_seconds is None
+                else _request_timeout(
+                    attempt_deadline,
+                    cancel_event,
+                    maximum=_ADAPTER_LANE_TIMEOUT_S,
+                )
+            )
             response_open = (
-                _adapter_urlopen(request, _request_timeout(deadline, cancel_event))
+                _adapter_urlopen(request, request_timeout)
                 if typed_transport
                 else urllib.request.urlopen(
                     request,
-                    timeout=_request_timeout(deadline, cancel_event),
+                    timeout=request_timeout,
                 )
             )
             with response_open as response:
@@ -2976,7 +2997,7 @@ def _download_range(
                         chunks = _adapter_response_chunks(
                             response,
                             size - present,
-                            deadline,
+                            attempt_deadline,
                             cancel_event,
                         )
                     else:
@@ -2985,19 +3006,19 @@ def _download_range(
                         for chunk in chunks:
                             output.write(chunk)
                             present += len(chunk)
-                            _check_deadline(deadline, cancel_event)
+                            _check_deadline(attempt_deadline, cancel_event)
                             if progress is not None:
                                 progress(source_index, len(chunk))
                     else:
                         while present < size:
-                            _check_deadline(deadline, cancel_event)
+                            _check_deadline(attempt_deadline, cancel_event)
                             chunk = response.read(min(16 * 1024 * 1024, size - present))
                             if not chunk:
                                 raise OSError(f"adapter range ended early: {destination.name}")
-                            _check_deadline(deadline, cancel_event)
+                            _check_deadline(attempt_deadline, cancel_event)
                             output.write(chunk)
                             present += len(chunk)
-                            _check_deadline(deadline, cancel_event)
+                            _check_deadline(attempt_deadline, cancel_event)
                             if progress is not None:
                                 progress(source_index, len(chunk))
             entry_stat = _stat_regular_entry(parent_fd, destination_name, "adapter range file")
@@ -5492,6 +5513,7 @@ def _download_with_parent(
                 cancel_event,
                 typed_transport=typed_transport,
                 retry_http_statuses=retry_http_statuses,
+                per_request_timeout_seconds=per_request_timeout_seconds,
             )
             for index, start, end in ranges
         ]
@@ -6014,6 +6036,7 @@ def stage_lora_adapter_files(
                         progress=report,
                         cancel_event=cancel_event,
                         deadline=operation_deadline,
+                        per_request_timeout_seconds=_configured_chunk_timeout(),
                         stream_cap=full_download_streams,
                         parent_fd=temporary_fd,
                         retry_http_statuses={404, 503},
@@ -6024,12 +6047,13 @@ def stage_lora_adapter_files(
                             destination_path,
                             cancel_event=cancel_event,
                         )
-                    progress_bytes = 0
+                    completed_bytes = 0
                     for name in _ADAPTER_FILES:
                         path = temporary / name
                         _reject_symlink_path(path, "adapter file")
                         if _path_regular_size(path, "adapter file") == int(files[name]["size"]):
-                            progress_bytes += int(files[name]["size"])
+                            completed_bytes += int(files[name]["size"])
+                    progress_bytes = max(progress_bytes, completed_bytes)
             finally:
                 os.close(temporary_fd)
             transfer_finished = time.monotonic()

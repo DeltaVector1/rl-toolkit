@@ -144,7 +144,8 @@ class DownloadSchedulerTest(unittest.TestCase):
 
     def _legacy_full_download(
         self, filesystem, server, root, name, payload, *, stream_cap=1,
-        source_urls=None,
+        source_urls=None, per_request_timeout_seconds=1, cancel_event=None,
+        deadline_seconds=10,
     ):
         destination = root / name
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -165,8 +166,9 @@ class DownloadSchedulerTest(unittest.TestCase):
                 source_urls=source_urls or [url],
                 stream_cap=stream_cap,
                 parallel_ranges=True,
-                deadline=time.monotonic() + 10,
-                per_request_timeout_seconds=1,
+                deadline=time.monotonic() + deadline_seconds,
+                per_request_timeout_seconds=per_request_timeout_seconds,
+                cancel_event=cancel_event,
                 retry_http_statuses={404, 503},
                 typed_transport=True,
                 parent_fd=parent_fd,
@@ -680,6 +682,122 @@ class DownloadSchedulerTest(unittest.TestCase):
                 )
         finally:
             filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_legacy_full_trickle_body_hits_request_timeout(self):
+        filesystem = load_filesystem_module()
+        payload = b"x" * 128
+
+        def trickle_body(request, _number):
+            range_header = request.headers.get("Range")
+            start = 0 if range_header is None else int(
+                range_header.removeprefix("bytes=").split("-", 1)[0]
+            )
+            body = payload[start:]
+            request.send_response(206)
+            request.send_header("Content-Length", str(len(body)))
+            request.send_header(
+                "Content-Range", f"bytes {start}-{len(payload) - 1}/{len(payload)}"
+            )
+            request.end_headers()
+            request.wfile.write(body[:1])
+            request.wfile.flush()
+            time.sleep(0.5)
+            return True
+
+        server, thread, _handler = self._persistent_server(
+            filesystem, payload, trickle_body
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        old_threshold = filesystem._PARALLEL_DOWNLOAD_THRESHOLD
+        filesystem.lane_rotation_delay_seconds = 0
+        filesystem._PARALLEL_DOWNLOAD_THRESHOLD = 0
+        started = time.monotonic()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                url = f"http://127.0.0.1:{server.server_address[1]}/trickle"
+                with self.assertRaises(OSError):
+                    self._legacy_full_download(
+                        filesystem,
+                        server,
+                        Path(temporary),
+                        "trickle",
+                        payload,
+                        stream_cap=2,
+                        source_urls=[url, url],
+                        per_request_timeout_seconds=0.05,
+                        deadline_seconds=0.4,
+                    )
+            self.assertLess(time.monotonic() - started, 0.8)
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
+            filesystem._PARALLEL_DOWNLOAD_THRESHOLD = old_threshold
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_legacy_full_cancellation_is_bounded_during_body_read(self):
+        filesystem = load_filesystem_module()
+        payload = b"cancel-legacy-body"
+
+        def stalled_body(request, _number):
+            request.send_response(206)
+            request.send_header("Content-Length", str(len(payload)))
+            request.send_header(
+                "Content-Range", f"bytes 0-{len(payload) - 1}/{len(payload)}"
+            )
+            request.end_headers()
+            request.wfile.write(payload[:1])
+            request.wfile.flush()
+            time.sleep(0.5)
+            return True
+
+        server, thread, _handler = self._persistent_server(
+            filesystem, payload, stalled_body
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        old_threshold = filesystem._PARALLEL_DOWNLOAD_THRESHOLD
+        filesystem.lane_rotation_delay_seconds = 0
+        filesystem._PARALLEL_DOWNLOAD_THRESHOLD = 0
+        cancel_event = threading.Event()
+        errors = []
+        started = time.monotonic()
+
+        def run_download():
+            try:
+                with tempfile.TemporaryDirectory() as temporary:
+                    url = f"http://127.0.0.1:{server.server_address[1]}/cancel"
+                    self._legacy_full_download(
+                        filesystem,
+                        server,
+                        Path(temporary),
+                        "cancel",
+                        payload,
+                        stream_cap=2,
+                        source_urls=[url, url],
+                        per_request_timeout_seconds=0.1,
+                        cancel_event=cancel_event,
+                        deadline_seconds=2,
+                    )
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run_download)
+        worker.start()
+        time.sleep(0.05)
+        cancel_event.set()
+        worker.join(timeout=1)
+        elapsed = time.monotonic() - started
+        try:
+            self.assertFalse(worker.is_alive())
+            self.assertLess(elapsed, 0.7)
+            self.assertTrue(errors)
+            self.assertIsInstance(errors[0], TimeoutError)
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
+            filesystem._PARALLEL_DOWNLOAD_THRESHOLD = old_threshold
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
