@@ -4355,7 +4355,13 @@ def repair(what: str) -> str:
     if what.startswith("engine-watchdog:"):
         return _repair_engine_watchdog(what.split(":", 1)[1])
     if what.startswith("engine:"):
-        return _repair_engine(what.split(":", 1)[1])
+        target = what.split(":", 1)[1]
+        host, separator, config_dir = target.partition(":")
+        if not host:
+            raise Refused("engine repair requires a host")
+        if separator and not config_dir:
+            raise Refused("engine repair config directory cannot be empty")
+        return _repair_engine(host, config_dir=config_dir if separator else None)
     if what == "supervisors":
         return _repair_supervisors()
     if what == "microbatch-sync":
@@ -4376,7 +4382,7 @@ def repair(what: str) -> str:
             raise Refused("adapter-tunnels requires a run config directory")
         return _repair_adapter_tunnels(config_dir)
     raise Refused(
-        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, or adapter-tunnels[:config-dir]."
+        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>[:config-dir], supervisors, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, or adapter-tunnels[:config-dir]."
     )
 
 
@@ -4925,11 +4931,14 @@ def _engine_watchdog_identity_script(
     return "\n".join(lines) + "\n"
 
 
-def _repair_engine(host: str) -> str:
+def _repair_engine(host: str, config_dir: str | None = None) -> str:
     _check_host(host)
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
-    selected = _config_for_run(current_run())
+    if config_dir is None:
+        selected = _config_for_run(current_run())
+    else:
+        selected = _config_dir(config_dir, require_inference=True)
     inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     engine_container = glm_inference_container
     engine_model = glm_model

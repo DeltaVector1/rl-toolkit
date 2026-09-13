@@ -33,6 +33,56 @@ def _load_function(path, name, namespace=None):
 
 
 class OrchestratorRepairTest(unittest.TestCase):
+    def test_engine_repair_accepts_explicit_config_without_current_run(self):
+        host = training_ops.inference_hosts[0]
+        ssh_calls = []
+
+        def fake_ssh(ssh_host, script, timeout=120):
+            ssh_calls.append((ssh_host, script, timeout))
+            return 0, "issued\n" if len(ssh_calls) == 2 else "watchdog okay\n"
+
+        with mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh), mock.patch.object(
+            training_ops,
+            "current_run",
+            side_effect=AssertionError("explicit engine repair must not inspect current run"),
+        ), mock.patch.object(
+            training_ops,
+            "_config_for_run",
+            side_effect=AssertionError("explicit engine repair must not scan runs"),
+        ):
+            result = training_ops.repair(f"engine:{host}:configs/general-agent")
+
+        self.assertEqual(result, "issued")
+        self.assertEqual(len(ssh_calls), 3)
+        expected_config = f"{training_ops.remote_repo}/configs/general-agent/inference.toml"
+        self.assertTrue(all(expected_config in script for _, script, _ in ssh_calls))
+
+    def test_engine_repair_rejects_missing_explicit_config_before_ssh(self):
+        with mock.patch.object(training_ops, "_ssh") as ssh:
+            with self.assertRaisesRegex(training_ops.Refused, "no trainer.toml"):
+                training_ops.repair("engine:h200a:configs/missing")
+        ssh.assert_not_called()
+
+    def test_engine_repair_without_config_keeps_current_run_selection(self):
+        host = training_ops.inference_hosts[0]
+        ssh_calls = []
+        selected = {"inference": "configs/general-agent/inference.toml"}
+
+        def fake_ssh(ssh_host, script, timeout=120):
+            ssh_calls.append((ssh_host, script, timeout))
+            return 0, "issued\n" if len(ssh_calls) == 2 else "watchdog okay\n"
+
+        with mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh), mock.patch.object(
+            training_ops, "current_run", return_value="legacy-run"
+        ), mock.patch.object(
+            training_ops, "_config_for_run", return_value=selected
+        ) as config_for_run:
+            result = training_ops.repair(f"engine:{host}")
+
+        self.assertEqual(result, "issued")
+        config_for_run.assert_called_once_with("legacy-run")
+        self.assertEqual(len(ssh_calls), 3)
+
     def test_adapter_tunnels_uses_explicit_config_dir_and_tunnels_only(self):
         ssh_calls = []
 
