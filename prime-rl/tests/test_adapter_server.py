@@ -656,6 +656,83 @@ class AdapterServerTest(unittest.TestCase):
             self.assertTrue(destination.is_dir())
             self.assertEqual(destination.stat().st_ino, identity[1])
 
+    def test_directory_publication_rejects_child_changed_before_replace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "pending" / "step_1"
+            destination = root / "cache" / "step_1"
+            source.mkdir(parents=True, mode=0o700)
+            destination.mkdir(parents=True, mode=0o700)
+            (source / "value").write_bytes(b"new-data")
+            (destination / "value").write_bytes(b"old-data")
+            manifest = destination / adapter_server.adapter_manifest_name
+            manifest.write_text("old-manifest\n", encoding="utf-8")
+            old_manifest = manifest.read_bytes()
+            identity = adapter_server._directory_identity(source)
+            original_replace = adapter_server.os.replace
+
+            def mutate_before_publication(source_name, destination_name, **kwargs):
+                if (
+                    Path(source_name).name.startswith(".step_1.candidate-")
+                    and destination_name == "step_1"
+                ):
+                    child = destination.parent / Path(source_name).name / "value"
+                    child_stat = child.stat()
+                    child.write_bytes(b"raced!!!")
+                    os.utime(
+                        child,
+                        ns=(child_stat.st_atime_ns, child_stat.st_mtime_ns),
+                    )
+                return original_replace(source_name, destination_name, **kwargs)
+
+            adapter_server.os.replace = mutate_before_publication
+            try:
+                def validate(path):
+                    if (path / "value").read_bytes() != b"new-data":
+                        raise OSError("child content changed")
+
+                with self.assertRaises(adapter_server.UpgradeError):
+                    adapter_server._replace_from_dirs(
+                        source,
+                        destination,
+                        identity,
+                        directory_validator=validate,
+                    )
+            finally:
+                adapter_server.os.replace = original_replace
+            self.assertEqual((destination / "value").read_bytes(), b"old-data")
+            self.assertEqual(manifest.read_bytes(), old_manifest)
+
+    def test_directory_publication_removes_new_tree_after_post_validation_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "pending" / "step_1"
+            destination = root / "cache" / "step_1"
+            source.mkdir(parents=True, mode=0o700)
+            destination.parent.mkdir()
+            (source / "value").write_bytes(b"new-data")
+            identity = adapter_server._directory_identity(source)
+            calls = 0
+
+            def validate(path):
+                nonlocal calls
+                calls += 1
+                self.assertEqual((path / "value").read_bytes(), b"new-data")
+                if calls == 3:
+                    raise adapter_server.UpgradeError("post-publication validation failed")
+
+            with self.assertRaisesRegex(
+                adapter_server.UpgradeError,
+                "post-publication validation failed",
+            ):
+                adapter_server._replace_from_dirs(
+                    source,
+                    destination,
+                    identity,
+                    directory_validator=validate,
+                )
+            self.assertFalse(destination.exists())
+
     def test_regular_file_rename_ignores_ctime_change(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

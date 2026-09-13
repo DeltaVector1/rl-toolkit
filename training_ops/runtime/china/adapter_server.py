@@ -552,15 +552,19 @@ def _replace_directory_from_dirs(
             dst_dir_fd=destination_dir,
         )
         destination_replaced = True
+        if validator is not None:
+            validator(destination_parent / destination_name)
         destination_stat = os.stat(destination_name, dir_fd=destination_dir, follow_symlinks=False)
         if _stable_rename_identity(destination_stat) != stable_source_identity:
             raise OSError("adapter publication destination identity differs")
         if destination_exists:
             shutil.rmtree(destination_parent / backup_name)
             backup_name = ""
-    except OSError:
+    except (OSError, UpgradeError) as publication_error:
         try:
             if destination_exists and backup_name:
+                if destination_replaced:
+                    _remove_leftover(destination_parent / destination_name)
                 os.replace(
                     backup_name,
                     destination_name,
@@ -569,10 +573,10 @@ def _replace_directory_from_dirs(
                 )
                 backup_name = ""
             elif destination_replaced:
-                os.unlink(destination_name, dir_fd=destination_dir)
-        except (FileNotFoundError, OSError):
-            pass
-        raise
+                _remove_leftover(destination_parent / destination_name)
+        except (FileNotFoundError, OSError, UpgradeError) as restore_error:
+            raise UpgradeError("cannot restore previous adapter directory") from restore_error
+        raise publication_error
     finally:
         try:
             candidate_stat = os.stat(candidate_name, dir_fd=destination_dir, follow_symlinks=False)
