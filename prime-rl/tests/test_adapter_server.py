@@ -59,6 +59,25 @@ class AdapterServerTest(unittest.TestCase):
                     self.assertEqual(response.headers["Content-Range"], "bytes 2-8/20")
                     self.assertEqual(response.read(), payload[2:9])
 
+                for range_value, expected in (("bytes=-7", payload[-7:]), ("bytes=9-", payload[9:])):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/chunk.bin",
+                        headers={"Range": range_value},
+                    )
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.status, 206)
+                        self.assertEqual(response.read(), expected)
+
+                for range_value in ("bytes=20-", "bytes=-0", "bytes=4-3", "bytes=0-1,2-3"):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}/chunk.bin",
+                        headers={"Range": range_value},
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(request, timeout=5)
+                    self.assertEqual(raised.exception.code, 416)
+                    self.assertEqual(raised.exception.headers["Content-Range"], "bytes */20")
+
                 connection = socket.create_connection(
                     ("127.0.0.1", server.server_port), timeout=5
                 )
@@ -204,6 +223,13 @@ class AdapterServerTest(unittest.TestCase):
                                 "sha256": weights_digest,
                             },
                         ],
+                        "chunks": [
+                            {
+                                "file": "adapter_model.safetensors.transport-predictive-00000.bin",
+                                "wire_size": len(chunk),
+                                "wire_sha256": hashlib.sha256(chunk).hexdigest(),
+                            }
+                        ],
                     }
                 ),
                 encoding="utf-8",
@@ -291,6 +317,14 @@ class AdapterServerTest(unittest.TestCase):
                 adapter_server._identity_from_published_directory = original_identity
                 with urllib.request.urlopen(url, timeout=5) as response:
                     self.assertEqual(response.read(), chunk)
+                stale = step / "adapter_model.safetensors.transport-predictive-stale.bin"
+                stale.write_bytes(chunk)
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/active/step_0/{stale.name}",
+                        timeout=5,
+                    )
+                self.assertEqual(raised.exception.code, 404)
                 self.assertEqual(calls.count("adapter_config.json"), 3)
             finally:
                 server.shutdown()
@@ -300,6 +334,75 @@ class AdapterServerTest(unittest.TestCase):
                     adapter_server._identity_from_published_directory = original_identity
                 adapter_server._sha256 = original_sha256
                 adapter_server._identity_cache.clear()
+
+    def test_predictive_install_rejects_false_chunk_checksum(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "step_2"
+            build = root / "build"
+            target.mkdir()
+            build.mkdir()
+            (target / adapter_server.adapter_manifest_name).write_text("{}", encoding="utf-8")
+            (target / adapter_server.adapter_digest_name).write_text("0" * 64, encoding="ascii")
+            chunk_name = f"{adapter_server.adapter_weights_name}.transport-predictive-00000.bin"
+            chunk = b"chunk"
+            (build / chunk_name).write_bytes(chunk)
+            (build / adapter_server.adapter_manifest_name).write_text("{}", encoding="utf-8")
+            (build / adapter_server.adapter_digest_name).write_text("0" * 64, encoding="ascii")
+            manifest = {
+                "version": 2,
+                "mode": "delta",
+                "target_step": 2,
+                "base_step": 1,
+                "base2_step": 0,
+                "chunks": [
+                    {
+                        "file": chunk_name,
+                        "wire_size": len(chunk),
+                        "wire_sha256": "0" * 64,
+                    }
+                ],
+            }
+            with self.assertRaises(adapter_server.UpgradeError):
+                adapter_server._install_predictive_manifest(target, build, manifest, 2)
+
+    def test_upgrade_scavenges_exact_leftovers_and_keeps_private_modes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "active"
+            active.mkdir()
+            cache = active / adapter_server.cache_name
+            cache.mkdir(mode=0o700)
+            (active / "step_4").mkdir()
+            (active / ".predictive-build-11-22").mkdir()
+            (cache / ".pending-11-22").mkdir()
+            (active / ".predictive-build-not-a-leftover").mkdir()
+            adapter_server._scavenge_upgrade_leftovers(active)
+            self.assertFalse((active / ".predictive-build-11-22").exists())
+            self.assertFalse((cache / ".pending-11-22").exists())
+            self.assertTrue((active / "step_4").exists())
+            self.assertTrue((active / ".predictive-build-not-a-leftover").exists())
+            source = root / "source"
+            source.mkdir()
+            (source / adapter_server.adapter_config_name).write_bytes(b"{}")
+            (source / adapter_server.adapter_weights_name).write_bytes(b"weights")
+            identity = {
+                "step": 4,
+                "config_size": 2,
+                "config_sha256": hashlib.sha256(b"{}").hexdigest(),
+                "weights_size": 7,
+                "weights_sha256": hashlib.sha256(b"weights").hexdigest(),
+            }
+            destination = cache / "step_4"
+            adapter_server._link_cache_entry(source, identity, destination)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
+            for name in (
+                adapter_server.adapter_config_name,
+                adapter_server.adapter_weights_name,
+                adapter_server.adapter_digest_name,
+                ".identity.json",
+            ):
+                self.assertEqual((destination / name).stat().st_mode & 0o777, 0o600)
 
     def test_old_stable_manifest_is_not_upgraded_after_newer_step_exists(self):
         run_path = "run_glm-1/broadcasts"
