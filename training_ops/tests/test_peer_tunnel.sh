@@ -597,6 +597,22 @@ PATH="$tmp/bin:$PATH" peer_tunnel_connection lora-0 \
   -R "127.0.0.1:18101:127.0.0.1:$relay_port"
 test "$(grep -F -c -- '-- -10000' "$dead_lane_kill")" -eq 1
 test "$(grep -F -c -- '-R 127.0.0.1:18100:127.0.0.1:' "$dead_lane_log")" -eq 1
+
+# An existing supervisor can be between SSH child retries. Wait for its child
+# to return before replacing the supervisor, preserving its PID.
+delayed_children="$tmp/delayed-children"
+: >"$delayed_children"
+(
+  repair_sleep() {
+    printf '%s %s %s\n' 20000 10000 "$peer_exact_command" >"$delayed_children"
+  }
+  export PEER_TEST_LOG="$dead_lane_log" PEER_CHILDREN_OUTPUT="$delayed_children"
+  PATH="$tmp/bin:$PATH" \
+  peer_tunnel_wait_child_identity 10000 current peer-tunnel-lora-0 \
+    -R "127.0.0.1:18100:127.0.0.1:$relay_port" \
+    -R "127.0.0.1:18101:127.0.0.1:$relay_port"
+  test "$peer_snapshot_child_pid" = 20000
+)
 unset -f kill
 unset PEER_TEST_LOG PEER_QUERY PEER_CHILDREN_OUTPUT PEER_GROUP_COMMANDS
 

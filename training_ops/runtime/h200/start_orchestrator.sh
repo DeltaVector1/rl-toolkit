@@ -400,7 +400,11 @@ repair_wait_started_tunnel() {
   local command_line current_start pgid startup_deadline=$((SECONDS + 10))
   while [ "$SECONDS" -lt "$startup_deadline" ]; do
     repair_remaining >/dev/null || return 1
-    repair_direct_child_owned "$pid" || return 1
+    if ! repair_direct_child_owned "$pid"; then
+      [ -e "/proc/$pid" ] || return 1
+      sleep 0.05
+      continue
+    fi
     current_start=$(process_start_time "$pid") || return 1
     [ "$current_start" = "$start_time" ] || return 1
     command_line=$(process_command_line "$pid") || return 1
@@ -1648,9 +1652,13 @@ peer_tunnel_wait_child_identity() {
     peer_snapshot_child_command=
     peer_snapshot_child_start=
     if peer_tunnel_supervisor_child_identity "$supervisor_pid" "$shape" "$marker" "$@"; then
+      child_status=0
+    else
+      child_status=$?
+    fi
+    if [ "$child_status" -eq 0 ]; then
       return 0
     fi
-    child_status=$?
     [ "$child_status" -eq 1 ] || return "$child_status"
     repair_sleep 1 || return 1
   done
@@ -2736,7 +2744,6 @@ china_tunnel_reconcile_connection() {
           [ "$?" -eq 1 ] || return 1
         fi
       done
-      [ -n "$old_keeper" ] || return 1
       replace_all=1
     fi
   fi
@@ -3013,15 +3020,22 @@ peer_tunnel_supervisors_ready() {
     fi
     if [ "$child_status" -ne 0 ]; then
       [ "$child_status" -eq 1 ] || return 1
-      peer_tunnel_connection "lora-$lane_number" \
-        "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:$relay_port" \
-        "${lane_forwards[@]}" || return 1
-      peer_tunnel_lane_supervisor "$marker" "${lane_forwards[@]}" || return 1
-      matching_pid=$peer_ready_pid
-      matching_command=$peer_ready_command
-      peer_tunnel_wait_child_identity "$matching_pid" current "$marker" \
-        "${lane_forwards[@]}" || return 1
-      supervisor_start=$(process_start_time "$matching_pid") || return 1
+      if peer_tunnel_wait_child_identity "$matching_pid" current "$marker" \
+          "${lane_forwards[@]}"; then
+        child_status=0
+      else
+        child_status=$?
+        [ "$child_status" -eq 1 ] || return 1
+        peer_tunnel_connection "lora-$lane_number" \
+          "-R 127.0.0.1:${lane_ports[0]}:127.0.0.1:$relay_port" \
+          "${lane_forwards[@]}" || return 1
+        peer_tunnel_lane_supervisor "$marker" "${lane_forwards[@]}" || return 1
+        matching_pid=$peer_ready_pid
+        matching_command=$peer_ready_command
+        peer_tunnel_wait_child_identity "$matching_pid" current "$marker" \
+          "${lane_forwards[@]}" || return 1
+        supervisor_start=$(process_start_time "$matching_pid") || return 1
+      fi
     fi
     peer_supervisor_pids[$marker]=$matching_pid
     peer_supervisor_starts[$marker]=$supervisor_start
