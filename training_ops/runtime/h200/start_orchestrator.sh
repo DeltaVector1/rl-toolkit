@@ -2213,11 +2213,18 @@ china_tunnel_supervisor_owns_forwards() {
 }
 
 china_tunnel_grouped_legacy_match() {
-  local command_line=$1 forward_total
+  local command_line=$1 forward_total marker ssh_command
   china_tunnel_marker_match "$command_line" || return 1
   case "$command_line" in *"while true; do"*) ;; *) return 1 ;; esac
   tunnel_command_has "$command_line" "$trainer_ssh_target" || return 1
   china_tunnel_forward_shape "$command_line" cleanup || return 1
+  marker=$(sed -n 's/.*# \(china-tunnel-lora-[0-9][0-9]*\)$/\1/p' <<<"$command_line")
+  [ -n "$marker" ] || return 1
+  ssh_command=$(tunnel_supervisor_ssh_command "$command_line" "$marker") || return 1
+  # The unscoped cleanup runs before the current two-forward lanes start.
+  # Only the old SSH shape is safe to remove here. A current-shaped supervisor
+  # may use a cleanup-shaped forward count during a migration.
+  china_tunnel_known_old_ssh_args_match "$ssh_command" cleanup || return 1
   case "$command_line" in
     *"while true; do"*"$trainer_ssh_target"*"# china-tunnel-lora-"*) ;;
     *) return 1 ;;

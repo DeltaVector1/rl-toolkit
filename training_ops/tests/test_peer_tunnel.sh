@@ -719,6 +719,13 @@ china_old_command_prefix="ssh -NT -o BatchMode=yes -o ConnectTimeout=30 -o ExitO
 china_supervisor_command="bash -c while true; do $china_exact_command; sleep 3; done # china-tunnel-lora-0"
 china_escaped_supervisor_command=$(sed 's/ChannelTimeout=\*-tcpip=45s/ChannelTimeout=\\*-tcpip=45s/' <<<"$china_supervisor_command")
 china_tunnel_supervisor_match "$china_supervisor_command" current china-tunnel-lora-0
+# The unscoped cleanup must reject a current SSH command even when its forward
+# count has an old cleanup shape.
+current_single_forward=${china_supervisor_command/ -L 127.0.0.1:18101:127.0.0.1:8100/}
+if china_tunnel_grouped_legacy_match "$current_single_forward"; then
+  echo "current China tunnel was classified as legacy" >&2
+  exit 1
+fi
 for hostile_target in \
   "china-trainer.evil" \
   "" \
