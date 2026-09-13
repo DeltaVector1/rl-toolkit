@@ -4,7 +4,18 @@ set -euo pipefail
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 launcher="$repo/training_ops/runtime/h200/start_orchestrator.sh"
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+cleanup_test_processes() {
+  local ready pid
+  for ready in "$tmp"/ready-* "$tmp"/failure-*; do
+    [ -s "$ready" ] || continue
+    while read -r pid _; do
+      case "$pid" in ''|*[!0-9]*) continue ;; esac
+      /bin/kill -- "-$pid" 2>/dev/null || /bin/kill "$pid" 2>/dev/null || true
+    done <"$ready"
+  done
+  rm -rf "$tmp"
+}
+trap cleanup_test_processes EXIT
 
 fixture="$tmp/repair-fixture.sh"
 cat >"$fixture" <<'EOF'
@@ -13,7 +24,9 @@ set -uo pipefail
 source <(sed '/^RUN=\${RUN:/,$d' "$LAUNCHER")
 
 tunnels_only=1
+tunnel_repair_deadline=$((SECONDS + 120))
 repair_created_tunnels=()
+repair_unregistered_tunnels=()
 repair_failed=0
 
 # The fixture keeps the real register, EXIT, and signal functions. These
@@ -35,13 +48,33 @@ china_tunnel_stop_supervisor() {
   kill "$1" 2>/dev/null || true
 }
 
+fixture_pids=()
+fixture_keep_pid=
 spawn_fixture_process() {
   setsid sleep 1000 >/dev/null 2>&1 &
-  printf '%s\n' "$!"
+  spawned_pid=$!
+  fixture_pids+=("$spawned_pid")
+}
+fixture_cleanup() {
+  local pid
+  for pid in "${fixture_pids[@]}"; do
+    [ "$pid" = "$fixture_keep_pid" ] && continue
+    /bin/kill -- "-$pid" 2>/dev/null || /bin/kill "$pid" 2>/dev/null || true
+  done
 }
 
+fixture_status_trap() {
+  local status=$?
+  if ! repair_cleanup_created_tunnels; then status=125; fi
+  if ! repair_cleanup_unregistered_tunnels; then status=125; fi
+  fixture_cleanup
+  exit "$status"
+}
+trap fixture_status_trap EXIT
+
 if [ "${MODE:-signal}" = register-failure ]; then
-  pid=$(spawn_fixture_process)
+  spawn_fixture_process
+  pid=$spawned_pid
   process_start_time() { return 1; }
   generic_tunnel_stale_group_safe() { return 0; }
   generic_tunnel_stale_supervisor_match() { return 0; }
@@ -65,10 +98,66 @@ if [ "${MODE:-signal}" = register-failure ]; then
   exit 0
 fi
 
-created_pid=$(spawn_fixture_process)
-peer_pid=$(spawn_fixture_process)
-china_pid=$(spawn_fixture_process)
-preexisting_pid=$(spawn_fixture_process)
+if [ "${MODE:-signal}" = register-disappears ]; then
+  spawn_fixture_process
+  pid=$spawned_pid
+  /bin/kill "$pid"
+  wait "$pid" 2>/dev/null || true
+  process_start_time() { return 1; }
+  set +e
+  repair_register_tunnel generic "$pid" disappeared-marker 127.0.0.1:29500:target:22
+  status=$?
+  set -e
+  test "$status" -ne 0
+  exit 0
+fi
+
+if [ "${MODE:-signal}" = register-reused ]; then
+  spawn_fixture_process
+  pid=$spawned_pid
+  printf '%s\n' "$pid" >"$FAILURE_PID_FILE"
+  generic_tunnel_stale_supervisor_match() { return 1; }
+  kill() { printf '%s\n' reached >"$KILL_REACHED_FILE"; return 1; }
+  set +e
+  repair_stop_unregistered_tunnel generic "$pid" reused-marker 127.0.0.1:29500:target:22
+  status=$?
+  set -e
+  test "$status" -ne 0
+  test ! -s "$KILL_REACHED_FILE"
+  exit 0
+fi
+
+if [ "${MODE:-signal}" = register-kill-failure ]; then
+  spawn_fixture_process
+  pid=$spawned_pid
+  printf '%s\n' "$pid" >"$FAILURE_PID_FILE"
+  process_start_time() { return 1; }
+  generic_tunnel_stale_group_safe() { return 0; }
+  generic_tunnel_stale_supervisor_match() { return 0; }
+  kill() {
+    attempts=$(cat "$KILL_ATTEMPTS_FILE" 2>/dev/null || printf '0')
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" >"$KILL_ATTEMPTS_FILE"
+    [ "$attempts" -gt 1 ] || return 1
+    command kill "$@"
+  }
+  set +e
+  repair_register_tunnel generic "$pid" failed-marker 127.0.0.1:29500:target:22
+  status=$?
+  set -e
+  test "$status" -ne 0
+  exit "$status"
+fi
+
+spawn_fixture_process
+created_pid=$spawned_pid
+spawn_fixture_process
+peer_pid=$spawned_pid
+spawn_fixture_process
+china_pid=$spawned_pid
+spawn_fixture_process
+preexisting_pid=$spawned_pid
+fixture_keep_pid=$preexisting_pid
 repair_register_tunnel generic "$created_pid" created-marker 127.0.0.1:29500:target:22
 repair_register_tunnel peer "$peer_pid" peer-marker
 repair_register_tunnel china "$china_pid" china-marker
@@ -97,6 +186,7 @@ run_signal() {
   status=$?
   set -e
   test "$status" -ne 0
+  test "$(wc -l <"$log")" -eq 3
   for pid in "$created_pid" "$peer_pid" "$china_pid"; do
     state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
     case "$state" in ''|Z*) continue ;; esac
@@ -114,8 +204,47 @@ run_signal() {
   wait "$preexisting_pid" 2>/dev/null || true
 }
 
+run_register_failure() {
+  local mode=$1 status pid state
+  local failure_file="$tmp/failure-$mode"
+  case "$mode" in
+    register-kill-failure)
+      set +e
+      LAUNCHER="$launcher" MODE="$mode" FAILURE_PID_FILE="$failure_file" \
+        KILL_ATTEMPTS_FILE="$tmp/kill-attempts" CLEANUP_LOG="$tmp/kill-log" \
+        bash "$fixture"
+      status=$?
+      set -e
+      test "$status" -ne 0
+      test "$(cat "$tmp/kill-attempts")" -ge 2
+      ;;
+    register-reused)
+      LAUNCHER="$launcher" MODE="$mode" FAILURE_PID_FILE="$failure_file" \
+        KILL_REACHED_FILE="$tmp/kill-reached" CLEANUP_LOG="$tmp/reused-log" \
+        bash "$fixture"
+      test ! -s "$tmp/kill-reached"
+      ;;
+    *)
+      LAUNCHER="$launcher" MODE="$mode" FAILURE_PID_FILE="$failure_file" \
+        CLEANUP_LOG="$tmp/disappeared-log" bash "$fixture"
+      ;;
+  esac
+  if [ -s "$failure_file" ]; then
+    read -r pid <"$failure_file"
+    state=$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    case "$state" in ''|Z*) ;; *)
+      echo "$mode left a live child" >&2
+      return 1
+      ;;
+    esac
+  fi
+}
+
 run_signal TERM
 run_signal HUP
 LAUNCHER="$launcher" MODE=register-failure READY_FILE="$tmp/unused" \
   CLEANUP_LOG="$tmp/register-failure-log" bash "$fixture"
+run_register_failure register-disappears
+run_register_failure register-reused
+run_register_failure register-kill-failure
 echo "repair signal and registration tests passed"
