@@ -451,29 +451,165 @@ def _replace_from_dirs(
         raise UpgradeError("cannot open adapter publication directory") from exc
     try:
         source_stat = os.stat(source.name, dir_fd=source_dir, follow_symlinks=False)
-        if stat.S_ISLNK(source_stat.st_mode):
-            raise OSError("adapter publication source is a symlink")
-        source_identity = _stat_identity_from_stat(source_stat)
-        if expected_identity is not None and source_identity != expected_identity:
-            raise OSError("adapter publication source changed")
-        os.replace(
-            source.name,
-            destination.name,
-            src_dir_fd=source_dir,
-            dst_dir_fd=destination_dir,
-        )
-        destination_stat = os.stat(
-            destination.name,
-            dir_fd=destination_dir,
-            follow_symlinks=False,
-        )
-        if stat.S_ISLNK(destination_stat.st_mode) or _stat_identity_from_stat(destination_stat) != source_identity:
-            raise OSError("adapter publication destination identity differs")
+        if stat.S_ISDIR(source_stat.st_mode):
+            _replace_directory_from_dirs(
+                source_dir,
+                destination_dir,
+                source.name,
+                destination.name,
+                expected_identity,
+            )
+        elif stat.S_ISREG(source_stat.st_mode):
+            _replace_regular_from_dirs(
+                source_dir,
+                destination_dir,
+                source.name,
+                destination.name,
+                expected_identity,
+            )
+        else:
+            raise OSError("adapter publication source is not regular")
     except OSError as exc:
         raise UpgradeError("cannot publish adapter file") from exc
     finally:
         os.close(source_dir)
         os.close(destination_dir)
+
+
+def _replace_directory_from_dirs(
+    source_dir: int,
+    destination_dir: int,
+    source_name: str,
+    destination_name: str,
+    expected_identity: tuple[int, int, int, int, int] | None,
+) -> None:
+    source_stat = os.stat(source_name, dir_fd=source_dir, follow_symlinks=False)
+    source_identity = _stat_identity_from_stat(source_stat)
+    if expected_identity is not None and source_identity != expected_identity:
+        raise OSError("adapter publication source changed")
+    os.replace(
+        source_name,
+        destination_name,
+        src_dir_fd=source_dir,
+        dst_dir_fd=destination_dir,
+    )
+    destination_stat = os.stat(
+        destination_name,
+        dir_fd=destination_dir,
+        follow_symlinks=False,
+    )
+    if stat.S_ISLNK(destination_stat.st_mode) or _stat_identity_from_stat(destination_stat) != source_identity:
+        raise OSError("adapter publication destination identity differs")
+
+
+def _replace_regular_from_dirs(
+    source_dir: int,
+    destination_dir: int,
+    source_name: str,
+    destination_name: str,
+    expected_identity: tuple[int, int, int, int, int] | None,
+) -> None:
+    source_fd = destination_fd = backup_fd = None
+    temp_name = f".{destination_name}.publish-{os.getpid()}-{time.time_ns()}"
+    backup_name = f".{destination_name}.backup-{os.getpid()}-{time.time_ns()}"
+    destination_exists = False
+    try:
+        source_fd = os.open(
+            source_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=source_dir,
+        )
+        source_identity = _stat_identity_from_stat(os.fstat(source_fd))
+        if expected_identity is not None and source_identity[:4] != expected_identity[:4]:
+            raise OSError("adapter publication source changed")
+        try:
+            destination_fd = os.open(
+                destination_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=destination_dir,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            destination_stat = os.fstat(destination_fd)
+            if not stat.S_ISREG(destination_stat.st_mode):
+                raise OSError("adapter publication destination is not regular")
+            destination_exists = True
+            os.link(
+                destination_name,
+                backup_name,
+                src_dir_fd=destination_dir,
+                dst_dir_fd=destination_dir,
+                follow_symlinks=False,
+            )
+            backup_fd = os.open(
+                backup_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=destination_dir,
+            )
+            if _stat_identity_from_stat(os.fstat(backup_fd)) != _stat_identity_from_stat(destination_stat):
+                raise OSError("adapter publication backup identity differs")
+        os.link(
+            source_name,
+            temp_name,
+            src_dir_fd=source_dir,
+            dst_dir_fd=destination_dir,
+            follow_symlinks=False,
+        )
+        temp_fd = os.open(
+            temp_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=destination_dir,
+        )
+        try:
+            temp_identity = _stat_identity_from_stat(os.fstat(temp_fd))
+        finally:
+            os.close(temp_fd)
+        if temp_identity != _stat_identity_from_stat(os.fstat(source_fd)):
+            raise OSError("adapter publication source changed")
+        os.replace(temp_name, destination_name, src_dir_fd=destination_dir, dst_dir_fd=destination_dir)
+        destination_stat = os.stat(destination_name, dir_fd=destination_dir, follow_symlinks=False)
+        if stat.S_ISLNK(destination_stat.st_mode) or _stat_identity_from_stat(destination_stat) != temp_identity:
+            raise OSError("adapter publication destination identity differs")
+        if destination_exists and backup_name:
+            os.unlink(backup_name, dir_fd=destination_dir)
+        temp_name = ""
+        backup_name = ""
+    except OSError:
+        if temp_name:
+            try:
+                os.unlink(temp_name, dir_fd=destination_dir)
+            except FileNotFoundError:
+                pass
+        if destination_exists and backup_name:
+            try:
+                os.replace(
+                    backup_name,
+                    destination_name,
+                    src_dir_fd=destination_dir,
+                    dst_dir_fd=destination_dir,
+                )
+                backup_name = ""
+            except OSError:
+                try:
+                    os.unlink(destination_name, dir_fd=destination_dir)
+                except FileNotFoundError:
+                    pass
+        elif not destination_exists:
+            try:
+                os.unlink(destination_name, dir_fd=destination_dir)
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        for fd in (source_fd, destination_fd, backup_fd):
+            if fd is not None:
+                os.close(fd)
+        if backup_name:
+            try:
+                os.unlink(backup_name, dir_fd=destination_dir)
+            except FileNotFoundError:
+                pass
 
 
 def _remove_leftover(path: Path) -> None:

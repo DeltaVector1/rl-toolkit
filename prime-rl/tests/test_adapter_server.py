@@ -454,20 +454,31 @@ class AdapterServerTest(unittest.TestCase):
             source.parent.mkdir()
             destination.parent.mkdir()
             source.write_bytes(b"before")
+            destination.write_bytes(b"old-target")
+            manifest = destination.parent / adapter_server.adapter_manifest_name
+            manifest.write_text("old-manifest\n", encoding="utf-8")
+            old_manifest = manifest.read_bytes()
             identity = adapter_server._stat_identity(source)
-            original_replace = adapter_server.os.replace
+            original_link = adapter_server.os.link
+            swapped = False
 
-            def replace_after_mutation(*args, **kwargs):
-                source.write_bytes(b"raced!!")
-                return original_replace(*args, **kwargs)
+            def link_after_source_swap(*args, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    replacement = source.with_name(".source-swap")
+                    replacement.write_bytes(b"raced!!")
+                    os.replace(replacement, source)
+                    swapped = True
+                return original_link(*args, **kwargs)
 
-            adapter_server.os.replace = replace_after_mutation
+            adapter_server.os.link = link_after_source_swap
             try:
                 with self.assertRaises(adapter_server.UpgradeError):
                     adapter_server._replace_from_dirs(source, destination, identity)
             finally:
-                adapter_server.os.replace = original_replace
-            self.assertEqual(destination.read_bytes(), b"raced!!")
+                adapter_server.os.link = original_link
+            self.assertEqual(destination.read_bytes(), b"old-target")
+            self.assertEqual(manifest.read_bytes(), old_manifest)
 
     def test_existing_v2_manifest_with_missing_chunk_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
