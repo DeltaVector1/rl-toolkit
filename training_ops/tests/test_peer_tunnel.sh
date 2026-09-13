@@ -337,6 +337,7 @@ export REAL_CAT="$real_cat" REAL_SSH="$real_ssh" REAL_AWK="$real_awk"
 start=$(grep -n '^generic_tunnel_ssh_match() {' "$script" | cut -d: -f1)
 end=$(grep -n '^china_legacy_cleanup_required=0$' "$script" | cut -d: -f1)
 source <(sed -n "${start},$((end - 1))p" "$script")
+source <(sed -n '/^repair_launch_tunnel() {/,/^}/p' "$script")
 # Use real ps padding and a real, isolated group before installing shell
 # mocks. This sleeper is an allowed peer-group member, not an SSH service.
 (
