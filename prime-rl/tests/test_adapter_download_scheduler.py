@@ -88,6 +88,81 @@ class DownloadSchedulerTest(unittest.TestCase):
             "http://source/step_1/.adapter-transport-bundle?token=abc",
         )
 
+    def test_bundle_requires_exact_first_forward_pool(self):
+        filesystem = load_filesystem_module()
+        source_url = "http://127.0.0.1:18100/step_1?token=abc"
+        old_ports = os.environ.get("PRIME_LORA_SOURCE_PORTS")
+        old_probe = filesystem._responsive_adapter_source_urls
+        ports = list(range(18100, 18228, 2)) + list(range(18101, 18228, 2))
+        try:
+            os.environ.pop("PRIME_LORA_SOURCE_PORTS", None)
+            with self.assertRaisesRegex(OSError, "exactly 128"):
+                filesystem._bundle_responsive_source_urls(source_url, None, None)
+
+            os.environ["PRIME_LORA_SOURCE_PORTS"] = ",".join(str(port) for port in ports)
+            source_urls = filesystem._adapter_source_urls(source_url)
+            filesystem._responsive_adapter_source_urls = lambda *_args: (source_urls[:64], 128)
+            self.assertEqual(
+                [urlsplit(url).port for url in filesystem._bundle_responsive_source_urls(source_url, None, None)],
+                ports[:64],
+            )
+            filesystem._responsive_adapter_source_urls = lambda *_args: (source_urls[:63], 128)
+            with self.assertRaisesRegex(OSError, "64 responsive"):
+                filesystem._bundle_responsive_source_urls(source_url, None, None)
+
+            bad_ports = list(ports)
+            bad_ports[65] = bad_ports[64]
+            os.environ["PRIME_LORA_SOURCE_PORTS"] = ",".join(str(port) for port in bad_ports)
+            with self.assertRaisesRegex(OSError, "port mapping"):
+                filesystem._bundle_responsive_source_urls(source_url, None, None)
+            bad_order = list(ports)
+            bad_order[0], bad_order[1] = bad_order[1], bad_order[0]
+            os.environ["PRIME_LORA_SOURCE_PORTS"] = ",".join(str(port) for port in bad_order)
+            with self.assertRaisesRegex(OSError, "port mapping"):
+                filesystem._bundle_responsive_source_urls(source_url, None, None)
+        finally:
+            filesystem._responsive_adapter_source_urls = old_probe
+            if old_ports is None:
+                os.environ.pop("PRIME_LORA_SOURCE_PORTS", None)
+            else:
+                os.environ["PRIME_LORA_SOURCE_PORTS"] = old_ports
+
+    def test_bundle_plan_is_private_and_ready_identity_stays_canonical(self):
+        filesystem = load_filesystem_module()
+        chunks = [
+            {"file": f"chunk-{index}", "wire_size": 1}
+            for index in range(64)
+        ]
+        bundle = filesystem._bundle_identity(
+            "http://127.0.0.1:18100/step_1?token=abc",
+            {
+                "source_manifest": {
+                    "bundle": {
+                        "path": ".adapter-transport-bundle",
+                        "size": 64,
+                        "sha256": hashlib.sha256(bytes(range(64))).hexdigest(),
+                    }
+                },
+                "chunks": chunks,
+            },
+        )
+        chunks = [
+            {
+                "file": f"chunk-{index}",
+                "offset": index,
+                "bundle_offset": index,
+                "wire_size": 1,
+            }
+            for index in range(64)
+        ]
+        sources = [f"http://127.0.0.1:{18100 + index}/step_1?token=abc" for index in range(64)]
+        before = json.dumps(bundle, sort_keys=True)
+        plan = filesystem._bundle_lane_plan(bundle, chunks, sources)
+        self.assertEqual(json.dumps(bundle, sort_keys=True), before)
+        self.assertNotIn("lane_plan", bundle)
+        recorded = {**bundle, "lane_plan": plan}
+        self.assertTrue(filesystem._bundle_identity_matches(recorded, bundle))
+
     def test_bundle_lane_plan_uses_first_64_sources_and_exact_ranges(self):
         filesystem = load_filesystem_module()
         ports = list(range(18100, 18164, 2)) + list(range(18101, 18165, 2))

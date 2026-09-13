@@ -1698,6 +1698,47 @@ def _bundle_identity(
     return {"path": path, "size": size, "sha256": digest, "url": bundle_url}
 
 
+def _bundle_identity_matches(recorded: object, expected: dict[str, object]) -> bool:
+    """Compare canonical bundle identity without runtime lane state."""
+    if not isinstance(recorded, dict):
+        return False
+    return {key: value for key, value in recorded.items() if key != "lane_plan"} == expected
+
+
+def _bundle_responsive_source_urls(
+    source_url: str,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+) -> list[str]:
+    """Return exactly one responsive first forward from each SSH pair."""
+    source_urls = _adapter_source_urls(source_url)
+    if len(source_urls) != 128:
+        raise OSError("adapter bundle requires exactly 128 mapped source URLs")
+    try:
+        ports = [urlsplit(url).port for url in source_urls]
+    except ValueError as exc:
+        raise OSError("adapter bundle source port mapping is invalid") from exc
+    if any(port is None for port in ports):
+        raise OSError("adapter bundle source port mapping is invalid")
+    first = ports[:64]
+    second = ports[64:]
+    if (
+        len(set(ports)) != 128
+        or any(port != first[0] + index * 2 for index, port in enumerate(first))
+        or second != [port + 1 for port in first]
+    ):
+        raise OSError("adapter bundle source port mapping is invalid")
+    responsive, configured_count = _responsive_adapter_source_urls(
+        source_url,
+        deadline,
+        cancel_event,
+    )
+    responsive_ports = [urlsplit(url).port for url in responsive]
+    if configured_count != 128 or len(responsive) != 64 or responsive_ports != first:
+        raise OSError("adapter bundle requires 64 responsive first-forward URLs")
+    return responsive
+
+
 def _read_delta_manifest_with_visibility_wait(
     source_url: str,
     *,
@@ -2992,12 +3033,14 @@ def _bundle_lane_plan(
     source_urls: list[str],
 ) -> dict[str, object]:
     """Partition sorted virtual-bundle chunks into balanced contiguous lanes."""
-    if not source_urls or not chunks or any(not isinstance(url, str) for url in source_urls):
-        raise OSError("adapter bundle has no source lanes or chunks")
+    if (
+        len(source_urls) != _ADAPTER_BUNDLE_MAX_LANES
+        or len(chunks) < _ADAPTER_BUNDLE_MAX_LANES
+        or any(not isinstance(url, str) for url in source_urls)
+    ):
+        raise OSError("adapter bundle requires exactly 64 source lanes and chunks")
     ordered = sorted(chunks, key=lambda item: int(item.get("offset", -1)))
-    lane_count = min(_ADAPTER_BUNDLE_MAX_LANES, len(source_urls), len(ordered))
-    if lane_count <= 0:
-        raise OSError("adapter bundle has no usable source lanes")
+    lane_count = _ADAPTER_BUNDLE_MAX_LANES
     if len(set(source_urls[:lane_count])) != lane_count:
         raise OSError("adapter bundle source lanes are not independent")
     prefix = [0]
@@ -4334,16 +4377,18 @@ def _stage_chunked_xor_adapter(
     chunks = transport["chunks"]
     assert isinstance(chunks, list)
     chunks = sorted(chunks, key=lambda item: int(item["offset"]))
-    bundle_lane_urls = None
+    bundle_lane_plan = None
     if bundle is not None:
-        responsive_urls, _responsive_count = _responsive_adapter_source_urls(
+        bundle_lane_urls = _bundle_responsive_source_urls(
             source_url,
             deadline,
             cancel_event,
         )
-        bundle_lane_urls = responsive_urls[:_ADAPTER_BUNDLE_MAX_LANES]
-        bundle["lane_plan"] = _bundle_lane_plan(bundle, chunks, bundle_lane_urls)
-    transport_identity = json.dumps(transport, sort_keys=True, separators=(",", ":"))
+        bundle_lane_plan = _bundle_lane_plan(bundle, chunks, bundle_lane_urls)
+    identity_transport = dict(transport)
+    if bundle_lane_plan is not None:
+        identity_transport["bundle_lane_plan"] = bundle_lane_plan
+    transport_identity = json.dumps(identity_transport, sort_keys=True, separators=(",", ":"))
     identity_path = temporary / "transport-manifest.json"
     _reset_staging_directory_identity(
         temporary,
@@ -4441,7 +4486,7 @@ def _stage_chunked_xor_adapter(
             cancel_event,
         )
     else:
-        lane_plan = bundle.get("lane_plan")
+        lane_plan = bundle_lane_plan
         if (
             not isinstance(lane_plan, dict)
             or not isinstance(lane_plan.get("lanes"), list)
@@ -4678,7 +4723,7 @@ def _stage_chunked_xor_adapter(
         with timing_lock:
             if transfer_started is None:
                 transfer_started = time.monotonic()
-        lane_plan = bundle.get("lane_plan")
+        lane_plan = bundle_lane_plan
         if not isinstance(lane_plan, dict) or not isinstance(lane_plan.get("lanes"), list):
             raise OSError("adapter bundle lane plan is unavailable")
 
@@ -5449,7 +5494,7 @@ def stage_lora_adapter_files(
                             )
                         )
                         and proof.get("source_url") == source_url
-                        and (not require_bundle or proof.get("bundle") == bundle)
+                        and (not require_bundle or _bundle_identity_matches(proof.get("bundle"), bundle))
                         and proof.get("target_sha256") == transport["target_sha256"]
                         and (
                             transport.get("transport") == _ADAPTER_DELTA_TRANSPORT

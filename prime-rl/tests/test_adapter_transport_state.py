@@ -1284,6 +1284,98 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("checksum mismatch")))
         self.assertFalse(filesystem._preserve_adapter_stage_partial(OSError("path is a symbolic link")))
 
+    def test_bundle_ready_cache_hit_ignores_runtime_lane_plan(self):
+        filesystem = load_filesystem_module()
+        source_url = "http://127.0.0.1:18100/run/broadcasts/step_1"
+        config = b"{}\n"
+        model = b"model"
+        config_sha = hashlib.sha256(config).hexdigest()
+        model_sha = hashlib.sha256(model).hexdigest()
+        bundle_payload = b"wire"
+        bundle_sha = hashlib.sha256(bundle_payload).hexdigest()
+        bundle_manifest = {
+            "path": ".adapter-transport-bundle",
+            "size": len(bundle_payload),
+            "sha256": bundle_sha,
+        }
+        manifest = {
+            "version": 1,
+            "kind": "lora-adapter",
+            "mode": "delta",
+            "transport": "chunked-shuffled-xor-zstd",
+            "target_step": 1,
+            "base_step": 0,
+            "files": {
+                "adapter_config.json": {"size": len(config), "sha256": config_sha},
+                "adapter_model.safetensors": {"size": len(model), "sha256": model_sha},
+            },
+        }
+        transport = {
+            "version": 1,
+            "mode": "delta",
+            "transport": "chunked-shuffled-xor-zstd",
+            "source_manifest": {"target_step": 1, "bundle": bundle_manifest},
+            "base_url": "http://127.0.0.1:18100/run/broadcasts/step_0",
+            "base_sha256": "a" * 64,
+            "target_sha256": model_sha,
+            "target_size": len(model),
+            "config_sha256": config_sha,
+            "config_size": len(config),
+            "chunks": [{"file": "chunk-0", "wire_size": len(bundle_payload)}],
+        }
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_manifest = filesystem._read_chunked_xor_manifest
+        old_source_manifest = filesystem._source_manifest
+        old_relay_match = filesystem._relay_manifest_matches
+        old_cleanup = filesystem._cleanup_adapter_caches
+        old_lane_sources = filesystem._bundle_responsive_source_urls
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path(source_url)
+                destination.mkdir(parents=True)
+                (destination / "adapter_config.json").write_bytes(config)
+                (destination / "adapter_model.safetensors").write_bytes(model)
+                (destination / "READY").write_text("ready\n", encoding="ascii")
+                bundle = filesystem._bundle_identity(source_url, transport)
+                (destination / "transport.json").write_text(
+                    json.dumps(
+                        {
+                            "mode": "chunked-shuffled-xor-zstd",
+                            "source_url": source_url,
+                            "bundle": {**bundle, "lane_plan": {"version": 1}},
+                            "target_sha256": model_sha,
+                            "base_url": transport["base_url"],
+                            "base_sha256": transport["base_sha256"],
+                        }
+                    )
+                )
+                filesystem._read_chunked_xor_manifest = lambda *_args, **_kwargs: transport
+                filesystem._source_manifest = lambda *_args, **_kwargs: manifest
+                filesystem._relay_manifest_matches = lambda *_args, **_kwargs: True
+                filesystem._cleanup_adapter_caches = lambda *_args, **_kwargs: True
+                filesystem._bundle_responsive_source_urls = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("READY cache hit must not probe bundle lanes")
+                )
+                committed = threading.Event()
+                result = filesystem.stage_lora_adapter_files(
+                    source_url,
+                    require_bundle=True,
+                    committed_event=committed,
+                )
+                self.assertEqual(result, destination)
+                self.assertTrue(committed.is_set())
+        finally:
+            filesystem._read_chunked_xor_manifest = old_manifest
+            filesystem._source_manifest = old_source_manifest
+            filesystem._relay_manifest_matches = old_relay_match
+            filesystem._cleanup_adapter_caches = old_cleanup
+            filesystem._bundle_responsive_source_urls = old_lane_sources
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
     def test_relay_unavailable_is_temporary_for_both_delta_versions(self):
         filesystem = load_filesystem_module()
         old_reader = filesystem._read_source_text

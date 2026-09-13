@@ -17,6 +17,7 @@ from urllib.parse import unquote, urlsplit
 
 
 relay_manifest_name = "relay_manifest.json"
+transport_bundle_name = ".adapter-transport-bundle"
 ready_marker_name = "READY"
 relaying_marker_name = "RELAYING"
 relay_transport = "chunked-shuffled-xor-zstd"
@@ -41,6 +42,13 @@ class CanonicalSource:
 @dataclass(frozen=True)
 class RelayFile:
     path: Path
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class RelayBundle:
+    parts: tuple[RelayFile, ...]
     size: int
     sha256: str
 
@@ -363,7 +371,61 @@ def _cached_relay_index(
     return index
 
 
-def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayFile:
+def _load_bundle(
+    cache_path: Path,
+    published_path: Path,
+    source_url: str,
+    index: RelayIndex,
+) -> RelayBundle:
+    if index.transport != relay_transport:
+        raise RelayRequestError(404, "adapter bundle is not published")
+    try:
+        source_manifest = json.loads(
+            (published_path / "adapter_manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        raise RelayRequestError(500, "relay source manifest is invalid") from exc
+    bundle = source_manifest.get("bundle") if isinstance(source_manifest, dict) else None
+    if (
+        not isinstance(bundle, dict)
+        or bundle.get("path") != transport_bundle_name
+        or type(bundle.get("size")) is not int
+        or bundle["size"] <= 0
+        or not isinstance(bundle.get("sha256"), str)
+        or not digest_pattern.fullmatch(bundle["sha256"])
+    ):
+        raise RelayRequestError(404, "adapter bundle is not published")
+    raw_chunks = source_manifest.get("chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks:
+        raise RelayRequestError(500, "relay source manifest has no bundle chunks")
+    parts: list[RelayFile] = []
+    seen: set[str] = set()
+    total = 0
+    for item in raw_chunks:
+        if not isinstance(item, dict) or not isinstance(item.get("file"), str):
+            raise RelayRequestError(500, "relay source manifest bundle chunk is invalid")
+        name = item["file"]
+        if name in seen or Path(name).name != name:
+            raise RelayRequestError(500, "relay source manifest bundle chunk is invalid")
+        seen.add(name)
+        spec = index.files.get(name)
+        if not isinstance(spec, dict):
+            raise RelayRequestError(503, "relay bundle chunk is not published")
+        wire_size = item.get("wire_size")
+        wire_sha256 = item.get("wire_sha256")
+        if spec.get("size") != wire_size or spec.get("sha256") != wire_sha256:
+            raise RelayRequestError(500, "relay bundle chunk identity differs")
+        selected = _load_file(cache_path, source_url, name)
+        if not isinstance(selected, RelayFile):
+            raise RelayRequestError(500, "relay bundle chunk identity is invalid")
+        parts.append(selected)
+        total += selected.size
+    if total != bundle["size"] or len(parts) != len(index.files) - 3:
+        raise RelayRequestError(500, "relay bundle size differs from its chunks")
+    return RelayBundle(tuple(parts), bundle["size"], bundle["sha256"])
+
+
+def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayFile | RelayBundle:
     ready = cache_path / ready_marker_name
     relaying_path = cache_path.with_name(f"{cache_path.name}.partial")
     ready_file = ready.is_file()
@@ -394,6 +456,8 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
     )
     transport = index.transport
     files = index.files
+    if requested_name == transport_bundle_name:
+        return _load_bundle(cache_path, published_path, source_url, index)
     streaming_transports = {relay_transport, predictive_transport}
     if (
         relaying
@@ -535,10 +599,37 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
             self.send_header("Content-Length", str(length))
             self.send_header("Accept-Ranges", "bytes")
+            if isinstance(selected, RelayBundle):
+                self.send_header("ETag", f'"{selected.sha256}"')
             if status == 206:
                 self.send_header("Content-Range", f"bytes {start}-{end}/{selected.size}")
             self.end_headers()
             if self.command != "GET" or length == 0:
+                return
+            if isinstance(selected, RelayBundle):
+                cursor = start
+                remaining = length
+                offset = 0
+                for part in selected.parts:
+                    part_end = offset + part.size
+                    if cursor < part_end and remaining:
+                        local_start = max(0, cursor - offset)
+                        amount = min(remaining, part.size - local_start)
+                        with part.path.open("rb") as source:
+                            source.seek(local_start)
+                            while amount:
+                                chunk = source.read(min(1024 * 1024, amount))
+                                if not chunk:
+                                    raise RelayRequestError(503, "relay bundle chunk ended early")
+                                self.wfile.write(chunk)
+                                amount -= len(chunk)
+                                remaining -= len(chunk)
+                                cursor += len(chunk)
+                    offset = part_end
+                    if not remaining:
+                        break
+                if remaining:
+                    raise RelayRequestError(503, "relay bundle ended before its declared size")
                 return
             with selected.path.open("rb") as source:
                 source.seek(start)
