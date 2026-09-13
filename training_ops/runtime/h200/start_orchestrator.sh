@@ -1861,6 +1861,30 @@ peer_tunnel_remove_orphan_children() {
   [ "$found" = 0 ]
 }
 
+peer_tunnel_remove_orphan_api_listener() {
+  local listener pid ppid command_line supervisor_command start_time current_start
+  listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":$peer_api_port" '$4 ~ port "$" {print; exit}') || return 1
+  [ -n "$listener" ] || return 0
+  pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  command_line=$(process_command_line "$pid") || return 1
+  peer_tunnel_ssh_args_match "$command_line" api || return 1
+  ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
+  if [ "$ppid" != 1 ] && supervisor_command=$(process_command_line "$ppid" 2>/dev/null); then
+    peer_tunnel_supervisor_forwards_match "$supervisor_command" api peer-tunnel-api \
+      "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" && return 0
+  fi
+  start_time=$(process_start_time "$pid") || return 1
+  current_start=$start_time
+  [ "$current_start" = "$(process_start_time "$pid")" ] || return 1
+  kill "$pid" 2>/dev/null || return 1
+  for _ in $(seq 1 10); do
+    ss -H -ltnp 2>/dev/null | awk -v port=":$peer_api_port" '$4 ~ port "$" {found=1} END {exit found}' && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 peer_remote_ports_ready() {
   local probe_seconds=${1:-10} peer_target verified_ports probe_output probe_status
   peer_missing_remote_ports=
@@ -2906,6 +2930,10 @@ peer_tunnel() {
     return 1
   fi
   [ "$peer_enabled" = 1 ] || return 0
+  peer_tunnel_remove_orphan_api_listener || {
+    echo "peer phase=api stage=orphan-listener elapsed=$((SECONDS - phase_start))" >&2
+    return 1
+  }
   peer_tunnel_connection "api" \
     "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" \
     -L "127.0.0.1:$peer_api_port:127.0.0.1:8000" || {
