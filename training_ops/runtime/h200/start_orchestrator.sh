@@ -1639,13 +1639,22 @@ peer_tunnel_ssh_args_match() {
 }
 
 peer_tunnel_api_variant_match() {
-  local command_line=$1 variant
-  peer_tunnel_ssh_args_match "$command_line" api && return 0
-  for variant in compression channel-compression; do
-    command_line=$1
-    [ "$variant" = compression ] && command_line=$(sed "s| $peer_ssh_user@$peer_host$| -o Compression=no $peer_ssh_user@$peer_host|" <<<"$command_line")
-    [ "$variant" = channel-compression ] && command_line=$(sed "s|^ssh -NT|ssh -NT -o ChannelTimeout=*-tcpip=45s -o Compression=no|" <<<"$command_line")
-    peer_tunnel_ssh_args_match "$command_line" api && return 0
+  local command_line=$1 expected option index
+  local -a args expected_args
+  command_line=$(tunnel_channel_timeout_normalize "$command_line") || return 1
+  read -r -a args <<<"$command_line"
+  expected_args=(ssh -NT -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=30
+    -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+    -o 'ChannelTimeout=*-tcpip=45s' -o TCPKeepAlive=yes -o IPQoS=none
+    -i "$peer_ssh_identity" -p "$peer_ssh_port")
+  for option in current compression channel-compression; do
+    local -a candidate=("${expected_args[@]}")
+    [ "$option" = compression ] && candidate=(${candidate[@]/-o Compression=no/})
+    [ "$option" = channel-compression ] && candidate=(${candidate[@]/-o 'ChannelTimeout=*-tcpip=45s'/})
+    [ "${#args[@]}" -ge "$(( ${#candidate[@]} + 3 ))" ] || continue
+    for index in "${!candidate[@]}"; do [ "${args[index]}" = "${candidate[index]}" ] || break 2; done
+    [ "${args[-1]}" = "$peer_ssh_user@$peer_host" ] || continue
+    return 0
   done
   return 1
 }
@@ -1888,10 +1897,10 @@ peer_tunnel_remove_orphan_api_listener() {
   pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
   command_line=$(process_command_line "$pid") || return 1
-  peer_tunnel_ssh_args_match "$command_line" api || return 1
+  peer_tunnel_api_variant_match "$command_line" || return 1
   ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || return 1
   if [ "$ppid" != 1 ] && supervisor_command=$(process_command_line "$ppid" 2>/dev/null); then
-    peer_tunnel_supervisor_forwards_match "$supervisor_command" api peer-tunnel-api \
+    peer_tunnel_api_supervisor_variant_match "$supervisor_command" peer-tunnel-api \
       "-L 127.0.0.1:$peer_api_port:127.0.0.1:8000" && return 0
   fi
   start_time=$(process_start_time "$pid") || return 1
