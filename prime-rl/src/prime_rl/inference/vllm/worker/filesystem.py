@@ -4587,16 +4587,17 @@ def _stage_chunked_linear_adapter(
             def lane_report(_lane: int, amount: int) -> None:
                 report(chunk_lane, amount)
 
-            chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
-            chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
+            chunk_urls = persistent_pool.urls_for_lane(chunk_lane, name)
             incoming_path = chunk_path.with_name(f".{chunk_path.name}.incoming")
             transfer_started_at = time.monotonic()
             with reconstruct_lock:
                 if transfer_started is None or transfer_started_at < transfer_started:
                     transfer_started = transfer_started_at
-            _download_persistent_file(
+            persistent_pool.download(
                 chunk_urls,
+                chunk_lane,
                 incoming_path,
+                chunk_root_fd,
                 expected_size=wire_size,
                 expected_sha256=wire_sha256,
                 progress=lane_report,
@@ -4743,9 +4744,28 @@ def _stage_chunked_linear_adapter(
 
     download_streams = _configured_download_streams()
     download_width = min(download_streams, len(lane_urls), len(chunks))
-    reconstruct_executor = ThreadPoolExecutor(
-        max_workers=min(len(chunks), _PREDICTIVE_RECONSTRUCT_WORKERS)
+    status_metadata["active_persistent_connections"] = download_width
+    chunk_root_fd = _open_directory_nofollow(
+        chunk_root,
+        create=False,
+        label="adapter transport chunk directory",
     )
+    try:
+        persistent_pool = _PersistentAdapterLanePool(
+            lane_urls,
+            width=download_width,
+        )
+    except BaseException:
+        os.close(chunk_root_fd)
+        raise
+    try:
+        reconstruct_executor = ThreadPoolExecutor(
+            max_workers=min(len(chunks), _PREDICTIVE_RECONSTRUCT_WORKERS)
+        )
+    except BaseException:
+        persistent_pool.close()
+        os.close(chunk_root_fd)
+        raise
     reconstruct_futures = []
     reconstruct_futures_lock = threading.Lock()
 
@@ -4760,24 +4780,28 @@ def _stage_chunked_linear_adapter(
             reconstruct_futures.append(future)
 
     try:
-        _run_bounded_futures(
-            chunks,
-            fetch_and_reconstruct,
-            download_width,
+        try:
+            _run_bounded_futures(
+                chunks,
+                fetch_and_reconstruct,
+                download_width,
+                deadline,
+                cancel_event,
+            )
+        except BaseException:
+            reconstruct_executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        with reconstruct_futures_lock:
+            pending_reconstruction = list(reconstruct_futures)
+        _wait_for_futures(
+            reconstruct_executor,
+            pending_reconstruction,
             deadline,
             cancel_event,
         )
-    except BaseException:
-        reconstruct_executor.shutdown(wait=True, cancel_futures=True)
-        raise
-    with reconstruct_futures_lock:
-        pending_reconstruction = list(reconstruct_futures)
-    _wait_for_futures(
-        reconstruct_executor,
-        pending_reconstruction,
-        deadline,
-        cancel_event,
-    )
+    finally:
+        persistent_pool.close()
+        os.close(chunk_root_fd)
     output_fd = _open_nofollow(output_path, os.O_RDONLY)
     try:
         os.fsync(output_fd)

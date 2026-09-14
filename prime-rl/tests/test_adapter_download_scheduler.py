@@ -245,6 +245,91 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
+    def test_persistent_pool_closes_reused_connection_after_success(self):
+        filesystem = load_filesystem_module()
+        payload = b"close-after-success"
+        server, thread, _handler = self._persistent_server(filesystem, payload)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                chunks = Path(temporary) / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                connection = pool._lanes[0][1]
+                try:
+                    url = f"http://127.0.0.1:{server.server_address[1]}"
+                    for name in ("one", "two"):
+                        pool.download(
+                            [f"{url}/{name}"],
+                            0,
+                            chunks / name,
+                            parent_fd,
+                            expected_size=len(payload),
+                            expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            per_request_timeout_seconds=2,
+                        )
+                    self.assertIsNotNone(connection._connection)
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertIsNone(connection._connection)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_pool_closes_connection_after_error(self):
+        filesystem = load_filesystem_module()
+        payload = b"close-after-error"
+
+        def bad_identity(request, number):
+            if number != 1:
+                return False
+            request.send_response(206)
+            request.send_header("Content-Length", str(len(payload)))
+            request.send_header(
+                "Content-Range", f"bytes 0-{len(payload) - 1}/{len(payload)}"
+            )
+            request.send_header("ETag", '"wrong"')
+            request.end_headers()
+            request.wfile.write(payload)
+            request.close_connection = True
+            return True
+
+        server, thread, _handler = self._persistent_server(
+            filesystem, payload, bad_identity
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                chunks = Path(temporary) / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                connection = pool._lanes[0][1]
+                try:
+                    with self.assertRaisesRegex(OSError, "ETag"):
+                        pool.download(
+                            [f"http://127.0.0.1:{server.server_address[1]}/bad"],
+                            0,
+                            chunks / "bad",
+                            parent_fd,
+                            expected_size=len(payload),
+                            expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            per_request_timeout_seconds=2,
+                        )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertIsNone(connection._connection)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
     def test_persistent_pool_width_binds_primaries_and_ordered_failover(self):
         filesystem = load_filesystem_module()
         payload = b"fixed-primary"

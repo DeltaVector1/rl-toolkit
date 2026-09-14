@@ -596,11 +596,13 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         old_source = filesystem._source_manifest
         old_decode = filesystem._decode_linear_transport_chunk
         old_timeout = filesystem._delta_stage_timeout_s
+        old_pool = filesystem._PersistentAdapterLanePool
         relaying_seen_before_chunk = False
         wire_proof_seen_during_decode = False
         decode_calls = 0
         chunk_download_calls = 0
         base_calls = []
+        pool_instances = []
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
@@ -631,11 +633,36 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     if kwargs.get("progress"):
                         kwargs["progress"](0, destination.stat().st_size)
 
+                class FakePool:
+                    def __init__(self, source_urls, width):
+                        self.source_urls = list(source_urls)
+                        self.width = width
+                        self.closed = False
+                        pool_instances.append(self)
+
+                    def urls_for_lane(self, lane, name):
+                        primary = self.source_urls[lane % self.width]
+                        return [
+                            f"{primary.rstrip('/')}/{name}",
+                            *(
+                                f"{source.rstrip('/')}/{name}"
+                                for source in self.source_urls
+                                if source != primary
+                            ),
+                        ]
+
+                    def download(self, _urls, lane, destination, _parent_fd, **kwargs):
+                        fake_download(None, destination, progress=kwargs.get("progress"))
+
+                    def close(self):
+                        self.closed = True
+
                 def fake_base(url, *_args, **_kwargs):
                     base_calls.append((url, _kwargs))
                     return base_paths[url] / "adapter_model.safetensors", base_paths[url] / "adapter_config.json"
 
                 filesystem._download_persistent_file = fake_download
+                filesystem._PersistentAdapterLanePool = FakePool
                 filesystem._adapter_source_urls = lambda _source: ["http://lane"]
                 filesystem._configured_download_streams = lambda: 1
                 filesystem._verified_adapter_base = fake_base
@@ -693,6 +720,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 self.assertEqual((result / "adapter_model.safetensors").read_bytes(), target)
                 self.assertTrue(wire_proof_seen_during_decode)
                 self.assertEqual(chunk_download_calls, 1)
+                self.assertTrue(all(pool.closed for pool in pool_instances))
                 self.assertFalse(
                     (result / "transport-chunks" / "chunk-0.wire-ready").exists()
                 )
@@ -741,6 +769,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             filesystem._source_manifest = old_source
             filesystem._decode_linear_transport_chunk = old_decode
             filesystem._delta_stage_timeout_s = old_timeout
+            filesystem._PersistentAdapterLanePool = old_pool
 
     def test_linear_receiver_caps_download_workers_to_responsive_lanes(self):
         filesystem = load_filesystem()
@@ -812,7 +841,9 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         old_decode = filesystem._decode_linear_transport_chunk
         old_executor = filesystem.ThreadPoolExecutor
         old_timeout = filesystem._delta_stage_timeout_s
+        old_pool = filesystem._PersistentAdapterLanePool
         workers = []
+        pool_instances = []
         real_executor = filesystem.ThreadPoolExecutor
 
         class RecordingExecutor:
@@ -850,7 +881,32 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     if kwargs.get("progress"):
                         kwargs["progress"](0, len(value))
 
+                class FakePool:
+                    def __init__(self, source_urls, width):
+                        self.source_urls = list(source_urls)
+                        self.width = width
+                        self.closed = False
+                        pool_instances.append(self)
+
+                    def urls_for_lane(self, lane, name):
+                        primary = self.source_urls[lane % self.width]
+                        return [
+                            f"{primary.rstrip('/')}/{name}",
+                            *(
+                                f"{source.rstrip('/')}/{name}"
+                                for source in self.source_urls
+                                if source != primary
+                            ),
+                        ]
+
+                    def download(self, _urls, _lane, destination, _parent_fd, **kwargs):
+                        fake_download(None, destination, progress=kwargs.get("progress"))
+
+                    def close(self):
+                        self.closed = True
+
                 filesystem._download_persistent_file = fake_download
+                filesystem._PersistentAdapterLanePool = FakePool
                 filesystem._responsive_adapter_source_urls = (
                     lambda *_args, **_kwargs: (["http://lane"], 3)
                 )
@@ -882,6 +938,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 self.assertTrue((result / "READY").is_file())
                 self.assertEqual((result / "adapter_model.safetensors").read_bytes(), target)
                 self.assertEqual(workers, [2, 1])
+                self.assertTrue(all(pool.closed for pool in pool_instances))
         finally:
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)
@@ -894,6 +951,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             filesystem._decode_linear_transport_chunk = old_decode
             filesystem.ThreadPoolExecutor = old_executor
             filesystem._delta_stage_timeout_s = old_timeout
+            filesystem._PersistentAdapterLanePool = old_pool
 
     def test_receiver_rejects_symlinked_partial_before_external_write(self):
         filesystem = load_filesystem()
