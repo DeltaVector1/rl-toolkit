@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from urllib.error import HTTPError
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -72,6 +73,30 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"), namespace)
     return namespace["_verify_startup_adapter_delta"]
+
+
+def load_pruned_resume_selector(urlopen, verify, validate_manifest=None):
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_select_pruned_resume_tail"
+    )
+    namespace = {
+        "OrchestratorConfig": object,
+        "HTTPError": HTTPError,
+        "urlopen": urlopen,
+        "get_broadcast_dir": lambda output_dir: output_dir,
+        "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
+        "inference_weight_path": lambda _config, path, _lora_name: (
+            f"http://source/{path.name}"
+        ),
+        "_verify_startup_adapter_delta": verify,
+        "validate_adapter_manifest": validate_manifest or (lambda *_args, **_kwargs: None),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"), namespace)
+    return namespace["_select_pruned_resume_tail"]
 
 
 def load_server_load_endpoints(destination, handler, reader_lock=None):
@@ -1001,6 +1026,208 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertLess(
             setup.index("if sync_version != final_sync_version"),
             setup.index("await self.policy_inference.update_weights("),
+        )
+
+    def test_pruned_policy_zero_selects_three_step_v2_tail(self):
+        calls = []
+
+        def fetch(_url, timeout):
+            raise HTTPError("http://source/step_0/adapter_manifest.json", 404, "gone", {}, None)
+
+        def verify(*args, **_kwargs):
+            calls.append(args)
+            return (
+                {"version": 2, "base_step": 3, "base2_step": 2},
+                {
+                    "version": 2,
+                    "target_step": 3,
+                    "target_url": "http://source/step_3",
+                    "base_url": "http://source/step_2",
+                    "base2_url": "http://source/step_1",
+                    "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+                },
+                {
+                    "version": 2,
+                    "target_step": 2,
+                    "target_url": "http://source/step_2",
+                    "base_url": "http://source/step_1",
+                    "base2_url": "http://source/step_0",
+                    "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+                },
+            )
+
+        def validate(manifest, *, target_step, target_url, base_url, base2_url):
+            if (
+                manifest.get("version") != 2
+                or manifest.get("target_step") != target_step
+                or manifest.get("target_url") != target_url
+                or manifest.get("base_url") != base_url
+                or manifest.get("base2_url") != base2_url
+                or manifest.get("transport") != "chunked-bf16-linear-zigzag-sparse-zstd"
+            ):
+                raise RuntimeError("invalid predecessor")
+
+        selector = load_pruned_resume_selector(fetch, verify, validate)
+        selected = selector(
+            SimpleNamespace(output_dir=Path("/tmp/output")),
+            "adapter",
+            6,
+            (1, 2, 3, 4, 5, 6),
+            None,
+        )
+        self.assertEqual(selected, (4, 5, 6))
+        self.assertEqual(calls[0][2], 4)
+
+    def test_pruned_tail_rejects_non_v2_or_malformed_predecessors(self):
+        def fetch(_url, timeout):
+            raise HTTPError("http://source/step_0/adapter_manifest.json", 404, "gone", {}, None)
+
+        def validate(manifest, *, target_step, target_url, base_url, base2_url):
+            if (
+                manifest.get("version") != 2
+                or manifest.get("target_step") != target_step
+                or manifest.get("target_url") != target_url
+                or manifest.get("base_url") != base_url
+                or manifest.get("base2_url") != base2_url
+                or manifest.get("transport") != "chunked-bf16-linear-zigzag-sparse-zstd"
+            ):
+                raise RuntimeError("invalid predecessor")
+
+        def chain(step3, step2):
+            return (
+                {"version": 2, "base_step": 3, "base2_step": 2},
+                step3,
+                step2,
+            )
+
+        exact_step3 = {
+            "version": 2,
+            "target_step": 3,
+            "target_url": "http://source/step_3",
+            "base_url": "http://source/step_2",
+            "base2_url": "http://source/step_1",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+        }
+        exact_step2 = {
+            "version": 2,
+            "target_step": 2,
+            "target_url": "http://source/step_2",
+            "base_url": "http://source/step_1",
+            "base2_url": "http://source/step_0",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+        }
+        cases = [(dict(exact_step3, version=1), exact_step2)]
+        for field in ("target_url", "base_url", "transport"):
+            cases.append((exact_step3, dict(exact_step2, **{field: "http://source/bad"})) if field != "transport" else (exact_step3, dict(exact_step2, transport="bad")))
+        for step3, step2 in cases:
+            with self.subTest(step3=step3, step2=step2):
+                selector = load_pruned_resume_selector(
+                    fetch,
+                    lambda *_args, chain=chain(step3, step2), **_kwargs: chain,
+                    validate,
+                )
+                with self.assertRaisesRegex(RuntimeError, "invalid|version-two"):
+                    selector(
+                        SimpleNamespace(output_dir=Path("/tmp/output")),
+                        "adapter",
+                        6,
+                        (1, 2, 3, 4, 5, 6),
+                        None,
+                    )
+
+    def test_pruned_resume_rejects_noncontiguous_saved_tail(self):
+        def fetch(_url, timeout):
+            raise HTTPError("http://source/step_0/adapter_manifest.json", 404, "gone", {}, None)
+
+        selector = load_pruned_resume_selector(fetch, lambda *_args, **_kwargs: {"version": 2})
+        with self.assertRaisesRegex(RuntimeError, "not contiguous"):
+            selector(
+                SimpleNamespace(output_dir=Path("/tmp/output")),
+                "adapter",
+                6,
+                (1, 2, 3, 5, 6),
+                None,
+            )
+
+    def test_available_policy_zero_keeps_full_replay(self):
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fetch(_url, timeout):
+            return Response(b"manifest")
+
+        def verify(*_args):
+            raise AssertionError("full replay must not preflight a tail")
+
+        selector = load_pruned_resume_selector(fetch, verify)
+        versions = tuple(range(7))
+        self.assertEqual(
+            selector(SimpleNamespace(output_dir=Path("/tmp/output")), "adapter", 6, versions, None),
+            versions,
+        )
+
+    def test_pruned_policy_zero_does_not_skip_timeout_or_server_error(self):
+        for failure in (
+            TimeoutError("timed out"),
+            HTTPError("http://source/step_0/adapter_manifest.json", 500, "error", {}, None),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                def fetch(_url, timeout, failure=failure):
+                    raise failure
+
+                selector = load_pruned_resume_selector(fetch, lambda *_args, **_kwargs: {"version": 2})
+                with self.assertRaises((TimeoutError, RuntimeError)):
+                    selector(
+                        SimpleNamespace(output_dir=Path("/tmp/output")),
+                        "adapter",
+                        6,
+                        tuple(range(7)),
+                        None,
+                    )
+
+    def test_pruned_resume_rejects_non_v2_or_missing_predecessors(self):
+        def fetch(_url, timeout):
+            raise HTTPError("http://source/step_0/adapter_manifest.json", 404, "gone", {}, None)
+
+        for result in (
+            {"version": 1},
+            RuntimeError("adapter manifest is unavailable"),
+        ):
+            with self.subTest(result=result):
+                def verify(*_args, result=result, **_kwargs):
+                    if isinstance(result, Exception):
+                        raise result
+                    return result
+
+                selector = load_pruned_resume_selector(fetch, verify)
+                with self.assertRaises(RuntimeError):
+                    selector(
+                        SimpleNamespace(output_dir=Path("/tmp/output")),
+                        "adapter",
+                        6,
+                        tuple(range(7)),
+                        None,
+                    )
+
+    def test_common_loaded_receipt_keeps_existing_resume_path(self):
+        def fetch(_url, _timeout):
+            raise AssertionError("common loaded receipt must skip policy-zero probe")
+
+        selector = load_pruned_resume_selector(fetch, lambda *_args: None)
+        versions = tuple(range(7))
+        self.assertEqual(
+            selector(
+                SimpleNamespace(output_dir=Path("/tmp/output")),
+                "adapter",
+                6,
+                versions,
+                {"source_url": "http://source/step_3"},
+            ),
+            versions,
         )
 
     def test_server_fallback_stages_in_the_host_process(self):
