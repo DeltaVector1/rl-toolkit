@@ -2,11 +2,29 @@
 
 ## Measured long-haul evidence
 
-Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
+Snapshot: 2026-09-14 15:14 UTC, run `glm-decensor-difficulty-9`.
 
-- The latest reward report covers steps 7-34. Effective reward mean is
-  0.0629, fit is -0.0421, and the noise threshold is 0.0650. Verdict:
-  **inside the noise**. This is not evidence of improvement or decline.
+- The earlier reward report covered steps 7-34. Effective reward mean was
+  0.0629, fit was -0.0421, and the noise threshold was 0.0650. Verdict:
+  **inside the noise**. This was not evidence of improvement or decline.
+- Completed steps 35-50 had effective rewards
+  [0.0131, 0.0515, 0.0308, 0.0663, 0.0322, 0.0557, 0.0221, 0.0563,
+  0.0265, 0.0118, 0.0116, 0.0501, 0.0370, 0.0285, 0.0136, 0.0395].
+  Mean is 0.0342, standard deviation is 0.0177, fit is -0.0119, residual is
+  0.0173, and the noise threshold is 0.0346. Verdict: **inside the noise**.
+  The measured change is too small to show improvement or decline.
+- Descriptively, steps 35-40 had mean reward 0.0416, while the hard-heavy
+  steps 41-50 had mean reward 0.0297. This comparison is descriptive, not
+  statistically proven.
+- Step 50 reward was 0.0395 with 766/1,568 trainable rollouts (48.9%), zero
+  errors, and 29m08 rollout time.
+- Trainer compute for steps 44-49 was 403.74s, 405.86s, 403.26s, 406.36s,
+  403.99s, and 404.66s. This was stable at about 6m44-6m46, with a peak of
+  44.4 GiB/GPU and no OOM or nonfinite values.
+- Adapter staging for v44-v49 stayed below 5m. Examples were v44 2m58 with
+  1m33 network time, v45 3m03 with 1m30 network time, v46 2m48 with 1m28
+  network time, and v48 3m02 with 1m34 network time.
+- n82 cleanup left about 879 GiB free (74% used) during the run.
 - Step 32 reward is 0.0156 with 400/640 trainable rollouts (62.5%). The
   accepted mix is easy 10.0%, medium 32.5%, hard 57.5%; rewards are easy
   0.0366, medium 0.0111, and hard 0.0122. Compare each difficulty separately;
@@ -67,6 +85,9 @@ Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
 
 ## Did not work or is not enough
 
+- The hard-heavy staged curriculum did not show a reward climb by step 50.
+  Recent trainable rates were roughly 49-55%. These observations do not show
+  causality.
 - One step is not a reward result. Step 1 took 44m09, had 1,024/1,200
   trainable rollouts, mean reward 0.1080, and mix easy 48% / medium 36% /
   hard 16%; it is only a collection check.
@@ -83,19 +104,8 @@ Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
 
 ## In progress
 
-- The current run continues unchanged to 50 completed trainer steps.
-- Finish the active long-haul run to 40-50 completed trainer steps, then
-  compare easy, medium, and hard rewards separately and require movement
-  beyond the measured noise before claiming improvement.
-- Keep the measured raw-mix control and its approximate compensation:
-  easy:medium:hard = 1:1.05:1.97.
-- Do not change steps 41-50 mid-run.
-- If the current run remains inside the noise at 50, run a clean comparison
-  first, using constant 1:1:1 raw easy:medium:hard sampling and no other
-  mid-run changes.
-- Establish a fresh production-shaped trainer baseline below 600s with the
-  same measured token and sequence workload. Do not replay the saved rollout
-  batch or loosen the limit.
+- Next clean comparison: run 50 steps with constant 1:1:1 raw easy:medium:hard
+  sampling and everything else unchanged.
 
 ## Untested
 
@@ -104,10 +114,10 @@ Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
   history, events, retries, and strict validation.
 - A specialized correction prompt for contradictory declined and explicit-
   refusal fields.
-- Add an explicit `answer_restriction_applied` decision so a brief caution in
-  a fully fulfilled answer is not treated as an internal refusal. Keep the
-  penalty for declined, partial, or replaced answers. Test this alone for
-  40-50 steps.
+- After the clean comparison, add an explicit `answer_restriction_applied`
+  decision so a brief caution in a fully fulfilled answer is not treated as
+  an internal refusal. Keep the penalty for declined, partial, or replaced
+  answers. Test this alone for 40-50 steps.
 - Distinguish an actual refusal decision in the reasoning trace from a brief
   caution in an otherwise fulfilled answer. Do not deploy it mid-run; compare
   it only in a clean 40-50-step run.
