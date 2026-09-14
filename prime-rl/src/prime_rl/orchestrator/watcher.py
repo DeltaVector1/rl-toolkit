@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import quote
 from urllib.request import urlopen
 
+import httpx
 from modelexpress import p2p_pb2
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
@@ -486,35 +487,47 @@ class WeightWatcher:
         self.task = asyncio.current_task()
         try:
             while not self.stopped.is_set():
-                if not self.bootstrap_staged:
-                    await _run_with_retries("Initial adapter staging", self.stage_bootstrap_adapter)
+                operation_name = "Initial adapter staging"
+                try:
                     if not self.bootstrap_staged:
-                        await asyncio.sleep(self.poll_interval)
-                        continue
-                next_step = self.compute_next_ckpt_step()
-                if next_step > self.ckpt_step:
-                    update_deadline = None
-                    update_attempts = 1
-                    if self.lora_name is not None and next_step > 0:
-                        update_deadline = time.monotonic() + 2 * adapter_stage_limit_seconds(
-                            next_step
+                        await _run_with_retries(operation_name, self.stage_bootstrap_adapter)
+                        if not self.bootstrap_staged:
+                            await asyncio.sleep(self.poll_interval)
+                            continue
+                    next_step = self.compute_next_ckpt_step()
+                    if next_step > self.ckpt_step:
+                        operation_name = f"Policy update {next_step}"
+                        update_deadline = None
+                        update_attempts = 1
+                        if self.lora_name is not None and next_step > 0:
+                            update_deadline = time.monotonic() + 2 * adapter_stage_limit_seconds(
+                                next_step
+                            )
+                            update_attempts = 2
+                        await _run_with_retries(
+                            operation_name,
+                            lambda: self.apply_policy_update(next_step, update_deadline),
+                            attempts=update_attempts,
                         )
-                        update_attempts = 2
-                    await _run_with_retries(
-                        f"Policy update {next_step}",
-                        lambda: self.apply_policy_update(next_step, update_deadline),
-                        attempts=update_attempts,
+                    elif time.monotonic() - self.last_reconcile_check_at >= self.reconcile_interval:
+                        operation_name = "Current policy reconciliation"
+                        self.last_reconcile_check_at = time.monotonic()
+                        reconcile_attempts = (
+                            1 if self.lora_name is not None and self.ckpt_step > 0 else 3
+                        )
+                        await _run_with_retries(
+                            operation_name,
+                            self.reconcile_current_policy,
+                            attempts=reconcile_attempts,
+                        )
+                except httpx.TransportError as exc:
+                    # Wait for bounded engine health after an endpoint transport failure.
+                    get_logger().warning(
+                        f"{operation_name} saw an inference endpoint outage ({exc!r}); "
+                        "waiting for configured inference health before retrying"
                     )
-                elif time.monotonic() - self.last_reconcile_check_at >= self.reconcile_interval:
-                    self.last_reconcile_check_at = time.monotonic()
-                    reconcile_attempts = (
-                        1 if self.lora_name is not None and self.ckpt_step > 0 else 3
-                    )
-                    await _run_with_retries(
-                        "Current policy reconciliation",
-                        self.reconcile_current_policy,
-                        attempts=reconcile_attempts,
-                    )
+                    await self.inference.wait_for_ready(self.config.model.name)
+                    self.last_reconcile_check_at = 0.0
                 await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             return
