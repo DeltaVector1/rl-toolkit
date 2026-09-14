@@ -2,8 +2,13 @@
 
 ## Measured long-haul evidence
 
-Snapshot: 2026-09-14 15:14 UTC, run `glm-decensor-difficulty-9`.
+Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
 
+- The completed full steps 1-50 reward result has mean 0.0574, standard
+  deviation 0.0364, fit -0.0701, residual 0.0298, and noise threshold 0.0596.
+  Verdict: **falling**. The raw fall is confounded by the planned curriculum
+  moving to about 82% hard prompts, so it does not prove that the model itself
+  regressed.
 - The earlier reward report covered steps 7-34. Effective reward mean was
   0.0629, fit was -0.0421, and the noise threshold was 0.0650. Verdict:
   **inside the noise**. This was not evidence of improvement or decline.
@@ -85,15 +90,15 @@ Snapshot: 2026-09-14 15:14 UTC, run `glm-decensor-difficulty-9`.
 
 ## Did not work or is not enough
 
-- The hard-heavy staged curriculum did not show a reward climb by step 50.
-  Recent trainable rates were roughly 49-55%. These observations do not show
-  causality.
+- The hard-heavy staged curriculum did not successfully produce a reward climb
+  by step 50. Recent trainable rates were roughly 49-55%. These observations
+  do not show causality.
 - One step is not a reward result. Step 1 took 44m09, had 1,024/1,200
   trainable rollouts, mean reward 0.1080, and mix easy 48% / medium 36% /
   hard 16%; it is only a collection check.
-- The current long-haul reward is **inside the noise**, not a proven trend.
-  Do not judge an idea from five steps. Use 40-50 completed trainer steps,
-  unless a hard failure ends the experiment.
+- The steps 35-50 local window was **inside the noise**, but the authoritative
+  full steps 1-50 result is falling. Do not infer model regression from the raw
+  fall because the planned curriculum changed the difficulty mix.
 - An earlier steps 6-40 summary had reward fit -0.0048 and noise threshold
   0.0433. Keep it as historical evidence, not as the current step-32 result.
 - The previous production-shaped trainer trial stopped at the 600s
