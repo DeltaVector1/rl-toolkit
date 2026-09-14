@@ -4,12 +4,9 @@
 
 Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
 
-- The latest trainer line is step 32. Acceptance counts 31/50 completed
-  trainer steps. The run is active; it has not stopped.
-- The reward report has 26 current rows (steps 7-32). Effective mean is
-  0.0640, standard deviation 0.0359, fit -0.0418, and residual spread
-  0.0336. The noise threshold is 0.0671. Verdict: **inside the noise**.
-  This is not evidence of improvement or decline.
+- The latest reward report covers steps 7-34. Effective reward mean is
+  0.0629, fit is -0.0421, and the noise threshold is 0.0650. Verdict:
+  **inside the noise**. This is not evidence of improvement or decline.
 - Step 32 reward is 0.0156 with 400/640 trainable rollouts (62.5%). The
   accepted mix is easy 10.0%, medium 32.5%, hard 57.5%; rewards are easy
   0.0366, medium 0.0111, and hard 0.0122. Compare each difficulty separately;
@@ -34,6 +31,22 @@ Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
   reward hack. Invalid model responses are 1.55%; judge parse failures are
   0.06%.
 - Conclusion: low hard reward is mainly real refusal, not judge error.
+
+## Reasoning audit
+
+- The audit has 15,356 scored records and 5,157 fulfilled turns. None of the
+  fulfilled turns has an explicit refusal.
+- The 2,655 fulfilled-only records are the strongest possible false-positive
+  set for an internal-refusal penalty.
+- The reasoning multiplier affected 13,221 records, but this includes true
+  refusals.
+
+## Group 16 signal
+
+- Full groups were easy 278 (6 all-refusal), medium 390 (52 all-refusal), and
+  hard 477 (252 all-refusal).
+- Hard non-all-refusal groups had reward spread 217/225. This shows usable
+  signal exists, but more than half of hard groups refuse entirely.
 
 ## Worked
 
@@ -76,9 +89,10 @@ Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
   beyond the measured noise before claiming improvement.
 - Keep the measured raw-mix control and its approximate compensation:
   easy:medium:hard = 1:1.05:1.97.
+- Do not change steps 41-50 mid-run.
 - If the current run remains inside the noise at 50, run a clean comparison
-  with constant 1:1:1 raw easy:medium:hard sampling and no other mid-run
-  changes.
+  first, using constant 1:1:1 raw easy:medium:hard sampling and no other
+  mid-run changes.
 - Establish a fresh production-shaped trainer baseline below 600s with the
   same measured token and sequence workload. Do not replay the saved rollout
   batch or loosen the limit.
@@ -90,6 +104,10 @@ Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
   history, events, retries, and strict validation.
 - A specialized correction prompt for contradictory declined and explicit-
   refusal fields.
+- Add an explicit `answer_restriction_applied` decision so a brief caution in
+  a fully fulfilled answer is not treated as an internal refusal. Keep the
+  penalty for declined, partial, or replaced answers. Test this alone for
+  40-50 steps.
 - Distinguish an actual refusal decision in the reasoning trace from a brief
   caution in an otherwise fulfilled answer. Do not deploy it mid-run; compare
   it only in a clean 40-50-step run.
