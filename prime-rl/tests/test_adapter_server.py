@@ -36,6 +36,53 @@ class QuietAdapterHandler(adapter_server.RangeHandler):
 
 
 class AdapterServerTest(unittest.TestCase):
+    def _write_predictive_step(self, root, step_number=0, chunk=b"chunk"):
+        step = root / f"step_{step_number}"
+        step.mkdir()
+        config = b"{}\n"
+        weights = b"weights"
+        (step / adapter_server.stable_name).write_text("stable\n", encoding="utf-8")
+        (step / adapter_server.adapter_config_name).write_bytes(config)
+        (step / adapter_server.adapter_weights_name).write_bytes(weights)
+        weights_digest = hashlib.sha256(weights).hexdigest()
+        (step / adapter_server.adapter_digest_name).write_text(
+            weights_digest + "\n", encoding="ascii"
+        )
+        chunk_name = f"{adapter_server.adapter_weights_name}.transport-predictive-00000.bin"
+        (step / chunk_name).write_bytes(chunk)
+        manifest = {
+            "version": 2,
+            "kind": "lora-adapter",
+            "target_step": step_number,
+            "files": [
+                {
+                    "name": adapter_server.adapter_config_name,
+                    "size": len(config),
+                    "sha256": hashlib.sha256(config).hexdigest(),
+                },
+                {
+                    "name": adapter_server.adapter_weights_name,
+                    "size": len(weights),
+                    "sha256": weights_digest,
+                },
+            ],
+            "chunks": [
+                {
+                    "file": chunk_name,
+                    "wire_size": len(chunk),
+                    "wire_sha256": hashlib.sha256(chunk).hexdigest(),
+                }
+            ],
+        }
+        (step / adapter_server.adapter_manifest_name).write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        return step, manifest
+
+    def _clear_identity_state(self):
+        adapter_server._identity_cache.clear()
+        adapter_server._identity_validation_runs.clear()
+
     def test_http11_range_framing_and_disconnect(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -464,6 +511,218 @@ class AdapterServerTest(unittest.TestCase):
                     adapter_server._identity_from_published_directory = original_identity
                 adapter_server._sha256 = original_sha256
                 adapter_server._identity_cache.clear()
+
+    def test_predictive_validation_is_single_flight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            step, _manifest = self._write_predictive_step(Path(temporary))
+            original_validate = adapter_server._validate_predictive_chunks
+            started = threading.Event()
+            release = threading.Event()
+            calls = 0
+            calls_lock = threading.Lock()
+
+            def slow_validate(directory, chunks):
+                nonlocal calls
+                with calls_lock:
+                    calls += 1
+                started.set()
+                if not release.wait(5):
+                    raise AssertionError("validation did not receive release")
+                return original_validate(directory, chunks)
+
+            adapter_server._validate_predictive_chunks = slow_validate
+            self._clear_identity_state()
+            errors = []
+            results = []
+
+            def validate():
+                try:
+                    results.append(
+                        adapter_server._identity_from_published_directory(
+                            step, 0, cache=False
+                        )
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            requests = [threading.Thread(target=validate) for _ in range(16)]
+            try:
+                for request in requests:
+                    request.start()
+                self.assertTrue(started.wait(5))
+                time.sleep(0.1)
+                self.assertEqual(calls, 1)
+                release.set()
+                for request in requests:
+                    request.join(timeout=5)
+                self.assertFalse(errors)
+                self.assertEqual(len(results), len(requests))
+            finally:
+                release.set()
+                for request in requests:
+                    request.join(timeout=5)
+                adapter_server._validate_predictive_chunks = original_validate
+                self._clear_identity_state()
+
+    def test_changed_publication_runs_predictive_validation_again(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            step, manifest = self._write_predictive_step(Path(temporary))
+            original_validate = adapter_server._validate_predictive_chunks
+            calls = 0
+
+            def counted_validate(directory, chunks):
+                nonlocal calls
+                calls += 1
+                return original_validate(directory, chunks)
+
+            adapter_server._validate_predictive_chunks = counted_validate
+            self._clear_identity_state()
+            try:
+                adapter_server._identity_from_published_directory(step, 0, cache=False)
+                (step / adapter_server.adapter_manifest_name).write_text(
+                    json.dumps(manifest) + "\n", encoding="utf-8"
+                )
+                adapter_server._identity_from_published_directory(step, 0, cache=False)
+                self.assertEqual(calls, 2)
+            finally:
+                adapter_server._validate_predictive_chunks = original_validate
+                self._clear_identity_state()
+
+    def test_validation_error_is_shared_and_retry_can_validate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            step, _manifest = self._write_predictive_step(Path(temporary))
+            original_validate = adapter_server._validate_predictive_chunks
+            started = threading.Event()
+            release = threading.Event()
+            calls = 0
+            calls_lock = threading.Lock()
+
+            def failing_validate(directory, chunks):
+                nonlocal calls
+                with calls_lock:
+                    calls += 1
+                started.set()
+                if not release.wait(5):
+                    raise AssertionError("validation did not receive release")
+                raise adapter_server.UpgradeError("shared validation failure")
+
+            adapter_server._validate_predictive_chunks = failing_validate
+            self._clear_identity_state()
+            errors = []
+
+            def validate():
+                try:
+                    adapter_server._identity_from_published_directory(
+                        step, 0, cache=False
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            requests = [threading.Thread(target=validate) for _ in range(8)]
+            try:
+                for request in requests:
+                    request.start()
+                self.assertTrue(started.wait(5))
+                time.sleep(0.1)
+                self.assertEqual(calls, 1)
+                release.set()
+                for request in requests:
+                    request.join(timeout=5)
+                self.assertEqual(len(errors), len(requests))
+                self.assertTrue(all(str(error) == "shared validation failure" for error in errors))
+                adapter_server._validate_predictive_chunks = original_validate
+                adapter_server._identity_from_published_directory(step, 0, cache=False)
+                self.assertEqual(calls, 1)
+            finally:
+                release.set()
+                for request in requests:
+                    request.join(timeout=5)
+                adapter_server._validate_predictive_chunks = original_validate
+                self._clear_identity_state()
+
+    def test_distinct_publications_do_not_share_validation_waiters(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            step_zero, _manifest = self._write_predictive_step(root, 0)
+            step_one, _manifest = self._write_predictive_step(root, 1)
+            original_validate = adapter_server._validate_predictive_chunks
+            started = threading.Event()
+            release = threading.Event()
+
+            def block_first_publication(directory, chunks):
+                if directory == step_zero:
+                    started.set()
+                    if not release.wait(5):
+                        raise AssertionError("validation did not receive release")
+                return original_validate(directory, chunks)
+
+            adapter_server._validate_predictive_chunks = block_first_publication
+            self._clear_identity_state()
+            first_error = []
+            first = threading.Thread(
+                target=lambda: self._validate_for_test(step_zero, 0, first_error)
+            )
+            try:
+                first.start()
+                self.assertTrue(started.wait(5))
+                second_error = []
+                self._validate_for_test(step_one, 1, second_error)
+                self.assertFalse(second_error)
+                release.set()
+                first.join(timeout=5)
+                self.assertFalse(first.is_alive())
+                self.assertFalse(first_error)
+            finally:
+                release.set()
+                first.join(timeout=5)
+                adapter_server._validate_predictive_chunks = original_validate
+                self._clear_identity_state()
+
+    def test_identity_cache_is_bounded_and_keeps_recent_publications(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for step_number in range(adapter_server._MAX_IDENTITY_CACHE_ENTRIES + 2):
+                self._write_predictive_step(root, step_number)
+            original_validate = adapter_server._validate_predictive_chunks
+            calls = 0
+
+            def counted_validate(directory, chunks):
+                nonlocal calls
+                calls += 1
+                return original_validate(directory, chunks)
+
+            adapter_server._validate_predictive_chunks = counted_validate
+            self._clear_identity_state()
+            try:
+                for step_number in range(adapter_server._MAX_IDENTITY_CACHE_ENTRIES + 2):
+                    adapter_server._identity_from_published_directory(
+                        root / f"step_{step_number}", step_number, cache=False
+                    )
+                self.assertLessEqual(
+                    len(adapter_server._identity_cache),
+                    adapter_server._MAX_IDENTITY_CACHE_ENTRIES,
+                )
+                calls_after_fill = calls
+                adapter_server._identity_from_published_directory(
+                    root / f"step_{adapter_server._MAX_IDENTITY_CACHE_ENTRIES + 1}",
+                    adapter_server._MAX_IDENTITY_CACHE_ENTRIES + 1,
+                    cache=False,
+                )
+                self.assertEqual(calls, calls_after_fill)
+                adapter_server._identity_from_published_directory(
+                    root / "step_0", 0, cache=False
+                )
+                self.assertEqual(calls, calls_after_fill + 1)
+            finally:
+                adapter_server._validate_predictive_chunks = original_validate
+                self._clear_identity_state()
+
+    @staticmethod
+    def _validate_for_test(step, step_number, errors):
+        try:
+            adapter_server._identity_from_published_directory(step, step_number, cache=False)
+        except Exception as exc:
+            errors.append(exc)
 
     def test_predictive_install_rejects_false_chunk_checksum(self):
         with tempfile.TemporaryDirectory() as temporary:

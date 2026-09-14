@@ -12,7 +12,7 @@ import time
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from threading import Lock
+from threading import Event, Lock
 from urllib.parse import unquote, urlsplit
 
 
@@ -35,11 +35,22 @@ class UpgradeError(RuntimeError):
     pass
 
 
-_identity_cache: dict[
-    tuple[int, bool, bool, tuple[tuple[int, int, int, int, int], ...]],
+_identity_cache: OrderedDict[
+    tuple[object, ...],
     dict[str, object],
-] = {}
+] = OrderedDict()
 _identity_lock = Lock()
+_MAX_IDENTITY_CACHE_ENTRIES = 32
+
+
+class _ValidationRun:
+    def __init__(self) -> None:
+        self.done = Event()
+        self.result: dict[str, object] | None = None
+        self.error: BaseException | None = None
+
+
+_identity_validation_runs: dict[tuple[object, ...], _ValidationRun] = {}
 _transport_digest_cache: OrderedDict[tuple[str, tuple[int, int, int, int, int]], None] = OrderedDict()
 _transport_digest_lock = Lock()
 _MAX_TRANSPORT_DIGEST_CACHE_ENTRIES = 128
@@ -114,12 +125,10 @@ def _verify_transport_fd(fd: int, expected_size: int, expected_digest: str) -> N
             _transport_digest_cache.popitem(last=False)
 
 
-def _validate_predictive_chunks(
-    directory: Path, chunks: object
-) -> list[Path]:
+def _predictive_chunk_records(chunks: object) -> list[tuple[str, int, str]]:
     if not isinstance(chunks, list) or not chunks:
         raise UpgradeError("predictive manifest has no transport chunks")
-    paths: list[Path] = []
+    records: list[tuple[str, int, str]] = []
     seen: set[str] = set()
     for item in chunks:
         if not isinstance(item, dict) or not isinstance(item.get("file"), str):
@@ -140,6 +149,16 @@ def _validate_predictive_chunks(
             or digest_pattern.fullmatch(digest) is None
         ):
             raise UpgradeError("predictive manifest chunk identity is invalid")
+        records.append((name, size, digest))
+        seen.add(name)
+    return records
+
+
+def _validate_predictive_chunks(
+    directory: Path, chunks: object
+) -> list[Path]:
+    paths: list[Path] = []
+    for name, size, digest in _predictive_chunk_records(chunks):
         path = directory / name
         if path.is_symlink() or not path.is_file():
             raise UpgradeError(f"predictive manifest chunk is missing: {name}")
@@ -154,7 +173,6 @@ def _validate_predictive_chunks(
             _verify_transport_fd(fd, size, digest)
         finally:
             os.close(fd)
-        seen.add(name)
         paths.append(path)
     return paths
 
@@ -247,6 +265,7 @@ def _identity_from_published_directory(
     if not cache and not (directory / stable_name).is_file():
         raise UpgradeError(f"adapter step {step} is not stable")
 
+    predictive_chunk_records: tuple[tuple[str, int, str], ...] = ()
     if cache:
         identity = _json_object(directory / ".identity.json", f"adapter cache step {step} identity")
         if identity.get("step") != step:
@@ -275,10 +294,10 @@ def _identity_from_published_directory(
         if manifest.get("kind") != "lora-adapter" or manifest.get("target_step") != step:
             raise UpgradeError(f"adapter step {step} manifest has the wrong identity")
         records = _file_records(manifest, f"adapter step {step} manifest")
-        predictive_chunk_paths = (
-            _validate_predictive_chunks(directory, manifest.get("chunks"))
+        predictive_chunk_records = (
+            _predictive_chunk_records(manifest.get("chunks"))
             if manifest.get("version") == 2
-            else []
+            else ()
         )
         description = f"adapter step {step}"
 
@@ -311,41 +330,89 @@ def _identity_from_published_directory(
     ]
     if not cache:
         stat_paths.append(directory / stable_name)
-        stat_paths.extend(predictive_chunk_paths)
-    cache_key = (
+    metadata_key = (
         step,
         cache,
         verify_weights,
         tuple(_stat_identity(path) for path in stat_paths),
+        tuple(predictive_chunk_records),
+        opened_weight_stat,
     )
-    if opened_weight_stat is not None and opened_weight_stat != cache_key[3][1]:
+    if opened_weight_stat is not None and opened_weight_stat != _stat_identity(
+        directory / adapter_weights_name
+    ):
         raise UpgradeError(f"{description} weights changed before validation")
-    with _identity_lock:
-        cached = _identity_cache.get(cache_key)
-        if cached is not None:
-            return cached.copy()
 
-        actual_config_digest = _sha256(directory / adapter_config_name)
-        if actual_config_digest != records[adapter_config_name]["sha256"]:
-            raise UpgradeError(f"{description} configuration checksum differs")
-        if verify_weights:
-            actual_weights_digest = (
-                _sha256_fd(weight_fd, adapter_weights_name)
-                if weight_fd is not None
-                else _sha256(directory / adapter_weights_name)
-            )
-            if actual_weights_digest != records[adapter_weights_name]["sha256"]:
-                raise UpgradeError(f"{description} weight checksum differs")
-        if weight_fd is not None and _fd_stat_identity(weight_fd) != opened_weight_stat:
-            raise UpgradeError(f"{description} weights changed during validation")
-        validated_identity = {
-            "step": step,
-            "config_size": records[adapter_config_name]["size"],
-            "config_sha256": records[adapter_config_name]["sha256"],
-            "weights_size": records[adapter_weights_name]["size"],
-            "weights_sha256": records[adapter_weights_name]["sha256"],
-        }
-        _identity_cache[cache_key] = validated_identity
+    with _identity_lock:
+        validation_run = _identity_validation_runs.get(metadata_key)
+        if validation_run is None:
+            validation_run = _ValidationRun()
+            _identity_validation_runs[metadata_key] = validation_run
+            is_owner = True
+        else:
+            is_owner = False
+    if not is_owner:
+        validation_run.done.wait()
+        if validation_run.error is not None:
+            raise validation_run.error
+        if validation_run.result is None:
+            raise UpgradeError("published adapter validation returned no identity")
+        return validation_run.result.copy()
+
+    try:
+        chunk_stat_paths = tuple(
+            _stat_identity(directory / name) for name, _size, _digest in predictive_chunk_records
+        )
+        cache_key = metadata_key + (chunk_stat_paths,)
+        with _identity_lock:
+            cached = _identity_cache.get(cache_key)
+            if cached is not None:
+                _identity_cache.move_to_end(cache_key)
+        if cached is not None:
+            validated_identity = cached.copy()
+        else:
+            if predictive_chunk_records:
+                _validate_predictive_chunks(
+                    directory,
+                    manifest.get("chunks"),
+                )
+            actual_config_digest = _sha256(directory / adapter_config_name)
+            if actual_config_digest != records[adapter_config_name]["sha256"]:
+                raise UpgradeError(f"{description} configuration checksum differs")
+            if verify_weights:
+                actual_weights_digest = (
+                    _sha256_fd(weight_fd, adapter_weights_name)
+                    if weight_fd is not None
+                    else _sha256(directory / adapter_weights_name)
+                )
+                if actual_weights_digest != records[adapter_weights_name]["sha256"]:
+                    raise UpgradeError(f"{description} weight checksum differs")
+            if weight_fd is not None and _fd_stat_identity(weight_fd) != opened_weight_stat:
+                raise UpgradeError(f"{description} weights changed during validation")
+            validated_identity = {
+                "step": step,
+                "config_size": records[adapter_config_name]["size"],
+                "config_sha256": records[adapter_config_name]["sha256"],
+                "weights_size": records[adapter_weights_name]["size"],
+                "weights_sha256": records[adapter_weights_name]["sha256"],
+            }
+            with _identity_lock:
+                _identity_cache[cache_key] = validated_identity.copy()
+                _identity_cache.move_to_end(cache_key)
+                while len(_identity_cache) > _MAX_IDENTITY_CACHE_ENTRIES:
+                    _identity_cache.popitem(last=False)
+                validated_identity = validated_identity.copy()
+    except BaseException as exc:
+        with _identity_lock:
+            validation_run.error = exc
+            _identity_validation_runs.pop(metadata_key, None)
+            validation_run.done.set()
+        raise
+    else:
+        with _identity_lock:
+            validation_run.result = validated_identity.copy()
+            _identity_validation_runs.pop(metadata_key, None)
+            validation_run.done.set()
         return validated_identity.copy()
 
 
