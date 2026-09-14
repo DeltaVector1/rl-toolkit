@@ -861,11 +861,11 @@ def _run_bounded_futures(
     deadline: float | None,
     cancel_event: threading.Event | None = None,
 ) -> None:
-    """Run at most ``width`` active or queued tasks and refill on completion."""
+    """Run bounded tasks and reuse each lane as its task completes."""
     if width < 1:
         raise OSError("adapter download stream width must be positive")
     entries = iter(enumerate(items))
-    pending = set()
+    pending = {}
     executor = ThreadPoolExecutor(max_workers=min(width, len(items))) if items else None
     if executor is None:
         return
@@ -875,7 +875,8 @@ def _run_bounded_futures(
                 index, item = next(entries)
             except StopIteration:
                 break
-            pending.add(executor.submit(worker, index, item))
+            lane = len(pending)
+            pending[executor.submit(worker, index, item, lane)] = lane
         while pending:
             _check_deadline(deadline, cancel_event)
             timeout = None
@@ -891,15 +892,14 @@ def _run_bounded_futures(
             if not done:
                 raise TimeoutError("adapter delta staging exceeded its time limit")
             for future in done:
-                pending.remove(future)
+                lane = pending.pop(future)
                 future.result()
                 _check_cancelled(cancel_event)
-            while len(pending) < width:
                 try:
                     index, item = next(entries)
                 except StopIteration:
-                    break
-                pending.add(executor.submit(worker, index, item))
+                    continue
+                pending[executor.submit(worker, index, item, lane)] = lane
         _check_cancelled(cancel_event)
     except BaseException:
         if cancel_event is not None:
@@ -4350,7 +4350,11 @@ def _stage_chunked_linear_adapter(
     )
     _write_marker(temporary / _RELAYING_MARKER, "relaying\n")
 
-    def fetch_wire(index: int, item: dict[str, object]) -> None:
+    def fetch_wire(
+        index: int,
+        item: dict[str, object],
+        assigned_lane: int,
+    ) -> None:
         nonlocal transfer_started, transfer_finished
         _check_cancelled(cancel_event)
         name = item["file"]
@@ -4416,7 +4420,7 @@ def _stage_chunked_linear_adapter(
                 wire_ready_valid = False
 
         if not wire_ready_valid:
-            chunk_lane = index % len(lane_urls)
+            chunk_lane = assigned_lane
 
             def lane_report(_lane: int, amount: int) -> None:
                 report(chunk_lane, amount)
@@ -4583,19 +4587,24 @@ def _stage_chunked_linear_adapter(
     reconstruct_futures = []
     reconstruct_futures_lock = threading.Lock()
 
-    def fetch_and_reconstruct(index: int, item: dict[str, object]) -> None:
-        fetch_wire(index, item)
+    def fetch_and_reconstruct(
+        index: int,
+        item: dict[str, object],
+        assigned_lane: int,
+    ) -> None:
+        fetch_wire(index, item, assigned_lane)
         future = reconstruct_executor.submit(reconstruct, index, item)
         with reconstruct_futures_lock:
             reconstruct_futures.append(future)
 
-    download_executor = ThreadPoolExecutor(max_workers=download_width)
-    download_futures = [
-        download_executor.submit(fetch_and_reconstruct, index, item)
-        for index, item in enumerate(chunks)
-    ]
     try:
-        _wait_for_futures(download_executor, download_futures, deadline, cancel_event)
+        _run_bounded_futures(
+            chunks,
+            fetch_and_reconstruct,
+            download_width,
+            deadline,
+            cancel_event,
+        )
     except BaseException:
         reconstruct_executor.shutdown(wait=True, cancel_futures=True)
         raise
@@ -4985,7 +4994,11 @@ def _stage_chunked_xor_adapter(
         )
         _write_marker(temporary / _RELAYING_MARKER, "relaying\n")
 
-    def fetch(index: int, item: dict[str, object]) -> None:
+    def fetch(
+        index: int,
+        item: dict[str, object],
+        assigned_lane: int | None = None,
+    ) -> None:
         nonlocal transfer_started, transfer_finished
         nonlocal reconstruction_started, reconstruction_finished
         nonlocal reconstruction_worker_seconds
@@ -5004,7 +5017,9 @@ def _stage_chunked_xor_adapter(
         completed_path = chunk_path.with_name(f"{chunk_path.name}.done")
         _reject_symlink_path(completed_path, "adapter completed proof")
 
-        if persistent_pool is not None:
+        if assigned_lane is not None:
+            chunk_lane = assigned_lane
+        elif persistent_pool is not None:
             chunk_lane = index % persistent_pool.slot_count
         else:
             chunk_lane = index % len(lane_urls)

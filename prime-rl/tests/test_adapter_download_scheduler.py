@@ -1652,7 +1652,7 @@ class DownloadSchedulerTest(unittest.TestCase):
         pending = 0
         maximum_pending = 0
 
-        def worker(index, _item):
+        def worker(index, _item, _lane):
             nonlocal active, maximum_active
             with lock:
                 active += 1
@@ -1702,13 +1702,44 @@ class DownloadSchedulerTest(unittest.TestCase):
         self.assertLessEqual(maximum_active, 2)
         self.assertLessEqual(maximum_pending, 2)
 
+    def test_bounded_scheduler_reuses_freed_lane(self):
+        filesystem = load_filesystem_module()
+        lock = threading.Lock()
+        started = {}
+        finished = {}
+        release_slow = threading.Event()
+
+        def worker(index, _item, lane):
+            with lock:
+                started[index] = (lane, time.monotonic())
+            if index == 0:
+                self.assertTrue(release_slow.wait(2))
+            elif index == 1:
+                time.sleep(0.03)
+            elif index == 2:
+                release_slow.set()
+            with lock:
+                finished[index] = time.monotonic()
+
+        filesystem._run_bounded_futures(
+            list(range(3)),
+            worker,
+            2,
+            time.monotonic() + 3,
+            threading.Event(),
+        )
+        self.assertEqual(started[0][0], 0)
+        self.assertEqual(started[1][0], 1)
+        self.assertEqual(started[2][0], 1)
+        self.assertLess(started[2][1], finished[0])
+
     def test_bounded_full_scheduler_caps_configured_streams_to_lanes(self):
         filesystem = load_filesystem_module()
         lock = threading.Lock()
         pending = 0
         maximum_pending = 0
 
-        def worker(_index, _item):
+        def worker(_index, _item, _lane):
             time.sleep(0.005)
 
         real_executor = filesystem.ThreadPoolExecutor
