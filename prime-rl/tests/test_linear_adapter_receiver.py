@@ -597,12 +597,15 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         old_decode = filesystem._decode_linear_transport_chunk
         old_timeout = filesystem._delta_stage_timeout_s
         old_pool = filesystem._PersistentAdapterLanePool
+        old_status = filesystem._write_stage_status
+        old_interval = filesystem._ADAPTER_STATUS_INTERVAL_S
         relaying_seen_before_chunk = False
         wire_proof_seen_during_decode = False
         decode_calls = 0
         chunk_download_calls = 0
         base_calls = []
         pool_instances = []
+        statuses = []
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
@@ -622,6 +625,14 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 def fake_download(_source, destination, **kwargs):
                     nonlocal relaying_seen_before_chunk, chunk_download_calls
                     destination.parent.mkdir(parents=True, exist_ok=True)
+                    if (
+                        "adapter_config.json" in destination.name
+                        and destination.is_file()
+                        and destination.stat().st_size == len(config)
+                        and hashlib.sha256(destination.read_bytes()).hexdigest()
+                        == digest(config)
+                    ):
+                        return
                     if "chunk-" in destination.name:
                         chunk_download_calls += 1
                         relaying_seen_before_chunk = (
@@ -632,6 +643,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     )
                     if kwargs.get("progress"):
                         kwargs["progress"](0, destination.stat().st_size)
+                        time.sleep(0.02)
 
                 class FakePool:
                     def __init__(self, source_urls, width):
@@ -669,6 +681,14 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 filesystem._source_manifest = lambda *_args, **_kwargs: source_manifest
                 filesystem._delta_stage_timeout_s = lambda: 30.0
 
+                def record_status(cache_root, value, **kwargs):
+                    statuses.append(dict(value))
+                    time.sleep(0.001)
+                    return old_status(cache_root, value, **kwargs)
+
+                filesystem._write_stage_status = record_status
+                filesystem._ADAPTER_STATUS_INTERVAL_S = 0.005
+
                 def fake_decode(*_args, **_kwargs):
                     nonlocal decode_calls, wire_proof_seen_during_decode
                     decode_calls += 1
@@ -705,6 +725,8 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 self.assertTrue(
                     (partial / "transport-chunks" / "chunk-0.wire-ready").is_file()
                 )
+                (partial / ".adapter_config.json.incoming").write_bytes(config)
+                statuses.clear()
                 result = filesystem._stage_chunked_linear_adapter(
                     source_url,
                     transport,
@@ -721,6 +743,34 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 self.assertTrue(wire_proof_seen_during_decode)
                 self.assertEqual(chunk_download_calls, 1)
                 self.assertTrue(all(pool.closed for pool in pool_instances))
+                self.assertTrue(
+                    any(
+                        value["status"] == "staging"
+                        and value["phase"] == "downloading"
+                        and value["bytes_done"] == value["bytes_total"]
+                        for value in statuses
+                    )
+                )
+                segments = []
+                segment = []
+                for value in statuses:
+                    segment.append(value)
+                    if value.get("status") == "ready":
+                        segments.append(segment)
+                        segment = []
+                for segment in segments:
+                    progress = [
+                        value["bytes_done"]
+                        for value in segment
+                        if value.get("status") == "staging"
+                    ]
+                    self.assertEqual(progress, sorted(progress))
+                    elapsed = [
+                        value["elapsed_seconds"]
+                        for value in segment
+                        if value.get("status") == "staging"
+                    ]
+                    self.assertEqual(elapsed, sorted(elapsed))
                 self.assertFalse(
                     (result / "transport-chunks" / "chunk-0.wire-ready").exists()
                 )
@@ -770,6 +820,8 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             filesystem._decode_linear_transport_chunk = old_decode
             filesystem._delta_stage_timeout_s = old_timeout
             filesystem._PersistentAdapterLanePool = old_pool
+            filesystem._write_stage_status = old_status
+            filesystem._ADAPTER_STATUS_INTERVAL_S = old_interval
 
     def test_linear_receiver_caps_download_workers_to_responsive_lanes(self):
         filesystem = load_filesystem()
