@@ -75,7 +75,7 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
     return namespace["_verify_startup_adapter_delta"]
 
 
-def load_pruned_resume_selector(urlopen, verify):
+def load_pruned_resume_selector(urlopen, verify, validate_manifest=None):
     source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
     function = next(
         node
@@ -93,6 +93,7 @@ def load_pruned_resume_selector(urlopen, verify):
             f"http://source/{path.name}"
         ),
         "_verify_startup_adapter_delta": verify,
+        "validate_adapter_manifest": validate_manifest or (lambda *_args, **_kwargs: None),
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"), namespace)
     return namespace["_select_pruned_resume_tail"]
@@ -1033,11 +1034,40 @@ class ResumeRecoveryTest(unittest.TestCase):
         def fetch(_url, timeout):
             raise HTTPError("http://source/step_0/adapter_manifest.json", 404, "gone", {}, None)
 
-        def verify(*args):
+        def verify(*args, **_kwargs):
             calls.append(args)
-            return {"version": 2, "base_step": 3, "base2_step": 2}
+            return (
+                {"version": 2, "base_step": 3, "base2_step": 2},
+                {
+                    "version": 2,
+                    "target_step": 3,
+                    "target_url": "http://source/step_3",
+                    "base_url": "http://source/step_2",
+                    "base2_url": "http://source/step_1",
+                    "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+                },
+                {
+                    "version": 2,
+                    "target_step": 2,
+                    "target_url": "http://source/step_2",
+                    "base_url": "http://source/step_1",
+                    "base2_url": "http://source/step_0",
+                    "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+                },
+            )
 
-        selector = load_pruned_resume_selector(fetch, verify)
+        def validate(manifest, *, target_step, target_url, base_url, base2_url):
+            if (
+                manifest.get("version") != 2
+                or manifest.get("target_step") != target_step
+                or manifest.get("target_url") != target_url
+                or manifest.get("base_url") != base_url
+                or manifest.get("base2_url") != base2_url
+                or manifest.get("transport") != "chunked-bf16-linear-zigzag-sparse-zstd"
+            ):
+                raise RuntimeError("invalid predecessor")
+
+        selector = load_pruned_resume_selector(fetch, verify, validate)
         selected = selector(
             SimpleNamespace(output_dir=Path("/tmp/output")),
             "adapter",
@@ -1048,11 +1078,68 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertEqual(selected, (4, 5, 6))
         self.assertEqual(calls[0][2], 4)
 
+    def test_pruned_tail_rejects_non_v2_or_malformed_predecessors(self):
+        def fetch(_url, timeout):
+            raise HTTPError("http://source/step_0/adapter_manifest.json", 404, "gone", {}, None)
+
+        def validate(manifest, *, target_step, target_url, base_url, base2_url):
+            if (
+                manifest.get("version") != 2
+                or manifest.get("target_step") != target_step
+                or manifest.get("target_url") != target_url
+                or manifest.get("base_url") != base_url
+                or manifest.get("base2_url") != base2_url
+                or manifest.get("transport") != "chunked-bf16-linear-zigzag-sparse-zstd"
+            ):
+                raise RuntimeError("invalid predecessor")
+
+        def chain(step3, step2):
+            return (
+                {"version": 2, "base_step": 3, "base2_step": 2},
+                step3,
+                step2,
+            )
+
+        exact_step3 = {
+            "version": 2,
+            "target_step": 3,
+            "target_url": "http://source/step_3",
+            "base_url": "http://source/step_2",
+            "base2_url": "http://source/step_1",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+        }
+        exact_step2 = {
+            "version": 2,
+            "target_step": 2,
+            "target_url": "http://source/step_2",
+            "base_url": "http://source/step_1",
+            "base2_url": "http://source/step_0",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+        }
+        cases = [(dict(exact_step3, version=1), exact_step2)]
+        for field in ("target_url", "base_url", "transport"):
+            cases.append((exact_step3, dict(exact_step2, **{field: "http://source/bad"})) if field != "transport" else (exact_step3, dict(exact_step2, transport="bad")))
+        for step3, step2 in cases:
+            with self.subTest(step3=step3, step2=step2):
+                selector = load_pruned_resume_selector(
+                    fetch,
+                    lambda *_args, chain=chain(step3, step2), **_kwargs: chain,
+                    validate,
+                )
+                with self.assertRaisesRegex(RuntimeError, "invalid|version-two"):
+                    selector(
+                        SimpleNamespace(output_dir=Path("/tmp/output")),
+                        "adapter",
+                        6,
+                        (1, 2, 3, 4, 5, 6),
+                        None,
+                    )
+
     def test_pruned_resume_rejects_noncontiguous_saved_tail(self):
         def fetch(_url, timeout):
             raise HTTPError("http://source/step_0/adapter_manifest.json", 404, "gone", {}, None)
 
-        selector = load_pruned_resume_selector(fetch, lambda *_args: {"version": 2})
+        selector = load_pruned_resume_selector(fetch, lambda *_args, **_kwargs: {"version": 2})
         with self.assertRaisesRegex(RuntimeError, "not contiguous"):
             selector(
                 SimpleNamespace(output_dir=Path("/tmp/output")),
@@ -1092,7 +1179,7 @@ class ResumeRecoveryTest(unittest.TestCase):
                 def fetch(_url, timeout, failure=failure):
                     raise failure
 
-                selector = load_pruned_resume_selector(fetch, lambda *_args: {"version": 2})
+                selector = load_pruned_resume_selector(fetch, lambda *_args, **_kwargs: {"version": 2})
                 with self.assertRaises((TimeoutError, RuntimeError)):
                     selector(
                         SimpleNamespace(output_dir=Path("/tmp/output")),
@@ -1111,7 +1198,7 @@ class ResumeRecoveryTest(unittest.TestCase):
             RuntimeError("adapter manifest is unavailable"),
         ):
             with self.subTest(result=result):
-                def verify(*_args, result=result):
+                def verify(*_args, result=result, **_kwargs):
                     if isinstance(result, Exception):
                         raise result
                     return result

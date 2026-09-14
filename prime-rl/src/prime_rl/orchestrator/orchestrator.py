@@ -183,7 +183,8 @@ def _verify_startup_adapter_delta(
     *,
     previous_identity: dict[str, object] | None = None,
     previous_previous_identity: dict[str, object] | None = None,
-) -> dict[str, object] | None:
+    return_predecessors: bool = False,
+) -> dict[str, object] | tuple[dict[str, object], dict[str, object], dict[str, object]] | None:
     """Reject a positive resume unless its published adjacent delta is exact."""
     if lora_name is None or step <= 0:
         return
@@ -319,6 +320,9 @@ def _verify_startup_adapter_delta(
             raise RuntimeError(
                 f"cannot resume LoRA policy v{step}: adjacent adapter base or SHA-256 identity differs"
             )
+        if return_predecessors:
+            assert previous_manifest is not None and previous_previous_manifest is not None
+            return manifest, previous_manifest, previous_previous_manifest
         return manifest
 
     if previous_identity is not None:
@@ -433,16 +437,57 @@ def _select_pruned_resume_tail(
         tail[0],
         tail_path,
         tail_url,
+        return_predecessors=True,
     )
     if (
-        not isinstance(tail_manifest, dict)
-        or tail_manifest.get("version") != 2
-        or tail_manifest.get("base_step") != tail[0] - 1
-        or tail_manifest.get("base2_step") != tail[0] - 2
+        not isinstance(tail_manifest, tuple)
+        or len(tail_manifest) != 3
     ):
         raise RuntimeError(
             f"cannot resume policy {final_sync_version}: retained adapter tail is not a version-two delta"
         )
+    target_manifest, *predecessors = tail_manifest
+    if (
+        target_manifest.get("version") != 2
+        or target_manifest.get("base_step") != tail[0] - 1
+        or target_manifest.get("base2_step") != tail[0] - 2
+    ):
+        raise RuntimeError(
+            f"cannot resume policy {final_sync_version}: retained adapter tail is not a version-two delta"
+        )
+    for predecessor_step, predecessor_manifest in zip((3, 2), predecessors):
+        predecessor_url = inference_weight_path(
+            config, get_step_path(broadcast_dir, predecessor_step), lora_name
+        )
+        predecessor_base_url = inference_weight_path(
+            config, get_step_path(broadcast_dir, predecessor_step - 1), lora_name
+        )
+        predecessor_base2_url = inference_weight_path(
+            config, get_step_path(broadcast_dir, predecessor_step - 2), lora_name
+        )
+        if not all(
+            isinstance(url, str)
+            for url in (predecessor_url, predecessor_base_url, predecessor_base2_url)
+        ):
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: retained predecessor has no source URL"
+            )
+        if predecessor_manifest.get("version") != 2:
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: retained predecessor is not a version-two delta"
+            )
+        try:
+            validate_adapter_manifest(
+                predecessor_manifest,
+                target_step=predecessor_step,
+                target_url=predecessor_url,
+                base_url=predecessor_base_url,
+                base2_url=predecessor_base2_url,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: retained predecessor is invalid"
+            ) from exc
     return tail
 
 
