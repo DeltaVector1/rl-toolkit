@@ -1659,6 +1659,285 @@ class AdapterTransportStateTest(unittest.TestCase):
             (new_cache / "adapter_model.safetensors").write_bytes(b"new-model")
             self.assertEqual((old_cache / "adapter_model.safetensors").read_bytes(), model)
 
+    def test_restart_reuses_verified_cache_without_remote_manifest(self):
+        filesystem = load_filesystem_module()
+        source_url = "http://source/run/broadcasts/step_0"
+        config = b"{}\n"
+        model = b"verified-model"
+        config_spec = {"size": len(config), "sha256": hashlib.sha256(config).hexdigest()}
+        model_spec = {"size": len(model), "sha256": hashlib.sha256(model).hexdigest()}
+        files = {"adapter_config.json": config_spec, "adapter_model.safetensors": model_spec}
+        adapter_manifest = {
+            "version": 1,
+            "kind": "lora-adapter",
+            "mode": "full",
+            "target_step": 0,
+            "base_step": None,
+            "full_size": model_spec["size"],
+            "full_sha256": model_spec["sha256"],
+            "target_size": model_spec["size"],
+            "target_sha256": model_spec["sha256"],
+            "config_size": config_spec["size"],
+            "config_sha256": config_spec["sha256"],
+            "files": [{"name": name, **spec} for name, spec in files.items()],
+        }
+        relay_files = {
+            "adapter_manifest.json": {
+                "path": "adapter_manifest.json",
+                "size": len(json.dumps(adapter_manifest)),
+                "sha256": hashlib.sha256(json.dumps(adapter_manifest).encode()).hexdigest(),
+            },
+            **{
+                name: {"path": name, **spec}
+                for name, spec in files.items()
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+            old_stage_id = os.environ.get("PRIME_LORA_STAGE_ID")
+            try:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                os.environ["PRIME_LORA_STAGE_ID"] = "restart-stage"
+                destination = filesystem.adapter_cache_path(source_url)
+                destination.mkdir(parents=True)
+                manifest = {"version": 1, "source_url": source_url, "files": files}
+                adapter_manifest_text = json.dumps(adapter_manifest)
+                (destination / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                (destination / "adapter_manifest.json").write_text(
+                    adapter_manifest_text,
+                    encoding="utf-8",
+                )
+                (destination / "relay_manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "source_url": source_url,
+                            "transport": "full",
+                            "files": relay_files,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (destination / "adapter_config.json").write_bytes(config)
+                (destination / "adapter_model.safetensors").write_bytes(model)
+                (destination / "adapter_model.safetensors.sha256").write_text(
+                    model_spec["sha256"] + "\n",
+                    encoding="ascii",
+                )
+                (destination / "READY").write_text("ready\n", encoding="ascii")
+                with mock.patch.object(
+                    filesystem,
+                    "_read_chunked_xor_manifest",
+                    side_effect=AssertionError("remote manifest must not be read"),
+                ), mock.patch.object(
+                    filesystem,
+                    "_source_manifest",
+                    side_effect=AssertionError("remote source manifest must not be read"),
+                ):
+                    result = filesystem.stage_lora_adapter_files(source_url)
+                self.assertEqual(result, destination)
+                status = filesystem.adapter_stage_status()
+                self.assertEqual(status["stage_id"], "restart-stage")
+                self.assertEqual(status["pid"], os.getpid())
+                self.assertEqual(status["source_url"], source_url)
+                self.assertEqual(status["path"], destination.as_posix())
+                self.assertEqual(status["target_sha256"], model_spec["sha256"])
+                self.assertTrue(status["cache_hit"])
+            finally:
+                if old_cache is None:
+                    os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+                else:
+                    os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+                if old_stage_id is None:
+                    os.environ.pop("PRIME_LORA_STAGE_ID", None)
+                else:
+                    os.environ["PRIME_LORA_STAGE_ID"] = old_stage_id
+
+    def test_restart_cache_recovery_rejects_unverified_entries(self):
+        filesystem = load_filesystem_module()
+        source_url = "http://source/run/broadcasts/step_0"
+        config = b"{}\n"
+        model = b"verified-model"
+        files = {
+            "adapter_config.json": {
+                "size": len(config),
+                "sha256": hashlib.sha256(config).hexdigest(),
+            },
+            "adapter_model.safetensors": {
+                "size": len(model),
+                "sha256": hashlib.sha256(model).hexdigest(),
+            },
+        }
+
+        def populate(destination, cache_source_url=source_url):
+            adapter_manifest = {
+                "version": 1,
+                "kind": "lora-adapter",
+                "mode": "full",
+                "target_step": 0,
+                "base_step": None,
+                "full_size": files["adapter_model.safetensors"]["size"],
+                "full_sha256": files["adapter_model.safetensors"]["sha256"],
+                "target_size": files["adapter_model.safetensors"]["size"],
+                "target_sha256": files["adapter_model.safetensors"]["sha256"],
+                "config_size": files["adapter_config.json"]["size"],
+                "config_sha256": files["adapter_config.json"]["sha256"],
+                "files": [{"name": name, **spec} for name, spec in files.items()],
+            }
+            adapter_manifest_text = json.dumps(adapter_manifest)
+            relay_files = {
+                "adapter_manifest.json": {
+                    "path": "adapter_manifest.json",
+                    "size": len(adapter_manifest_text.encode()),
+                    "sha256": hashlib.sha256(adapter_manifest_text.encode()).hexdigest(),
+                },
+                **{
+                    name: {"path": name, **spec}
+                    for name, spec in files.items()
+                },
+            }
+            destination.mkdir(parents=True)
+            (destination / "manifest.json").write_text(
+                json.dumps({"version": 1, "source_url": cache_source_url, "files": files}),
+                encoding="utf-8",
+            )
+            (destination / "adapter_manifest.json").write_text(
+                adapter_manifest_text,
+                encoding="utf-8",
+            )
+            (destination / "relay_manifest.json").write_text(
+                json.dumps(
+                        {
+                            "version": 1,
+                            "source_url": cache_source_url,
+                            "transport": "full",
+                        "files": relay_files,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (destination / "adapter_config.json").write_bytes(config)
+            (destination / "adapter_model.safetensors").write_bytes(model)
+            (destination / "adapter_model.safetensors.sha256").write_text(
+                files["adapter_model.safetensors"]["sha256"] + "\n",
+                encoding="ascii",
+            )
+            (destination / "READY").write_text("ready\n", encoding="ascii")
+
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                for case in (
+                    "source",
+                    "digest",
+                    "symlink",
+                    "ready",
+                    "file",
+                    "mode",
+                    "target_step",
+                    "base_step",
+                    "model_size",
+                    "transport",
+                ):
+                    with self.subTest(case=case):
+                        destination = filesystem.adapter_cache_path(source_url)
+                        populate(destination)
+                        if case == "source":
+                            (destination / "manifest.json").write_text(
+                                json.dumps({"version": 1, "source_url": "http://wrong/step_0", "files": files}),
+                                encoding="utf-8",
+                            )
+                        elif case == "digest":
+                            (destination / "adapter_model.safetensors").write_bytes(b"wrong")
+                        elif case == "symlink":
+                            (destination / "adapter_model.safetensors").unlink()
+                            (destination / "adapter_model.safetensors").symlink_to(destination / "outside")
+                            (destination / "outside").write_bytes(model)
+                        elif case == "ready":
+                            (destination / "READY").unlink()
+                        elif case == "file":
+                            (destination / "adapter_config.json").unlink()
+                        elif case == "model_size":
+                            manifest_path = destination / "manifest.json"
+                            manifest = json.loads(manifest_path.read_text())
+                            manifest["files"]["adapter_model.safetensors"]["size"] = 0
+                            manifest_path.write_text(json.dumps(manifest))
+                        elif case in {"mode", "target_step", "base_step"}:
+                            adapter_manifest_path = destination / "adapter_manifest.json"
+                            adapter_manifest = json.loads(adapter_manifest_path.read_text())
+                            adapter_manifest[case] = {
+                                "mode": "delta",
+                                "target_step": 1,
+                                "base_step": 0,
+                            }[case]
+                            adapter_manifest_path.write_text(json.dumps(adapter_manifest))
+                        elif case == "transport":
+                            (destination / "transport.json").write_text(
+                                json.dumps(
+                                    {
+                                        "mode": "delta",
+                                        "transport": "chunked-shuffled-xor-zstd",
+                                        "source_url": source_url,
+                                        "target_sha256": files["adapter_model.safetensors"]["sha256"],
+                                        "config_sha256": files["adapter_config.json"]["sha256"],
+                                        "base_url": "http://source/run/broadcasts/step_-1",
+                                    }
+                                )
+                            )
+                        with mock.patch.object(
+                            filesystem,
+                            "_read_chunked_xor_manifest",
+                            side_effect=OSError("remote manifest unavailable"),
+                        ):
+                            with self.assertRaisesRegex(OSError, "remote manifest unavailable"):
+                                filesystem.stage_lora_adapter_files(source_url)
+                        for child in destination.parent.iterdir():
+                            if child.name.startswith(destination.name):
+                                if child.is_dir():
+                                    import shutil
+
+                                    shutil.rmtree(child)
+                step_source_url = "http://source/run/broadcasts/step_1"
+                step_destination = filesystem.adapter_cache_path(step_source_url)
+                populate(step_destination, step_source_url)
+                with mock.patch.object(
+                    filesystem,
+                    "_read_chunked_xor_manifest",
+                    side_effect=OSError("remote manifest unavailable"),
+                ):
+                    with self.assertRaisesRegex(OSError, "remote manifest unavailable"):
+                        filesystem.stage_lora_adapter_files(step_source_url)
+
+                valid_destination = filesystem.adapter_cache_path(source_url)
+                populate(valid_destination)
+                self.assertTrue(
+                    filesystem._full_cache_matches_manifest(
+                        valid_destination,
+                        files,
+                        verify_files=True,
+                    )
+                )
+                with self.assertRaises(TimeoutError):
+                    filesystem._full_cache_matches_manifest(
+                        valid_destination,
+                        files,
+                        deadline=time.monotonic() - 1,
+                    )
+                cancelled = threading.Event()
+                cancelled.set()
+                with self.assertRaises(TimeoutError):
+                    filesystem._full_cache_matches_manifest(
+                        valid_destination,
+                        files,
+                        cancel_event=cancelled,
+                    )
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
     def test_full_cache_reuse_rejects_changed_identity_and_symlink(self):
         filesystem = load_filesystem_module()
         with tempfile.TemporaryDirectory() as temporary:

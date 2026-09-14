@@ -94,8 +94,8 @@ def _adapter_step_from_source_url(source_url: str) -> int:
     if match is None:
         raise OSError("adapter source URL does not identify one policy step")
     step = int(match.group(1))
-    if step <= 0:
-        raise OSError("adapter source URL does not identify a positive policy step")
+    if step < 0:
+        raise OSError("adapter source URL does not identify a non-negative policy step")
     return step
 
 
@@ -2710,6 +2710,8 @@ def _full_cache_matches_manifest(
     files: dict[str, object],
     *,
     verify_files: bool = True,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> bool:
     """Check a READY full cache using its already-published file proof."""
     _reject_symlink_path(candidate, "cached adapter path")
@@ -2763,18 +2765,178 @@ def _full_cache_matches_manifest(
         for filename, spec in files.items():
             if not isinstance(spec, dict) or type(spec.get("size")) is not int:
                 return False
+            if filename == _ADAPTER_FILES[1] and spec["size"] <= 0:
+                return False
             entry = _stat_regular_entry(directory_fd, filename, "cached adapter file")
             if entry is None or entry.st_size != spec["size"]:
                 return False
-            if verify_files and _sha256_entry(
-                directory_fd,
-                filename,
-                "cached adapter file",
+            if verify_files and _sha256(
+                Path(filename),
+                deadline,
+                cancel_event,
+                parent_fd=directory_fd,
             ) != spec.get("sha256"):
                 return False
         return True
     finally:
         os.close(directory_fd)
+
+
+def _verified_local_full_adapter_cache(
+    source_url: str,
+    destination: Path,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, object] | None:
+    """Return a complete local cache proof without reading the remote source."""
+    if destination != adapter_cache_path(source_url):
+        return None
+    try:
+        if _adapter_step_from_source_url(source_url) != 0:
+            return None
+    except OSError:
+        return None
+    _reject_symlink_path(destination, "cached adapter path")
+    try:
+        manifest = json.loads(
+            _read_text_nofollow(
+                destination / "manifest.json",
+                encoding="utf-8",
+                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+            )
+        )
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("version") != 1
+            or manifest.get("source_url") != source_url
+        ):
+            return None
+        files = manifest.get("files")
+        if not isinstance(files, dict) or set(files) != set(_ADAPTER_FILES):
+            return None
+        for name in _ADAPTER_FILES:
+            spec = files.get(name)
+            if (
+                not isinstance(spec, dict)
+                or type(spec.get("size")) is not int
+                or (
+                    spec["size"] <= 0
+                    if name == _ADAPTER_FILES[1]
+                    else spec["size"] < 0
+                )
+                or not isinstance(spec.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", spec["sha256"]) is None
+            ):
+                return None
+
+        adapter_manifest = json.loads(
+            _read_text_nofollow(
+                destination / _ADAPTER_MANIFEST,
+                encoding="utf-8",
+                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+            )
+        )
+        if (
+            not isinstance(adapter_manifest, dict)
+            or type(adapter_manifest.get("version")) is not int
+            or adapter_manifest.get("version") not in {1, 2}
+            or adapter_manifest.get("kind") != "lora-adapter"
+            or adapter_manifest.get("mode") != "full"
+            or adapter_manifest.get("target_step") != 0
+            or "base_step" not in adapter_manifest
+            or adapter_manifest.get("base_step") is not None
+            or (
+                "source_url" in adapter_manifest
+                and adapter_manifest.get("source_url") != source_url
+            )
+        ):
+            return None
+        target_spec = files[_ADAPTER_FILES[1]]
+        config_spec = files[_ADAPTER_FILES[0]]
+        if any(
+            adapter_manifest.get(name) != expected
+            for name, expected in {
+                "full_size": target_spec["size"],
+                "full_sha256": target_spec["sha256"],
+                "target_size": target_spec["size"],
+                "target_sha256": target_spec["sha256"],
+                "config_size": config_spec["size"],
+                "config_sha256": config_spec["sha256"],
+            }.items()
+        ):
+            return None
+        raw_files = adapter_manifest.get("files")
+        if not isinstance(raw_files, list) or len(raw_files) != len(_ADAPTER_FILES):
+            return None
+        adapter_files = {
+            item.get("name"): item
+            for item in raw_files
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        if set(adapter_files) != set(_ADAPTER_FILES):
+            return None
+        for name in _ADAPTER_FILES:
+            adapter_spec = adapter_files[name]
+            local_spec = files[name]
+            if (
+                adapter_spec.get("size") != local_spec["size"]
+                or adapter_spec.get("sha256") != local_spec["sha256"]
+            ):
+                return None
+
+        relay_transport = {
+            "mode": "full",
+            "source_manifest": adapter_manifest,
+            "config_size": files[_ADAPTER_FILES[0]]["size"],
+            "config_sha256": files[_ADAPTER_FILES[0]]["sha256"],
+            "target_size": files[_ADAPTER_FILES[1]]["size"],
+            "target_sha256": files[_ADAPTER_FILES[1]]["sha256"],
+        }
+        if not _relay_manifest_matches(destination, source_url, relay_transport):
+            return None
+        if not _full_cache_matches_manifest(
+            destination,
+            files,
+            verify_files=True,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        ):
+            return None
+
+        try:
+            transport = json.loads(
+                _read_text_nofollow(
+                    destination / "transport.json",
+                    encoding="utf-8",
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
+            )
+        except FileNotFoundError:
+            transport = None
+        if transport is not None and (
+            not isinstance(transport, dict)
+            or transport.get("mode") != "full"
+            or transport.get("transport") not in (None, _ADAPTER_FULL_TRANSPORT)
+            or transport.get("source_url") != source_url
+            or transport.get("target_sha256") != files[_ADAPTER_FILES[1]]["sha256"]
+            or transport.get("config_sha256") not in (None, files[_ADAPTER_FILES[0]]["sha256"])
+            or any(
+                name in transport
+                for name in (
+                    "base_url",
+                    "base_sha256",
+                    "base2_url",
+                    "base2_sha256",
+                    "base_step",
+                    "base2_step",
+                )
+            )
+        ):
+            return None
+        return {"files": files}
+    except (FileNotFoundError, OSError, UnicodeError, TypeError, ValueError, KeyError):
+        return None
 
 
 def _reuse_full_adapter_cache(
@@ -5922,6 +6084,40 @@ def stage_lora_adapter_files(
         _acquire_stage_lock(host_lock, operation_deadline, cancel_event)
         transport: dict[str, object] | None = None
         try:
+            if not require_delta:
+                local_cache = _verified_local_full_adapter_cache(
+                    source_url,
+                    destination,
+                    deadline=operation_deadline,
+                    cancel_event=cancel_event,
+                )
+                if local_cache is not None:
+                    files = local_cache["files"]
+                    assert isinstance(files, dict)
+                    cache_hit = True
+                    write_stage_status(
+                        {
+                            "status": "ready",
+                            "source_url": source_url,
+                            "path": destination.as_posix(),
+                            "transport": "full",
+                            "verified_files": files,
+                            "bytes_done": 0,
+                            "bytes_total": 0,
+                            "updated_at": time.time(),
+                            "elapsed_seconds": round(time.monotonic() - started, 3),
+                        },
+                    )
+                    _cleanup_adapter_caches(
+                        destination.parent,
+                        destination,
+                        deadline=operation_deadline,
+                        cancel_event=cancel_event,
+                    )
+                    if committed_event is not None:
+                        with _adapter_stage_publish_lock:
+                            committed_event.set()
+                    return destination
             if require_delta:
                 transport = _read_delta_manifest_with_visibility_wait(
                     source_url,
