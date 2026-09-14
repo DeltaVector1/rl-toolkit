@@ -61,7 +61,7 @@ class AdapterUpdateTest(unittest.TestCase):
             ("receiver", receiver_limit, OSError),
             ("client", client_limit, RuntimeError),
         )
-        for step, expected in ((1, 600), (2, 600), (3, 300), (4, 300), (99, 300)):
+        for step, expected in ((1, 960), (2, 600), (3, 300), (4, 300), (99, 300)):
             with self.subTest(step=step):
                 self.assertEqual(
                     [int(limit(step)) for _, limit, _ in layers],
@@ -634,7 +634,7 @@ class AdapterUpdateTest(unittest.TestCase):
             evidence,
         )
 
-    def test_step_one_terminal_status_uses_600_limit_and_reports_target_overrun(self):
+    def test_step_one_terminal_status_uses_960_limit_and_reports_target_overrun(self):
         config = training_ops._adapter_update_config("glm-perf-3")
         broadcast = training_ops.AdapterBroadcast(
             path="/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3/broadcasts/step_1",
@@ -647,9 +647,9 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 1,
-            "stage_timeout_seconds": 600,
+            "stage_timeout_seconds": 960,
             "acceptance_target_seconds": 300,
-            "elapsed_seconds": 600.0,
+            "elapsed_seconds": 960.0,
             "error": "_PersistentTransportError: adapter persistent request failed",
         }
         with mock.patch.object(
@@ -662,7 +662,7 @@ class AdapterUpdateTest(unittest.TestCase):
             return_value={"h200a": (0, json.dumps(failed)), "h200b": (0, json.dumps(failed))},
         ):
             evidence = training_ops._adapter_stage_status_evidence("glm-perf-3", config, "")
-        self.assertIn("operational limit 600s", evidence)
+        self.assertIn("operational limit 960s", evidence)
         self.assertIn("300s acceptance target exceeded on h200a, h200b", evidence)
 
     def test_terminal_stage_status_refuses_stale_unknown_and_success(self):
