@@ -15,9 +15,25 @@ Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
   0.0366, medium 0.0111, and hard 0.0122. Compare each difficulty separately;
   the mix changes the aggregate.
 - Step 32 trainer forward/backward time is 408.95s. The status snapshot has
-  1,268,125/1,500,000 batch items (84.5%), 248 inflight rollouts, and no
+  1,268,125/1,500,000 accepted tokens (84.5%), 248 inflight rollouts, and no
   rollout failures or unscored rollouts in the last five minutes. Acceptance
   still records one transport/rollout failure and no 2,048-batch validation.
+
+## Qualitative audit through step 32
+
+- The audit covers 23,435 rows and 46,340 turns.
+- Audit reward by difficulty is easy 0.1452, medium 0.0195, and hard 0.0057.
+- Hard reward is mainly real refusal: 7,150/8,228 hard records score refusal
+  9. Hard records include 387 fulfilled and 15,732 declined cases.
+- Hard reasoning penalty is 98.5%; meta is 16.2%, word is 75.3%, and Markdown
+  is 28.4%.
+- Visible-answer failures are 0.33%; reasoning incoherence is 0.035%.
+- High-refusal judge decisions are consistent: 26,678 decisions, only 2
+  partially fulfilled, and no silent replacement.
+- Topic switches are 0.17% overall and 0.068% for hard; there is no broad
+  reward hack. Invalid model responses are 1.55%; judge parse failures are
+  0.06%.
+- Conclusion: low hard reward is mainly real refusal, not judge error.
 
 ## Worked
 
@@ -61,6 +77,9 @@ Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
   history, events, retries, and strict validation.
 - A specialized correction prompt for contradictory declined and explicit-
   refusal fields.
+- Distinguish an actual refusal decision in the reasoning trace from a brief
+  caution in an otherwise fulfilled answer. Do not deploy it mid-run; compare
+  it only in a clean 40-50-step run.
 
 ## Acceptance
 
