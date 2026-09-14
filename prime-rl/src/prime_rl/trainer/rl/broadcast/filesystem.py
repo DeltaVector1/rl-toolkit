@@ -421,7 +421,7 @@ class FileSystemWeightBroadcast(WeightBroadcast):
             )
             retention_floor = min(
                 current_step - 2,
-                highest_ack_step if before_step is not None else highest_ack_step - 2,
+                highest_ack_step - 1 if before_step is not None else highest_ack_step - 2,
             )
             if retention_floor <= 0:
                 continue

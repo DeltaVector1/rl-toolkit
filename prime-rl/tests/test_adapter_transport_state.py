@@ -257,6 +257,32 @@ def write_receiver_ack(step_path: Path, root: Path, step: int, *, run_name="run_
     (step_path / "receivers-ready.json").write_text(json.dumps(identity), encoding="utf-8")
 
 
+def lora_cleanup_broadcast(root: Path, progress_step: int):
+    config = SimpleNamespace(
+        model=SimpleNamespace(
+            lora=SimpleNamespace(name="adapter"),
+            client=SimpleNamespace(
+                base_url=["http://h200-a/v1", "http://h200-b/v1"],
+                admin_base_url=None,
+            ),
+        ),
+        weight_broadcast=SimpleNamespace(source_url="http://source", source_dir=root.parent),
+    )
+    manager = SimpleNamespace(
+        used_idxs=[0],
+        progress={0: SimpleNamespace(step=progress_step)},
+        get_run_dir=lambda _idx: root,
+        idx_2_id={0: "run_test"},
+        get_orchestrator_config=lambda _run_id: config,
+    )
+    return SimpleNamespace(
+        world=SimpleNamespace(is_master=True),
+        multi_run_manager=manager,
+        lora_config=object(),
+        logger=SimpleNamespace(debug=lambda *_args: None, warning=lambda *_args: None),
+    )
+
+
 def load_broadcast_weights_method():
     path = ROOT / "src/prime_rl/trainer/rl/broadcast/filesystem.py"
     function = next(
@@ -660,33 +686,47 @@ class AdapterTransportStateTest(unittest.TestCase):
             for step in range(4):
                 write_published_step(root, step)
             write_receiver_ack(root / "step_2", root, 2)
-            config = SimpleNamespace(
-                model=SimpleNamespace(
-                    lora=SimpleNamespace(name="adapter"),
-                    client=SimpleNamespace(
-                        base_url=["http://h200-a/v1", "http://h200-b/v1"],
-                        admin_base_url=None,
-                    ),
-                ),
-                weight_broadcast=SimpleNamespace(source_url="http://source", source_dir=root.parent),
-            )
-            manager = SimpleNamespace(
-                used_idxs=[0],
-                progress={0: SimpleNamespace(step=4)},
-                get_run_dir=lambda _idx: root,
-                idx_2_id={0: "run_test"},
-                get_orchestrator_config=lambda _run_id: config,
-            )
-            broadcast = SimpleNamespace(
-                world=SimpleNamespace(is_master=True),
-                multi_run_manager=manager,
-                lora_config=object(),
-                logger=SimpleNamespace(debug=lambda *_args: None, warning=lambda *_args: None),
-            )
+            broadcast = lora_cleanup_broadcast(root, progress_step=4)
             cleanup(broadcast, None, run_idx=0, before_step=3)
             self.assertFalse((root / "step_0").exists())
             for step in (1, 2, 3):
                 self.assertTrue((root / f"step_{step}").exists())
+
+    def test_lora_cleanup_before_broadcast_keeps_oldest_step_for_lagging_receiver(self):
+        cleanup = load_broadcast_cleanup_method()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "broadcasts"
+            root.mkdir()
+            for step in range(3):
+                write_published_step(root, step)
+            write_receiver_ack(root / "step_1", root, 1)
+            cleanup(lora_cleanup_broadcast(root, progress_step=4), None, run_idx=0, before_step=3)
+            for step in range(3):
+                self.assertTrue((root / f"step_{step}").exists())
+
+    def test_lora_cleanup_before_broadcast_keeps_delayed_delta_bases(self):
+        cleanup = load_broadcast_cleanup_method()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "broadcasts"
+            root.mkdir()
+            for step in range(4):
+                write_published_step(root, step)
+            write_receiver_ack(root / "step_2", root, 2)
+            cleanup(lora_cleanup_broadcast(root, progress_step=5), None, run_idx=0, before_step=4)
+            self.assertFalse((root / "step_0").exists())
+            for step in (1, 2, 3):
+                self.assertTrue((root / f"step_{step}").exists())
+
+    def test_lora_cleanup_before_broadcast_rejects_future_ack(self):
+        cleanup = load_broadcast_cleanup_method()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "broadcasts"
+            root.mkdir()
+            for step in range(5):
+                write_published_step(root, step)
+            write_receiver_ack(root / "step_4", root, 4)
+            with self.assertRaises(RuntimeError):
+                cleanup(lora_cleanup_broadcast(root, progress_step=4), None, run_idx=0, before_step=3)
 
     def test_lora_cleanup_rejects_invalid_highest_ack(self):
         cleanup = load_broadcast_cleanup_method()
