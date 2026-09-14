@@ -9,6 +9,14 @@ Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
   Verdict: **falling**. The raw fall is confounded by the planned curriculum
   moving to about 82% hard prompts, so it does not prove that the model itself
   regressed.
+- Per-difficulty reward also stayed inside the noise after 50 steps: easy was
+  0.1466 for the first 10 steps and 0.1874 for the last 10, with fit +0.0451
+  versus threshold 0.2018; medium was 0.0227 to 0.0277, with fit +0.00746
+  versus threshold 0.0401; hard was 0.00604 to 0.00937, with fit +0.00393
+  versus threshold 0.00496. Refusal and reasoning-safety trends for all three
+  buckets were also inside the noise. No difficulty bucket has proven
+  learning after 50 steps; the aggregate fall mostly reflects later
+  hard-heavy sampling.
 - The earlier reward report covered steps 7-34. Effective reward mean was
   0.0629, fit was -0.0421, and the noise threshold was 0.0650. Verdict:
   **inside the noise**. This was not evidence of improvement or decline.
