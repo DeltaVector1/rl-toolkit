@@ -27,6 +27,7 @@ import os
 import re
 import time
 from typing import TYPE_CHECKING
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import tomli_w
@@ -182,7 +183,7 @@ def _verify_startup_adapter_delta(
     *,
     previous_identity: dict[str, object] | None = None,
     previous_previous_identity: dict[str, object] | None = None,
-) -> None:
+) -> dict[str, object] | None:
     """Reject a positive resume unless its published adjacent delta is exact."""
     if lora_name is None or step <= 0:
         return
@@ -318,7 +319,7 @@ def _verify_startup_adapter_delta(
             raise RuntimeError(
                 f"cannot resume LoRA policy v{step}: adjacent adapter base or SHA-256 identity differs"
             )
-        return
+        return manifest
 
     if previous_identity is not None:
         valid_previous = True
@@ -372,6 +373,77 @@ def _verify_startup_adapter_delta(
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: adjacent adapter base or SHA-256 identity differs"
         )
+    return manifest
+
+
+def _select_pruned_resume_tail(
+    config: OrchestratorConfig,
+    lora_name: str | None,
+    final_sync_version: int,
+    sync_versions: tuple[int, ...],
+    loaded_receipt: dict[str, object] | None,
+) -> tuple[int, ...]:
+    """Use a verified second-order tail only after a definitive policy-zero 404."""
+    if loaded_receipt is not None or lora_name is None or not sync_versions:
+        return sync_versions
+    broadcast_dir = get_broadcast_dir(config.output_dir)
+    policy_zero_url = inference_weight_path(
+        config, get_step_path(broadcast_dir, 0), lora_name
+    )
+    if not isinstance(policy_zero_url, str):
+        if sync_versions[0] > 0:
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: saved adapter chain is incomplete"
+            )
+        return sync_versions
+    try:
+        with urlopen(
+            f"{policy_zero_url.rstrip('/')}/adapter_manifest.json",
+            timeout=30,
+        ):
+            if sync_versions[0] > 0:
+                raise RuntimeError(
+                    f"cannot resume policy {final_sync_version}: saved adapter chain is incomplete"
+                )
+            return sync_versions
+    except HTTPError as exc:
+        if exc.code != 404:
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: leading adapter manifest probe failed"
+            ) from exc
+
+    if final_sync_version != 6:
+        raise RuntimeError(
+            f"cannot resume policy {final_sync_version}: retained adapter tail is too short"
+        )
+    tail = (4, 5, 6)
+    if sync_versions[-3:] != tail:
+        raise RuntimeError(
+            f"cannot resume policy {final_sync_version}: retained adapter tail is not contiguous"
+        )
+    tail_path = get_step_path(broadcast_dir, tail[0])
+    tail_url = inference_weight_path(config, tail_path, lora_name)
+    if not isinstance(tail_url, str):
+        raise RuntimeError(
+            f"cannot resume policy {final_sync_version}: retained adapter tail has no source URL"
+        )
+    tail_manifest = _verify_startup_adapter_delta(
+        config,
+        lora_name,
+        tail[0],
+        tail_path,
+        tail_url,
+    )
+    if (
+        not isinstance(tail_manifest, dict)
+        or tail_manifest.get("version") != 2
+        or tail_manifest.get("base_step") != tail[0] - 1
+        or tail_manifest.get("base2_step") != tail[0] - 2
+    ):
+        raise RuntimeError(
+            f"cannot resume policy {final_sync_version}: retained adapter tail is not a version-two delta"
+        )
+    return tail
 
 
 class Orchestrator:
@@ -679,11 +751,13 @@ class Orchestrator:
                     self.policy_inference.admin_clients, self.lora_name
                 )
                 if loaded_receipt is None:
-                    if sync_versions[0] > 0:
-                        raise RuntimeError(
-                            "cannot resume adapter transfer: inference has no common loaded "
-                            "policy and the initial policy is no longer saved"
-                        )
+                    sync_versions = _select_pruned_resume_tail(
+                        config,
+                        self.lora_name,
+                        final_sync_version,
+                        sync_versions,
+                        loaded_receipt,
+                    )
                 else:
                     loaded_source_url = loaded_receipt["source_url"]
                     matching_steps = tuple(
