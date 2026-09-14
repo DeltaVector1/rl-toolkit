@@ -69,6 +69,25 @@ def odd_offset_safetensor_bytes(words: list[int]) -> bytes:
 
 
 class PredictiveAdapterCodecTest(unittest.TestCase):
+    def test_forced_full_zstd_manifest_supports_a_positive_policy_step(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "step_6"
+            target.mkdir()
+            (target / "adapter_config.json").write_text("{}", encoding="utf-8")
+            (target / "adapter_model.safetensors").write_bytes(bytes(range(251)) * 17)
+            manifest = adapter_delta.publish_adapter_manifest(
+                target,
+                target_step=6,
+                force_full_zstd=True,
+                max_workers=2,
+            )
+            self.assertEqual(manifest["version"], 1)
+            self.assertEqual(manifest["mode"], "full")
+            self.assertEqual(manifest["transport"], adapter_delta.full_transport_name)
+            self.assertEqual(manifest["target_step"], 6)
+            self.assertIsNone(manifest["base_step"])
+            self.assertTrue(manifest["chunks"])
+
     def test_adapter_chunk_rejects_malicious_declared_zstd_size(self):
         payload = adapter_delta._compress(b"hello")
         malicious = payload[:4] + b"\xe0" + (1 << 40).to_bytes(8, "little") + payload[6:]

@@ -1,6 +1,8 @@
 import json
+import os
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Literal
@@ -22,6 +24,13 @@ from prime_rl.trainer.weights import (
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.adapter_delta import publish_adapter_manifest
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
+
+
+restart_full_dir_name = "restart"
+
+
+def _restart_full_step_path(broadcast_dir: Path, step: int) -> Path:
+    return broadcast_dir / restart_full_dir_name / f"step_{step}"
 
 
 def _valid_digest(value: object) -> bool:
@@ -85,6 +94,23 @@ def _receiver_ids(config) -> list[str]:
     return sorted(endpoint_ids)
 
 
+def _receiver_ack_source_urls(config, step_path: Path) -> set[str]:
+    broadcast = config.weight_broadcast
+    source_url = getattr(broadcast, "source_url", None)
+    source_dir = getattr(broadcast, "source_dir", None)
+    if not isinstance(source_url, str) or not source_url or source_dir is None:
+        raise RuntimeError("receiver ACK requires configured adapter source URL and directory")
+    try:
+        relative = step_path.resolve().relative_to(Path(source_dir).resolve()).as_posix()
+    except ValueError as exc:
+        raise RuntimeError("receiver ACK step is outside the configured adapter source directory") from exc
+    restart_relative = f"{restart_full_dir_name}/{relative}"
+    return {
+        f"{source_url.rstrip('/')}/{quote(relative)}",
+        f"{source_url.rstrip('/')}/{quote(restart_relative)}",
+    }
+
+
 def _receiver_ack_identity(config, step_path: Path, step: int, run_name: str) -> dict[str, object]:
     published = _published_adapter_identity(step_path)
     broadcast = config.weight_broadcast
@@ -96,6 +122,7 @@ def _receiver_ack_identity(config, step_path: Path, step: int, run_name: str) ->
         relative = step_path.resolve().relative_to(Path(source_dir).resolve()).as_posix()
     except ValueError as exc:
         raise RuntimeError("receiver ACK step is outside the configured adapter source directory") from exc
+    source_url = f"{source_url.rstrip('/')}/{quote(relative)}"
     lora = getattr(getattr(config, "model", None), "lora", None)
     base_name = getattr(lora, "name", None)
     if not isinstance(base_name, str) or not base_name:
@@ -104,7 +131,7 @@ def _receiver_ack_identity(config, step_path: Path, step: int, run_name: str) ->
         "version": 1,
         "run_name": run_name,
         "step": step,
-        "source_url": f"{source_url.rstrip('/')}/{quote(relative)}",
+        "source_url": source_url,
         **published,
         "slot": base_name if step == 0 else f"{base_name}-slot{step % 2}",
         "receivers": None,
@@ -123,6 +150,7 @@ def _validate_receiver_ack(ack_path: Path, config, step_path: Path, current_step
     step_name = step_path.name.removeprefix("step_")
     step = int(step_name)
     expected = _receiver_ack_identity(config, step_path, step, run_name)
+    accepted_source_urls = _receiver_ack_source_urls(config, step_path)
     if step > current_step:
         raise RuntimeError(f"receiver ACK is from a future step: {ack_path}")
     if set(ack) != set(expected):
@@ -134,6 +162,8 @@ def _validate_receiver_ack(ack_path: Path, config, step_path: Path, current_step
             base_name = value.removesuffix(f"-slot{step % 2}")
             if ack.get(name) not in {value, base_name}:
                 raise RuntimeError(f"receiver ACK {name} differs from the published step: {ack_path}")
+        elif name == "source_url" and ack.get(name) not in accepted_source_urls:
+            raise RuntimeError(f"receiver ACK {name} differs from the published step: {ack_path}")
         elif name != "receivers" and ack.get(name) != value:
             raise RuntimeError(f"receiver ACK {name} differs from the published step: {ack_path}")
     receivers = ack.get("receivers")
@@ -182,9 +212,109 @@ class FileSystemWeightBroadcast(WeightBroadcast):
         self.save_sharded = config.save_sharded if lora_config is None else False
         self.world = get_world()
         self.multi_run_manager = get_multi_run_manager()
+        self._restart_full_lock = threading.Lock()
+        self._restart_full_pending = None
+        self._restart_full_worker = None
         self.logger.debug(
             f"Filesystem broadcast initialized (save_format={config.save_format}, save_sharded={self.save_sharded})"
         )
+
+    def _prepare_restart_full(self, source_dir: Path, broadcast_dir: Path, step: int) -> Path:
+        restart_dir = broadcast_dir / restart_full_dir_name
+        restart_dir.mkdir(parents=True, exist_ok=True)
+        temporary = restart_dir / f".step_{step}.pending-{os.getpid()}-{time.time_ns()}"
+        temporary.mkdir()
+        try:
+            for name in ("adapter_config.json", "adapter_model.safetensors"):
+                source = source_dir / name
+                if source.is_symlink() or not source.is_file():
+                    raise RuntimeError(f"restart full source is not a regular adapter file: {source}")
+                os.link(source, temporary / name)
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+        return temporary
+
+    def _build_restart_full(self, temporary: Path, broadcast_dir: Path, step: int) -> None:
+        final_dir = _restart_full_step_path(broadcast_dir, step)
+        try:
+            with self._restart_full_lock:
+                superseded = self._restart_full_pending is not None
+            if superseded:
+                shutil.rmtree(temporary, ignore_errors=True)
+                return
+            publish_adapter_manifest(
+                temporary,
+                target_step=step,
+                force_full_zstd=True,
+            )
+            (temporary / "STABLE").touch()
+            with self._restart_full_lock:
+                superseded = self._restart_full_pending is not None
+            if superseded:
+                shutil.rmtree(temporary, ignore_errors=True)
+                return
+            if final_dir.exists() or final_dir.is_symlink():
+                if final_dir.is_dir() and not final_dir.is_symlink():
+                    shutil.rmtree(final_dir)
+                else:
+                    final_dir.unlink()
+            os.replace(temporary, final_dir)
+            self.logger.info(
+                f"Published deferred standalone full adapter for restart policy v{step}"
+            )
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            self.logger.exception(
+                f"Failed to publish deferred standalone full adapter for restart policy v{step}"
+            )
+
+    def _restart_full_worker_loop(self) -> None:
+        while True:
+            with self._restart_full_lock:
+                task = self._restart_full_pending
+                self._restart_full_pending = None
+            if task is None:
+                with self._restart_full_lock:
+                    if self._restart_full_pending is None:
+                        self._restart_full_worker = None
+                        return
+                continue
+            temporary, broadcast_dir, step = task
+            self._build_restart_full(temporary, broadcast_dir, step)
+
+    def _schedule_restart_full(
+        self,
+        source_dir: Path,
+        broadcast_dir: Path,
+        step: int,
+        config,
+    ) -> None:
+        broadcast = getattr(config, "weight_broadcast", None)
+        if not isinstance(getattr(broadcast, "source_url", None), str):
+            return
+        try:
+            temporary = self._prepare_restart_full(source_dir, broadcast_dir, step)
+        except BaseException:
+            self.logger.exception(
+                f"Failed to prepare deferred standalone full adapter for restart policy v{step}"
+            )
+            return
+        old_pending = None
+        with self._restart_full_lock:
+            old_pending = self._restart_full_pending
+            self._restart_full_pending = (temporary, broadcast_dir, step)
+            worker = self._restart_full_worker
+            if worker is None or not worker.is_alive():
+                worker = threading.Thread(
+                    target=self._restart_full_worker_loop,
+                    name="restart-full-adapter",
+                    daemon=True,
+                )
+                self._restart_full_worker = worker
+                worker.start()
+        if old_pending is not None:
+            shutil.rmtree(old_pending[0], ignore_errors=True)
 
     def broadcast_weights(self, model: nn.Module, step: int) -> None:
         """Broadcast weights by saving a HF-compatible checkpoint to shared filesystem and notifies the orchestrator."""
@@ -229,6 +359,11 @@ class FileSystemWeightBroadcast(WeightBroadcast):
             if self.world.is_master:
                 try:
                     run_id = self.multi_run_manager.idx_2_id[idx]
+                    orchestrator_config = (
+                        self.multi_run_manager.get_orchestrator_config(run_id)
+                        if run_id != "run_trainer_only"
+                        else None
+                    )
                     # pack() already advanced progress to the next step, so the model we just
                     # trained — policy v(step-1) — broadcasts to broadcasts/step_{step-1}.
                     broadcast_step = self.multi_run_manager.progress[idx].step - 1
@@ -329,6 +464,17 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                         )
 
                     self._notify_orchestrator(save_dir)
+                    if (
+                        adapter_only
+                        and broadcast_step > 0
+                        and orchestrator_config is not None
+                    ):
+                        self._schedule_restart_full(
+                            save_dir,
+                            get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
+                            broadcast_step,
+                            orchestrator_config,
+                        )
 
                     # If the run is deleted, remove the run directory
                     # This is avoid the creation of zombie runs when the directory is deleted while we are broadcasting which recreates the directory
@@ -437,3 +583,17 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                     continue
                 self.logger.debug(f"Removing path {candidate_path}")
                 shutil.rmtree(candidate_path)
+            restart_dir = broadcast_dir / restart_full_dir_name
+            if restart_dir.is_dir() and not restart_dir.is_symlink():
+                for candidate_path in restart_dir.iterdir():
+                    if (
+                        candidate_path.is_symlink()
+                        or not candidate_path.is_dir()
+                        or re.fullmatch(r"step_[0-9]+", candidate_path.name) is None
+                    ):
+                        continue
+                    candidate_step = int(candidate_path.name.removeprefix("step_"))
+                    if candidate_step >= highest_ack_step:
+                        continue
+                    self.logger.debug(f"Removing acknowledged restart full path {candidate_path}")
+                    shutil.rmtree(candidate_path)

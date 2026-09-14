@@ -73,6 +73,27 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
     return namespace["_verify_startup_adapter_delta"]
 
 
+def load_full_startup_validator(file_records):
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_verify_startup_adapter_full"
+    )
+    namespace = {
+        "OrchestratorConfig": object,
+        "json": json,
+        "urlopen": None,
+        "_adapter_file_records": file_records,
+    }
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"),
+        namespace,
+    )
+    return namespace["_verify_startup_adapter_full"]
+
+
 def load_server_load_endpoints(destination, handler, reader_lock=None):
     source = SERVER_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -247,6 +268,124 @@ def write_cached_adapter(
 
 
 class ResumeRecoveryTest(unittest.TestCase):
+    def test_no_receipt_uses_only_a_verified_full_final_policy(self):
+        source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+        setup = ast.get_source_segment(
+            source,
+            next(
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
+            ),
+        )
+        no_receipt = setup.index("if loaded_receipt is None:")
+        self.assertIn("_verify_startup_adapter_full(", setup[no_receipt:])
+        self.assertIn("_restart_full_step_path(", setup[no_receipt:])
+        self.assertIn("sync_versions = (final_sync_version,)", setup[no_receipt:])
+        self.assertIn("direct_full_sync = True", setup[no_receipt:])
+        self.assertIn("and not (direct_full_sync", setup)
+
+    def test_full_final_validator_rejects_missing_or_corrupt_representation(self):
+        def file_records(manifest):
+            return {
+                item["name"]: item
+                for item in manifest["files"]
+            }
+
+        validator = load_full_startup_validator(file_records)
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary)
+            with self.assertRaisesRegex(RuntimeError, "full adapter manifest is unavailable"):
+                validator(object(), "adapter", 3, target)
+
+            manifest = {
+                "version": 1,
+                "kind": "lora-adapter",
+                "mode": "delta",
+                "target_step": 3,
+                "base_step": 2,
+                "files": [],
+            }
+            (target / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "standalone full representation"):
+                validator(object(), "adapter", 3, target)
+
+            model_digest = "a" * 64
+            config_digest = "b" * 64
+            manifest = {
+                "version": 1,
+                "kind": "lora-adapter",
+                "mode": "full",
+                "target_step": 3,
+                "base_step": None,
+                "target_size": 7,
+                "target_sha256": model_digest,
+                "full_size": 7,
+                "full_sha256": model_digest,
+                "config_size": 2,
+                "config_sha256": config_digest,
+                "files": [
+                    {"name": "adapter_config.json", "size": 2, "sha256": config_digest},
+                    {"name": "adapter_model.safetensors", "size": 7, "sha256": model_digest},
+                ],
+            }
+            (target / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            validator(object(), "adapter", 3, target)
+            manifest.update(
+                {
+                    "transport": "chunked-full-zstd",
+                    "encoded_size": 7,
+                    "chunk_count": 1,
+                    "chunks": [
+                        {
+                            "file": "adapter_model.safetensors.transport-000000",
+                            "offset": 0,
+                            "raw_size": 7,
+                            "wire_size": 7,
+                            "wire_sha256": "d" * 64,
+                            "raw_sha256": model_digest,
+                            "codec": "zstd",
+                        }
+                    ],
+                }
+            )
+            (target / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            validator(object(), "adapter", 3, target)
+            manifest = {
+                "version": 2,
+                "kind": "lora-adapter",
+                "mode": "delta",
+                "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+                "target_step": 3,
+                "base_step": 2,
+                "base2_step": 1,
+            }
+            (target / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "standalone full representation"):
+                validator(object(), "adapter", 3, target)
+
+            manifest = {
+                "version": 1,
+                "kind": "lora-adapter",
+                "mode": "full",
+                "target_step": 3,
+                "base_step": None,
+                "target_size": 7,
+                "target_sha256": model_digest,
+                "full_size": 7,
+                "full_sha256": model_digest,
+                "config_size": 2,
+                "config_sha256": config_digest,
+                "files": [
+                    {"name": "adapter_config.json", "size": 2, "sha256": config_digest},
+                    {"name": "adapter_model.safetensors", "size": 7, "sha256": model_digest},
+                ],
+            }
+            manifest["full_sha256"] = "c" * 64
+            (target / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "identity differs"):
+                validator(object(), "adapter", 3, target)
+
     def test_token_batch_budget_refills_a_drained_pipeline(self):
         _, budget = load_rollout_budget_functions()
         self.assertEqual(
@@ -855,6 +994,24 @@ class ResumeRecoveryTest(unittest.TestCase):
             setup.index("if sync_version != final_sync_version"),
             setup.index("await self.policy_inference.update_weights("),
         )
+
+    def test_loaded_receipt_still_replays_only_the_remaining_adjacent_deltas(self):
+        source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+        setup = ast.get_source_segment(
+            source,
+            next(
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
+            ),
+        )
+        loaded_receipt = setup.index("else:\n                    loaded_source_url")
+        self.assertIn(
+            "sync_versions = tuple(step for step in sync_versions if step >= loaded_step)",
+            setup[loaded_receipt:],
+        )
+        self.assertIn("require_delta", setup[loaded_receipt:])
+        self.assertIn("_verify_startup_adapter_delta(", setup[loaded_receipt:])
 
     def test_server_fallback_stages_in_the_host_process(self):
         source = SERVER_PATH.read_text(encoding="utf-8")

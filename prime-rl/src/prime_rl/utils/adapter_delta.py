@@ -873,6 +873,7 @@ def publish_adapter_manifest(
     base2_step: int | None = None,
     chunk_size: int | None = None,
     max_workers: int = default_workers,
+    force_full_zstd: bool = False,
 ) -> dict[str, Any]:
     """Publish full or exact delta chunks for one adapter directory.
 
@@ -881,6 +882,13 @@ def publish_adapter_manifest(
     """
     if max_workers <= 0 or max_workers > max_workers_limit:
         raise ValueError(f"adapter worker count must be between 1 and {max_workers_limit}")
+    if force_full_zstd and any(
+        value is not None
+        for value in (base_dir, base2_dir, base_url, base2_url, base_step, base2_step)
+    ):
+        raise ValueError("standalone full transport cannot have an adapter base")
+    if force_full_zstd and (type(target_step) is not int or target_step < 0):
+        raise ValueError("standalone full transport requires a non-negative target step")
     build_started = time.perf_counter()
     target_dir = target_dir.resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -931,7 +939,7 @@ def publish_adapter_manifest(
             base_step = None
         if base_dir is not None:
             selected_mode = "delta"
-        elif target_step == 0:
+        elif target_step == 0 or force_full_zstd:
             selected_mode = "full-zstd"
         else:
             selected_mode = "full"
@@ -976,7 +984,11 @@ def publish_adapter_manifest(
     if selected_mode == "delta" and weight_encoded_size >= target_weights.stat().st_size:
         _remove_transport_chunks(target_dir)
         raise ValueError("delta transport is not smaller than the full adapter")
-    if selected_mode == "full-zstd" and weight_encoded_size >= target_weights.stat().st_size:
+    if (
+        selected_mode == "full-zstd"
+        and weight_encoded_size >= target_weights.stat().st_size
+        and not force_full_zstd
+    ):
         _remove_transport_chunks(target_dir)
         selected_mode = "full"
         weight_chunks = []

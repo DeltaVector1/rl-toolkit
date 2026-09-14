@@ -1347,14 +1347,17 @@ def _read_chunked_v1_manifest(
     if mode == "full":
         if value.get("transport") != _ADAPTER_FULL_TRANSPORT:
             return {"mode": "full", "source_manifest": value}
-        if value.get("kind") != "lora-adapter" or value.get("target_step") != 0:
-            raise OSError("full zstd adapter manifest is not policy zero")
+        if value.get("kind") != "lora-adapter":
+            raise OSError("full zstd adapter manifest is not a LoRA adapter")
+        target_step = value.get("target_step")
+        if type(target_step) is not int or target_step < 0:
+            raise OSError("full zstd adapter manifest has an invalid target step")
         parsed_source = urlsplit(source_url)
         if parsed_source.scheme not in ("http", "https") or not parsed_source.hostname:
             raise OSError("adapter source URL must use HTTP or HTTPS")
         match = re.fullmatch(r"step_(\d+)", Path(parsed_source.path.rstrip("/")).name)
-        if match is None or int(match.group(1)) != 0:
-            raise OSError("adapter source URL does not identify policy zero")
+        if match is None or int(match.group(1)) != target_step:
+            raise OSError("adapter source URL does not identify the target policy")
         target_size = value.get("target_size")
         full_size = value.get("full_size")
         target_sha256 = value.get("target_sha256")

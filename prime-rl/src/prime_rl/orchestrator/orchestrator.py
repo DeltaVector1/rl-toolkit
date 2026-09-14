@@ -124,6 +124,11 @@ MAX_CONSECUTIVE_EMPTY_BATCHES = 10
 # Keep complete GRPO groups available when the last active request is slow.
 # Completed overflow carries into the next batch.
 ROLLOUT_TAIL_SPARE_GROUPS = 32
+restart_full_dir_name = "restart"
+
+
+def _restart_full_step_path(broadcast_dir, step: int):
+    return broadcast_dir / restart_full_dir_name / f"step_{step}"
 
 
 def rollout_budget(
@@ -298,6 +303,88 @@ def _verify_startup_adapter_delta(
     ):
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: adjacent adapter base or SHA-256 identity differs"
+        )
+
+
+def _verify_startup_adapter_full(
+    config: OrchestratorConfig,
+    lora_name: str | None,
+    step: int,
+    target_path,
+    target_url: str | None = None,
+) -> None:
+    """Require a positive resume policy to be a standalone full adapter."""
+    if lora_name is None or step <= 0:
+        return
+
+    def read_manifest(path, url: str | None) -> dict[str, object]:
+        try:
+            if url is None:
+                with (path / "adapter_manifest.json").open("r", encoding="utf-8") as source:
+                    value = json.load(source)
+            else:
+                with urlopen(
+                    f"{url.rstrip('/')}/adapter_manifest.json",
+                    timeout=30,
+                ) as source:
+                    value = json.load(source)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: full adapter manifest is unavailable"
+            ) from exc
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: full adapter manifest is not an object"
+            )
+        return value
+
+    manifest = read_manifest(target_path, target_url)
+    if (
+        manifest.get("version") != 1
+        or manifest.get("kind") != "lora-adapter"
+        or manifest.get("mode") != "full"
+        or manifest.get("target_step") != step
+        or manifest.get("base_step") is not None
+        or manifest.get("base_url") is not None
+        or manifest.get("base2_step") is not None
+        or manifest.get("base2_url") is not None
+        or manifest.get("transport") not in (None, "chunked-full-zstd")
+        or (
+            manifest.get("transport") == "chunked-full-zstd"
+            and (
+                not isinstance(manifest.get("chunks"), list)
+                or not manifest.get("chunks")
+                or manifest.get("chunk_count") != len(manifest["chunks"])
+            )
+        )
+        or (
+            manifest.get("transport") is None
+            and "chunks" in manifest
+        )
+    ):
+        raise RuntimeError(
+            f"cannot resume LoRA policy v{step}: final adapter is not a standalone full representation; "
+            "the producer must publish the final adapter with mode=full and no base"
+        )
+    try:
+        files = _adapter_file_records(manifest)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"cannot resume LoRA policy v{step}: final full adapter manifest is invalid"
+        ) from exc
+    target_weights = files["adapter_model.safetensors"]
+    target_config = files["adapter_config.json"]
+    expected_identity = {
+        "target_size": target_weights["size"],
+        "target_sha256": target_weights["sha256"],
+        "full_size": target_weights["size"],
+        "full_sha256": target_weights["sha256"],
+        "config_size": target_config["size"],
+        "config_sha256": target_config["sha256"],
+    }
+    if any(manifest.get(name) != value for name, value in expected_identity.items()):
+        raise RuntimeError(
+            f"cannot resume LoRA policy v{step}: final full adapter identity differs from its file records"
         )
 
 
@@ -586,6 +673,8 @@ class Orchestrator:
         ):
             final_sync_version = self.resume_policy_step if self.resume_policy_step is not None else 0
             sync_versions = (final_sync_version,)
+            direct_full_sync = False
+            direct_full_path = None
             if (
                 self.lora_name is not None
                 and config.weight_broadcast.type == "filesystem"
@@ -606,11 +695,25 @@ class Orchestrator:
                     self.policy_inference.admin_clients, self.lora_name
                 )
                 if loaded_receipt is None:
-                    if sync_versions[0] > 0:
-                        raise RuntimeError(
-                            "cannot resume adapter transfer: inference has no common loaded "
-                            "policy and the initial policy is no longer saved"
-                        )
+                    final_path = get_step_path(broadcast_dir, final_sync_version)
+                    restart_full_path = _restart_full_step_path(
+                        broadcast_dir, final_sync_version
+                    )
+                    if (restart_full_path / "STABLE").is_file():
+                        final_path = restart_full_path
+                        direct_full_path = restart_full_path
+                    final_source_url = inference_weight_path(
+                        config, final_path, self.lora_name
+                    )
+                    _verify_startup_adapter_full(
+                        config,
+                        self.lora_name,
+                        final_sync_version,
+                        final_path,
+                        final_source_url if isinstance(final_source_url, str) else None,
+                    )
+                    sync_versions = (final_sync_version,)
+                    direct_full_sync = True
                 else:
                     loaded_source_url = loaded_receipt["source_url"]
                     matching_steps = tuple(
@@ -662,7 +765,11 @@ class Orchestrator:
                     )
 
             for sync_version in sync_versions:
-                require_delta = self.lora_name is not None and sync_version > 0
+                require_delta = (
+                    self.lora_name is not None
+                    and sync_version > 0
+                    and not (direct_full_sync and sync_version == final_sync_version)
+                )
                 startup_delta_deadline = None
                 if config.weight_broadcast.type == "nixl":
                     weights_path = None
@@ -686,17 +793,36 @@ class Orchestrator:
                         wait_timeout=wait_timeout,
                     )
                     local_weights_path = weights_path
+                    if direct_full_sync and sync_version == final_sync_version:
+                        if direct_full_path is None:
+                            raise RuntimeError(
+                                "cannot resume adapter transfer: final full adapter path is unavailable"
+                            )
+                        weights_path = direct_full_path
                     source_weights_path = inference_weight_path(
                         config, weights_path, self.lora_name
                     )
-                    _verify_startup_adapter_delta(
-                        config,
-                        self.lora_name,
-                        sync_version,
-                        weights_path,
-                        source_weights_path if isinstance(source_weights_path, str) else None,
-                        deadline=startup_delta_deadline,
-                    )
+                    if direct_full_sync and sync_version == final_sync_version:
+                        _verify_startup_adapter_full(
+                            config,
+                            self.lora_name,
+                            sync_version,
+                            weights_path,
+                            source_weights_path
+                            if isinstance(source_weights_path, str)
+                            else None,
+                        )
+                    else:
+                        _verify_startup_adapter_delta(
+                            config,
+                            self.lora_name,
+                            sync_version,
+                            weights_path,
+                            source_weights_path
+                            if isinstance(source_weights_path, str)
+                            else None,
+                            deadline=startup_delta_deadline,
+                        )
                     if require_delta:
                         startup_delta_deadline = (
                             time.monotonic() + adapter_stage_limit_seconds(sync_version)

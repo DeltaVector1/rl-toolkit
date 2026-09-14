@@ -38,6 +38,11 @@ from prime_rl.utils.checkpoint_delta import build_xor_delta_checkpoint
 
 v1_adapter_transport = "chunked-shuffled-xor-zstd"
 v2_adapter_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
+restart_full_dir_name = "restart"
+
+
+def _restart_full_step_path(broadcast_dir, step: int):
+    return broadcast_dir / restart_full_dir_name / f"step_{step}"
 
 
 def _receiver_id(client) -> str:
@@ -941,6 +946,25 @@ class WeightWatcher:
                 broadcast_dir = get_broadcast_dir(self.config.output_dir)
                 candidate = get_step_path(broadcast_dir, self.ckpt_step)
                 if (candidate / "STABLE").exists():
+                    restart_candidate = _restart_full_step_path(broadcast_dir, self.ckpt_step)
+                    restart_source = inference_weight_path(
+                        self.config, restart_candidate, self.lora_name
+                    )
+                    ack_source = None
+                    ack_marker = candidate / "receivers-ready.json"
+                    if ack_marker.is_file() and not ack_marker.is_symlink():
+                        try:
+                            ack_value = json.loads(ack_marker.read_text(encoding="utf-8"))
+                            ack_source = ack_value.get("source_url") if isinstance(ack_value, dict) else None
+                        except (OSError, ValueError):
+                            ack_source = None
+                    restart_full = (
+                        (restart_candidate / "STABLE").is_file()
+                        and isinstance(restart_source, str)
+                        and ack_source == restart_source
+                    )
+                    if restart_full:
+                        candidate = restart_candidate
                     weights_path = inference_weight_path(self.config, candidate, self.lora_name)
                     self.current_weights_path = weights_path
                 elif remote_filesystem:
@@ -950,7 +974,10 @@ class WeightWatcher:
             if weights_path is None:
                 return
 
-            require_delta = self.ckpt_step > 0
+            require_delta = self.ckpt_step > 0 and not (
+                isinstance(weights_path, str)
+                and "/restart/step_" in weights_path
+            )
             if require_delta and self.verified_adapter_step != self.ckpt_step:
                 raise RuntimeError(
                     f"cannot reconcile policy v{self.ckpt_step}: exact loaded policy is not verified"
