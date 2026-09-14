@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from typing import TYPE_CHECKING
 from urllib.request import urlopen
@@ -178,6 +179,9 @@ def _verify_startup_adapter_delta(
     target_path,
     target_url: str | None = None,
     deadline: float | None = None,
+    *,
+    previous_identity: dict[str, object] | None = None,
+    previous_previous_identity: dict[str, object] | None = None,
 ) -> None:
     """Reject a positive resume unless its published adjacent delta is exact."""
     if lora_name is None or step <= 0:
@@ -223,6 +227,40 @@ def _verify_startup_adapter_delta(
             raise RuntimeError(f"cannot resume LoRA policy v{step}: adapter manifest is not an object")
         return value
 
+    def staged_files(
+        identity: dict[str, object],
+        expected_url: str | None,
+    ) -> dict[str, dict[str, object]]:
+        target_sha256 = identity.get("target_sha256")
+        target_size = identity.get("target_size")
+        config_sha256 = identity.get("config_sha256")
+        config_size = identity.get("config_size")
+        if (
+            not isinstance(expected_url, str)
+            or identity.get("source_url") != expected_url
+            or type(target_size) is not int
+            or target_size <= 0
+            or not isinstance(target_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", target_sha256) is None
+            or type(config_size) is not int
+            or config_size <= 0
+            or not isinstance(config_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", config_sha256) is None
+        ):
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: staged predecessor identity is invalid"
+            )
+        return {
+            "adapter_model.safetensors": {
+                "size": target_size,
+                "sha256": target_sha256,
+            },
+            "adapter_config.json": {
+                "size": config_size,
+                "sha256": config_sha256,
+            },
+        }
+
     manifest = read_manifest(target_path, target_url)
     try:
         validate_adapter_manifest(
@@ -236,19 +274,55 @@ def _verify_startup_adapter_delta(
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: {exc}"
         ) from exc
-    if manifest.get("version") == 2:
-        # Version-two manifests carry exact identities for both predecessor
-        # adapters. The receiver checks the corresponding cached files.
-        return
-
-    if not (previous_path / "STABLE").is_file():
+    if manifest.get("version") == 1 and not (previous_path / "STABLE").is_file():
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: exact predecessor v{step - 1} is not STABLE"
         )
-    previous_manifest = read_manifest(
-        previous_path, previous_url if isinstance(previous_url, str) else None
+    previous_manifest = (
+        None
+        if previous_identity is not None
+        else read_manifest(previous_path, previous_url if isinstance(previous_url, str) else None)
     )
-    if step == 1:
+    try:
+        previous_files = (
+            staged_files(previous_identity, previous_url)
+            if previous_identity is not None
+            else _adapter_file_records(previous_manifest)
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
+    if manifest.get("version") == 2:
+        previous_previous_manifest = (
+            None
+            if previous_previous_identity is not None
+            else read_manifest(previous_previous_path, previous_previous_url)
+        )
+        try:
+            previous_previous_files = (
+                staged_files(previous_previous_identity, previous_previous_url)
+                if previous_previous_identity is not None
+                else _adapter_file_records(previous_previous_manifest)
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
+        if (
+            manifest.get("base_size") != previous_files["adapter_model.safetensors"].get("size")
+            or manifest.get("base_sha256") != previous_files["adapter_model.safetensors"].get("sha256")
+            or manifest.get("base_config_size") != previous_files["adapter_config.json"].get("size")
+            or manifest.get("base_config_sha256") != previous_files["adapter_config.json"].get("sha256")
+            or manifest.get("base2_size") != previous_previous_files["adapter_model.safetensors"].get("size")
+            or manifest.get("base2_sha256") != previous_previous_files["adapter_model.safetensors"].get("sha256")
+            or manifest.get("base2_config_size") != previous_previous_files["adapter_config.json"].get("size")
+            or manifest.get("base2_config_sha256") != previous_previous_files["adapter_config.json"].get("sha256")
+        ):
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: adjacent adapter base or SHA-256 identity differs"
+            )
+        return
+
+    if previous_identity is not None:
+        valid_previous = True
+    elif step == 1:
         valid_previous = (
             previous_manifest.get("version") in {1, 2}
             and previous_manifest.get("kind") == "lora-adapter"
@@ -280,7 +354,6 @@ def _verify_startup_adapter_delta(
         )
     try:
         target_files = _adapter_file_records(manifest)
-        previous_files = _adapter_file_records(previous_manifest)
     except RuntimeError as exc:
         raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
     target_weights = target_files["adapter_model.safetensors"]
@@ -661,6 +734,7 @@ class Orchestrator:
                         f"resuming adapter transfer there"
                     )
 
+            staged_adapter_identities: dict[int, dict[str, object]] = {}
             for sync_version in sync_versions:
                 require_delta = self.lora_name is not None and sync_version > 0
                 startup_delta_deadline = None
@@ -696,6 +770,8 @@ class Orchestrator:
                         weights_path,
                         source_weights_path if isinstance(source_weights_path, str) else None,
                         deadline=startup_delta_deadline,
+                        previous_identity=staged_adapter_identities.get(sync_version - 1),
+                        previous_previous_identity=staged_adapter_identities.get(sync_version - 2),
                     )
                     if require_delta:
                         startup_delta_deadline = (
@@ -754,6 +830,11 @@ class Orchestrator:
                                 "resuming its saved partial once"
                             )
                     adapter_identity = stage_result["adapter_identity"]
+                    if not isinstance(adapter_identity, dict):
+                        raise RuntimeError(
+                            f"cannot resume LoRA policy v{sync_version}: staged adapter identity is unavailable"
+                        )
+                    staged_adapter_identities[sync_version] = adapter_identity
                     prefetched = True
                     if require_delta:
                         get_logger().info(
