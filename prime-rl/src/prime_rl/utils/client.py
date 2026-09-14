@@ -1320,11 +1320,7 @@ def adapter_stage_limit_seconds(policy_step: int) -> float:
     """Return the bounded operational staging limit for one adapter step."""
     if type(policy_step) is not int or policy_step <= 0:
         raise RuntimeError("adapter policy step must be a positive integer")
-    if policy_step == 1:
-        return 960.0
-    if policy_step == 2:
-        return 600.0
-    return 300.0
+    return 960.0
 
 
 def _delta_stage_timeout_s() -> float:

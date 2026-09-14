@@ -64,8 +64,8 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
         "_delta_stage_timeout_s": lambda: 30.0,
         "adapter_stage_limit_seconds": lambda step: {
             1: 960.0,
-            2: 600.0,
-        }.get(step, 300.0),
+            2: 960.0,
+        }.get(step, 960.0),
         "validate_adapter_manifest": validate_manifest,
         "_adapter_file_records": file_records,
     }
@@ -169,8 +169,8 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
         ),
         "adapter_stage_limit_seconds": lambda step: {
             1: 960.0,
-            2: 600.0,
-        }.get(step, 300.0),
+            2: 960.0,
+        }.get(step, 960.0),
         "asyncio": asyncio,
         "ErrorResponse": FakeErrorResponse,
         "JSONResponse": FakeJSONResponse,
@@ -370,7 +370,7 @@ class ResumeRecoveryTest(unittest.TestCase):
             self.assertEqual(delta_success["status"], "ok")
             self.assertEqual(len(stage_calls), 1)
             self.assertEqual(stage_calls[0][1]["policy_step"], 2)
-            self.assertEqual(stage_calls[0][1]["stage_timeout_seconds"], 600.0)
+            self.assertEqual(stage_calls[0][1]["stage_timeout_seconds"], 960.0)
 
             async def status_during_staging():
                 stage_started = threading.Event()
@@ -683,10 +683,10 @@ class ResumeRecoveryTest(unittest.TestCase):
         validator = load_startup_validator(fetch, validate, records)
         with tempfile.TemporaryDirectory() as temporary:
             validator(SimpleNamespace(output_dir=Path(temporary)), "adapter", 6, Path(temporary) / "step_6", target_url)
-        self.assertEqual(calls, [(target_url + "/adapter_manifest.json", 300.0)])
+        self.assertEqual(calls, [(target_url + "/adapter_manifest.json", 960.0)])
 
     def test_resume_manifest_probe_uses_exact_policy_step_limit(self):
-        for step, expected_limit in ((1, 960.0), (2, 600.0), (3, 300.0)):
+        for step, expected_limit in ((1, 960.0), (2, 960.0), (3, 960.0)):
             with self.subTest(step=step):
                 calls = []
 

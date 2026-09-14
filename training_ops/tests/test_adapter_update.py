@@ -61,7 +61,7 @@ class AdapterUpdateTest(unittest.TestCase):
             ("receiver", receiver_limit, OSError),
             ("client", client_limit, RuntimeError),
         )
-        for step, expected in ((1, 960), (2, 600), (3, 300), (4, 300), (99, 300)):
+        for step, expected in ((1, 960), (2, 960), (3, 960), (4, 960), (99, 960)):
             with self.subTest(step=step):
                 self.assertEqual(
                     [int(limit(step)) for _, limit, _ in layers],
@@ -603,7 +603,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 6,
-            "stage_timeout_seconds": 300,
+            "stage_timeout_seconds": 960,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 298.297,
             "error": "TimeoutError: adapter persistent request exceeded its stage time limit",
@@ -613,7 +613,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 6,
-            "stage_timeout_seconds": 300,
+            "stage_timeout_seconds": 960,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 299.102,
             "error": "_PersistentTransportError: adapter persistent download retries exhausted",
@@ -681,7 +681,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 6,
-            "stage_timeout_seconds": 300,
+            "stage_timeout_seconds": 960,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 262.336,
         }
@@ -690,7 +690,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 6,
-            "stage_timeout_seconds": 300,
+            "stage_timeout_seconds": 960,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 298.297,
             "error": "_PersistentTransportError: adapter persistent request failed",

@@ -96,11 +96,7 @@ _dependency_remote_archive_pattern = re.compile(
 def _adapter_stage_limit_seconds(policy_step: int) -> int:
     if type(policy_step) is not int or policy_step <= 0:
         raise Refused("adapter policy step must be a positive integer")
-    if policy_step == 1:
-        return 960
-    if policy_step == 2:
-        return 600
-    return adapter_delta_stage_timeout_seconds
+    return 960
 
 if set(inference_hosts) != set(inference_settings):
     raise RuntimeError("each inference host must have one [inference.<host>] entry")

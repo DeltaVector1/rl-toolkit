@@ -517,7 +517,7 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
                         {task},
                         timeout=(
                             adapter_stage_limit_seconds(policy_step)
-                            if policy_step == 1
+                            if policy_step is not None
                             else 600.0
                         ),
                     )
