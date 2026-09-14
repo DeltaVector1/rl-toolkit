@@ -231,10 +231,13 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                     run_id = self.multi_run_manager.idx_2_id[idx]
                     # pack() already advanced progress to the next step, so the model we just
                     # trained — policy v(step-1) — broadcasts to broadcasts/step_{step-1}.
+                    broadcast_step = self.multi_run_manager.progress[idx].step - 1
                     save_dir = get_step_path(
                         get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
-                        self.multi_run_manager.progress[idx].step - 1,
+                        broadcast_step,
                     )
+                    if adapter_only and broadcast_step >= 3:
+                        self.maybe_clean(None, run_idx=idx, before_step=broadcast_step)
                     save_dir.mkdir(parents=True, exist_ok=True)
 
                     self.logger.debug(f"Saving weights for run {idx} to {save_dir}")
@@ -253,7 +256,6 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                             alpha=orch_lora.alpha,
                             dropout=self.lora_config.dropout,
                         )
-                        broadcast_step = self.multi_run_manager.progress[idx].step - 1
                         previous_dir = get_step_path(
                             get_broadcast_dir(self.multi_run_manager.get_run_dir(idx)),
                             broadcast_step - 1,
@@ -360,12 +362,23 @@ class FileSystemWeightBroadcast(WeightBroadcast):
         stable_file = save_dir / "STABLE"
         stable_file.touch()
 
-    def maybe_clean(self, interval_to_keep: int | None):
+    def maybe_clean(
+        self,
+        interval_to_keep: int | None,
+        *,
+        run_idx: int | None = None,
+        before_step: int | None = None,
+    ):
         if not self.world.is_master:
             return
-        for idx in self.multi_run_manager.used_idxs:
+        indices = self.multi_run_manager.used_idxs if run_idx is None else [run_idx]
+        for idx in indices:
             broadcast_dir = get_broadcast_dir(self.multi_run_manager.get_run_dir(idx))
-            current_step = self.multi_run_manager.progress[idx].step - 1
+            current_step = (
+                before_step
+                if before_step is not None
+                else self.multi_run_manager.progress[idx].step - 1
+            )
             if self.lora_config is None:
                 maybe_clean(broadcast_dir, current_step, interval_to_keep)
                 continue
@@ -406,7 +419,10 @@ class FileSystemWeightBroadcast(WeightBroadcast):
                 current_step,
                 run_id,
             )
-            retention_floor = min(current_step - 2, highest_ack_step - 2)
+            retention_floor = min(
+                current_step - 2,
+                highest_ack_step if before_step is not None else highest_ack_step - 2,
+            )
             if retention_floor <= 0:
                 continue
             for candidate_path in broadcast_dir.iterdir():
