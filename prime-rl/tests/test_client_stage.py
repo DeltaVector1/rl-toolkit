@@ -549,7 +549,7 @@ class StageLoraAdapterTest(unittest.TestCase):
     def test_adapter_stage_limits_are_exact_at_step_boundaries(self):
         _stage_lora_adapter, namespace = _load_stage_function()
         limit = namespace["adapter_stage_limit_seconds"]
-        self.assertEqual([limit(step) for step in (1, 2, 3, 4)], [600.0, 600.0, 300.0, 300.0])
+        self.assertEqual([limit(step) for step in (1, 2, 3, 4)], [960.0, 600.0, 300.0, 300.0])
 
     def test_distinct_ports_each_stage(self):
         stage_lora_adapter, namespace = _load_stage_function()
@@ -832,13 +832,13 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(finished, [origin])
 
     def test_server_receives_selected_policy_step_limit_without_client_probe(self):
-        for policy_step, expected_limit in ((2, 600.0), (3, 300.0)):
+        for policy_step, expected_limit in ((1, 960.0), (2, 600.0), (3, 300.0)):
             with self.subTest(policy_step=policy_step):
                 _ManifestProbeClient.requests.clear()
                 stage_lora_adapter, namespace = _load_stage_function(
                     probe_version=2, probe_step=policy_step
                 )
-                namespace["_delta_stage_timeout_s"] = lambda: 600.0
+                namespace["_delta_stage_timeout_s"] = lambda: 960.0
 
                 class Response:
                     def json(self):

@@ -64,7 +64,7 @@ def load_watcher_delta_method(urlopen):
         "urlopen": urlopen,
         "_delta_stage_timeout_s": lambda: 30,
         "adapter_stage_limit_seconds": lambda step: {
-            1: 600.0,
+            1: 960.0,
             2: 600.0,
         }.get(step, 300.0),
         "get_broadcast_dir": lambda output_dir: output_dir,
@@ -983,10 +983,10 @@ class AdapterTransportStateTest(unittest.TestCase):
 
             self.assertEqual(result, f"{target_url}/adapter_manifest.json")
             self.assertEqual(watcher.last_adapter_delta_build_time, 2.5)
-            self.assertEqual(calls, [(f"{target_url}/adapter_manifest.json", 600.0)])
+            self.assertEqual(calls, [(f"{target_url}/adapter_manifest.json", 960.0)])
 
     def test_watcher_manifest_probe_uses_exact_policy_step_limit(self):
-        for target_step, expected_limit in ((1, 600.0), (2, 600.0), (3, 300.0)):
+        for target_step, expected_limit in ((1, 960.0), (2, 600.0), (3, 300.0)):
             with self.subTest(target_step=target_step), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 for step in range(target_step + 1):
@@ -1797,7 +1797,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         old_operations = os.environ.get("PRIME_RL_OPERATIONS_CONFIG")
         try:
             os.environ["PRIME_RL_OPERATIONS_CONFIG"] = "/missing/operations.toml"
-            self.assertEqual(filesystem._delta_stage_timeout_s(), 600.0)
+            self.assertEqual(filesystem._delta_stage_timeout_s(), 960.0)
         finally:
             if old_timeout is not None:
                 os.environ["PRIME_LORA_DELTA_STAGE_TIMEOUT_S"] = old_timeout

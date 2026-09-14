@@ -477,13 +477,13 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
             return JSONResponse(content={"error": "prefetched must be a boolean"}, status_code=400)
         if remote_adapter:
             _loaded_lora_receipts.pop(lora_request.lora_name, None)
+        policy_step = None
         if remote_adapter:
             _begin_lora_stage()
         try:
             adapter_identity = None
             if remote_adapter:
                 source_url = lora_request.lora_path
-                policy_step = None
                 if require_delta:
                     try:
                         policy_step = _adapter_step_from_source_url(source_url)
@@ -513,7 +513,14 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
             async def load_engine_adapter():
                 task = asyncio.create_task(handler.load_lora_adapter(lora_request))
                 try:
-                    done, _ = await asyncio.wait({task}, timeout=600.0)
+                    done, _ = await asyncio.wait(
+                        {task},
+                        timeout=(
+                            adapter_stage_limit_seconds(policy_step)
+                            if policy_step == 1
+                            else 600.0
+                        ),
+                    )
                     if task in done:
                         return task.result()
                     task.cancel()

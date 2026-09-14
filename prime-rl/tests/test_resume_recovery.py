@@ -63,7 +63,7 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
         ),
         "_delta_stage_timeout_s": lambda: 30.0,
         "adapter_stage_limit_seconds": lambda step: {
-            1: 600.0,
+            1: 960.0,
             2: 600.0,
         }.get(step, 300.0),
         "validate_adapter_manifest": validate_manifest,
@@ -168,7 +168,7 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
             re.fullmatch(r"step_(\d+)", Path(source_url.rstrip("/")).name).group(1)
         ),
         "adapter_stage_limit_seconds": lambda step: {
-            1: 600.0,
+            1: 960.0,
             2: 600.0,
         }.get(step, 300.0),
         "asyncio": asyncio,
@@ -686,7 +686,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertEqual(calls, [(target_url + "/adapter_manifest.json", 300.0)])
 
     def test_resume_manifest_probe_uses_exact_policy_step_limit(self):
-        for step, expected_limit in ((1, 600.0), (2, 600.0), (3, 300.0)):
+        for step, expected_limit in ((1, 960.0), (2, 600.0), (3, 300.0)):
             with self.subTest(step=step):
                 calls = []
 

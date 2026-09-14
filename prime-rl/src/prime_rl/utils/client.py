@@ -1061,7 +1061,7 @@ async def stage_lora_adapter(
         match = re.fullmatch(r"step_(\d+)", source_name)
         if match is None or int(match.group(1)) != policy_step:
             raise RuntimeError("adapter source URL differs from its policy step")
-        selected_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
+        selected_deadline = time.monotonic() + max(POLICY_PHASE_TIMEOUT_S, stage_limit)
         selected_deadline = min(selected_deadline, time.monotonic() + min(stage_limit, configured_delta_timeout))
         if delta_deadline is None:
             delta_deadline = selected_deadline
@@ -1313,7 +1313,7 @@ LORA_LOAD_READ_TIMEOUT_S = 600.0
 LORA_LOAD_TOTAL_TIMEOUT_S = 600.0
 LORA_STAGE_ATTEMPT_TIMEOUT_S = 1800.0
 LORA_STAGE_TOTAL_TIMEOUT_S = 1800.0
-default_delta_stage_timeout_s = 600.0
+default_delta_stage_timeout_s = 960.0
 
 
 def adapter_stage_limit_seconds(policy_step: int) -> float:
@@ -1321,7 +1321,7 @@ def adapter_stage_limit_seconds(policy_step: int) -> float:
     if type(policy_step) is not int or policy_step <= 0:
         raise RuntimeError("adapter policy step must be a positive integer")
     if policy_step == 1:
-        return 600.0
+        return 960.0
     if policy_step == 2:
         return 600.0
     return 300.0

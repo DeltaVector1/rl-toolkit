@@ -42,7 +42,7 @@ _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
 _MAX_DOWNLOAD_STREAMS = 128
 full_download_streams = 48
-default_delta_stage_timeout_s = 600.0
+default_delta_stage_timeout_s = 960.0
 full_adapter_stage_timeout_s = 1800.0
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
@@ -87,7 +87,7 @@ def adapter_stage_limit_seconds(policy_step: int) -> float:
     if type(policy_step) is not int or policy_step <= 0:
         raise OSError("adapter policy step must be a positive integer")
     if policy_step == 1:
-        return 600.0
+        return 960.0
     if policy_step == 2:
         return 600.0
     return 300.0
