@@ -368,14 +368,16 @@ def load_filesystem_module():
                 sys.modules[name] = previous
 
 
-def load_server_stage_method(stage_worker, publish_lock=None):
+def load_server_stage_method(stage_worker, publish_lock=None, initial_stage_state=None):
     path = ROOT / "src/prime_rl/inference/vllm/server.py"
     source = path.read_text(encoding="utf-8")
-    function = next(
+    functions = [
         node
         for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "stage_lora_adapter"
-    )
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name
+        in {"_stage_lora_adapter_once", "_run_lora_stage_task", "stage_lora_adapter"}
+    ]
 
     class FakeJSONResponse:
         def __init__(self, content, status_code):
@@ -387,7 +389,7 @@ def load_server_stage_method(stage_worker, publish_lock=None):
             return lambda function: function
 
     stage_path = {}
-    stage_state = {}
+    stage_state = dict(initial_stage_state or {})
     processes = {}
 
     class FakeProcess:
@@ -518,7 +520,14 @@ def load_server_stage_method(stage_worker, publish_lock=None):
             "target_size": 8,
         },
     }
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    namespace.update(
+        {
+            "_lora_stage_tasks": {},
+            "_lora_stage_tasks_lock": threading.Lock(),
+            "_lora_stage_serial_lock": asyncio.Lock(),
+        }
+    )
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"), namespace)
     return namespace["stage_lora_adapter"], FakeJSONResponse
 
 
@@ -2404,14 +2413,16 @@ class AdapterTransportStateTest(unittest.TestCase):
                 task.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await task
-                return time.monotonic() - started_at
+                response = await stage_method(Request())
+                return time.monotonic() - started_at, response
 
-            elapsed = asyncio.run(cancel_request())
-            self.assertTrue(stopped.is_set())
+            elapsed, response = asyncio.run(cancel_request())
+            self.assertFalse(stopped.is_set())
             self.assertGreaterEqual(elapsed, 0.035)
-            self.assertFalse(ready.exists())
+            self.assertEqual(response["status"], "ok")
+            self.assertTrue(ready.exists())
 
-    def test_request_disconnect_stops_worker(self):
+    def test_request_disconnect_keeps_shared_worker(self):
         with tempfile.TemporaryDirectory() as temporary:
             ready = Path(temporary) / "READY"
             started = threading.Event()
@@ -2451,11 +2462,122 @@ class AdapterTransportStateTest(unittest.TestCase):
                     return True
 
             response = asyncio.run(stage_method(Request()))
-            self.assertIsInstance(response, response_type)
-            self.assertEqual(response.status_code, 499)
+            self.assertIsInstance(response, dict)
+            self.assertEqual(response["status"], "ok")
             self.assertTrue(started.is_set())
-            self.assertTrue(stopped.is_set())
-            self.assertFalse(ready.exists())
+            self.assertFalse(stopped.is_set())
+            self.assertTrue(ready.exists())
+
+    def test_same_source_retry_joins_live_stage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            started = threading.Event()
+            release = threading.Event()
+            calls = []
+
+            def stage_worker(source_url, **_kwargs):
+                calls.append(source_url)
+                started.set()
+                self.assertTrue(release.wait(1.0))
+                return Path(temporary)
+
+            stage_method, _ = load_server_stage_method(stage_worker)
+
+            class Request:
+                async def json(self):
+                    return {"lora_path": "http://source/step_1", "require_delta": False}
+
+            async def run_requests():
+                first = asyncio.create_task(stage_method(Request()))
+                await asyncio.to_thread(started.wait)
+                second = asyncio.create_task(stage_method(Request()))
+                await asyncio.sleep(0.01)
+                self.assertEqual(calls, ["http://source/step_1"])
+                release.set()
+                return await first, await second
+
+            first, second = asyncio.run(run_requests())
+            self.assertEqual(first, second)
+            self.assertEqual(calls, ["http://source/step_1"])
+
+    def test_different_sources_serialize_stage_workers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            started = threading.Event()
+            release = threading.Event()
+            calls = []
+            active = 0
+            max_active = 0
+            state_lock = threading.Lock()
+
+            def stage_worker(source_url, **_kwargs):
+                nonlocal active, max_active
+                with state_lock:
+                    calls.append(source_url)
+                    active += 1
+                    max_active = max(max_active, active)
+                try:
+                    if source_url.endswith("/a"):
+                        started.set()
+                        self.assertTrue(release.wait(1.0))
+                    return Path(temporary)
+                finally:
+                    with state_lock:
+                        active -= 1
+
+            stage_method, _ = load_server_stage_method(stage_worker)
+
+            class Request:
+                def __init__(self, source_url):
+                    self.source_url = source_url
+
+                async def json(self):
+                    return {"lora_path": self.source_url, "require_delta": False}
+
+            async def run_requests():
+                first = asyncio.create_task(stage_method(Request("http://source/a")))
+                await asyncio.to_thread(started.wait)
+                second = asyncio.create_task(stage_method(Request("http://source/b")))
+                await asyncio.sleep(0.01)
+                self.assertEqual(calls, ["http://source/a"])
+                release.set()
+                return await first, await second
+
+            first, second = asyncio.run(run_requests())
+            self.assertEqual(first["status"], "ok")
+            self.assertEqual(second["status"], "ok")
+            self.assertEqual(calls, ["http://source/a", "http://source/b"])
+            self.assertEqual(max_active, 1)
+
+    def test_stale_stage_owner_is_recovered(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            attempts = 0
+
+            def stage_worker(_source_url, **_kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("dead owner")
+                return Path(temporary)
+
+            stage_method, response_type = load_server_stage_method(
+                stage_worker,
+                initial_stage_state={
+                    "status": "staging",
+                    "stage_id": "dead-stage",
+                    "pid": 999999,
+                    "source_url": "http://source/step_1",
+                },
+            )
+
+            class Request:
+                async def json(self):
+                    return {"lora_path": "http://source/step_1", "require_delta": False}
+
+            first = asyncio.run(stage_method(Request()))
+            self.assertIsInstance(first, response_type)
+            self.assertEqual(first.status_code, 500)
+            second = asyncio.run(stage_method(Request()))
+            self.assertEqual(second["status"], "ok")
+            self.assertEqual(attempts, 2)
 
     def test_inventory_defines_bounded_transfer(self):
         nodes = REPOSITORY / "configs/nodes.toml"
