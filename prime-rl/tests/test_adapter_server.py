@@ -53,6 +53,8 @@ class AdapterServerTest(unittest.TestCase):
         manifest = {
             "version": 2,
             "kind": "lora-adapter",
+            "mode": "delta",
+            "transport": adapter_server.adapter_predictive_transport,
             "target_step": step_number,
             "files": [
                 {
@@ -137,6 +139,25 @@ class AdapterServerTest(unittest.TestCase):
             second = adapter_server._manifest_cache_entry(step, 0)
             self.assertNotEqual(first.key, second.key)
             self.assertEqual(len(adapter_server._manifest_cache), 2)
+
+    def test_manifest_rejects_unknown_or_oversize_without_fd_leak(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            step, manifest = self._write_predictive_step(Path(temporary))
+            manifest_path = step / adapter_server.adapter_manifest_name
+            self._clear_identity_state()
+            unknown = dict(manifest)
+            unknown["version"] = 99
+            manifest_path.write_text(json.dumps(unknown), encoding="utf-8")
+            with self.assertRaisesRegex(adapter_server.UpgradeError, "unsupported version"):
+                adapter_server._manifest_cache_entry(step, 0)
+
+            before = len(os.listdir("/proc/self/fd"))
+            manifest_path.write_bytes(
+                b"{" + b"x" * adapter_server.adapter_metadata_max_bytes + b"}"
+            )
+            with self.assertRaisesRegex(adapter_server.UpgradeError, "metadata size limit"):
+                adapter_server._manifest_cache_entry(step, 0)
+            self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
     def test_manifest_cache_is_bounded(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -457,6 +478,8 @@ class AdapterServerTest(unittest.TestCase):
                     {
                         "version": 2,
                         "kind": "lora-adapter",
+                        "mode": "delta",
+                        "transport": adapter_server.adapter_predictive_transport,
                         "target_step": 0,
                         "files": [
                             {
@@ -1157,6 +1180,8 @@ class AdapterServerTest(unittest.TestCase):
                     {
                         "version": 2,
                         "kind": "lora-adapter",
+                        "mode": "delta",
+                        "transport": adapter_server.adapter_predictive_transport,
                         "target_step": 2,
                         "files": [
                             {

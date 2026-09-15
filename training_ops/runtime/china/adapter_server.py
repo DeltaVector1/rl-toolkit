@@ -21,6 +21,7 @@ adapter_config_name = "adapter_config.json"
 adapter_weights_name = "adapter_model.safetensors"
 adapter_manifest_name = "adapter_manifest.json"
 adapter_digest_name = "adapter_model.safetensors.sha256"
+adapter_predictive_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
 stable_name = "STABLE"
 cache_name = ".adapter-predictive-cache"
 lock_name = ".adapter-predictive-upgrade.lock"
@@ -30,6 +31,8 @@ run_pattern = re.compile(r"[A-Za-z0-9_-]+\Z")
 transfer_write_bytes = 256 * 1024
 # Keep the server idle read bound above the worker's 90-second chunk deadline.
 connection_timeout_seconds = 120
+adapter_metadata_max_bytes = 2 * 1024 * 1024
+max_transport_chunks = 65_536
 
 
 class UpgradeError(RuntimeError):
@@ -60,6 +63,7 @@ _MAX_TRANSPORT_DIGEST_CACHE_ENTRIES = 128
 @dataclass(frozen=True)
 class _ManifestCacheEntry:
     key: tuple[str, tuple[int, int, int, int, int]]
+    directory_identity: tuple[int, int, int, int, int]
     files: dict[str, dict[str, object]]
     chunk_records: tuple[tuple[str, int, str], ...]
     chunk_index: dict[str, tuple[int, str]]
@@ -79,6 +83,8 @@ def _json_object(path: Path, description: str) -> dict[str, object]:
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(fd, "r", encoding="utf-8") as source:
+            if os.fstat(fd).st_size > adapter_metadata_max_bytes:
+                raise UpgradeError(f"{description} exceeds the metadata size limit")
             value = json.load(source)
     except (OSError, ValueError) as exc:
         raise UpgradeError(f"{description} is not valid JSON") from exc
@@ -147,6 +153,8 @@ def _predictive_chunk_records(chunks: object) -> list[tuple[str, int, str]]:
         return list(chunks.chunk_records)
     if not isinstance(chunks, list) or not chunks:
         raise UpgradeError("predictive manifest has no transport chunks")
+    if len(chunks) > max_transport_chunks:
+        raise UpgradeError("predictive manifest has too many transport chunks")
     records: list[tuple[str, int, str]] = []
     seen: set[str] = set()
     for item in chunks:
@@ -163,7 +171,7 @@ def _predictive_chunk_records(chunks: object) -> list[tuple[str, int, str]]:
         digest = item.get("wire_sha256")
         if (
             type(size) is not int
-            or size < 0
+            or size <= 0
             or not isinstance(digest, str)
             or digest_pattern.fullmatch(digest) is None
         ):
@@ -177,24 +185,42 @@ def _manifest_cache_entry(step_path: Path, step: int) -> _ManifestCacheEntry:
     canonical_step = step_path.resolve(strict=False)
     manifest_path = canonical_step / adapter_manifest_name
     for _attempt in range(3):
+        directory_identity = _directory_identity(canonical_step)
         manifest_identity = _stat_identity(manifest_path)
         cache_key = (str(canonical_step), manifest_identity)
         with _manifest_cache_lock:
             cached = _manifest_cache.get(cache_key)
-            if cached is not None:
+            if (
+                cached is not None
+                and _directory_identity(canonical_step) == cached.directory_identity
+            ):
                 _manifest_cache.move_to_end(cache_key)
                 return cached
         with _manifest_parse_lock:
             with _manifest_cache_lock:
                 cached = _manifest_cache.get(cache_key)
-                if cached is not None:
+                if (
+                    cached is not None
+                    and _directory_identity(canonical_step) == cached.directory_identity
+                ):
                     _manifest_cache.move_to_end(cache_key)
                     return cached
             manifest = _json_object(manifest_path, f"adapter step {step} manifest")
-            if _stat_identity(manifest_path) != manifest_identity:
+            if (
+                _stat_identity(manifest_path) != manifest_identity
+                or _directory_identity(canonical_step) != directory_identity
+            ):
                 continue
+            version = manifest.get("version")
+            if type(version) is not int or version not in {1, 2}:
+                raise UpgradeError(f"adapter step {step} manifest has an unsupported version")
             if manifest.get("kind") != "lora-adapter" or manifest.get("target_step") != step:
                 raise UpgradeError(f"adapter step {step} manifest has the wrong identity")
+            if version == 2 and (
+                manifest.get("mode") != "delta"
+                or manifest.get("transport") != adapter_predictive_transport
+            ):
+                raise UpgradeError(f"adapter step {step} manifest has an unsupported transport")
             files = _file_records(manifest, f"adapter step {step} manifest")
             chunk_records = (
                 tuple(_predictive_chunk_records(manifest.get("chunks")))
@@ -203,6 +229,7 @@ def _manifest_cache_entry(step_path: Path, step: int) -> _ManifestCacheEntry:
             )
             entry = _ManifestCacheEntry(
                 key=cache_key,
+                directory_identity=directory_identity,
                 files=files,
                 chunk_records=chunk_records,
                 chunk_index={
@@ -211,7 +238,7 @@ def _manifest_cache_entry(step_path: Path, step: int) -> _ManifestCacheEntry:
             )
             with _manifest_cache_lock:
                 cached = _manifest_cache.get(cache_key)
-                if cached is not None:
+                if cached is not None and cached.directory_identity == directory_identity:
                     _manifest_cache.move_to_end(cache_key)
                     return cached
                 _manifest_cache[cache_key] = entry
