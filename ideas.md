@@ -142,6 +142,22 @@ Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
 - A gain only with the prefix is a prompt effect, not proof that the
   unprompted model learned.
 
+Preliminary evidence from the first prefill attempt:
+
+- Rollout step 1 took 15m01, reward was .1900, and 672/672 rollouts were
+  trainable. Step 2 took 8m53, reward was .1870, and 336/336 were trainable.
+  Trainer forward/backward time was 431.77s and KL was .01295.
+- Matched reward was .1938 versus .1633 for the prior easy run. Policy
+  reasoning was 42.6% versus 71.7%; rejected was 5.5% versus .8%, visible
+  failures were 8.0% versus 1.9%, and reasoning failures were 7.5% versus
+  .8%.
+- This is preliminary evidence, not a conclusion. The run was stopped
+  mistakenly after one nonfatal dropped judge group and is being rerun to
+  40-50 steps.
+- The 35 deterministic invalid-output zero-reward records were valid training
+  inputs by design. The one three-attempt judge validation failure was
+  unscored, and its whole group was excluded and replaced.
+
 Research basis, kept brief: DeepSeekMath GRPO (arXiv:2402.03300), the DAPO
 paper, Online Difficulty Filtering (arXiv:2504.03380), Easy-to-Hard
 Generalization (arXiv:2506.06632), and PrefixRL (arXiv:2601.18795).
