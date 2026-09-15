@@ -1232,6 +1232,59 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
 
+    def test_pre_stage_cleanup_keeps_target_bases_and_active_only(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                base2_url = "http://source/run/broadcasts/step_1"
+                base_url = "http://source/run/broadcasts/step_2"
+                target_url = "http://source/run/broadcasts/step_3"
+                obsolete_url = "http://source/run/broadcasts/step_0"
+                paths = {
+                    url: filesystem.adapter_cache_path(url)
+                    for url in (base2_url, base_url, target_url, obsolete_url)
+                }
+                for url in (base2_url, base_url, obsolete_url):
+                    path = paths[url]
+                    path.mkdir(parents=True)
+                    (path / "READY").write_text("ready\n", encoding="ascii")
+                    (path / "transport.json").write_text(
+                        json.dumps({"source_url": url}),
+                        encoding="utf-8",
+                    )
+                target_partial = paths[target_url].with_name(
+                    f"{paths[target_url].name}.partial"
+                )
+                target_partial.mkdir()
+                obsolete_partial = paths[obsolete_url].with_name(
+                    f"{paths[obsolete_url].name}.partial"
+                )
+                obsolete_partial.mkdir()
+
+                filesystem._cleanup_adapter_space_before_stage(
+                    Path(temporary),
+                    paths[target_url],
+                    {
+                        "mode": "delta",
+                        "base_url": base_url,
+                        "base2_url": base2_url,
+                    },
+                    {"status": "failed", "source_url": target_url},
+                )
+
+                self.assertTrue(paths[base_url].is_dir())
+                self.assertTrue(paths[base2_url].is_dir())
+                self.assertFalse(paths[obsolete_url].exists())
+                self.assertTrue(target_partial.is_dir())
+                self.assertFalse(obsolete_partial.exists())
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
     def test_delta_cleanup_rejects_a_symlinked_candidate(self):
         filesystem = load_filesystem()
         old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")

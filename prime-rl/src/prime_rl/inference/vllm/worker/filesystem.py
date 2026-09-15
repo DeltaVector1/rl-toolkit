@@ -2538,6 +2538,8 @@ def _cleanup_previous_adapter_caches(
     cache_root: Path,
     active: Path,
     *,
+    preserve_names: set[str] | None = None,
+    preserve_active_bases: bool = True,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> None:
@@ -2622,7 +2624,7 @@ def _cleanup_previous_adapter_caches(
             finally:
                 os.close(candidate_fd)
 
-        keep = {active_name}
+        keep = {active_name, *(preserve_names or set())}
         active_step = None
         try:
             active_fd = _open_directory_entry_nofollow(
@@ -2644,12 +2646,13 @@ def _cleanup_previous_adapter_caches(
                 os.close(active_fd)
         except (FileNotFoundError, OSError, ValueError):
             transport = None
-        for key in ("base_url", "base2_url"):
-            predecessor_url = transport.get(key) if isinstance(transport, dict) else None
-            if isinstance(predecessor_url, str):
-                predecessor_name = adapter_cache_path(predecessor_url).name
-                if predecessor_name in ready_candidates:
-                    keep.add(predecessor_name)
+        if preserve_active_bases:
+            for key in ("base_url", "base2_url"):
+                predecessor_url = transport.get(key) if isinstance(transport, dict) else None
+                if isinstance(predecessor_url, str):
+                    predecessor_name = adapter_cache_path(predecessor_url).name
+                    if predecessor_name in ready_candidates:
+                        keep.add(predecessor_name)
 
         if active_step is not None:
             keep.update(
@@ -2682,6 +2685,120 @@ def _cleanup_previous_adapter_caches(
                 continue
     finally:
         os.close(cache_fd)
+
+
+def _cleanup_obsolete_adapter_partials(
+    cache_root: Path,
+    preserve_names: set[str],
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Remove abandoned adapter partials while preserving resumable stages."""
+    try:
+        cache_fd = _open_directory_nofollow(
+            cache_root,
+            create=False,
+            label="adapter cache directory",
+        )
+    except FileNotFoundError:
+        return
+
+    try:
+        names: list[str] = []
+        entry_count = 0
+        with os.scandir(cache_fd) as entries:
+            for entry in entries:
+                _check_deadline(deadline, cancel_event)
+                entry_count += 1
+                if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                    raise OSError("adapter cache has too many cleanup entries")
+                if entry.name.endswith(".partial") and re.fullmatch(
+                    r"[0-9a-f]{64}", entry.name[: -len(".partial")]
+                ):
+                    names.append(entry.name)
+    finally:
+        os.close(cache_fd)
+    for name in names:
+        _check_deadline(deadline, cancel_event)
+        if name[: -len(".partial")] in preserve_names:
+            continue
+        _cleanup_delta_stage_artifacts(
+            cache_root / name[: -len(".partial")],
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+
+
+def _cleanup_adapter_space_before_stage(
+    cache_root: Path,
+    destination: Path,
+    transport: dict[str, object],
+    previous_status: dict[str, object],
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Prune old receiver state before reserving the next adapter stage."""
+    cleanup_deadline = time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S
+    if deadline is not None:
+        cleanup_deadline = min(cleanup_deadline, deadline)
+    preserve_names = {destination.name}
+    active_urls: list[str] = []
+    for key in ("base_url", "base2_url"):
+        predecessor_url = transport.get(key)
+        if isinstance(predecessor_url, str):
+            preserve_names.add(adapter_cache_path(predecessor_url).name)
+    predecessor_url = transport.get("base_url")
+    if isinstance(predecessor_url, str):
+        active_urls.append(predecessor_url)
+
+    status_url = previous_status.get("source_url")
+    if isinstance(status_url, str):
+        active_urls.append(status_url)
+
+    active: Path | None = None
+    for active_url in active_urls:
+        candidate = adapter_cache_path(active_url)
+        if candidate.parent != cache_root or candidate.name == destination.name:
+            continue
+        try:
+            ready = _path_regular_size(candidate / "READY", "active adapter ready marker")
+        except OSError:
+            ready = None
+        if ready is not None:
+            active = candidate
+            preserve_names.add(candidate.name)
+            break
+    if active is None:
+        try:
+            ready = _path_regular_size(destination / "READY", "target adapter ready marker")
+        except OSError:
+            ready = None
+        if ready is None:
+            return
+        active = destination
+
+    _cleanup_retired_adapters(
+        cache_root,
+        destination.name,
+        deadline=cleanup_deadline,
+        cancel_event=cancel_event,
+    )
+    _cleanup_previous_adapter_caches(
+        cache_root,
+        active,
+        preserve_names=preserve_names,
+        preserve_active_bases=False,
+        deadline=cleanup_deadline,
+        cancel_event=cancel_event,
+    )
+    _cleanup_obsolete_adapter_partials(
+        cache_root,
+        preserve_names,
+        deadline=cleanup_deadline,
+        cancel_event=cancel_event,
+    )
 
 
 def _cleanup_adapter_caches(
@@ -6101,6 +6218,7 @@ def stage_lora_adapter_files(
         "w",
     ) as host_lock:
         _acquire_stage_lock(host_lock, operation_deadline, cancel_event)
+        previous_status = adapter_stage_status()
         transport: dict[str, object] | None = None
         try:
             if not require_delta:
@@ -6186,6 +6304,14 @@ def stage_lora_adapter_files(
                     or config_spec.get("size") != transport["config_size"]
                 ):
                     raise OSError("adapter transport target differs from source manifest")
+                _cleanup_adapter_space_before_stage(
+                    destination.parent,
+                    destination,
+                    transport,
+                    previous_status,
+                    deadline=operation_deadline,
+                    cancel_event=cancel_event,
+                )
                 _reject_symlink_path(destination / "READY", "adapter ready marker")
                 if _path_regular_size(destination / "READY", "adapter ready marker") is not None:
                     try:
