@@ -88,3 +88,8 @@ Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
 - With exclusion enabled, all-refusal groups create no optimizer samples.
 - Use 40-50 completed trainer steps unless a hard failure occurs.
 - Compare each difficulty separately and require reward movement beyond noise.
+
+- Prefill-2 step 1 reward was 0.1819 with 0% errors; rollout plus judge took
+  24m15s. The collected batch had 1,980 sequences, 4,236,410 tokens, and 130
+  packed microbatches; forward/backward stopped at 610.70s. Cause: fixed-rollout
+  batching. Next test: 1.5M-token cap. One point gives no reward trend claim.
