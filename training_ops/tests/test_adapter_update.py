@@ -772,6 +772,33 @@ class AdapterUpdateTest(unittest.TestCase):
                 "glm52-decensor-h200", 8000, startup_timeout_seconds=180
             )
 
+    def test_orchestrator_control_wait_uses_engine_startup_budget(self):
+        source_path = Path(training_ops.__file__)
+        source = source_path.read_text(encoding="utf-8")
+        start = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FunctionDef) and node.name == "start"
+        )
+        wait = next(
+            node
+            for node in ast.walk(start)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "wait_for_orchestrator_control"
+        )
+        wait_source = ast.get_source_segment(source, wait)
+        self.assertIsNotNone(wait_source)
+        assert wait_source is not None
+        self.assertIn(
+            "seq 1 {adapter_update_engine_startup_timeout_seconds}",
+            wait_source,
+        )
+        self.assertNotIn("seq 1 60", wait_source)
+        self.assertIn(
+            "timeout=adapter_update_engine_startup_timeout_seconds + 30",
+            wait_source,
+        )
+
     def test_orchestrator_state_script_requires_exact_stopped_container(self):
         script = training_ops._orchestrator_state_script(
             "glm52-decensor-orchestrator"

@@ -6755,7 +6755,7 @@ def start(
     def wait_for_orchestrator_control() -> None:
         control_file = f"{service_run_dir}/control/orch.toml"
         script = f"""set -eu
-for _ in $(seq 1 60); do
+for _ in $(seq 1 {adapter_update_engine_startup_timeout_seconds}); do
   if [ -s {shlex.quote(control_file)} ]; then
     echo ready
     exit 0
@@ -6765,7 +6765,11 @@ done
 echo "orchestrator control file did not arrive" >&2
 exit 1
 """
-        code, output = _ssh(trainer_head, script, timeout=70)
+        code, output = _ssh(
+            trainer_head,
+            script,
+            timeout=adapter_update_engine_startup_timeout_seconds + 30,
+        )
         if code:
             detail = output.strip() or "no output"
             raise RuntimeError(
