@@ -52,6 +52,7 @@ _RELAYING_MARKER = "RELAYING"
 _WIRE_READY_SUFFIX = ".wire-ready"
 _COMPLETED_SUFFIX = ".done"
 _ADAPTER_STATUS = ".adapter-stage-status.json"
+_ADAPTER_LOADED_RECEIPTS = ".adapter-loaded-receipts.json"
 _ADAPTER_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
 _ADAPTER_FULL_TRANSPORT = "chunked-full-zstd"
 _ADAPTER_LINEAR_TRANSPORT = "chunked-bf16-linear-zigzag-sparse-zstd"
@@ -1780,6 +1781,20 @@ def _write_json(
     )
 
 
+def write_loaded_adapter_receipts(receipts: dict[str, dict[str, object]]) -> None:
+    """Persist the loaded policy lease used by cache cleanup."""
+    cache_root = Path(os.environ.get("PRIME_LORA_CACHE_DIR", "/tmp/prime-rl-lora"))
+    path = cache_root / _ADAPTER_LOADED_RECEIPTS
+    if not receipts:
+        try:
+            _unlink_path(path, "loaded adapter receipts")
+        except FileNotFoundError:
+            pass
+        return
+    _ensure_directory(cache_root, "adapter cache directory")
+    _write_json(path, {"pid": os.getpid(), "receipts": receipts})
+
+
 def _write_marker(path: Path, value: str) -> None:
     """Publish a state marker with one atomic rename."""
     _write_text_atomic(path, value, encoding="ascii")
@@ -2730,11 +2745,47 @@ def _cleanup_obsolete_adapter_partials(
         )
 
 
+def _loaded_adapter_source_urls(cache_root: Path) -> list[str]:
+    try:
+        cache_fd = _open_directory_nofollow(
+            cache_root,
+            create=False,
+            label="adapter cache directory",
+        )
+        try:
+            value = json.loads(
+                _read_text_nofollow(
+                    _ADAPTER_LOADED_RECEIPTS,
+                    encoding="utf-8",
+                    dir_fd=cache_fd,
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
+            )
+        finally:
+            os.close(cache_fd)
+    except (FileNotFoundError, OSError, ValueError):
+        return []
+    pid = value.get("pid") if isinstance(value, dict) else None
+    if type(pid) is not int or pid <= 0:
+        return []
+    try:
+        os.kill(pid, 0)
+    except (OSError, OverflowError):
+        return []
+    receipts = value.get("receipts") if isinstance(value, dict) else None
+    if not isinstance(receipts, dict):
+        return []
+    return [
+        receipt["source_url"]
+        for receipt in receipts.values()
+        if isinstance(receipt, dict) and isinstance(receipt.get("source_url"), str)
+    ]
+
+
 def _cleanup_adapter_space_before_stage(
     cache_root: Path,
     destination: Path,
     transport: dict[str, object],
-    previous_status: dict[str, object],
     *,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
@@ -2744,18 +2795,14 @@ def _cleanup_adapter_space_before_stage(
     if deadline is not None:
         cleanup_deadline = min(cleanup_deadline, deadline)
     preserve_names = {destination.name}
-    active_urls: list[str] = []
+    loaded_urls = _loaded_adapter_source_urls(cache_root)
+    if not loaded_urls:
+        return
+    active_urls = list(loaded_urls)
     for key in ("base_url", "base2_url"):
         predecessor_url = transport.get(key)
         if isinstance(predecessor_url, str):
             preserve_names.add(adapter_cache_path(predecessor_url).name)
-    predecessor_url = transport.get("base_url")
-    if isinstance(predecessor_url, str):
-        active_urls.append(predecessor_url)
-
-    status_url = previous_status.get("source_url")
-    if isinstance(status_url, str):
-        active_urls.append(status_url)
 
     active: Path | None = None
     for active_url in active_urls:
@@ -6218,7 +6265,6 @@ def stage_lora_adapter_files(
         "w",
     ) as host_lock:
         _acquire_stage_lock(host_lock, operation_deadline, cancel_event)
-        previous_status = adapter_stage_status()
         transport: dict[str, object] | None = None
         try:
             if not require_delta:
@@ -6308,7 +6354,6 @@ def stage_lora_adapter_files(
                     destination.parent,
                     destination,
                     transport,
-                    previous_status,
                     deadline=operation_deadline,
                     cancel_event=cancel_event,
                 )

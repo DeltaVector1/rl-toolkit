@@ -1232,55 +1232,88 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
 
-    def test_pre_stage_cleanup_keeps_target_bases_and_active_only(self):
+    def test_pre_stage_cleanup_preserves_loaded_policy_over_staged_status(self):
         filesystem = load_filesystem()
         old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
-                active_url = "http://source/run/broadcasts/step_5"
-                base2_url = "http://source/run/broadcasts/step_8"
-                base_url = "http://source/run/broadcasts/step_9"
-                target_url = "http://source/run/broadcasts/step_10"
-                obsolete_url = "http://source/run/broadcasts/step_0"
+                loaded_url = "http://source/run/broadcasts/step_0"
+                base2_url = "http://source/run/broadcasts/step_1"
+                base_url = "http://source/run/broadcasts/step_2"
+                target_url = "http://source/run/broadcasts/step_3"
+                obsolete_url = "http://old/adapter"
                 paths = {
                     url: filesystem.adapter_cache_path(url)
-                    for url in (active_url, base2_url, base_url, target_url, obsolete_url)
+                    for url in (loaded_url, base2_url, base_url, target_url, obsolete_url)
                 }
-                for url in (active_url, base2_url, base_url, obsolete_url):
+                for url in (loaded_url, base2_url, base_url, obsolete_url):
                     path = paths[url]
                     path.mkdir(parents=True)
                     (path / "READY").write_text("ready\n", encoding="ascii")
                     (path / "transport.json").write_text(
-                        json.dumps({"source_url": url}),
-                        encoding="utf-8",
+                        json.dumps({"source_url": url}), encoding="utf-8"
                     )
                 target_partial = paths[target_url].with_name(
                     f"{paths[target_url].name}.partial"
                 )
                 target_partial.mkdir()
-                obsolete_partial = paths[obsolete_url].with_name(
-                    f"{paths[obsolete_url].name}.partial"
+                filesystem.write_loaded_adapter_receipts(
+                    {"adapter-slot1": {"source_url": loaded_url}}
                 )
-                obsolete_partial.mkdir()
+                (Path(temporary) / ".adapter-stage-status.json").write_text(
+                    json.dumps({"status": "staging", "source_url": base_url}),
+                    encoding="utf-8",
+                )
 
                 filesystem._cleanup_adapter_space_before_stage(
                     Path(temporary),
                     paths[target_url],
-                    {
-                        "mode": "delta",
-                        "base_url": base_url,
-                        "base2_url": base2_url,
-                    },
-                    {"status": "ready", "source_url": active_url},
+                    {"mode": "delta", "base_url": base_url, "base2_url": base2_url},
                 )
 
-                self.assertTrue(paths[active_url].is_dir())
-                self.assertTrue(paths[base_url].is_dir())
-                self.assertTrue(paths[base2_url].is_dir())
-                self.assertFalse(paths[obsolete_url].exists())
+                for url in (loaded_url, base2_url, base_url):
+                    self.assertTrue(paths[url].is_dir())
                 self.assertTrue(target_partial.is_dir())
-                self.assertFalse(obsolete_partial.exists())
+                self.assertFalse(paths[obsolete_url].exists())
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_pre_stage_cleanup_skips_stale_loaded_lease_after_restart(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                urls = {
+                    name: f"http://source/run/broadcasts/step_{step}"
+                    for name, step in (("loaded", 0), ("base2", 1), ("base", 2), ("target", 3))
+                }
+                paths = {name: filesystem.adapter_cache_path(url) for name, url in urls.items()}
+                for name in ("loaded", "base2", "base"):
+                    paths[name].mkdir(parents=True)
+                    (paths[name] / "READY").write_text("ready\n", encoding="ascii")
+                    (paths[name] / "transport.json").write_text(
+                        json.dumps({"source_url": urls[name]}), encoding="utf-8"
+                    )
+                paths["target"].with_name(f"{paths['target'].name}.partial").mkdir()
+                (Path(temporary) / filesystem._ADAPTER_LOADED_RECEIPTS).write_text(
+                    json.dumps({"pid": 2**31, "receipts": {"slot": {"source_url": urls["loaded"]}}}),
+                    encoding="utf-8",
+                )
+
+                filesystem._cleanup_adapter_space_before_stage(
+                    Path(temporary),
+                    paths["target"],
+                    {"mode": "delta", "base_url": urls["base"], "base2_url": urls["base2"]},
+                )
+
+                for name in ("loaded", "base2", "base"):
+                    self.assertTrue(paths[name].exists())
+                self.assertTrue(paths["target"].with_name(f"{paths['target'].name}.partial").exists())
         finally:
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)

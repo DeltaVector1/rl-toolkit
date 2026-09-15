@@ -226,6 +226,7 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
         "_lora_stage_status": lambda: {"status": "idle"},
         "_loaded_lora_receipts": {},
         "_server_instance_id": "server-a",
+        "write_loaded_adapter_receipts": lambda _receipts: None,
         "lora_load_lock": asyncio.Lock(),
     }
     async def stage_lora_adapter(request):

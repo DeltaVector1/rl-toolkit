@@ -40,6 +40,7 @@ from prime_rl.inference.vllm.worker.filesystem import (
     adapter_stage_status,
     full_adapter_stage_timeout_s,
     stage_full_checkpoint_files,
+    write_loaded_adapter_receipts,
 )
 from prime_rl.inference.patches import (
     monkey_patch_dp_coordinator_startup_timeout,
@@ -577,6 +578,7 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
             if isinstance(response, ErrorResponse):
                 return JSONResponse(content=response.model_dump(), status_code=response.error.code)
             if not remote_adapter:
+                write_loaded_adapter_receipts({})
                 return {"status": "ok"}
             stored_name = getattr(stored, "lora_name", None) if stored is not None else None
             stored_path = getattr(stored, "lora_path", None) if stored is not None else None
@@ -595,6 +597,7 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
                 "server_instance": _server_instance_id,
             }
             _loaded_lora_receipts[lora_request.lora_name] = receipt
+            write_loaded_adapter_receipts(_loaded_lora_receipts)
             return {"status": "ok", "loaded_receipt": receipt}
         finally:
             if remote_adapter:
