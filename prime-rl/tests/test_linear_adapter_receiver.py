@@ -1238,15 +1238,16 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
-                base2_url = "http://source/run/broadcasts/step_1"
-                base_url = "http://source/run/broadcasts/step_2"
-                target_url = "http://source/run/broadcasts/step_3"
+                active_url = "http://source/run/broadcasts/step_5"
+                base2_url = "http://source/run/broadcasts/step_8"
+                base_url = "http://source/run/broadcasts/step_9"
+                target_url = "http://source/run/broadcasts/step_10"
                 obsolete_url = "http://source/run/broadcasts/step_0"
                 paths = {
                     url: filesystem.adapter_cache_path(url)
-                    for url in (base2_url, base_url, target_url, obsolete_url)
+                    for url in (active_url, base2_url, base_url, target_url, obsolete_url)
                 }
-                for url in (base2_url, base_url, obsolete_url):
+                for url in (active_url, base2_url, base_url, obsolete_url):
                     path = paths[url]
                     path.mkdir(parents=True)
                     (path / "READY").write_text("ready\n", encoding="ascii")
@@ -1271,9 +1272,10 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                         "base_url": base_url,
                         "base2_url": base2_url,
                     },
-                    {"status": "failed", "source_url": target_url},
+                    {"status": "ready", "source_url": active_url},
                 )
 
+                self.assertTrue(paths[active_url].is_dir())
                 self.assertTrue(paths[base_url].is_dir())
                 self.assertTrue(paths[base2_url].is_dir())
                 self.assertFalse(paths[obsolete_url].exists())

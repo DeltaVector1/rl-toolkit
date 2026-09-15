@@ -2767,9 +2767,9 @@ def _cleanup_adapter_space_before_stage(
         except OSError:
             ready = None
         if ready is not None:
-            active = candidate
             preserve_names.add(candidate.name)
-            break
+            if active is None:
+                active = candidate
     if active is None:
         try:
             ready = _path_regular_size(destination / "READY", "target adapter ready marker")
