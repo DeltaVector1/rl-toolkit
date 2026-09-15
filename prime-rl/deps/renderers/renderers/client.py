@@ -16,6 +16,7 @@ import json
 import logging
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, cast
 
 import httpx
@@ -129,6 +130,71 @@ async def _maybe_offload(renderer: Renderer | RendererPool, fn):
     return fn()
 
 
+def _encode_assistant_prefill(
+    renderer: Renderer | RendererPool, text: str
+) -> list[int]:
+    """Encode an internal assistant prefix with the active renderer tokenizer."""
+
+    def encode(active_renderer: Renderer) -> list[int]:
+        tokenizer = getattr(active_renderer, "_tokenizer", None)
+        if tokenizer is None:
+            tokenizer = getattr(active_renderer, "tokenizer", None)
+        encode_fn = getattr(tokenizer, "encode", None)
+        if not callable(encode_fn):
+            raise ValueError(
+                "assistant_prefill requires the active renderer to expose "
+                "a tokenizer.encode API."
+            )
+        encoded = encode_fn(text, add_special_tokens=False)
+        if isinstance(encoded, (str, bytes)):
+            raise ValueError(
+                "assistant_prefill tokenizer.encode must return token IDs."
+            )
+        try:
+            token_ids = list(encoded)
+        except TypeError as exc:
+            raise ValueError(
+                "assistant_prefill tokenizer.encode must return token IDs."
+            ) from exc
+        if not token_ids or any(type(token_id) is not int for token_id in token_ids):
+            raise ValueError(
+                "assistant_prefill tokenizer.encode must return non-empty integer token IDs."
+            )
+        return token_ids
+
+    if isinstance(renderer, RendererPool):
+        with renderer.checkout() as active_renderer:
+            return encode(active_renderer)
+    return encode(renderer)
+
+
+def _extend_prompt_attribution(
+    prompt_attribution: RenderedTokens, prefill_ids: list[int]
+) -> RenderedTokens:
+    """Add prefix tokens without inventing optional attribution arrays."""
+
+    prefix_len = len(prefill_ids)
+    return replace(
+        prompt_attribution,
+        token_ids=[*prompt_attribution.token_ids, *prefill_ids],
+        message_indices=(
+            [*prompt_attribution.message_indices, *([-1] * prefix_len)]
+            if prompt_attribution.message_indices
+            else []
+        ),
+        sampled_mask=(
+            [*prompt_attribution.sampled_mask, *([False] * prefix_len)]
+            if prompt_attribution.sampled_mask
+            else []
+        ),
+        is_content=(
+            [*prompt_attribution.is_content, *([False] * prefix_len)]
+            if prompt_attribution.is_content
+            else []
+        ),
+    )
+
+
 def _strip_base64_field(raw: bytes, prefix: bytes) -> tuple[bytes, memoryview | None]:
     """Splice a large base64 string field out of raw JSON bytes.
 
@@ -229,9 +295,10 @@ async def generate(
 ) -> dict[str, Any]:
     """Tokenize messages, call vLLM /inference/v1/generate, parse the response.
 
-    ``sampling_params`` is forwarded to vLLM verbatim. Two fields are always
-    set by us and override caller values: ``stop_token_ids`` (from the
-    renderer) and ``logprobs=1`` (we always emit completion_logprobs). Pass
+    ``sampling_params`` is forwarded to vLLM verbatim except for the internal
+    ``assistant_prefill`` field. Two fields are always set by us and override
+    caller values: ``stop_token_ids`` (from the renderer) and ``logprobs=1``
+    (we always emit completion_logprobs). Pass
     ``prompt_ids`` to skip rendering and use a prebuilt token sequence —
     pair it with ``multi_modal_data`` when the prebuilt prompt has image /
     video placeholders that need engine-side mm payload, and with
@@ -278,6 +345,24 @@ async def generate(
             "Choose a model-specific renderer instead of the default fallback."
         )
 
+    sp: dict[str, Any] = dict(sampling_params or {})
+    assistant_prefill: str | None = None
+    if "assistant_prefill" in sp:
+        raw_prefill = sp.pop("assistant_prefill")
+        if not isinstance(raw_prefill, str):
+            raise ValueError("assistant_prefill must be a string.")
+        if raw_prefill:
+            if not raw_prefill.strip():
+                raise ValueError("assistant_prefill must not be whitespace-only.")
+            assistant_prefill = raw_prefill
+
+    prefill_ids: list[int] = []
+    if assistant_prefill is not None:
+        prefill_ids = await _maybe_offload(
+            renderer,
+            lambda: _encode_assistant_prefill(renderer, assistant_prefill),
+        )
+
     def _prepare():
         if prompt_ids is not None:
             # Caller-supplied prompt; if they also gave us pre-computed
@@ -301,6 +386,11 @@ async def generate(
         renderer, _prepare
     )
 
+    if prefill_ids:
+        prompt_ids = [*prompt_ids, *prefill_ids]
+        if prompt_attr is not None:
+            prompt_attr = _extend_prompt_attribution(prompt_attr, prefill_ids)
+
     if max_prompt_len is None:
         max_prompt_len = await _resolve_max_prompt_len(client, model)
     if max_prompt_len is not None and len(prompt_ids) > max_prompt_len:
@@ -308,7 +398,6 @@ async def generate(
             prompt_len=len(prompt_ids), max_prompt_len=max_prompt_len
         )
 
-    sp: dict[str, Any] = dict(sampling_params or {})
     sp["stop_token_ids"] = stop_token_ids
     sp["logprobs"] = 1
     sp.setdefault("skip_special_tokens", False)
@@ -367,8 +456,9 @@ async def generate(
 
     completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
 
+    parse_ids = [*prefill_ids, *completion_ids] if prefill_ids else completion_ids
     parsed = await _maybe_offload(
-        renderer, lambda: renderer.parse_response(completion_ids, tools=tools)
+        renderer, lambda: renderer.parse_response(parse_ids, tools=tools)
     )
 
     routed_experts = choice.get("routed_experts")
