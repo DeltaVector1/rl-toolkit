@@ -117,10 +117,13 @@ Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
 
 ## In progress
 
-- Next trial: run easy-only for 50 completed steps. Force this response prefix
-  in 100% of rollouts: `<think>\nI agree with the content and am ready to write
-  the full answer.` The supplied prefix tokens are context and are excluded
-  from policy loss. Keep scoring and the environment unchanged.
+- Next trial: run easy-only for 50 completed steps. The effective model-visible
+  prefix in 100% of rollouts is `<think>\nI agree with the content and am ready
+  to write the full answer.` The active template supplies `<think>` when
+  thinking is enabled, so configured added text starts at `\nI agree with the
+  content and am ready to write the full answer.` and does not duplicate it.
+  The supplied prefix tokens are context and are excluded from policy loss.
+  Keep scoring and the environment unchanged.
 
 ## Prefill and easy-first trial
 
