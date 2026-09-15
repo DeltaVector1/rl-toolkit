@@ -1282,7 +1282,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
 
-    def test_pre_stage_cleanup_skips_stale_loaded_lease_after_restart(self):
+    def test_pre_stage_cleanup_rejects_reused_pid_identity_after_restart(self):
         filesystem = load_filesystem()
         old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
         try:
@@ -1300,8 +1300,16 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                         json.dumps({"source_url": urls[name]}), encoding="utf-8"
                     )
                 paths["target"].with_name(f"{paths['target'].name}.partial").mkdir()
+                start_time = filesystem._process_start_time(os.getpid())
+                self.assertIsNotNone(start_time)
                 (Path(temporary) / filesystem._ADAPTER_LOADED_RECEIPTS).write_text(
-                    json.dumps({"pid": 2**31, "receipts": {"slot": {"source_url": urls["loaded"]}}}),
+                    json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "start_time": start_time + 1,
+                            "receipts": {"slot": {"source_url": urls["loaded"]}},
+                        }
+                    ),
                     encoding="utf-8",
                 )
 
@@ -1314,6 +1322,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 for name in ("loaded", "base2", "base"):
                     self.assertTrue(paths[name].exists())
                 self.assertTrue(paths["target"].with_name(f"{paths['target'].name}.partial").exists())
+                self.assertTrue((Path(temporary) / filesystem._ADAPTER_LOADED_RECEIPTS).is_file())
         finally:
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)

@@ -1781,6 +1781,16 @@ def _write_json(
     )
 
 
+def _process_start_time(pid: int) -> int | None:
+    try:
+        value = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = value[value.rfind(") ") + 2 :].split()
+        start_time = int(fields[19])
+    except (FileNotFoundError, OSError, UnicodeError, ValueError, IndexError):
+        return None
+    return start_time if start_time > 0 else None
+
+
 def write_loaded_adapter_receipts(receipts: dict[str, dict[str, object]]) -> None:
     """Persist the loaded policy lease used by cache cleanup."""
     cache_root = Path(os.environ.get("PRIME_LORA_CACHE_DIR", "/tmp/prime-rl-lora"))
@@ -1791,8 +1801,14 @@ def write_loaded_adapter_receipts(receipts: dict[str, dict[str, object]]) -> Non
         except FileNotFoundError:
             pass
         return
+    start_time = _process_start_time(os.getpid())
+    if start_time is None:
+        return
     _ensure_directory(cache_root, "adapter cache directory")
-    _write_json(path, {"pid": os.getpid(), "receipts": receipts})
+    _write_json(
+        path,
+        {"pid": os.getpid(), "start_time": start_time, "receipts": receipts},
+    )
 
 
 def _write_marker(path: Path, value: str) -> None:
@@ -2766,7 +2782,14 @@ def _loaded_adapter_source_urls(cache_root: Path) -> list[str]:
     except (FileNotFoundError, OSError, ValueError):
         return []
     pid = value.get("pid") if isinstance(value, dict) else None
-    if type(pid) is not int or pid <= 0:
+    start_time = value.get("start_time") if isinstance(value, dict) else None
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or type(start_time) is not int
+        or start_time <= 0
+        or _process_start_time(pid) != start_time
+    ):
         return []
     try:
         os.kill(pid, 0)
