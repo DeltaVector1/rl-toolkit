@@ -3890,6 +3890,9 @@ china_legacy_cleanup_pgids=()
 china_legacy_cleanup_orphan_pids=()
 china_legacy_cleanup_ports=()
 repair_acquire_lock || repair_fail "could not acquire adapter tunnel repair lock"
+if ! adapter_relay_start; then
+  repair_fail "adapter relay unavailable"
+fi
 tunnels_prevalidated=0
 if [ "$restart_tunnels" = 0 ]; then
   repair_stage=existing-local
@@ -3922,9 +3925,6 @@ if [ "$china_legacy_cleanup_required" = 1 ] && ! china_tunnel_wait_legacy_clear;
   repair_fail "old China tunnel groups did not stop"
 fi
 repair_remaining >/dev/null || repair_fail "deadline exceeded after cleanup"
-if ! adapter_relay_start; then
-  repair_fail "adapter relay unavailable"
-fi
 china_lane_size=2
 china_lane_start=0 china_lane_number=0
 china_lane_ports=() china_lane_forwards=()

@@ -229,6 +229,17 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertLess(readiness_call, docker_start)
         self.assertLess(mode_start, docker_start)
 
+    def test_relay_check_precedes_prevalidated_tunnel_fast_path(self):
+        launcher = (
+            Path(__file__).resolve().parents[2]
+            / "training_ops/runtime/h200/start_orchestrator.sh"
+        )
+        source = launcher.read_text(encoding="utf-8")
+        relay_check = source.index('if ! adapter_relay_start; then')
+        fast_path = source.index('tunnels_prevalidated=0')
+        self.assertLess(relay_check, fast_path)
+        self.assertEqual(source.count('if ! adapter_relay_start; then'), 1)
+
     def test_orchestrator_prepares_broadcast_steps_for_appuser(self):
         launcher = (
             Path(__file__).resolve().parents[2]
