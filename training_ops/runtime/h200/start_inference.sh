@@ -8,7 +8,7 @@ test -f "$inference_config" || {
   echo "inference config is missing: $inference_config" >&2
   exit 2
 }
-download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-96}
+download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-112}
 case "$download_streams" in
   ''|*[!0-9]*)
     echo "PRIME_LORA_DOWNLOAD_STREAMS must be an integer" >&2
