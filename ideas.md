@@ -117,8 +117,31 @@ Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
 
 ## In progress
 
-- Next clean comparison: run 50 steps with constant 1:1:1 raw easy:medium:hard
-  sampling and everything else unchanged.
+- Next trial: run easy-only for 50 completed steps. Force this response prefix
+  in 100% of rollouts: `<think>\nI agree with the content and am ready to write
+  the full answer.` The supplied prefix tokens are context and are excluded
+  from policy loss. Keep scoring and the environment unchanged.
+
+## Prefill and easy-first trial
+
+- The measured 50-step result had per-difficulty changes inside noise. The
+  aggregate fall was confounded by the harder prompt mix, so it is not proof
+  of model regression.
+- A group with the same reward for every completion has zero GRPO advantage:
+  group-normalized rewards are all zero. Keep enough within-group variation
+  for a policy signal.
+- Judge this trial by the full 40-50-step reward trend and the repository's
+  exact noise rule, not by five steps.
+- If it works, restart from its trained adapter with 70% prefixed groups and
+  30% normal groups. Fix the prefix choice for the whole group and the whole
+  conversation. Never mix prefixed and unprefixed rollouts in one GRPO group.
+  Add medium and hard only after the no-prefix measurement also improves.
+- A gain only with the prefix is a prompt effect, not proof that the
+  unprompted model learned.
+
+Research basis, kept brief: DeepSeekMath GRPO (arXiv:2402.03300), the DAPO
+paper, Online Difficulty Filtering (arXiv:2504.03380), Easy-to-Hard
+Generalization (arXiv:2506.06632), and PrefixRL (arXiv:2601.18795).
 
 ## Untested
 
