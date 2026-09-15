@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/glm-decensor-prefill-3/run_glm-decensor-prefill-3"
+output_dir = "/data/glm52-rl/runs/glm-decensor-prefill-4/run_glm-decensor-prefill-4"
 max_steps = 50
 skip_all_refusal_groups = true
 seq_len = 32768
@@ -13,9 +13,9 @@ level = "info"
 
 [swanlab]
 project = "glm-runs"
-name = "orchestrator-glm-decensor-prefill-3"
+name = "orchestrator-glm-decensor-prefill-4"
 group = "glm-runs"
-tags = ["decensor-prefill-3", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
+tags = ["decensor-prefill-4", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -78,8 +78,8 @@ max_concurrent_requests = 48
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/glm-decensor-prefill-3"
-source_dir = "/data/glm52-rl/runs/glm-decensor-prefill-3"
+source_url = "http://127.0.0.1:18100/glm-decensor-prefill-4"
+source_dir = "/data/glm52-rl/runs/glm-decensor-prefill-4"
 
 [rollout_transport]
 type = "filesystem"

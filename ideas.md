@@ -93,3 +93,8 @@ Snapshot: 2026-09-14 15:14 UTC, active run `glm-decensor-difficulty-9`.
   24m15s. The collected batch had 1,980 sequences, 4,236,410 tokens, and 130
   packed microbatches; forward/backward stopped at 610.70s. Cause: fixed-rollout
   batching. Next test: 1.5M-token cap. One point gives no reward trend claim.
+
+- Prefill-3 measured rewards were .2002/.1457/.2261/.1663; F/B was
+  430.98/404.30/403.49/330.93s; v2 stages were 415.193/406.830s. It stopped
+  at 3 completed steps on the H200A free-space guard. Retention fix and cleanup
+  evidence were recorded; no reward trend claim.
