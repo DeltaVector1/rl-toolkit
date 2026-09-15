@@ -160,7 +160,14 @@ Preliminary evidence from the first prefill attempt:
 
 Research basis, kept brief: DeepSeekMath GRPO (arXiv:2402.03300), the DAPO
 paper, Online Difficulty Filtering (arXiv:2504.03380), Easy-to-Hard
-Generalization (arXiv:2506.06632), and PrefixRL (arXiv:2601.18795).
+Generalization (arXiv:2506.06632), POPE (arXiv:2601.18779), PrefixRL
+(arXiv:2601.18795), Prefix-RFT (arXiv:2507.01679), and the official TRL GRPO
+docs.
+
+Research checks: fixed prefill is an exploration aid. Evidence for transfer
+comes from guided or task-specific prefixes, so evaluate the adapter without
+a prefix. Never mix prefill conditions within one GRPO group. Taper prefill
+only after measured learning.
 
 ## Untested
 
