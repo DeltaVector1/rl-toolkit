@@ -1106,9 +1106,14 @@ async def stage_lora_adapter(
 
     groups = [ordered_hosts, *peer_groups]
     if require_delta and len(groups) > 1:
-        grouped_results = []
-        for group in groups:
-            grouped_results.append(await _stage_group(group))
+        group_tasks = [asyncio.create_task(_stage_group(group)) for group in groups]
+        completed_groups = await asyncio.gather(*group_tasks, return_exceptions=True)
+        failures = [
+            result for result in completed_groups if isinstance(result, BaseException)
+        ]
+        if failures:
+            raise failures[0]
+        grouped_results = completed_groups
     else:
         grouped_results = [await _stage_group(group) for group in groups]
     results = [result for staged, _seconds in grouped_results for result in staged]

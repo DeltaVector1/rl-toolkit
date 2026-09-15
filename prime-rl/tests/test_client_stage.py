@@ -661,7 +661,7 @@ class StageLoraAdapterTest(unittest.TestCase):
             return Response()
 
         namespace["_admin_post_response"] = fake_admin_post_response
-        namespace["_delta_stage_timeout_s"] = lambda: 0.1
+        namespace["_delta_stage_timeout_s"] = lambda: 0.05
         origin = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
         peer = httpx.AsyncClient(base_url="http://127.0.0.1:18049")
 
@@ -675,7 +675,7 @@ class StageLoraAdapterTest(unittest.TestCase):
             )
         )
         self.assertEqual(result["host_count"], 2)
-        self.assertLess(result["total_stage_wall_seconds"], 0.1)
+        self.assertLess(result["total_stage_wall_seconds"], 0.05)
 
     def test_delta_accepts_a_late_response_for_work_finished_in_time(self):
         stage_lora_adapter, namespace = _load_stage_function()
@@ -751,33 +751,28 @@ class StageLoraAdapterTest(unittest.TestCase):
         )
         self.assertEqual(origin_request["total_timeout_s"], origin_request["timeout_s"])
         self.assertEqual(peer_request["total_timeout_s"], peer_request["timeout_s"])
-        self.assertLess(
+        self.assertAlmostEqual(
             peer_request["json"]["stage_timeout_seconds"],
             origin_request["json"]["stage_timeout_seconds"],
+            delta=0.01,
         )
         self.assertLessEqual(
             origin_request["json"]["stage_timeout_seconds"], 0.15
         )
         self.assertLessEqual(peer_request["json"]["stage_timeout_seconds"], 0.15)
 
-    def test_predictive_origin_finishes_before_peer_starts(self):
+    def test_predictive_origin_and_peer_start_together(self):
         _ManifestProbeClient.requests.clear()
         stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
         calls = []
-        origin_finished = False
 
         class Response:
             def json(self):
                 return {"status": "ok", "stage_seconds": 0.03, "adapter_identity": _adapter_identity(2)}
 
         async def fake_admin_post_response(client, _path, **_kwargs):
-            nonlocal origin_finished
             calls.append((client, time.perf_counter()))
-            if client is peer:
-                self.assertTrue(origin_finished)
             await asyncio.sleep(0.03)
-            if client is origin:
-                origin_finished = True
             return Response()
 
         namespace["_admin_post_response"] = fake_admin_post_response
@@ -794,15 +789,15 @@ class StageLoraAdapterTest(unittest.TestCase):
         )
 
         self.assertEqual([client for client, _ in calls], [origin, peer])
-        self.assertGreater(calls[1][1], calls[0][1])
+        self.assertLess(abs(calls[1][1] - calls[0][1]), 0.01)
         self.assertEqual(result["origin_host_count"], 1)
         self.assertEqual(result["peer_host_count"], 1)
-        self.assertGreaterEqual(result["total_stage_wall_seconds"], 0.06)
+        self.assertLess(result["total_stage_wall_seconds"], 0.10)
         self.assertEqual(_ManifestProbeClient.requests, [])
 
-    def test_peer_is_not_started_when_origin_fails(self):
+    def test_peer_failure_does_not_cancel_origin_progress(self):
         stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
-        calls = []
+        finished = []
 
         class Response:
             def json(self):
@@ -816,9 +811,11 @@ class StageLoraAdapterTest(unittest.TestCase):
         peer = httpx.AsyncClient(base_url="http://127.0.0.1:18049")
 
         async def fake_admin_post_response(client, _path, **_kwargs):
-            calls.append(client)
-            if client is origin:
+            if client is peer:
+                await asyncio.sleep(0.01)
                 raise RuntimeError("adapter identity mismatch")
+            await asyncio.sleep(0.05)
+            finished.append(client)
             return Response()
 
         namespace["_admin_post_response"] = fake_admin_post_response
@@ -832,7 +829,7 @@ class StageLoraAdapterTest(unittest.TestCase):
                     origin_base_urls=["http://127.0.0.1:8000"],
                 )
             )
-        self.assertEqual(calls, [origin])
+        self.assertEqual(finished, [origin])
 
     def test_server_receives_selected_policy_step_limit_without_client_probe(self):
         for policy_step, expected_limit in ((1, 960.0), (2, 960.0), (3, 960.0)):
