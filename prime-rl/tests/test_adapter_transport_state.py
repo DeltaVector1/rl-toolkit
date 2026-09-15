@@ -2,7 +2,6 @@ import asyncio
 import ast
 import functools
 import hashlib
-import http.server
 import importlib.util
 import io
 import json
@@ -539,13 +538,41 @@ class QuietDirectoryHandler(adapter_server.RangeHandler):
 class AdapterTransportStateTest(unittest.TestCase):
     def test_default_chunk_sizes_keep_v1_and_v2_transport_contracts(self):
         target_size = 30_767_549_784
+        self.assertEqual(adapter_delta.default_chunk_size, 8 * 1024 * 1024)
+        self.assertEqual(adapter_delta.predictive_chunk_size, 8 * 1024 * 1024)
         self.assertEqual(
             len(adapter_delta._chunk_ranges(target_size, adapter_delta.default_chunk_size)),
-            1834,
+            3668,
         )
         self.assertEqual(
             len(adapter_delta._chunk_ranges(target_size, adapter_delta.predictive_chunk_size)),
-            1834,
+            3668,
+        )
+        metadata = json.dumps(
+            {
+                "chunk_size": adapter_delta.default_chunk_size,
+                "chunk_count": 3668,
+                "chunks": [
+                    {
+                        "file": f"adapter_model.safetensors.transport-delta-{index:06d}",
+                        "offset": index * adapter_delta.default_chunk_size,
+                        "raw_size": min(
+                            adapter_delta.default_chunk_size,
+                            target_size - index * adapter_delta.default_chunk_size,
+                        ),
+                        "wire_size": adapter_delta.default_chunk_size // 2,
+                        "wire_sha256": "0" * 64,
+                        "raw_sha256": "0" * 64,
+                        "codec": "zstd",
+                    }
+                    for index in range(3668)
+                ],
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertLess(
+            len(metadata),
+            2 * 1024 * 1024,
         )
 
     def test_broadcast_file_not_found_only_skips_deleted_run(self):
@@ -1020,6 +1047,9 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertEqual(manifest["base_step"], 1)
             self.assertEqual(manifest["chunk_size"], adapter_delta.default_chunk_size)
             self.assertEqual(manifest["chunk_count"], 3)
+            self.assertTrue(
+                all(item["raw_size"] <= 8 * 1024 * 1024 for item in manifest["chunks"])
+            )
             self.assertEqual(bytes(rebuilt), bytes(changed))
             self.assertEqual(manifest["target_sha256"], hashlib.sha256(changed).hexdigest())
 
@@ -1206,7 +1236,13 @@ class AdapterTransportStateTest(unittest.TestCase):
             ]
             (source / "adapter_config.json").write_bytes(config)
             (source / "adapter_model.safetensors").write_bytes(model)
-            manifest = adapter_delta.publish_adapter_manifest(source, target_step=0, max_workers=2)
+            manifest = adapter_delta.publish_adapter_manifest(
+                source,
+                target_step=0,
+                chunk_size=16 * 1024 * 1024,
+                max_workers=2,
+            )
+            self.assertEqual(manifest["chunk_size"], 16 * 1024 * 1024)
             (source / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             handler = functools.partial(QuietDirectoryHandler, directory=str(root))
             with socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler) as server:
@@ -2606,7 +2642,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
         runtime = REPOSITORY / "training_ops/runtime/h200"
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
-        self.assertIn("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-96}", glm_source)
+        self.assertIn("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-112}", glm_source)
         self.assertIn('-e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams"', glm_source)
         self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
         source_generator = glm_source.split(
