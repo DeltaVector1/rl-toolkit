@@ -538,20 +538,20 @@ class QuietDirectoryHandler(adapter_server.RangeHandler):
 class AdapterTransportStateTest(unittest.TestCase):
     def test_default_chunk_sizes_keep_v1_and_v2_transport_contracts(self):
         target_size = 30_767_549_784
-        self.assertEqual(adapter_delta.default_chunk_size, 8 * 1024 * 1024)
-        self.assertEqual(adapter_delta.predictive_chunk_size, 8 * 1024 * 1024)
+        self.assertEqual(adapter_delta.default_chunk_size, 16 * 1024 * 1024)
+        self.assertEqual(adapter_delta.predictive_chunk_size, 16 * 1024 * 1024)
         self.assertEqual(
             len(adapter_delta._chunk_ranges(target_size, adapter_delta.default_chunk_size)),
-            3668,
+            1834,
         )
         self.assertEqual(
             len(adapter_delta._chunk_ranges(target_size, adapter_delta.predictive_chunk_size)),
-            3668,
+            1834,
         )
         metadata = json.dumps(
             {
                 "chunk_size": adapter_delta.default_chunk_size,
-                "chunk_count": 3668,
+                "chunk_count": 1834,
                 "chunks": [
                     {
                         "file": f"adapter_model.safetensors.transport-delta-{index:06d}",
@@ -565,7 +565,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                         "raw_sha256": "0" * 64,
                         "codec": "zstd",
                     }
-                    for index in range(3668)
+                    for index in range(1834)
                 ],
             },
             separators=(",", ":"),
@@ -1048,7 +1048,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             self.assertEqual(manifest["chunk_size"], adapter_delta.default_chunk_size)
             self.assertEqual(manifest["chunk_count"], 3)
             self.assertTrue(
-                all(item["raw_size"] <= 8 * 1024 * 1024 for item in manifest["chunks"])
+                all(item["raw_size"] <= 16 * 1024 * 1024 for item in manifest["chunks"])
             )
             self.assertEqual(bytes(rebuilt), bytes(changed))
             self.assertEqual(manifest["target_sha256"], hashlib.sha256(changed).hexdigest())

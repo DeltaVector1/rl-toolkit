@@ -9,6 +9,7 @@ import socket
 import shutil
 import stat
 import time
+from dataclasses import dataclass
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
@@ -27,8 +28,8 @@ digest_pattern = re.compile(r"[0-9a-f]{64}\Z")
 step_pattern = re.compile(r"step_(\d+)\Z")
 run_pattern = re.compile(r"[A-Za-z0-9_-]+\Z")
 transfer_write_bytes = 256 * 1024
-# Keep the server idle read bound above the worker's 45-second chunk deadline.
-connection_timeout_seconds = 60
+# Keep the server idle read bound above the worker's 90-second chunk deadline.
+connection_timeout_seconds = 120
 
 
 class UpgradeError(RuntimeError):
@@ -54,6 +55,22 @@ _identity_validation_runs: dict[tuple[object, ...], _ValidationRun] = {}
 _transport_digest_cache: OrderedDict[tuple[str, tuple[int, int, int, int, int]], None] = OrderedDict()
 _transport_digest_lock = Lock()
 _MAX_TRANSPORT_DIGEST_CACHE_ENTRIES = 128
+
+
+@dataclass(frozen=True)
+class _ManifestCacheEntry:
+    key: tuple[str, tuple[int, int, int, int, int]]
+    files: dict[str, dict[str, object]]
+    chunk_records: tuple[tuple[str, int, str], ...]
+    chunk_index: dict[str, tuple[int, str]]
+
+
+_manifest_cache: OrderedDict[
+    tuple[str, tuple[int, int, int, int, int]], _ManifestCacheEntry
+] = OrderedDict()
+_manifest_cache_lock = Lock()
+_manifest_parse_lock = Lock()
+_manifest_cache_limit = 64
 
 
 def _json_object(path: Path, description: str) -> dict[str, object]:
@@ -126,6 +143,8 @@ def _verify_transport_fd(fd: int, expected_size: int, expected_digest: str) -> N
 
 
 def _predictive_chunk_records(chunks: object) -> list[tuple[str, int, str]]:
+    if isinstance(chunks, _ManifestCacheEntry):
+        return list(chunks.chunk_records)
     if not isinstance(chunks, list) or not chunks:
         raise UpgradeError("predictive manifest has no transport chunks")
     records: list[tuple[str, int, str]] = []
@@ -154,16 +173,67 @@ def _predictive_chunk_records(chunks: object) -> list[tuple[str, int, str]]:
     return records
 
 
+def _manifest_cache_entry(step_path: Path, step: int) -> _ManifestCacheEntry:
+    canonical_step = step_path.resolve(strict=False)
+    manifest_path = canonical_step / adapter_manifest_name
+    for _attempt in range(3):
+        manifest_identity = _stat_identity(manifest_path)
+        cache_key = (str(canonical_step), manifest_identity)
+        with _manifest_cache_lock:
+            cached = _manifest_cache.get(cache_key)
+            if cached is not None:
+                _manifest_cache.move_to_end(cache_key)
+                return cached
+        with _manifest_parse_lock:
+            with _manifest_cache_lock:
+                cached = _manifest_cache.get(cache_key)
+                if cached is not None:
+                    _manifest_cache.move_to_end(cache_key)
+                    return cached
+            manifest = _json_object(manifest_path, f"adapter step {step} manifest")
+            if _stat_identity(manifest_path) != manifest_identity:
+                continue
+            if manifest.get("kind") != "lora-adapter" or manifest.get("target_step") != step:
+                raise UpgradeError(f"adapter step {step} manifest has the wrong identity")
+            files = _file_records(manifest, f"adapter step {step} manifest")
+            chunk_records = (
+                tuple(_predictive_chunk_records(manifest.get("chunks")))
+                if manifest.get("version") == 2
+                else ()
+            )
+            entry = _ManifestCacheEntry(
+                key=cache_key,
+                files=files,
+                chunk_records=chunk_records,
+                chunk_index={
+                    name: (size, digest) for name, size, digest in chunk_records
+                },
+            )
+            with _manifest_cache_lock:
+                cached = _manifest_cache.get(cache_key)
+                if cached is not None:
+                    _manifest_cache.move_to_end(cache_key)
+                    return cached
+                _manifest_cache[cache_key] = entry
+                _manifest_cache.move_to_end(cache_key)
+                while len(_manifest_cache) > _manifest_cache_limit:
+                    _manifest_cache.popitem(last=False)
+            return entry
+    raise UpgradeError(f"adapter step {step} manifest changed during validation")
+
+
 def _validate_predictive_chunks(
     directory: Path, chunks: object
 ) -> list[Path]:
     paths: list[Path] = []
     for name, size, digest in _predictive_chunk_records(chunks):
-        path = directory / name
-        if path.is_symlink() or not path.is_file():
+        if (directory / name).is_symlink() or not (directory / name).is_file():
             raise UpgradeError(f"predictive manifest chunk is missing: {name}")
         try:
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            fd = os.open(
+                directory / name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
         except OSError as exc:
             raise UpgradeError(f"predictive manifest chunk is unavailable: {name}") from exc
         try:
@@ -173,7 +243,7 @@ def _validate_predictive_chunks(
             _verify_transport_fd(fd, size, digest)
         finally:
             os.close(fd)
-        paths.append(path)
+        paths.append(directory / name)
     return paths
 
 
@@ -265,6 +335,7 @@ def _identity_from_published_directory(
     if not cache and not (directory / stable_name).is_file():
         raise UpgradeError(f"adapter step {step} is not stable")
 
+    manifest_entry: _ManifestCacheEntry | None = None
     predictive_chunk_records: tuple[tuple[str, int, str], ...] = ()
     if cache:
         identity = _json_object(directory / ".identity.json", f"adapter cache step {step} identity")
@@ -290,15 +361,9 @@ def _identity_from_published_directory(
                 raise UpgradeError(f"adapter cache step {step} has an invalid {name} identity")
         description = f"adapter cache step {step}"
     else:
-        manifest = _json_object(directory / adapter_manifest_name, f"adapter step {step} manifest")
-        if manifest.get("kind") != "lora-adapter" or manifest.get("target_step") != step:
-            raise UpgradeError(f"adapter step {step} manifest has the wrong identity")
-        records = _file_records(manifest, f"adapter step {step} manifest")
-        predictive_chunk_records = (
-            _predictive_chunk_records(manifest.get("chunks"))
-            if manifest.get("version") == 2
-            else ()
-        )
+        manifest_entry = _manifest_cache_entry(directory, step)
+        records = manifest_entry.files
+        predictive_chunk_records = manifest_entry.chunk_records
         description = f"adapter step {step}"
 
     if records[adapter_weights_name]["size"] <= 0:
@@ -330,12 +395,16 @@ def _identity_from_published_directory(
     ]
     if not cache:
         stat_paths.append(directory / stable_name)
+    stat_identities = tuple(_stat_identity(path) for path in stat_paths)
+    if manifest_entry is not None and stat_identities[2] != manifest_entry.key[1]:
+        raise UpgradeError(f"{description} manifest changed during validation")
     metadata_key = (
         step,
         cache,
         verify_weights,
-        tuple(_stat_identity(path) for path in stat_paths),
-        tuple(predictive_chunk_records),
+        stat_identities,
+        _directory_identity(directory),
+        manifest_entry.key if manifest_entry is not None else None,
         opened_weight_stat,
     )
     if opened_weight_stat is not None and opened_weight_stat != _stat_identity(
@@ -360,10 +429,7 @@ def _identity_from_published_directory(
         return validation_run.result.copy()
 
     try:
-        chunk_stat_paths = tuple(
-            _stat_identity(directory / name) for name, _size, _digest in predictive_chunk_records
-        )
-        cache_key = metadata_key + (chunk_stat_paths,)
+        cache_key = metadata_key
         with _identity_lock:
             cached = _identity_cache.get(cache_key)
             if cached is not None:
@@ -374,7 +440,7 @@ def _identity_from_published_directory(
             if predictive_chunk_records:
                 _validate_predictive_chunks(
                     directory,
-                    manifest.get("chunks"),
+                    manifest_entry,
                 )
             actual_config_digest = _sha256(directory / adapter_config_name)
             if actual_config_digest != records[adapter_config_name]["sha256"]:
@@ -1279,34 +1345,12 @@ class RangeHandler(SimpleHTTPRequestHandler):
         return path
 
     def _predictive_chunk_identity(
-        self, step_path: Path, name: str
+        self, step_path: Path, step: int, name: str
     ) -> tuple[int, str] | None:
         if not name.startswith(f"{adapter_weights_name}.transport-predictive-"):
             return None
-        try:
-            manifest = _json_object(
-                step_path / adapter_manifest_name,
-                f"adapter step manifest for {step_path.name}",
-            )
-        except UpgradeError:
-            return None
-        chunks = manifest.get("chunks")
-        if not isinstance(chunks, list):
-            return None
-        for item in chunks:
-            if not isinstance(item, dict) or item.get("file") != name:
-                continue
-            size = item.get("wire_size")
-            digest = item.get("wire_sha256")
-            if (
-                type(size) is not int
-                or size < 0
-                or not isinstance(digest, str)
-                or digest_pattern.fullmatch(digest) is None
-            ):
-                return None
-            return size, digest
-        return None
+        entry = _manifest_cache_entry(step_path, step)
+        return entry.chunk_index.get(name)
 
     def send_head(self):
         self.__dict__.pop("remaining", None)
@@ -1332,7 +1376,15 @@ class RangeHandler(SimpleHTTPRequestHandler):
             ):
                 if step_path is None:
                     step_path = path.parent
-                chunk_identity = self._predictive_chunk_identity(step_path, pieces[-1])
+                chunk_step = step
+                if chunk_step is None:
+                    step_match = step_pattern.fullmatch(step_path.name)
+                    if step_match is not None:
+                        chunk_step = int(step_match.group(1))
+                if chunk_step is not None:
+                    chunk_identity = self._predictive_chunk_identity(
+                        step_path, chunk_step, pieces[-1]
+                    )
                 if chunk_identity is None:
                     self.send_error(404)
                     return None

@@ -82,6 +82,87 @@ class AdapterServerTest(unittest.TestCase):
     def _clear_identity_state(self):
         adapter_server._identity_cache.clear()
         adapter_server._identity_validation_runs.clear()
+        adapter_server._manifest_cache.clear()
+
+    def test_manifest_cache_reuses_parse_and_skips_chunk_stat_walk(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            step, _manifest = self._write_predictive_step(Path(temporary))
+            original_json = adapter_server._json_object
+            original_stat = adapter_server._stat_identity
+            manifest_calls = 0
+            chunk_stat_calls = 0
+
+            def counted_json(path, description):
+                nonlocal manifest_calls
+                if path.name == adapter_server.adapter_manifest_name:
+                    manifest_calls += 1
+                return original_json(path, description)
+
+            def counted_stat(path):
+                nonlocal chunk_stat_calls
+                if path.name.startswith(
+                    f"{adapter_server.adapter_weights_name}.transport-predictive-"
+                ):
+                    chunk_stat_calls += 1
+                return original_stat(path)
+
+            adapter_server._json_object = counted_json
+            adapter_server._stat_identity = counted_stat
+            self._clear_identity_state()
+            chunk_name = f"{adapter_server.adapter_weights_name}.transport-predictive-00000.bin"
+            try:
+                for _ in range(4):
+                    adapter_server._identity_from_published_directory(step, 0, cache=False)
+                    size, digest = adapter_server._manifest_cache_entry(step, 0).chunk_index[chunk_name]
+                    fd = os.open(step / chunk_name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                    try:
+                        adapter_server._verify_transport_fd(fd, size, digest)
+                    finally:
+                        os.close(fd)
+                self.assertEqual(manifest_calls, 1)
+                self.assertEqual(chunk_stat_calls, 0)
+            finally:
+                adapter_server._json_object = original_json
+                adapter_server._stat_identity = original_stat
+                self._clear_identity_state()
+
+    def test_manifest_replacement_uses_new_cache_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            step, manifest = self._write_predictive_step(Path(temporary))
+            self._clear_identity_state()
+            first = adapter_server._manifest_cache_entry(step, 0)
+            replacement = step / ".manifest-replacement"
+            replacement.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+            os.replace(replacement, step / adapter_server.adapter_manifest_name)
+            second = adapter_server._manifest_cache_entry(step, 0)
+            self.assertNotEqual(first.key, second.key)
+            self.assertEqual(len(adapter_server._manifest_cache), 2)
+
+    def test_manifest_cache_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._clear_identity_state()
+            for step_number in range(adapter_server._manifest_cache_limit + 2):
+                step, _manifest = self._write_predictive_step(root, step_number)
+                adapter_server._manifest_cache_entry(step, step_number)
+            self.assertLessEqual(
+                len(adapter_server._manifest_cache),
+                adapter_server._manifest_cache_limit,
+            )
+            self._clear_identity_state()
+
+    def test_replaced_step_directory_does_not_reuse_manifest_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            step, _manifest = self._write_predictive_step(root)
+            self._clear_identity_state()
+            first = adapter_server._manifest_cache_entry(step, 0)
+            step.rename(root / "step_0.old")
+            replacement, _manifest = self._write_predictive_step(root)
+            second = adapter_server._manifest_cache_entry(replacement, 0)
+            self.assertNotEqual(first.key, second.key)
+            self.assertEqual(len(adapter_server._manifest_cache), 2)
+            self._clear_identity_state()
 
     def test_http11_range_framing_and_disconnect(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -374,6 +455,7 @@ class AdapterServerTest(unittest.TestCase):
             (step / "adapter_manifest.json").write_text(
                 json.dumps(
                     {
+                        "version": 2,
                         "kind": "lora-adapter",
                         "target_step": 0,
                         "files": [

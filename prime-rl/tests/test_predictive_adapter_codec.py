@@ -427,7 +427,7 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
                 max_workers=1,
             )
             self.assertEqual(manifest["chunk_size"], adapter_delta.predictive_chunk_size)
-            self.assertEqual(manifest["chunk_size"], 8 * 1024 * 1024)
+            self.assertEqual(manifest["chunk_size"], 16 * 1024 * 1024)
             self.assertEqual(manifest["data_offset"], data_offset)
             self.assertEqual(manifest["target_sha256"], hashlib.sha256(target_bytes).hexdigest())
             self.assertTrue(
@@ -493,7 +493,7 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
             self.assertEqual(manifest["transport"], adapter_delta.predictive_transport_name)
             self.assertEqual(manifest["chunk_size"], adapter_delta.predictive_chunk_size)
             self.assertTrue(
-                all(item["raw_size"] <= 8 * 1024 * 1024 for item in manifest["chunks"])
+                all(item["raw_size"] <= 16 * 1024 * 1024 for item in manifest["chunks"])
             )
             self.assertEqual(manifest["data_offset"], data_offset)
             self.assertEqual(manifest["chunk_alignment"], 2)

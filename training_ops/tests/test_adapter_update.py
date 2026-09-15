@@ -96,7 +96,7 @@ class AdapterUpdateTest(unittest.TestCase):
 
         self.assertEqual(b"".join(writes), payload)
         self.assertEqual(handler.remaining, 0)
-        self.assertEqual(adapter_server.connection_timeout_seconds, 60)
+        self.assertEqual(adapter_server.connection_timeout_seconds, 120)
 
     def test_adapter_server_closes_on_disconnected_output(self):
         class Output:
@@ -214,7 +214,8 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertIn('@ "$inference_config"', launcher)
         self.assertIn("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-112}", launcher)
         self.assertIn('-e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams"', launcher)
-        self.assertIn("-e PRIME_LORA_CHUNK_TIMEOUT_S=45", launcher)
+        self.assertIn("-e PRIME_LORA_LANE_TIMEOUT_S=90", launcher)
+        self.assertIn("-e PRIME_LORA_CHUNK_TIMEOUT_S=90", launcher)
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("install -d"))
         self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))
 
