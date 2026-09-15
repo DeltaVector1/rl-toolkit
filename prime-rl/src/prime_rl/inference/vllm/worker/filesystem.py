@@ -5370,18 +5370,13 @@ def _stage_chunked_xor_adapter(
         label="adapter transport chunk directory",
     )
     try:
-        if full_zstd:
-            _run_bounded_futures(
-                chunks,
-                fetch,
-                persistent_width,
-                deadline,
-                cancel_event,
-            )
-        else:
-            executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
-            futures = [executor.submit(fetch, index, item) for index, item in enumerate(chunks)]
-            _wait_for_futures(executor, futures, deadline, cancel_event)
+        _run_bounded_futures(
+            chunks,
+            fetch,
+            persistent_width,
+            deadline,
+            cancel_event,
+        )
     finally:
         if persistent_pool is not None:
             persistent_pool.close()
