@@ -3835,23 +3835,28 @@ adapter_tunnel_readiness() {
 }
 
 adapter_relay_start() {
-  local running relay_ready=0 relay_probe relay_status
+  local running relay_ready=0 relay_probe relay_status relay_identity
   if [ "$peer_enabled" != 1 ]; then
     [ "$tunnels_only" = 1 ] || sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
     return 0
   fi
   sudo install -d -o 1000 -g 1000 -m 0755 "$relay_cache_dir"
   running=$(sudo docker inspect "$relay_container" --format '{{.State.Running}}' 2>/dev/null || true)
+  relay_identity=$(sudo docker inspect "$relay_container" \
+    --format '{{index .Config.Labels "com.glm52.adapter-relay.source-url"}}' \
+    2>/dev/null || true)
     relay_probe=$(curl -sS --max-time 2 -H "Host: 127.0.0.1:${lora_source_ports[0]}" \
       -w '%{http_code}' "http://127.0.0.1:$relay_port/" 2>/dev/null || true)
     relay_status=${relay_probe: -3}
     relay_probe=${relay_probe:0:${#relay_probe}-3}
-    if [ "$running" = true ] && ss -tln 2>/dev/null | grep -q "127.0.0.1:$relay_port" && \
+    if [ "$running" = true ] && [ "$relay_identity" = "$relay_source_url" ] && \
+        ss -tln 2>/dev/null | grep -q "127.0.0.1:$relay_port" && \
         [ "$relay_status" = 404 ] && [ "$relay_probe" = $'source URL is not configured\n' ]; then
       return 0
   fi
   sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
   sudo docker run -d --name "$relay_container" --restart unless-stopped \
+    --label "com.glm52.adapter-relay.source-url=$relay_source_url" \
     --user 0:0 \
     --network host \
     --log-opt max-size=128m --log-opt max-file=2 \

@@ -240,6 +240,28 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertLess(relay_check, fast_path)
         self.assertEqual(source.count('if ! adapter_relay_start; then'), 1)
 
+    def test_relay_reuse_requires_configured_source_identity(self):
+        launcher = (
+            Path(__file__).resolve().parents[2]
+            / "training_ops/runtime/h200/start_orchestrator.sh"
+        )
+        source = launcher.read_text(encoding="utf-8")
+        relay_start = source.index("adapter_relay_start() {")
+        relay_end = source.index("\n}\n\nchina_legacy_cleanup_required", relay_start)
+        relay_block = source[relay_start:relay_end]
+        self.assertIn(
+            'relay_identity=$(sudo docker inspect "$relay_container"', relay_block
+        )
+        self.assertIn(
+            '--format \'{{index .Config.Labels "com.glm52.adapter-relay.source-url"}}\'',
+            relay_block,
+        )
+        self.assertIn('[ "$relay_identity" = "$relay_source_url" ]', relay_block)
+        self.assertIn(
+            '--label "com.glm52.adapter-relay.source-url=$relay_source_url"',
+            relay_block,
+        )
+
     def test_orchestrator_prepares_broadcast_steps_for_appuser(self):
         launcher = (
             Path(__file__).resolve().parents[2]
