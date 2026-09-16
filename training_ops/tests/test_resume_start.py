@@ -8,6 +8,19 @@ import training_ops
 
 
 class ResumeStartTest(unittest.TestCase):
+    def test_start_inventory_deploys_shared_drain_to_trainer_head(self):
+        selected = {
+            "trainer": "configs/general-agent/trainer.toml",
+            "orchestrator": "configs/general-agent/orchestrator.toml",
+            "inference": "configs/general-agent/inference.toml",
+        }
+        with mock.patch.object(training_ops, "mounted_files", return_value=[]):
+            inventory = dict(training_ops._start_dependency_inventory(selected, training_ops.trainer_hosts))
+        self.assertEqual(
+            set(inventory["training_ops/runtime/h200/drain_rollout_publisher.py"]),
+            {training_ops.trainer_head, *training_ops.inference_hosts},
+        )
+
     def run_start(self, *, mode="restart", resume=True, failure=None, control_files=None, nodes=None, state_failure=None, changed_origin=False):
         calls = []
         origin_checks = 0
@@ -92,6 +105,12 @@ class ResumeStartTest(unittest.TestCase):
         drain = next(i for i, command in enumerate(commands) if "drain_rollout_publisher.py" in command)
         final_origin = max(i for i, command in enumerate(commands) if command.startswith("check restart origin"))
         self.assertLess(drain, final_origin)
+        microbatch = [i for i, command in enumerate(commands) if command.endswith("sync_microbatches.sh --microbatch")]
+        self.assertEqual(len(microbatch), 1)
+        self.assertEqual(calls[microbatch[0]][0], training_ops.trainer_head)
+        self.assertLess(drain, microbatch[0])
+        self.assertLess(microbatch[0], final_origin)
+        self.assertFalse(any("stop_sync_processes()" in command for command in commands))
         self.assertLess(final_origin, min(checks))
         self.assertFalse(any("pkill -f '[s]ync_rollout_batches.sh'" in command for command in commands))
         self.assertFalse(any("fresh adapter" in command or ".trainer-restart-started" in command for command in commands))
@@ -196,6 +215,12 @@ class ResumeStartTest(unittest.TestCase):
         self.assertIsInstance(error, training_ops.Refused)
         self.assertIn("identity changed", str(error))
         self.assertFalse(any(command.endswith(" trainer") or command.endswith(training_ops.orchestrator_launcher) for _, command in calls))
+
+    def test_microbatch_drain_failure_never_scans_final_state_or_starts(self):
+        calls, error = self.run_start(failure=lambda _host, command: command.endswith("sync_microbatches.sh --microbatch"))
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(sum(command.startswith("check restart origin") for _, command in calls), 1)
+        self.assertFalse(any(command.startswith("check restart trainer") or command.endswith(" trainer") for _, command in calls))
 
 
 if __name__ == "__main__":

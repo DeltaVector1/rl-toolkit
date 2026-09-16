@@ -6012,6 +6012,7 @@ def _start_dependency_inventory(
         inference_hosts,
     )
     add("training_ops/runtime/china/resume_state.py", [orchestrator_host])
+    add("training_ops/runtime/h200/drain_rollout_publisher.py", [trainer_head])
 
     configured_hosts = list(dict.fromkeys([*trainer_hosts, *inference_hosts]))
     add("configs/nodes.toml", configured_hosts)
@@ -6908,9 +6909,11 @@ exit 1
             _remote_ok(orchestrator_host, drain_publisher, "restart rollout publisher drain", timeout=60)
             _remote_ok(
                 trainer_head,
-                _cold_cleanup_script(run, stop_only=True),
-                "restart batch publisher stop",
-                timeout=300,
+                f"python3 {runtime_root}/h200/drain_rollout_publisher.py "
+                f"{shlex.quote(service_run_dir)} "
+                f"{runtime_root}/china/sync_microbatches.sh --microbatch",
+                "restart microbatch publisher drain",
+                timeout=90,
             )
             final_identity = _check_adapter_restart(trainer_head, service_run_dir, resume_step, "origin", resume_adapter)
             if final_identity != identity:

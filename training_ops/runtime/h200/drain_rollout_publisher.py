@@ -18,10 +18,10 @@ def process(pid: int):
         return None
 
 
-def matches(pid: int, directory: Path, script: str, lock_identity) -> bool:
+def matches(pid: int, directory: Path, script: str, lock_identity, environment="SOURCE_RUN_DIR") -> bool:
     root = Path("/proc") / str(pid)
     try:
-        if f"SOURCE_RUN_DIR={directory}".encode() not in (root / "environ").read_bytes().split(b"\0"):
+        if f"{environment}={directory}".encode() not in (root / "environ").read_bytes().split(b"\0"):
             return False
         if script.encode() in (root / "cmdline").read_bytes().split(b"\0"):
             return True
@@ -39,11 +39,11 @@ def live_members(records, group):
     return {pid: record for pid, record in records.items() if record and record[1] != "Z" and record[2] == group}
 
 
-def signal_publishers(records, directory, script, lock_identity, stopped):
+def signal_publishers(records, directory, script, lock_identity, stopped, environment="SOURCE_RUN_DIR"):
     candidates = {
         record[2] for pid, record in records.items()
         if record and record[1] != "Z" and record[2] not in stopped
-        and matches(pid, directory, script, lock_identity)
+        and matches(pid, directory, script, lock_identity, environment)
     }
     plans = {}
     # Validate every candidate group before signalling any process. A matching
@@ -55,10 +55,10 @@ def signal_publishers(records, directory, script, lock_identity, stopped):
         leader = records.get(group)
         if leader is None and (Path("/proc") / str(group)).exists():
             raise ValueError(f"publisher group {group} has an unreadable leader")
-        if leader and leader[1] != "Z" and (leader[2] != group or not matches(group, directory, script, lock_identity)):
+        if leader and leader[1] != "Z" and (leader[2] != group or not matches(group, directory, script, lock_identity, environment)):
             raise ValueError(f"publisher group {group} has an unknown leader")
         for pid, record in members.items():
-            if process(pid) != record or not matches(pid, directory, script, lock_identity):
+            if process(pid) != record or not matches(pid, directory, script, lock_identity, environment):
                 raise ValueError(f"publisher group {group} has an unknown member {pid}")
         plans[group] = members
     current = snapshot()
@@ -66,7 +66,7 @@ def signal_publishers(records, directory, script, lock_identity, stopped):
         if live_members(current, group) != members:
             raise ValueError(f"publisher group {group} changed during validation")
         for pid, record in members.items():
-            if process(pid) != record or not matches(pid, directory, script, lock_identity):
+            if process(pid) != record or not matches(pid, directory, script, lock_identity, environment):
                 raise ValueError(f"publisher member {pid} changed during validation")
     final = snapshot()
     for group, members in plans.items():
@@ -81,7 +81,7 @@ def signal_publishers(records, directory, script, lock_identity, stopped):
                 # each orphan's start time and exact identity immediately
                 # before signalling only that PID.
                 for pid, record in members.items():
-                    if process(pid) != record or not matches(pid, directory, script, lock_identity):
+                    if process(pid) != record or not matches(pid, directory, script, lock_identity, environment):
                         raise ValueError(f"orphan publisher {pid} changed before signalling")
                     os.kill(pid, signal.SIGTERM)
             stopped.add(group)
@@ -89,14 +89,24 @@ def signal_publishers(records, directory, script, lock_identity, stopped):
             pass
 
 
-def drain(directory: str, script: str, timeout: float = 30.0) -> None:
+def drain(directory: str, script: str, timeout: float = 30.0, *, microbatch=False) -> None:
     root = Path(directory)
     if not root.is_absolute() or root.name != f"run_{root.parent.name}" or not Path(script).is_absolute():
         raise ValueError("publisher drain requires exact absolute run and script paths")
     for path in (root, *root.parents):
         if path.is_symlink():
             raise ValueError(f"publisher drain refuses symlink: {path}")
-    lock = root / ".batch-sync.lock"
+    # Trainers have used both paths. Drain only this exact run, never other
+    # runs found by a wildcard or a PID file.
+    if microbatch:
+        for directory in (root.parent, root):
+            drain_directory(directory, script, timeout, "run_dir", ".microbatch-sync.lock")
+    else:
+        drain_directory(root, script, timeout, "SOURCE_RUN_DIR", ".batch-sync.lock")
+
+
+def drain_directory(root, script, timeout, environment, lock_name):
+    lock = root / lock_name
     descriptor = None
     try:
         try:
@@ -113,7 +123,7 @@ def drain(directory: str, script: str, timeout: float = 30.0) -> None:
         deadline = time.monotonic() + timeout
         while True:
             records = snapshot()
-            signal_publishers(records, root, script, identity, groups)
+            signal_publishers(records, root, script, identity, groups, environment)
             alive = any(record and record[1] != "Z" and record[2] in groups for record in records.values())
             unlocked = descriptor is None
             if descriptor is not None:
@@ -139,6 +149,8 @@ def drain(directory: str, script: str, timeout: float = 30.0) -> None:
 
 if __name__ == "__main__":
     try:
-        drain(sys.argv[1], sys.argv[2])
+        if len(sys.argv) not in (3, 4) or (len(sys.argv) == 4 and sys.argv[3] != "--microbatch"):
+            raise ValueError("expected exact run directory, publisher script, and optional --microbatch")
+        drain(sys.argv[1], sys.argv[2], microbatch=len(sys.argv) == 4)
     except (OSError, ValueError) as error:
         raise SystemExit(f"publisher drain refused: {error}")

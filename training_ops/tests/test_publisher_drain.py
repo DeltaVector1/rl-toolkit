@@ -22,12 +22,13 @@ class PublisherDrainTest(unittest.TestCase):
         self.active.mkdir(parents=True)
         self.script = str(Path(self.temporary.name) / "sync_rollout_batches.sh")
 
-    def child(self, *, identity=True, publish=False):
-        ready = self.active / "ready"
+    def child(self, *, identity=True, publish=False, microbatch=False, parent=False):
+        directory = self.active.parent if parent else self.active
+        ready = directory / "ready"
         code = r'''
 import fcntl,os,pathlib,signal,sys,time
 root=pathlib.Path(sys.argv[1])
-fd=os.open(root/'.batch-sync.lock',os.O_CREAT|os.O_RDWR,0o600)
+fd=os.open(root/sys.argv[3],os.O_CREAT|os.O_RDWR,0o600)
 os.dup2(fd,9)
 if fd!=9: os.close(fd)
 fcntl.flock(9,fcntl.LOCK_EX)
@@ -36,7 +37,7 @@ def finish(*args):
  os.close(9)
  time.sleep(0.25)
  if sys.argv[2]=='publish':
-  target=root/'rollouts/step_4/train_rollouts.bin'
+  target=root/'rollouts/step_4'/sys.argv[4]
   target.parent.mkdir(parents=True,exist_ok=True)
   target.write_bytes(b'old in-flight publication')
  os._exit(0)
@@ -44,7 +45,14 @@ signal.signal(signal.SIGTERM,finish)
 (root/'ready').write_text(str(os.getpid()))
 while True: time.sleep(0.1)
 '''
-        process = subprocess.Popen([sys.executable, "-c", code, str(self.active), "publish" if publish else "idle"], start_new_session=True, env=dict(os.environ, SOURCE_RUN_DIR=str(self.active) if identity else "/unrelated"))
+        environment = "run_dir" if microbatch else "SOURCE_RUN_DIR"
+        lock = ".microbatch-sync.lock" if microbatch else ".batch-sync.lock"
+        filename = "rank_0.bin" if microbatch else "train_rollouts.bin"
+        process = subprocess.Popen(
+            [sys.executable, "-c", code, str(directory), "publish" if publish else "idle", lock, filename],
+            start_new_session=True,
+            env={**os.environ, environment: str(directory) if identity else "/unrelated"},
+        )
         process.wait(timeout=3)
         def cleanup():
             try:
@@ -80,6 +88,36 @@ while True: time.sleep(0.1)
         self.addCleanup(lambda: (unrelated.terminate(), unrelated.wait(timeout=3)))
         (self.active / ".batch-sync.pid").write_text(str(unrelated.pid))
         publisher.drain(str(self.active), self.script, timeout=0.2)
+        self.assertIsNone(unrelated.poll())
+
+    def test_microbatch_orphan_finishes_before_resume_scan_in_both_run_paths(self):
+        for parent in (False, True):
+            with self.subTest(parent=parent):
+                directory = self.active.parent if parent else self.active
+                pid = self.child(microbatch=True, parent=parent, publish=True)
+                started = time.monotonic()
+                publisher.drain(str(self.active), self.script, timeout=3, microbatch=True)
+                self.assertGreaterEqual(time.monotonic() - started, 0.2)
+                state = publisher.process(pid)
+                self.assertTrue(state is None or state[1] == "Z")
+                # A late SIGTERM handler deliberately closes its inherited
+                # lock before publishing. Resume must see that stale rank
+                # file now, not after its final cached-batch scan.
+                cached = directory / "rollouts/step_4/rank_0.bin"
+                self.assertEqual(cached.read_bytes(), b"old in-flight publication")
+
+    def test_microbatch_unknown_lock_holder_fails_closed_without_a_signal(self):
+        pid = self.child(microbatch=True, identity=False)
+        with self.assertRaises(TimeoutError):
+            publisher.drain(str(self.active), self.script, timeout=0.2, microbatch=True)
+        self.assertNotEqual(publisher.process(pid)[1], "Z")
+
+    def test_microbatch_stale_pid_does_not_target_unrelated_process(self):
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        self.addCleanup(lambda: (unrelated.terminate(), unrelated.wait(timeout=3)))
+        for directory in (self.active.parent, self.active):
+            (directory / ".microbatch-sync.pid").write_text(str(unrelated.pid))
+        publisher.drain(str(self.active), self.script, timeout=0.2, microbatch=True)
         self.assertIsNone(unrelated.poll())
 
     def test_matching_child_cannot_authorize_unrelated_group_members(self):
