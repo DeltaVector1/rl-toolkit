@@ -22,7 +22,7 @@ class PublisherDrainTest(unittest.TestCase):
         self.active.mkdir(parents=True)
         self.script = str(Path(self.temporary.name) / "sync_rollout_batches.sh")
 
-    def child(self, *, identity=True, publish=False, microbatch=False, parent=False):
+    def child(self, *, identity=True, publish=False, microbatch=False, parent=False, finish_delay=0.25):
         directory = self.active.parent if parent else self.active
         ready = directory / "ready"
         code = r'''
@@ -35,7 +35,7 @@ fcntl.flock(9,fcntl.LOCK_EX)
 if os.fork(): os._exit(0)
 def finish(*args):
  os.close(9)
- time.sleep(0.25)
+ time.sleep(float(sys.argv[5]))
  if sys.argv[2]=='publish':
   target=root/'rollouts/step_4'/sys.argv[4]
   target.parent.mkdir(parents=True,exist_ok=True)
@@ -49,7 +49,7 @@ while True: time.sleep(0.1)
         lock = ".microbatch-sync.lock" if microbatch else ".batch-sync.lock"
         filename = "rank_0.bin" if microbatch else "train_rollouts.bin"
         process = subprocess.Popen(
-            [sys.executable, "-c", code, str(directory), "publish" if publish else "idle", lock, filename],
+            [sys.executable, "-c", code, str(directory), "publish" if publish else "idle", lock, filename, str(finish_delay)],
             start_new_session=True,
             env={**os.environ, environment: str(directory) if identity else "/unrelated"},
         )
@@ -111,6 +111,44 @@ while True: time.sleep(0.1)
         with self.assertRaises(TimeoutError):
             publisher.drain(str(self.active), self.script, timeout=0.2, microbatch=True)
         self.assertNotEqual(publisher.process(pid)[1], "Z")
+
+    def test_microbatch_pre_signalled_orphan_cannot_publish_after_drain(self):
+        for parent in (False, True):
+            with self.subTest(parent=parent):
+                directory = self.active.parent if parent else self.active
+                pid = self.child(microbatch=True, parent=parent, publish=True, finish_delay=0.6)
+                os.kill(pid, signal.SIGTERM)
+                deadline = time.monotonic() + 3
+                while (Path("/proc") / str(pid) / "fd/9").exists() and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                self.assertFalse((Path("/proc") / str(pid) / "fd/9").exists())
+                self.assertNotEqual(publisher.process(pid)[1], "Z")
+                with mock.patch.object(publisher.os, "kill") as individual_signal, mock.patch.object(publisher.os, "killpg") as group_signal:
+                    publisher.drain(str(self.active), self.script, timeout=3, microbatch=True)
+                    individual_signal.assert_not_called()
+                    group_signal.assert_not_called()
+                state = publisher.process(pid)
+                self.assertTrue(state is None or state[1] == "Z")
+                cached = directory / "rollouts/step_4/rank_0.bin"
+                self.assertEqual(cached.read_bytes(), b"old in-flight publication")
+                # The final resume scan can now see and quarantine this file.
+                # No child is left that could refill the path after the scan.
+                cached.rename(cached.with_suffix(".quarantined"))
+                time.sleep(0.1)
+                self.assertFalse(cached.exists())
+
+    def test_same_run_environment_without_ownership_refuses_without_a_signal(self):
+        unrelated = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True,
+            env={**os.environ, "run_dir": str(self.active)},
+        )
+        self.addCleanup(lambda: (unrelated.terminate(), unrelated.wait(timeout=3)))
+        with mock.patch.object(publisher.os, "kill") as individual_signal, mock.patch.object(publisher.os, "killpg") as group_signal:
+            with self.assertRaises(TimeoutError):
+                publisher.drain(str(self.active), self.script, timeout=0.2, microbatch=True)
+            individual_signal.assert_not_called()
+            group_signal.assert_not_called()
+        self.assertIsNone(unrelated.poll())
 
     def test_microbatch_stale_pid_does_not_target_unrelated_process(self):
         unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)

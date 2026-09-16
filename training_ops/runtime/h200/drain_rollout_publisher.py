@@ -18,10 +18,18 @@ def process(pid: int):
         return None
 
 
+def same_run(pid: int, directory: Path, environment: str) -> bool:
+    try:
+        values = (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
+        return f"{environment}={directory}".encode() in values
+    except OSError:
+        return False
+
+
 def matches(pid: int, directory: Path, script: str, lock_identity, environment="SOURCE_RUN_DIR") -> bool:
     root = Path("/proc") / str(pid)
     try:
-        if f"{environment}={directory}".encode() not in (root / "environ").read_bytes().split(b"\0"):
+        if not same_run(pid, directory, environment):
             return False
         if script.encode() in (root / "cmdline").read_bytes().split(b"\0"):
             return True
@@ -37,6 +45,19 @@ def snapshot():
 
 def live_members(records, group):
     return {pid: record for pid, record in records.items() if record and record[1] != "Z" and record[2] == group}
+
+
+def pending_publishers(records, directory, environment, observed_groups):
+    # A child can receive SIGTERM and close fd 9 before this drain starts.
+    # Its exact run environment is enough to wait for completion, but never
+    # enough to authorize a signal. Keep its group in the barrier even if a
+    # later exec removes that environment or the original child exits first.
+    observed_groups.update(
+        record[2] for pid, record in records.items()
+        if pid != os.getpid() and record and record[1] != "Z"
+        and same_run(pid, directory, environment)
+    )
+    return any(record and record[1] != "Z" and record[2] in observed_groups for record in records.values())
 
 
 def signal_publishers(records, directory, script, lock_identity, stopped, environment="SOURCE_RUN_DIR"):
@@ -120,9 +141,11 @@ def drain_directory(root, script, timeout, environment, lock_name):
                 raise ValueError("publisher lock is not a regular file")
             identity = (info.st_dev, info.st_ino)
         groups = set()
+        observed_groups = set()
         deadline = time.monotonic() + timeout
         while True:
             records = snapshot()
+            pending = pending_publishers(records, root, environment, observed_groups)
             signal_publishers(records, root, script, identity, groups, environment)
             alive = any(record and record[1] != "Z" and record[2] in groups for record in records.values())
             unlocked = descriptor is None
@@ -134,7 +157,13 @@ def drain_directory(root, script, timeout, environment, lock_name):
                     unlocked = False
             # The group must be gone as well as the lock free: a child can
             # close fd 9 before completing its final remote publication.
-            if not alive and unlocked:
+            if not alive and not pending and unlocked:
+                # Check once more after the lock probe so a child born during
+                # the first /proc scan cannot bypass the completion barrier.
+                if pending_publishers(snapshot(), root, environment, observed_groups):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"publisher group did not drain: {root}")
+                    continue
                 if descriptor is not None and lock.stat().st_ino != identity[1]:
                     raise ValueError("publication lock changed during drain")
                 print(f"publisher drained: {root}; groups={len(groups)}; lock=free")
