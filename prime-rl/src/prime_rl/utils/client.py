@@ -1123,21 +1123,13 @@ async def stage_lora_adapter(
 
     transfer_values = group_wall_times("transfer_wall_seconds")
     legacy_wire_values = group_wall_times("wire_stage_seconds")
-    reconstruct_values = [
-        float(result["reconstruction_wall_seconds"])
-        for result in results
-        if result["reconstruction_wall_seconds"] is not None
-    ]
+    reconstruct_values = group_wall_times("reconstruction_wall_seconds")
     worker_values = [
         float(result["reconstruction_worker_seconds"])
         for result in results
         if result["reconstruction_worker_seconds"] is not None
     ]
-    verification_values = [
-        float(result["final_verification_wall_seconds"])
-        for result in results
-        if result["final_verification_wall_seconds"] is not None
-    ]
+    verification_values = group_wall_times("final_verification_wall_seconds")
     identities = [result["adapter_identity"] for result in results]
     if not identities or any(identity != identities[0] for identity in identities[1:]):
         raise RuntimeError("inference hosts reported different adapter identities")
@@ -1152,10 +1144,10 @@ async def stage_lora_adapter(
         ),
         "origin_stage_seconds": origin_stage_seconds,
         "peer_stage_seconds": peer_stage_seconds,
-        "reconstruction_wall_seconds": max(reconstruct_values) if reconstruct_values else None,
-        "reconstruct_seconds": max(reconstruct_values) if reconstruct_values else None,
+        "reconstruction_wall_seconds": sum(reconstruct_values) if None not in reconstruct_values else None,
+        "reconstruct_seconds": sum(reconstruct_values) if None not in reconstruct_values else None,
         "reconstruction_worker_seconds": max(worker_values) if worker_values else None,
-        "final_verification_wall_seconds": max(verification_values) if verification_values else None,
+        "final_verification_wall_seconds": sum(verification_values) if None not in verification_values else None,
         "total_stage_wall_seconds": time.perf_counter() - started,
         "cache_hit": bool(results) and all(bool(result["cache_hit"]) for result in results),
         "bytes_done": sum(int(result["bytes_done"]) for result in results),

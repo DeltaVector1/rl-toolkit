@@ -1239,6 +1239,32 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
 
+    def test_cache_run_comparison_ignores_slashes_in_url_queries(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                urls = (
+                    "http://source/run/step_1?token=/first/query",
+                    "http://source/run/step_2?token=/other/query",
+                    "http://source/old/step_9?token=/first/query",
+                )
+                paths = [filesystem.adapter_cache_path(url) for url in urls]
+                for url, path in zip(urls, paths):
+                    path.mkdir()
+                    (path / "READY").write_text("ready\n")
+                    (path / "transport.json").write_text(json.dumps({"source_url": url}))
+                filesystem._cleanup_previous_adapter_caches(Path(temporary), paths[0])
+                self.assertTrue(paths[0].is_dir())
+                self.assertTrue(paths[1].is_dir())
+                self.assertFalse(paths[2].exists())
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
     def test_pre_stage_cleanup_preserves_loaded_policy_over_staged_status(self):
         filesystem = load_filesystem()
         old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")

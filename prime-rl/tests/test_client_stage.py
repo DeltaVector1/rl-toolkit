@@ -652,6 +652,29 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertLess(budgets[1], budgets[0])
         self.assertLess(budgets[1], 0.8)
 
+    def test_stage_wall_times_sum_sequential_group_maxima(self):
+        stage_lora_adapter, namespace = _load_stage_function()
+        clients = [httpx.AsyncClient(base_url=f"http://host{index}:8000") for index in range(3)]
+
+        async def post(client, _path, **_kwargs):
+            duration = clients.index(client) + 1.0
+            return SimpleNamespace(json=lambda: {
+                "status": "ok",
+                "stage_seconds": duration,
+                "transfer_wall_seconds": duration,
+                "reconstruction_wall_seconds": duration,
+                "final_verification_wall_seconds": duration,
+                "adapter_identity": _adapter_identity(),
+            })
+
+        namespace["_admin_post_response"] = post
+        result = asyncio.run(stage_lora_adapter(
+            clients, "http://adapter/step_1", origin_base_urls=["http://host0:8000"]
+        ))
+        for name in ("transfer_wall_seconds", "reconstruction_wall_seconds",
+                     "reconstruct_seconds", "final_verification_wall_seconds"):
+            self.assertEqual(result[name], 4.0)
+
     def test_stage_retries_same_identity_three_times(self):
         stage_lora_adapter, namespace = _load_stage_function()
         calls = []

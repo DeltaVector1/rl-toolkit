@@ -2606,12 +2606,18 @@ def _cleanup_previous_adapter_caches(
                 source_url = metadata.get("source_url") if isinstance(metadata, dict) else None
                 if not isinstance(source_url, str):
                     continue
+                parsed = urlsplit(source_url)
                 match = re.fullmatch(
                     r"step_(\d+)",
-                    Path(urlsplit(source_url).path.rstrip("/")).name,
+                    Path(parsed.path.rstrip("/")).name,
                 )
                 if match is not None:
-                    return source_url.rstrip("/").rsplit("/", 1)[0], int(match.group(1))
+                    run_url = urlunsplit(parsed._replace(
+                        path=str(Path(parsed.path.rstrip("/")).parent),
+                        query="",
+                        fragment="",
+                    ))
+                    return run_url, int(match.group(1))
             return None
 
         entry_count = 0
