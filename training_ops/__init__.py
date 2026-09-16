@@ -3898,6 +3898,7 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
         raise Refused("latest adapter broadcast is not a positive policy update")
     stage_limit = _adapter_stage_limit_seconds(latest.step)
     target_exceeded = []
+    overruns = []
     for host, record in records.items():
         state = record.get("status")
         if state not in {"ready", "failed"}:
@@ -3910,7 +3911,6 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
             or not isinstance(elapsed, (int, float))
             or not math.isfinite(elapsed)
             or elapsed < 0
-            or elapsed > stage_limit
         ):
             raise Refused(f"adapter stage duration on {host} is invalid")
         if record.get("policy_step") != latest.step:
@@ -3919,6 +3919,10 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
             raise Refused(f"adapter stage status on {host} has the wrong operational limit")
         if record.get("acceptance_target_seconds") != adapter_stage_acceptance_target_seconds:
             raise Refused(f"adapter stage status on {host} has the wrong acceptance target")
+        if elapsed > stage_limit:
+            if state == "ready":
+                raise Refused(f"adapter stage on {host} completed after its {stage_limit:g}s operational limit")
+            overruns.append(f"{host} ({elapsed:g}s, {elapsed - stage_limit:g}s over)")
         if elapsed > adapter_stage_acceptance_target_seconds:
             target_exceeded.append(host)
         if state == "failed":
@@ -3939,7 +3943,7 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
     )
     return (
         f"policy update {latest.step} failed on {failure_details}; "
-        f"operational limit {stage_limit:g}s; "
+        f"operational limit {stage_limit:g}s{' exceeded on ' + ', '.join(overruns) if overruns else ''}; "
         f"300s acceptance target {'exceeded on ' + ', '.join(target_exceeded) if target_exceeded else 'not exceeded'}; "
         "exact terminal stage status matched every inference host"
     )

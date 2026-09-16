@@ -729,11 +729,28 @@ class AdapterUpdateTest(unittest.TestCase):
             {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(wrong_limit))},
             "wrong operational limit",
         )
-        overdue = dict(failed, elapsed_seconds=600.1)
+        overdue = dict(ready, elapsed_seconds=600.1)
         check(
             {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(overdue))},
-            "duration on h200b is invalid",
+            "completed after its 600s operational limit",
         )
+        for elapsed in (600.1, 960.0):
+            overdue = dict(failed, elapsed_seconds=elapsed)
+            with mock.patch.object(
+                training_ops, "_latest_adapter_broadcast", return_value=broadcast
+            ), mock.patch.object(
+                training_ops, "_fan",
+                return_value={"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(overdue))},
+            ):
+                evidence = training_ops._adapter_stage_status_evidence("glm-perf-3", config, "")
+            self.assertIn(f"operational limit 600s exceeded on h200b ({elapsed:g}s,", evidence)
+        for state in ("failed", "ready"):
+            for elapsed in (-1, float("nan"), float("inf"), True):
+                invalid = dict(failed, status=state, elapsed_seconds=elapsed)
+                check(
+                    {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(invalid))},
+                    "duration on h200b is invalid",
+                )
         check(
             {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(ready))},
             "succeeded on every",
