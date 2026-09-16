@@ -1013,13 +1013,27 @@ class Orchestrator:
                 adapter_identity = None
                 if self.lora_name is not None and isinstance(weights_path, str):
                     stage_attempts = 2 if require_delta else 1
+                    # Keep verification and retry bookkeeping inside 900s total.
+                    # Each attempt keeps its 600s cap; the client adds response grace.
+                    stage_retry_deadline = (
+                        startup_delta_deadline
+                        - adapter_stage_limit_seconds(sync_version)
+                        + 900.0
+                        if startup_delta_deadline is not None
+                        else None
+                    )
                     for stage_attempt in range(1, stage_attempts + 1):
+                        if stage_attempt > 1 and startup_delta_deadline is not None:
+                            startup_delta_deadline = min(
+                                time.monotonic() + adapter_stage_limit_seconds(sync_version),
+                                stage_retry_deadline,
+                            )
                         if (
                             startup_delta_deadline is not None
                             and time.monotonic() >= startup_delta_deadline
                         ):
                             raise TimeoutError(
-                                "adapter restart staging exceeded its ten-minute limit"
+                                "adapter restart staging deadline expired"
                             )
                         try:
                             stage_result = await stage_lora_adapter(
