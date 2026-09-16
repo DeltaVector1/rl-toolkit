@@ -1067,6 +1067,7 @@ class Orchestrator:
                         using_pruned_resume_tail
                         and sync_version < final_sync_version
                         and stage_result.get("cache_hit") is not True
+                        and sync_version - 1 not in resume_seed_identities
                     ):
                         raise RuntimeError(
                             f"cannot resume LoRA policy v{sync_version}: retained adapter cache is not ready"

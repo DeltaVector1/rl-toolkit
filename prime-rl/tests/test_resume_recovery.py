@@ -122,6 +122,82 @@ def load_resume_slot_finder(common_receipt):
     return namespace["_find_loaded_resume_policy"]
 
 
+def load_resume_staging(seed_identities, sync_versions, stage_results):
+    """Run the startup staging loop and its real final identity validator."""
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    setup = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
+    )
+    loop = next(
+        node for node in ast.walk(setup)
+        if isinstance(node, ast.For) and ast.unparse(node.target) == "sync_version"
+    )
+    wrapper = ast.parse("async def run():\n    pass\n").body[0]
+    wrapper.body = [loop]
+    validator = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_verify_startup_adapter_delta"
+    )
+    inference = SimpleNamespace(
+        admin_clients=[],
+        adapter_origin_base_urls=None,
+        update_weights=mock.AsyncMock(return_value=[]),
+        update_model_name=mock.Mock(),
+        wait_for_ready=mock.AsyncMock(),
+    )
+    state = SimpleNamespace(
+        lora_name="adapter", model_express=None,
+        policy_inference=inference, policy=SimpleNamespace(version=2),
+    )
+    config = SimpleNamespace(
+        output_dir=Path("/unused/resume-test"),
+        weight_broadcast=SimpleNamespace(type="filesystem"), ckpt=None,
+    )
+
+    async def stage(_clients, _path, **kwargs):
+        return stage_results[kwargs["policy_step"]]
+
+    async def read_manifest(url, _deadline):
+        if url != "http://source/step_4":
+            raise AssertionError("resume must use verified predecessor identities")
+        return retained_manifest_chain(2)[4], url
+
+    stage_mock = mock.AsyncMock(side_effect=stage)
+    namespace = {
+        "OrchestratorConfig": object,
+        "self": state,
+        "config": config,
+        "sync_versions": sync_versions,
+        "final_sync_version": 4,
+        "using_pruned_resume_tail": True,
+        "resume_seed_identities": seed_identities,
+        "staged_adapter_identities": dict(seed_identities),
+        "STARTUP_WEIGHT_WAIT_TIMEOUT_S": 30,
+        "time": time,
+        "json": json,
+        "re": re,
+        "get_weight_dir": lambda output, step, **_kwargs: output / f"step_{step}",
+        "get_broadcast_dir": lambda output: output,
+        "get_step_path": lambda output, step: output / f"step_{step}",
+        "inference_weight_path": lambda _config, path, _name: f"http://source/{path.name}",
+        "adapter_stage_limit_seconds": lambda _step: 600.0,
+        "get_logger": lambda: mock.Mock(),
+        "stage_lora_adapter": stage_mock,
+        "_read_remote_adapter_manifest": read_manifest,
+        "validate_adapter_manifest": lambda *_args, **_kwargs: None,
+        "_write_receivers_ready": mock.Mock(),
+    }
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[validator, wrapper], type_ignores=[])),
+                str(ORCHESTRATOR_PATH), "exec"),
+        namespace,
+    )
+    return namespace["run"], inference, stage_mock, state
+
+
 def load_server_load_endpoints(destination, handler, reader_lock=None):
     if not hasattr(handler, "lora_resolver_lock"):
         handler.lora_resolver_lock = defaultdict(asyncio.Lock)
@@ -1252,7 +1328,7 @@ class ResumeRecoveryTest(unittest.TestCase):
             setup.index("await self.policy_inference.update_weights("),
         )
 
-    def test_pruned_resume_requires_cache_hits_and_seeds_verified_loaded_identity(self):
+    def test_pruned_resume_seeds_verified_loaded_identity(self):
         source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
         setup = ast.get_source_segment(
             source,
@@ -1265,8 +1341,50 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertIn("resume_seed_identities", setup)
         self.assertIn("sync_versions = (retained_tail[1], final_sync_version)", setup)
         self.assertIn("sync_versions = (retained_tail[0], final_sync_version)", setup)
-        self.assertIn('stage_result.get("cache_hit") is not True', setup)
         self.assertIn("using_pruned_resume_tail and sync_version < final_sync_version", setup)
+
+    def test_loaded_v2_resume_accepts_fresh_v3_and_loads_only_v4(self):
+        results = {
+            3: {"cache_hit": False, "adapter_identity": startup_identity(3, "3", "b")},
+            4: {"cache_hit": False, "adapter_identity": startup_identity(4, "4", "c")},
+        }
+        run, inference, stage, state = load_resume_staging(
+            {2: startup_identity(2, "2", "a")}, (3, 4), results,
+        )
+        asyncio.run(run())
+        self.assertEqual([call.kwargs["policy_step"] for call in stage.await_args_list], [3, 4])
+        inference.update_weights.assert_awaited_once_with(
+            "http://source/step_4", lora_name="adapter-slot0", step=4,
+            require_delta=True, prefetched=True,
+            expected_adapter_identity=results[4]["adapter_identity"],
+        )
+        self.assertEqual(state.policy.version, 4)
+
+    def test_pruned_resume_rejects_fresh_cold_or_backward_predecessor(self):
+        for seed in ({}, {3: startup_identity(3, "3", "b")}, {4: startup_identity(4, "4", "c")}):
+            with self.subTest(seed=seed):
+                run, inference, stage, _state = load_resume_staging(
+                    seed, (2, 4),
+                    {2: {"cache_hit": False, "adapter_identity": startup_identity(2, "2", "a")}},
+                )
+                with self.assertRaisesRegex(RuntimeError, "retained adapter cache is not ready"):
+                    asyncio.run(run())
+                stage.assert_awaited_once()
+                inference.update_weights.assert_not_awaited()
+
+    def test_loaded_v2_resume_rejects_identity_mismatch_before_v4_load(self):
+        for bad_step in (2, 3):
+            with self.subTest(bad_step=bad_step):
+                seed = {2: startup_identity(2, "2", "a")}
+                staged = startup_identity(3, "3", "b")
+                (seed[2] if bad_step == 2 else staged)["target_sha256"] = "f" * 64
+                run, inference, stage, _state = load_resume_staging(
+                    seed, (3, 4), {3: {"cache_hit": False, "adapter_identity": staged}},
+                )
+                with self.assertRaisesRegex(RuntimeError, "identity differs"):
+                    asyncio.run(run())
+                stage.assert_awaited_once()
+                inference.update_weights.assert_not_awaited()
 
     def test_pruned_policy_zero_selects_three_step_v2_tail(self):
         final_sync_version = 34
