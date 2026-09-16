@@ -6598,21 +6598,18 @@ def start(
     if trainer_head in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [trainer_head] + [n for n in nodes if n != trainer_head]
     if mode == "restart" and resume_adapter is not None:
+        if trainer_head not in nodes:
+            raise Refused(f"adapter restart requires trainer head {trainer_head} in nodes")
         control_file = f"{service_run_dir}/control/orch.toml"
-        missing_control = [
-            host
-            for host, (code, _output) in _fan(
-                nodes,
-                lambda host: _ssh(
-                    host,
-                    f"test -f {shlex.quote(control_file)} && test -s {shlex.quote(control_file)}",
-                ),
-            ).items()
-            if code
-        ]
-        if missing_control:
+        # The orchestrator sends saved control only to the trainer head.
+        # Peer trainers consume synchronized rollout files, not this control.
+        code, _output = _ssh(
+            trainer_head,
+            f"test -f {shlex.quote(control_file)} && test -s {shlex.quote(control_file)}",
+        )
+        if code:
             raise Refused(
-                f"adapter restart requires a non-empty control file {control_file} on {missing_control}"
+                f"adapter restart requires a non-empty control file {control_file} on {trainer_head}"
             )
     required_files = _start_dependency_inventory(selected, nodes)
     _deploy_dependencies(required_files)
