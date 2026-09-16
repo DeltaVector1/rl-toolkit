@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("publisher_drain", Path(__file__).parents[1] / "runtime/h200/drain_rollout_publisher.py")
@@ -80,6 +81,70 @@ while True: time.sleep(0.1)
         (self.active / ".batch-sync.pid").write_text(str(unrelated.pid))
         publisher.drain(str(self.active), self.script, timeout=0.2)
         self.assertIsNone(unrelated.poll())
+
+    def test_matching_child_cannot_authorize_unrelated_group_members(self):
+        group = 987650
+        records = {
+            group: (Path(f"/proc/{group}"), "S", group, "100"),
+            group + 1: (Path(f"/proc/{group + 1}"), "S", group, "101"),
+            group + 2: (Path(f"/proc/{group + 2}"), "S", group, "102"),
+        }
+        for unrelated in (group, group + 2):
+            with self.subTest(unrelated=unrelated), mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", side_effect=lambda pid, *_args: pid != unrelated), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+                with self.assertRaisesRegex(ValueError, "unknown (member|leader)"):
+                    publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+                group_signal.assert_not_called()
+                individual_signal.assert_not_called()
+
+    def test_all_proven_members_allow_only_the_exact_group_signal(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid)) for pid in (group, group + 1)}
+        stopped = set()
+        with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+            publisher.signal_publishers(records, self.active, self.script, (1, 2), stopped)
+        group_signal.assert_called_once_with(group, signal.SIGTERM)
+        individual_signal.assert_not_called()
+        self.assertEqual(stopped, {group})
+
+    def test_orphan_signals_only_rechecked_proven_pids(self):
+        group = 987650
+        pid = group + 1
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, "101")}
+        with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+            publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+        group_signal.assert_not_called()
+        individual_signal.assert_called_once_with(pid, signal.SIGTERM)
+
+    def test_mixed_orphan_group_signals_nobody(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid)) for pid in (group + 1, group + 2)}
+        with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", side_effect=lambda pid, *_args: pid == group + 1), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+            with self.assertRaisesRegex(ValueError, "unknown member"):
+                publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+        group_signal.assert_not_called()
+        individual_signal.assert_not_called()
+
+    def test_orphan_start_time_change_signals_nobody(self):
+        group, pid = 987650, 987651
+        record = (Path(f"/proc/{pid}"), "S", group, "101")
+        changed = (*record[:3], "102")
+        records = {pid: record}
+        with mock.patch.object(publisher, "process", side_effect=[record, record, changed]), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+            with self.assertRaisesRegex(ValueError, "changed before signalling"):
+                publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+        group_signal.assert_not_called()
+        individual_signal.assert_not_called()
+
+    def test_launcher_drain_failure_exits_before_replacement_start(self):
+        source = (Path(__file__).parents[1] / "runtime/h200/start_orchestrator.sh").read_text()
+        block = source.split('  publisher_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"', 1)[1].split("  publisher_pid=$!", 1)[0]
+        # Preserve the exact drain command and failure operator from the
+        # launcher; replace only the background launch with a marker.
+        drain = block.split("  nohup setsid", 1)[0]
+        program = 'deployment=/unused; publisher_dir=/unused\npython3() { return 19; }\n' + drain + '\necho replacement-started\n'
+        result = subprocess.run(["bash", "-uc", program], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("replacement-started", result.stdout)
 
 
 if __name__ == "__main__":

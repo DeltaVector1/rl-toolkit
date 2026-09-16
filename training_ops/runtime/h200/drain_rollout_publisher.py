@@ -31,6 +31,64 @@ def matches(pid: int, directory: Path, script: str, lock_identity) -> bool:
         return False
 
 
+def snapshot():
+    return {int(path.name): process(int(path.name)) for path in Path("/proc").iterdir() if path.name.isdecimal()}
+
+
+def live_members(records, group):
+    return {pid: record for pid, record in records.items() if record and record[1] != "Z" and record[2] == group}
+
+
+def signal_publishers(records, directory, script, lock_identity, stopped):
+    candidates = {
+        record[2] for pid, record in records.items()
+        if record and record[1] != "Z" and record[2] not in stopped
+        and matches(pid, directory, script, lock_identity)
+    }
+    plans = {}
+    # Validate every candidate group before signalling any process. A matching
+    # child alone never authorizes a signal to an unrelated group leader.
+    for group in candidates:
+        if group <= 1 or group == os.getpgrp():
+            raise ValueError("publisher has no isolated process group")
+        members = live_members(records, group)
+        leader = records.get(group)
+        if leader is None and (Path("/proc") / str(group)).exists():
+            raise ValueError(f"publisher group {group} has an unreadable leader")
+        if leader and leader[1] != "Z" and (leader[2] != group or not matches(group, directory, script, lock_identity)):
+            raise ValueError(f"publisher group {group} has an unknown leader")
+        for pid, record in members.items():
+            if process(pid) != record or not matches(pid, directory, script, lock_identity):
+                raise ValueError(f"publisher group {group} has an unknown member {pid}")
+        plans[group] = members
+    current = snapshot()
+    for group, members in plans.items():
+        if live_members(current, group) != members:
+            raise ValueError(f"publisher group {group} changed during validation")
+        for pid, record in members.items():
+            if process(pid) != record or not matches(pid, directory, script, lock_identity):
+                raise ValueError(f"publisher member {pid} changed during validation")
+    final = snapshot()
+    for group, members in plans.items():
+        if live_members(final, group) != members:
+            raise ValueError(f"publisher group {group} changed before signalling")
+    for group, members in plans.items():
+        try:
+            if group in members:
+                os.killpg(group, signal.SIGTERM)
+            else:
+                # A missing leader never authorizes a group signal. Check
+                # each orphan's start time and exact identity immediately
+                # before signalling only that PID.
+                for pid, record in members.items():
+                    if process(pid) != record or not matches(pid, directory, script, lock_identity):
+                        raise ValueError(f"orphan publisher {pid} changed before signalling")
+                    os.kill(pid, signal.SIGTERM)
+            stopped.add(group)
+        except ProcessLookupError:
+            pass
+
+
 def drain(directory: str, script: str, timeout: float = 30.0) -> None:
     root = Path(directory)
     if not root.is_absolute() or root.name != f"run_{root.parent.name}" or not Path(script).is_absolute():
@@ -54,24 +112,9 @@ def drain(directory: str, script: str, timeout: float = 30.0) -> None:
         groups = set()
         deadline = time.monotonic() + timeout
         while True:
-            snapshot = {int(path.name): process(int(path.name)) for path in Path("/proc").iterdir() if path.name.isdecimal()}
-            for pid, record in snapshot.items():
-                if record is None or record[1] == "Z" or not matches(pid, root, script, identity):
-                    continue
-                group = record[2]
-                if group <= 1 or group == os.getpgrp():
-                    raise ValueError("publisher has no isolated process group")
-                if group not in groups:
-                    # Recheck start time, group and exact run/lock identity
-                    # immediately before signalling; a PID file is not proof.
-                    if process(pid) != record or not matches(pid, root, script, identity):
-                        continue
-                    groups.add(group)
-                    try:
-                        os.killpg(group, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-            alive = any(record and record[1] != "Z" and record[2] in groups for record in snapshot.values())
+            records = snapshot()
+            signal_publishers(records, root, script, identity, groups)
+            alive = any(record and record[1] != "Z" and record[2] in groups for record in records.values())
             unlocked = descriptor is None
             if descriptor is not None:
                 try:

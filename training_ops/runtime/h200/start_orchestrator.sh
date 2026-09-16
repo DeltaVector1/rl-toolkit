@@ -4096,7 +4096,7 @@ ctl=/data/glm52-rl/runs/$RUN/$RUN_NAME/control/orch.toml
 if [ "$transport" = filesystem ]; then
   publisher_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"
   python3 "$deployment/training_ops/runtime/h200/drain_rollout_publisher.py" \
-    "$publisher_dir" "$deployment/training_ops/runtime/h200/sync_rollout_batches.sh"
+    "$publisher_dir" "$deployment/training_ops/runtime/h200/sync_rollout_batches.sh" || exit 1
   nohup setsid env SOURCE_RUN_DIR="/data/glm52-rl/runs/$RUN/$RUN_NAME" \
     DEST_HOST="$trainer_ssh_target" \
     "$deployment/training_ops/runtime/h200/sync_rollout_batches.sh" \
