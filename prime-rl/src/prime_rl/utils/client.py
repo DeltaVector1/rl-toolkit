@@ -1112,11 +1112,15 @@ async def stage_lora_adapter(
                 raise
         return staged, time.perf_counter() - group_started
 
-    groups = [ordered_hosts, *peer_groups]
-    group_tasks = [asyncio.create_task(_stage_group(group)) for group in groups]
+    group_tasks = [asyncio.create_task(_stage_group(ordered_hosts))]
     try:
-        # Wait for origins first without delaying peer startup. A peer failure
-        # must not discard origin progress; an origin failure cancels peers.
+        # Full bootstrap peers need the origin's READY manifest. Delta peers
+        # stream concurrently; both modes retain the same absolute deadline.
+        if not require_delta:
+            await group_tasks[0]
+        group_tasks.extend(asyncio.create_task(_stage_group(group)) for group in peer_groups)
+        # A peer failure must not discard origin progress; an origin failure
+        # cancels any peers that delta staging has already started.
         grouped_results = [await task for task in group_tasks]
     except BaseException as exc:
         await _cancel_and_reap(group_tasks)
