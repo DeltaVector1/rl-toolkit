@@ -296,6 +296,67 @@ async def _run_with_retries(
     raise RuntimeError(f"{name} retry loop ended unexpectedly after {attempts} attempts")
 
 
+async def _stage_policy_adapter(
+    admin_clients,
+    weights_path: str,
+    *,
+    policy_step: int,
+    delta_deadline: float,
+    origin_base_urls,
+) -> dict[str, object]:
+    # The first deadline includes manifest preparation. Backoff and response
+    # cleanup consume the same fixed 900s budget; each stage still has <=600s.
+    total_deadline = delta_deadline + 300.0
+    for attempt in range(1, 3):
+        started = time.monotonic()
+        attempt_deadline = min(
+            delta_deadline if attempt == 1 else total_deadline,
+            started + adapter_stage_limit_seconds(policy_step),
+        )
+        if attempt_deadline <= started:
+            raise TimeoutError("adapter policy staging deadline expired")
+        try:
+            result = await stage_lora_adapter(
+                admin_clients, weights_path, require_delta=True,
+                policy_step=policy_step, delta_deadline=attempt_deadline,
+                origin_base_urls=origin_base_urls,
+            )
+        except (TimeoutError, httpx.HTTPStatusError) as exc:
+            if isinstance(exc, httpx.HTTPStatusError):
+                try:
+                    error = exc.response.json()
+                except ValueError:
+                    raise exc
+                if (
+                    exc.response.status_code != 504 or not isinstance(error, dict)
+                    or error.get("error_type") != "TimeoutError"
+                    or error.get("phase") != "staging"
+                ):
+                    raise
+            remaining = max(0.0, total_deadline - time.monotonic())
+            get_logger().warning(
+                f"Adapter v{policy_step} stage attempt {attempt}/2 failed: {exc!r}; "
+                f"elapsed={time.monotonic() - started:.3f}s, "
+                "preserved_partial=receiver-verified-only, bytes=not-reported, "
+                f"remaining_budget={remaining:.3f}s"
+            )
+            if attempt == 2 or remaining <= 0:
+                raise
+            # Reuse the exact URL and policy. Receivers revalidate the stored
+            # transport identity and each preserved chunk before reuse.
+            await asyncio.sleep(min(0.5, max(0.0, total_deadline - time.monotonic())))
+        else:
+            get_logger().info(
+                f"Adapter v{policy_step} stage attempt {attempt}/2 succeeded; "
+                f"elapsed={time.monotonic() - started:.3f}s, "
+                f"preserved_partial={'receiver-verified-only' if attempt == 2 else 'not-used'}, "
+                f"bytes={result.get('bytes_done', 'not-reported')}, "
+                f"remaining_budget={max(0.0, total_deadline - time.monotonic()):.3f}s"
+            )
+            return result
+    raise RuntimeError("adapter policy staging retry loop ended unexpectedly")
+
+
 def _valid_digest(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and all(
         character in "0123456789abcdef" for character in value
@@ -549,6 +610,7 @@ class WeightWatcher:
         try:
             while not self.stopped.is_set():
                 operation_name = "Initial adapter staging"
+                policy_update_started = False
                 try:
                     if not self.bootstrap_staged:
                         await _run_with_retries(operation_name, self.stage_bootstrap_adapter)
@@ -558,18 +620,8 @@ class WeightWatcher:
                     next_step = self.compute_next_ckpt_step()
                     if next_step > self.ckpt_step:
                         operation_name = f"Policy update {next_step}"
-                        update_deadline = None
-                        update_attempts = 1
-                        if self.lora_name is not None and next_step > 0:
-                            update_deadline = time.monotonic() + adapter_stage_limit_seconds(
-                                next_step
-                            )
-                            update_attempts = 2
-                        await _run_with_retries(
-                            operation_name,
-                            lambda: self.apply_policy_update(next_step, update_deadline),
-                            attempts=update_attempts,
-                        )
+                        policy_update_started = True
+                        await self.apply_policy_update(next_step)
                     elif time.monotonic() - self.last_reconcile_check_at >= self.reconcile_interval:
                         operation_name = "Current policy reconciliation"
                         self.last_reconcile_check_at = time.monotonic()
@@ -582,6 +634,9 @@ class WeightWatcher:
                             attempts=reconcile_attempts,
                         )
                 except httpx.TransportError as exc:
+                    if policy_update_started:
+                        # Never turn a failed stage/load into another apply.
+                        raise
                     # Wait for bounded engine health after an endpoint transport failure.
                     get_logger().warning(
                         f"{operation_name} saw an inference endpoint outage ({exc!r}); "
@@ -878,14 +933,17 @@ class WeightWatcher:
             if isinstance(weights_path, str):
                 stage_started = time.perf_counter()
                 if self.lora_name is not None:
-                    stage_result = await stage_lora_adapter(
-                        self.inference.admin_clients,
-                        weights_path,
-                        require_delta=require_delta,
-                        policy_step=next_step if require_delta else None,
-                        delta_deadline=delta_deadline if require_delta else None,
-                        origin_base_urls=self.inference.adapter_origin_base_urls,
-                    )
+                    if require_delta:
+                        stage_result = await _stage_policy_adapter(
+                            self.inference.admin_clients, weights_path,
+                            policy_step=next_step, delta_deadline=delta_deadline,
+                            origin_base_urls=self.inference.adapter_origin_base_urls,
+                        )
+                    else:
+                        stage_result = await stage_lora_adapter(
+                            self.inference.admin_clients, weights_path,
+                            origin_base_urls=self.inference.adapter_origin_base_urls,
+                        )
                     self.last_adapter_policy_step = int(stage_result.get("policy_step", next_step))
                     self.last_adapter_stage_limit_seconds = float(
                         stage_result.get(

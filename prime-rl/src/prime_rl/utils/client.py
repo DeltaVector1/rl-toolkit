@@ -1020,7 +1020,10 @@ async def stage_lora_adapter(
         *,
         absolute_deadline: float | None = None,
     ) -> dict[str, object]:
-        for attempt in range(1, 4):
+        # Delta retries belong to the caller's logical stage budget. Do not
+        # hide extra attempts or retry integrity/storage failures here.
+        attempts = 1 if require_delta else 3
+        for attempt in range(1, attempts + 1):
             remaining = None
             if absolute_deadline is not None:
                 remaining = absolute_deadline - time.monotonic()
@@ -1043,7 +1046,7 @@ async def stage_lora_adapter(
                         marker in message
                         for marker in ("identity", "checksum", "policy step", "manifest")
                     )
-                if attempt == 3 or not retryable:
+                if attempt == attempts or not retryable:
                     raise
                 delay = min(0.5 * 2 ** (attempt - 1), 10.0)
                 if absolute_deadline is not None:
@@ -1115,8 +1118,28 @@ async def stage_lora_adapter(
         # Wait for origins first without delaying peer startup. A peer failure
         # must not discard origin progress; an origin failure cancels peers.
         grouped_results = [await task for task in group_tasks]
-    except BaseException:
+    except BaseException as exc:
         await _cancel_and_reap(group_tasks)
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        # A completed peer integrity/storage failure must not be hidden by an
+        # origin timeout, which the caller may otherwise retry.
+        for task in group_tasks:
+            if task.cancelled():
+                continue
+            error = task.exception()
+            if error is None or isinstance(error, TimeoutError):
+                continue
+            if isinstance(error, httpx.HTTPStatusError):
+                try:
+                    payload = error.response.json()
+                except ValueError:
+                    payload = None
+                if (error.response.status_code == 504 and isinstance(payload, dict)
+                        and payload.get("error_type") == "TimeoutError"
+                        and payload.get("phase") == "staging"):
+                    continue
+            raise error
         raise
     results = [result for staged, _seconds in grouped_results for result in staged]
     group_seconds = [seconds for _staged, seconds in grouped_results]

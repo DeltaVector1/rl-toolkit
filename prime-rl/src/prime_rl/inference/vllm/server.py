@@ -827,12 +827,18 @@ async def _stage_lora_adapter_once(raw_request: Request, *, accepted_at: float |
             destination = adapter_cache_path(source_url)
             if current_commit(destination):
                 return success_payload(destination)
+            if not timed_out:
+                raise RuntimeError("adapter staging worker returned no result")
             raise TimeoutError("adapter staging worker stopped before returning a result")
         result = parse_result(stdout)
         if result.get("status") != "ok":
             error_type = result.get("error_type")
             status = 504 if error_type == "TimeoutError" else 500
-            return JSONResponse({"error": result.get("error", "adapter staging failed")}, status_code=status)
+            return JSONResponse(
+                {"error": result.get("error", "adapter staging failed"),
+                 "error_type": error_type, "phase": "staging"},
+                status_code=status,
+            )
         destination = Path(str(result.get("path", "")))
         try:
             return success_payload(destination)
@@ -848,6 +854,8 @@ async def _stage_lora_adapter_once(raw_request: Request, *, accepted_at: float |
         return JSONResponse(
             {
                 "error": "adapter delta staging exceeded its time limit",
+                "error_type": "TimeoutError",
+                "phase": "staging",
                 "policy_step": policy_step,
                 "stage_limit_seconds": stage_limit,
                 "acceptance_target_seconds": 300.0,

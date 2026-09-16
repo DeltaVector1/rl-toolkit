@@ -558,6 +558,45 @@ class QuietDirectoryHandler(adapter_server.RangeHandler):
 
 
 class AdapterTransportStateTest(unittest.TestCase):
+    def test_empty_worker_result_is_terminal_not_a_stage_timeout(self):
+        method, _ = load_server_stage_method(lambda *_args, **_kwargs: None)
+
+        class Process:
+            pid = 41000
+            returncode = 1
+
+            async def communicate(self, _payload):
+                return b"", None
+
+        async def create_process(*_args, **_kwargs):
+            return Process()
+
+        class Request:
+            async def json(self):
+                return {"lora_path": "http://source/step_1", "require_delta": True,
+                        "policy_step": 1, "stage_timeout_seconds": 1.0}
+
+        method.__globals__["asyncio"].create_subprocess_exec = create_process
+        with self.assertRaisesRegex(RuntimeError, "worker returned no result"):
+            asyncio.run(method.__globals__["_stage_lora_adapter_once"](Request()))
+
+    def test_worker_timeout_response_preserves_typed_stage_error(self):
+        def worker(*_args, **_kwargs):
+            raise TimeoutError("confirmed stage timeout")
+
+        method, response_type = load_server_stage_method(worker)
+
+        class Request:
+            async def json(self):
+                return {"lora_path": "http://source/step_1", "require_delta": True,
+                        "policy_step": 1, "stage_timeout_seconds": 1.0}
+
+        response = asyncio.run(method(Request()))
+        self.assertIsInstance(response, response_type)
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(response.content["error_type"], "TimeoutError")
+        self.assertEqual(response.content["phase"], "staging")
+
     def test_default_chunk_sizes_keep_v1_and_v2_transport_contracts(self):
         target_size = 30_767_549_784
         self.assertEqual(adapter_delta.default_chunk_size, 16 * 1024 * 1024)
@@ -2099,14 +2138,16 @@ class AdapterTransportStateTest(unittest.TestCase):
         watcher_source = watcher.read_text(encoding="utf-8")
         self.assertIn('manifest.get("version") != 1', watcher_source)
         policy_update = watcher_source[watcher_source.index('f"Policy update'):]
-        self.assertIn("attempts=update_attempts", policy_update)
-        self.assertIn("update_deadline = time.monotonic() + adapter_stage_limit_seconds", watcher_source)
+        self.assertIn("await self.apply_policy_update(next_step)", policy_update)
+        self.assertNotIn("attempts=update_attempts", policy_update)
+        self.assertIn("total_deadline = delta_deadline + 300.0", watcher_source)
+        self.assertIn("for attempt in range(1, 3)", watcher_source)
         self.assertNotIn("2 * adapter_stage_limit_seconds", watcher_source)
         self.assertIn("delta_deadline = min(delta_deadline, update_deadline)", watcher_source)
         self.assertIn("for attempt in range(1, attempts + 1)", watcher_source)
         self.assertIn("failed on attempt {attempt}/{attempts}", watcher_source)
         self.assertIn("delta_deadline = time.monotonic()", watcher_source)
-        self.assertIn("delta_deadline=delta_deadline if require_delta else None", watcher_source)
+        self.assertIn("policy_step=next_step, delta_deadline=delta_deadline", watcher_source)
         self.assertIn("next_step > 0", watcher_source)
 
     def test_stage_failure_preserves_transport_but_removes_invalid_partial(self):
