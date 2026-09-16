@@ -60,6 +60,23 @@ glm52_inference = "glm52-decensor-h200"
 [models]
 glm52 = "/models/glm52-fp8"
 
+[adapter_transport]
+download_streams = 64
+source_host = "n82"
+lanes_per_owner = 2
+setup_parallelism = 4
+setup_timeout_seconds = 180
+cleanup_timeout_seconds = 10
+reconnect_attempts = 3
+reconnect_backoff_seconds = 2
+reconnect_timeout_seconds = 30
+state_dir = "/data/glm52-rl/direct-adapter-route"
+ssh_host = "69.63.236.164"
+ssh_port = 40299
+ssh_user = "root"
+ssh_identity_file = "/home/ubuntu/.ssh/id_ed25519"
+ssh_known_hosts_file = "/home/ubuntu/.ssh/known_hosts"
+
 [inference.h200a.glm52]
 gpu_count = 8
 tensor_parallel_size = 8

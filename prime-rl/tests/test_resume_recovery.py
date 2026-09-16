@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from urllib.error import HTTPError
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -23,19 +24,47 @@ ORCHESTRATOR_PATH = ROOT / "src/prime_rl/orchestrator/orchestrator.py"
 SERVER_PATH = ROOT / "src/prime_rl/inference/vllm/server.py"
 
 
+def load_rollout_budget_functions():
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    functions = {
+        node.name: node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"rollout_budget", "token_batch_rollout_budget"}
+    }
+    namespace = {"ROLLOUT_TAIL_SPARE_GROUPS": 32}
+    exec(
+        compile(
+            ast.Module(body=list(functions.values()), type_ignores=[]),
+            str(ORCHESTRATOR_PATH),
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["rollout_budget"], namespace["token_batch_rollout_budget"]
+
+
 def load_startup_validator(urlopen, validate_manifest, file_records):
     source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
     function = next(
         node
         for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.FunctionDef)
+        if isinstance(node, ast.AsyncFunctionDef)
         and node.name == "_verify_startup_adapter_delta"
     )
+    async def read_remote(source_url, deadline):
+        with urlopen(source_url.rstrip("/") + "/adapter_manifest.json",
+                     round(deadline - time.monotonic(), 2)) as source:
+            return json.load(source), source_url
+
     namespace = {
         "OrchestratorConfig": object,
         "json": json,
+        "re": re,
         "time": time,
         "urlopen": urlopen,
+        "_read_remote_adapter_manifest": read_remote,
+        "adapter_manifest_max_bytes": 2 * 1024 * 1024,
         "get_broadcast_dir": lambda output_dir: output_dir,
         "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
         "inference_weight_path": lambda _config, path, _lora_name: (
@@ -43,14 +72,52 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
         ),
         "_delta_stage_timeout_s": lambda: 30.0,
         "adapter_stage_limit_seconds": lambda step: {
-            1: 600.0,
-            2: 600.0,
-        }.get(step, 300.0),
+            1: 960.0,
+            2: 960.0,
+        }.get(step, 960.0),
         "validate_adapter_manifest": validate_manifest,
         "_adapter_file_records": file_records,
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"), namespace)
-    return namespace["_verify_startup_adapter_delta"]
+    return lambda *args, **kwargs: asyncio.run(namespace["_verify_startup_adapter_delta"](*args, **kwargs))
+
+
+def load_pruned_resume_selector(urlopen, verify, validate_manifest=None):
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_select_pruned_resume_tail"
+    )
+    namespace = {
+        "OrchestratorConfig": object,
+        "HTTPError": HTTPError,
+        "json": json,
+        "urlopen": urlopen,
+        "get_broadcast_dir": lambda output_dir: output_dir,
+        "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
+        "inference_weight_path": lambda _config, path, _lora_name: (
+            f"http://source/{path.name}"
+        ),
+        "_verify_startup_adapter_delta": verify,
+        "validate_adapter_manifest": validate_manifest or (lambda *_args, **_kwargs: None),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"), namespace)
+    return namespace["_select_pruned_resume_tail"]
+
+
+def load_resume_slot_finder(common_receipt):
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_find_loaded_resume_policy"
+    )
+    namespace = {"common_loaded_lora_receipt": common_receipt}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"), namespace)
+    return namespace["_find_loaded_resume_policy"]
 
 
 def load_server_load_endpoints(destination, handler, reader_lock=None):
@@ -148,9 +215,9 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
             re.fullmatch(r"step_(\d+)", Path(source_url.rstrip("/")).name).group(1)
         ),
         "adapter_stage_limit_seconds": lambda step: {
-            1: 600.0,
-            2: 600.0,
-        }.get(step, 300.0),
+            1: 960.0,
+            2: 960.0,
+        }.get(step, 960.0),
         "asyncio": asyncio,
         "ErrorResponse": FakeErrorResponse,
         "JSONResponse": FakeJSONResponse,
@@ -166,6 +233,7 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
         "_lora_stage_status": lambda: {"status": "idle"},
         "_loaded_lora_receipts": {},
         "_server_instance_id": "server-a",
+        "write_loaded_adapter_receipts": lambda _receipts: None,
         "lora_load_lock": asyncio.Lock(),
     }
     async def stage_lora_adapter(request):
@@ -226,7 +294,188 @@ def write_cached_adapter(
         (destination / "transport.json").write_text(json.dumps(transport), encoding="utf-8")
 
 
+def startup_identity(step, target_sha256, config_sha256):
+    return {
+        "source_url": f"http://source/step_{step}",
+        "target_size": 8,
+        "target_sha256": target_sha256 * 64,
+        "config_size": 2,
+        "config_sha256": config_sha256 * 64,
+    }
+
+
+def startup_manifest(
+    step,
+    *,
+    version=1,
+    target_sha256="a",
+    config_sha256="b",
+    base_sha256="c",
+    base_config_sha256="d",
+    base2_sha256="e",
+    base2_config_sha256="f",
+):
+    manifest = {
+        "version": version,
+        "kind": "lora-adapter",
+        "mode": "delta",
+        "transport": (
+            "chunked-shuffled-xor-zstd"
+            if version == 1
+            else "chunked-bf16-linear-zigzag-sparse-zstd"
+        ),
+        "target_step": step,
+        "base_step": step - 1,
+        "target_url": f"http://source/step_{step}",
+        "base_url": f"http://source/step_{step - 1}",
+        "target_size": 8,
+        "target_sha256": target_sha256 * 64,
+        "config_size": 2,
+        "config_sha256": config_sha256 * 64,
+        "base_size": 8,
+        "base_sha256": base_sha256 * 64,
+        "base_config_sha256": base_config_sha256 * 64,
+        "files": [
+            {"name": "adapter_config.json", "size": 2, "sha256": config_sha256 * 64},
+            {"name": "adapter_model.safetensors", "size": 8, "sha256": target_sha256 * 64},
+        ],
+    }
+    if version == 2:
+        manifest.update(
+            {
+                "base2_step": step - 2,
+                "base2_url": f"http://source/step_{step - 2}",
+                "base_config_size": 2,
+                "base2_size": 8,
+                "base2_sha256": base2_sha256 * 64,
+                "base2_config_size": 2,
+                "base2_config_sha256": base2_config_sha256 * 64,
+                "data_offset": 0,
+            }
+        )
+    return manifest
+
+
+def retained_manifest_chain(first_step=32):
+    targets = {
+        first_step: ("2", "a"),
+        first_step + 1: ("3", "b"),
+        first_step + 2: ("4", "c"),
+    }
+    manifests = {}
+    for step, (target_sha256, target_config_sha256) in targets.items():
+        previous_sha256, previous_config_sha256 = targets.get(
+            step - 1, ("1", "z")
+        )
+        previous_previous_sha256, previous_previous_config_sha256 = targets.get(
+            step - 2, ("0", "y")
+        )
+        manifests[step] = startup_manifest(
+            step,
+            version=2,
+            target_sha256=target_sha256,
+            config_sha256=target_config_sha256,
+            base_sha256=previous_sha256,
+            base_config_sha256=previous_config_sha256,
+            base2_sha256=previous_previous_sha256,
+            base2_config_sha256=previous_previous_config_sha256,
+        )
+    return manifests
+
+
+class JsonResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+
+def run_startup_validator(
+    step,
+    manifest,
+    *,
+    previous_identity=None,
+    previous_previous_identity=None,
+):
+    target_url = f"http://source/step_{step}"
+    calls = []
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    def fetch(url, timeout):
+        calls.append((url, timeout))
+        if url == target_url + "/adapter_manifest.json":
+            return Response(json.dumps(manifest).encode("utf-8"))
+        raise OSError("pruned predecessor manifest")
+
+    validator = load_startup_validator(
+        fetch,
+        lambda *_args, **_kwargs: None,
+        lambda value: {item["name"]: item for item in value["files"]},
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        if step == 1:
+            step_zero = Path(temporary) / "step_0"
+            step_zero.mkdir()
+            (step_zero / "STABLE").write_text("stable")
+        validator(
+            SimpleNamespace(output_dir=Path(temporary)),
+            "adapter",
+            step,
+            Path(temporary) / f"step_{step}",
+            target_url,
+            previous_identity=previous_identity,
+            previous_previous_identity=previous_previous_identity,
+        )
+    return calls
+
+
 class ResumeRecoveryTest(unittest.TestCase):
+    def test_token_batch_budget_refills_a_drained_pipeline(self):
+        _, budget = load_rollout_budget_functions()
+        self.assertEqual(
+            budget(
+                current_tokens=699_296,
+                target_tokens=1_500_000,
+                live=0,
+                group_size=16,
+                max_inflight=256,
+            ),
+            256,
+        )
+
+    def test_token_batch_budget_refills_whole_groups(self):
+        _, budget = load_rollout_budget_functions()
+        self.assertEqual(
+            budget(
+                current_tokens=699_296,
+                target_tokens=1_500_000,
+                live=249,
+                group_size=16,
+                max_inflight=256,
+            ),
+            16,
+        )
+
+    def test_token_batch_budget_stops_at_target(self):
+        _, budget = load_rollout_budget_functions()
+        self.assertEqual(
+            budget(
+                current_tokens=1_500_000,
+                target_tokens=1_500_000,
+                live=0,
+                group_size=16,
+                max_inflight=256,
+            ),
+            0,
+        )
+
     def test_server_load_receipt_requires_backend_success_and_exact_slot(self):
         source_url = "http://source/step_2"
         with tempfile.TemporaryDirectory() as temporary:
@@ -311,7 +560,7 @@ class ResumeRecoveryTest(unittest.TestCase):
             self.assertEqual(delta_success["status"], "ok")
             self.assertEqual(len(stage_calls), 1)
             self.assertEqual(stage_calls[0][1]["policy_step"], 2)
-            self.assertEqual(stage_calls[0][1]["stage_timeout_seconds"], 600.0)
+            self.assertEqual(stage_calls[0][1]["stage_timeout_seconds"], 960.0)
 
             async def status_during_staging():
                 stage_started = threading.Event()
@@ -610,6 +859,8 @@ class ResumeRecoveryTest(unittest.TestCase):
 
         def fetch(url, timeout):
             calls.append((url, timeout))
+            if url != target_url + "/adapter_manifest.json":
+                raise OSError("pruned source manifest")
             return Response(json.dumps(manifest).encode("utf-8"))
 
         def validate(value, **kwargs):
@@ -622,40 +873,77 @@ class ResumeRecoveryTest(unittest.TestCase):
             return {item["name"]: item for item in value["files"]}
 
         validator = load_startup_validator(fetch, validate, records)
+        previous_identity = {
+            "source_url": "http://source/step_5",
+            "target_size": 8,
+            "target_sha256": "c" * 64,
+            "config_size": 2,
+            "config_sha256": "d" * 64,
+        }
+        previous_previous_identity = {
+            "source_url": "http://source/step_4",
+            "target_size": 8,
+            "target_sha256": "e" * 64,
+            "config_size": 2,
+            "config_sha256": "f" * 64,
+        }
         with tempfile.TemporaryDirectory() as temporary:
-            validator(SimpleNamespace(output_dir=Path(temporary)), "adapter", 6, Path(temporary) / "step_6", target_url)
-        self.assertEqual(calls, [(target_url + "/adapter_manifest.json", 300.0)])
+            validator(
+                SimpleNamespace(output_dir=Path(temporary)),
+                "adapter",
+                6,
+                Path(temporary) / "step_6",
+                target_url,
+                previous_identity=previous_identity,
+                previous_previous_identity=previous_previous_identity,
+            )
+        self.assertEqual(
+            calls,
+            [(target_url + "/adapter_manifest.json", 960.0)],
+        )
 
     def test_resume_manifest_probe_uses_exact_policy_step_limit(self):
-        for step, expected_limit in ((1, 600.0), (2, 600.0), (3, 300.0)):
+        for step, expected_limit in ((1, 960.0), (2, 960.0), (3, 960.0)):
             with self.subTest(step=step):
-                calls = []
-
-                class Response(io.BytesIO):
-                    def __enter__(self):
-                        return self
-
-                    def __exit__(self, *_args):
-                        self.close()
-
-                def fetch(url, timeout):
-                    calls.append((url, timeout))
-                    return Response(json.dumps({"version": 2}).encode("utf-8"))
-
-                validator = load_startup_validator(fetch, lambda *_args, **_kwargs: None, lambda _value: {})
-                with tempfile.TemporaryDirectory() as temporary:
-                    target_url = f"http://source/step_{step}"
-                    validator(
-                        SimpleNamespace(output_dir=Path(temporary)),
-                        "adapter",
-                        step,
-                        Path(temporary) / f"step_{step}",
-                        target_url,
-                    )
-                self.assertEqual(
-                    calls,
-                    [(target_url + "/adapter_manifest.json", expected_limit)],
+                manifest = startup_manifest(step, version=1 if step == 1 else 2)
+                calls = run_startup_validator(
+                    step,
+                    manifest,
+                    previous_identity=startup_identity(step - 1, "c", "d"),
+                    previous_previous_identity=(
+                        startup_identity(step - 2, "e", "f") if step >= 2 else None
+                    ),
                 )
+                self.assertEqual(calls, [(f"http://source/step_{step}/adapter_manifest.json", expected_limit)])
+
+    def test_resume_step_one_uses_staged_predecessor_identity_when_manifest_is_missing(self):
+        calls = run_startup_validator(
+            1,
+            startup_manifest(1),
+            previous_identity=startup_identity(0, "c", "d"),
+        )
+        self.assertEqual(calls, [("http://source/step_1/adapter_manifest.json", 960.0)])
+
+    def test_resume_step_one_rejects_staged_predecessor_identity_mismatch(self):
+        with self.assertRaisesRegex(RuntimeError, "identity differs"):
+            run_startup_validator(
+                1,
+                startup_manifest(1),
+                previous_identity=startup_identity(0, "e", "d"),
+            )
+
+    def test_resume_step_one_rejects_missing_predecessor_identity(self):
+        with self.assertRaisesRegex(RuntimeError, "manifest is unavailable"):
+            run_startup_validator(1, startup_manifest(1))
+
+    def test_resume_v2_uses_both_staged_predecessor_identities(self):
+        calls = run_startup_validator(
+            2,
+            startup_manifest(2, version=2),
+            previous_identity=startup_identity(1, "c", "d"),
+            previous_previous_identity=startup_identity(0, "e", "f"),
+        )
+        self.assertEqual(calls, [("http://source/step_2/adapter_manifest.json", 960.0)])
 
     def test_resume_uses_the_per_step_phase_budget(self):
         tree = ast.parse(CLIENT_PATH.read_text(encoding="utf-8"))
@@ -760,6 +1048,23 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertLess(stage_at, update_at)
         self.assertIn("prefetched=prefetched", setup[update_at:])
 
+    def test_fresh_filesystem_lora_loads_policy_zero_before_rollouts(self):
+        source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+        setup = ast.get_source_segment(
+            source,
+            next(
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
+            ),
+        )
+        initial_sync = setup.index("initial_filesystem_lora =")
+        stage = setup.index("await stage_lora_adapter(", initial_sync)
+        dispatcher = setup.index("self.dispatcher = RolloutDispatcher(")
+        self.assertIn('config.weight_broadcast.type == "filesystem"', setup[initial_sync:stage])
+        self.assertIn("configured_wait or STARTUP_WEIGHT_WAIT_TIMEOUT_S", setup[initial_sync:stage])
+        self.assertLess(stage, dispatcher)
+
     def test_filesystem_lora_resume_stages_saved_policies_and_loads_only_the_last(self):
         source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
         setup = ast.get_source_segment(
@@ -778,6 +1083,309 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertLess(
             setup.index("if sync_version != final_sync_version"),
             setup.index("await self.policy_inference.update_weights("),
+        )
+
+    def test_pruned_resume_requires_cache_hits_and_seeds_verified_loaded_identity(self):
+        source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+        setup = ast.get_source_segment(
+            source,
+            next(
+                node
+                for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.AsyncFunctionDef) and node.name == "setup"
+            ),
+        )
+        self.assertIn("resume_seed_identities", setup)
+        self.assertIn("sync_versions = (retained_tail[1], final_sync_version)", setup)
+        self.assertIn("sync_versions = (retained_tail[0], final_sync_version)", setup)
+        self.assertIn('stage_result.get("cache_hit") is not True', setup)
+        self.assertIn("using_pruned_resume_tail and sync_version < final_sync_version", setup)
+
+    def test_pruned_policy_zero_selects_three_step_v2_tail(self):
+        final_sync_version = 34
+        first_tail_step = final_sync_version - 2
+        manifests = retained_manifest_chain(first_tail_step)
+        calls = []
+
+        def fetch(url, timeout):
+            calls.append(url)
+            if url.endswith("step_0/adapter_manifest.json"):
+                raise HTTPError(url, 404, "gone", {}, None)
+            step = int(re.search(r"step_(\d+)/adapter_manifest", url).group(1))
+            if step not in manifests:
+                raise HTTPError(url, 404, "gone", {}, None)
+            return JsonResponse(json.dumps(manifests[step]).encode("utf-8"))
+
+        def verify(*_args, **_kwargs):
+            raise AssertionError("retained-tail validation must not fetch pruned predecessors")
+
+        def validate(manifest, *, target_step, target_url, base_url, base2_url):
+            if (
+                manifest.get("version") != 2
+                or manifest.get("target_step") != target_step
+                or manifest.get("target_url") != target_url
+                or manifest.get("base_url") != base_url
+                or manifest.get("base2_url") != base2_url
+                or manifest.get("transport") != "chunked-bf16-linear-zigzag-sparse-zstd"
+            ):
+                raise RuntimeError("invalid predecessor")
+
+        selector = load_pruned_resume_selector(fetch, verify, validate)
+        selected = selector(
+            SimpleNamespace(output_dir=Path("/tmp/output")),
+            "adapter",
+            final_sync_version,
+            tuple(range(1, final_sync_version + 1)),
+            None,
+        )
+        self.assertEqual(selected, (32, 33, 34))
+        self.assertEqual(selected, tuple(range(first_tail_step, final_sync_version + 1)))
+        self.assertTrue(any("step_32/adapter_manifest.json" in url for url in calls))
+        self.assertTrue(any("step_33/adapter_manifest.json" in url for url in calls))
+        self.assertTrue(any("step_34/adapter_manifest.json" in url for url in calls))
+        self.assertFalse(any("step_30/adapter_manifest.json" in url for url in calls))
+        self.assertFalse(any("step_31/adapter_manifest.json" in url for url in calls))
+
+    def test_pruned_resume_rejects_too_short_tail_before_manifest_probe(self):
+        def fetch(_url, timeout):
+            raise HTTPError("http://source/step_0/adapter_manifest.json", 404, "gone", {}, None)
+
+        def verify(*_args, **_kwargs):
+            raise AssertionError("too-short tails must fail before manifest validation")
+
+        selector = load_pruned_resume_selector(fetch, verify)
+        with self.assertRaisesRegex(RuntimeError, "too short"):
+            selector(
+                SimpleNamespace(output_dir=Path("/tmp/output")),
+                "adapter",
+                3,
+                (1, 2, 3),
+                None,
+            )
+
+    def test_pruned_tail_rejects_non_v2_or_malformed_predecessors(self):
+        final_sync_version = 6
+        first_tail_step = final_sync_version - 2
+
+        def validate(manifest, *, target_step, target_url, base_url, base2_url):
+            if (
+                manifest.get("version") != 2
+                or manifest.get("target_step") != target_step
+                or manifest.get("target_url") != target_url
+                or manifest.get("base_url") != base_url
+                or manifest.get("base2_url") != base2_url
+                or manifest.get("transport") != "chunked-bf16-linear-zigzag-sparse-zstd"
+            ):
+                raise RuntimeError("invalid predecessor")
+
+        base = retained_manifest_chain(first_tail_step)
+        cases = [
+            (first_tail_step + 2, dict(base[first_tail_step + 2], version=1)),
+            (
+                first_tail_step + 1,
+                dict(base[first_tail_step + 1], target_url="http://source/bad"),
+            ),
+            (
+                first_tail_step,
+                dict(base[first_tail_step], base2_url="http://source/bad"),
+            ),
+            (
+                first_tail_step,
+                dict(base[first_tail_step], transport="bad"),
+            ),
+        ]
+        for bad_step, bad_manifest in cases:
+            with self.subTest(bad_step=bad_step):
+                manifests = dict(base)
+                manifests[bad_step] = bad_manifest
+
+                def fetch(url, timeout):
+                    if url.endswith("step_0/adapter_manifest.json"):
+                        raise HTTPError(url, 404, "gone", {}, None)
+                    step = int(re.search(r"step_(\d+)/adapter_manifest", url).group(1))
+                    return JsonResponse(json.dumps(manifests[step]).encode("utf-8"))
+
+                selector = load_pruned_resume_selector(fetch, lambda *_args, **_kwargs: None, validate)
+                with self.assertRaisesRegex(RuntimeError, "invalid|version-two"):
+                    selector(
+                        SimpleNamespace(output_dir=Path("/tmp/output")),
+                        "adapter", final_sync_version, tuple(range(1, final_sync_version + 1)),
+                        None,
+                    )
+
+    def test_pruned_tail_rejects_retained_identity_mismatch(self):
+        manifests = retained_manifest_chain()
+        manifests[34]["base_sha256"] = "f" * 64
+
+        def fetch(url, timeout):
+            if url.endswith("step_0/adapter_manifest.json"):
+                raise HTTPError(url, 404, "gone", {}, None)
+            step = int(re.search(r"step_(\d+)/adapter_manifest", url).group(1))
+            return JsonResponse(json.dumps(manifests[step]).encode("utf-8"))
+
+        selector = load_pruned_resume_selector(fetch, lambda *_args, **_kwargs: None)
+        with self.assertRaisesRegex(RuntimeError, "identities differ"):
+            selector(
+                SimpleNamespace(output_dir=Path("/tmp/output")),
+                "adapter",
+                34,
+                tuple(range(1, 35)),
+                None,
+            )
+
+    def test_pruned_tail_rejects_missing_retained_manifest(self):
+        manifests = retained_manifest_chain()
+
+        def fetch(url, timeout):
+            if url.endswith("step_0/adapter_manifest.json") or "step_33/" in url:
+                raise HTTPError(url, 404, "gone", {}, None)
+            step = int(re.search(r"step_(\d+)/adapter_manifest", url).group(1))
+            return JsonResponse(json.dumps(manifests[step]).encode("utf-8"))
+
+        selector = load_pruned_resume_selector(fetch, lambda *_args, **_kwargs: None)
+        with self.assertRaisesRegex(RuntimeError, "manifest is unavailable"):
+            selector(
+                SimpleNamespace(output_dir=Path("/tmp/output")),
+                "adapter",
+                34,
+                tuple(range(1, 35)),
+                None,
+            )
+
+    def test_loaded_resume_finds_saved_rotating_slot(self):
+        receipt = {
+            "source_url": "http://source/step_33",
+            "target_size": 8,
+            "target_sha256": "a" * 64,
+            "config_size": 2,
+            "config_sha256": "b" * 64,
+        }
+        calls = []
+
+        async def common(_clients, slot):
+            calls.append(slot)
+            return receipt if slot.endswith("slot1") else None
+
+        finder = load_resume_slot_finder(common)
+        self.assertEqual(
+            asyncio.run(finder([], "glm52-decensor-r32-node-local", 34)),
+            ("glm52-decensor-r32-node-local-slot1", receipt),
+        )
+        self.assertEqual(
+            calls,
+            [
+                "glm52-decensor-r32-node-local-slot0",
+                "glm52-decensor-r32-node-local-slot1",
+            ],
+        )
+
+    def test_loaded_resume_rejects_mixed_or_missing_slot_receipts(self):
+        async def mixed(_clients, _slot):
+            raise RuntimeError("loaded policy receipt is missing on one endpoint")
+
+        finder = load_resume_slot_finder(mixed)
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            asyncio.run(finder([], "adapter", 34))
+
+        async def missing(_clients, _slot):
+            return None
+
+        finder = load_resume_slot_finder(missing)
+        self.assertEqual(asyncio.run(finder([], "adapter", 34)), (None, None))
+
+    def test_pruned_resume_rejects_noncontiguous_saved_tail(self):
+        def fetch(_url, timeout):
+            raise HTTPError("http://source/step_0/adapter_manifest.json", 404, "gone", {}, None)
+
+        selector = load_pruned_resume_selector(fetch, lambda *_args, **_kwargs: {"version": 2})
+        with self.assertRaisesRegex(RuntimeError, "not contiguous"):
+            selector(
+                SimpleNamespace(output_dir=Path("/tmp/output")),
+                "adapter",
+                6,
+                (1, 2, 3, 5, 6),
+                None,
+            )
+
+    def test_available_policy_zero_keeps_full_replay(self):
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fetch(_url, timeout):
+            return Response(b"manifest")
+
+        def verify(*_args):
+            raise AssertionError("full replay must not preflight a tail")
+
+        selector = load_pruned_resume_selector(fetch, verify)
+        versions = tuple(range(7))
+        self.assertEqual(
+            selector(SimpleNamespace(output_dir=Path("/tmp/output")), "adapter", 6, versions, None),
+            versions,
+        )
+
+    def test_pruned_policy_zero_does_not_skip_timeout_or_server_error(self):
+        for failure in (
+            TimeoutError("timed out"),
+            HTTPError("http://source/step_0/adapter_manifest.json", 500, "error", {}, None),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                def fetch(_url, timeout, failure=failure):
+                    raise failure
+
+                selector = load_pruned_resume_selector(fetch, lambda *_args, **_kwargs: {"version": 2})
+                with self.assertRaises((TimeoutError, RuntimeError)):
+                    selector(
+                        SimpleNamespace(output_dir=Path("/tmp/output")),
+                        "adapter",
+                        6,
+                        tuple(range(7)),
+                        None,
+                    )
+
+    def test_pruned_resume_rejects_non_v2_or_missing_predecessors(self):
+        def fetch(_url, timeout):
+            raise HTTPError("http://source/step_0/adapter_manifest.json", 404, "gone", {}, None)
+
+        for result in (
+            {"version": 1},
+            RuntimeError("adapter manifest is unavailable"),
+        ):
+            with self.subTest(result=result):
+                def verify(*_args, result=result, **_kwargs):
+                    if isinstance(result, Exception):
+                        raise result
+                    return result
+
+                selector = load_pruned_resume_selector(fetch, verify)
+                with self.assertRaises(RuntimeError):
+                    selector(
+                        SimpleNamespace(output_dir=Path("/tmp/output")),
+                        "adapter",
+                        6,
+                        tuple(range(7)),
+                        None,
+                    )
+
+    def test_common_loaded_receipt_keeps_existing_resume_path(self):
+        def fetch(_url, _timeout):
+            raise AssertionError("common loaded receipt must skip policy-zero probe")
+
+        selector = load_pruned_resume_selector(fetch, lambda *_args: None)
+        versions = tuple(range(7))
+        self.assertEqual(
+            selector(
+                SimpleNamespace(output_dir=Path("/tmp/output")),
+                "adapter",
+                6,
+                versions,
+                {"source_url": "http://source/step_3"},
+            ),
+            versions,
         )
 
     def test_server_fallback_stages_in_the_host_process(self):

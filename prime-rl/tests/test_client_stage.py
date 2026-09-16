@@ -107,6 +107,7 @@ def _load_stage_function(probe_version=1, probe_step=None):
                     probe_version, probe_step
                 ),
                 "HTTPError": httpx.HTTPError,
+                "HTTPStatusError": httpx.HTTPStatusError,
                 "Timeout": httpx.Timeout,
             },
         ),
@@ -118,6 +119,7 @@ def _load_stage_function(probe_version=1, probe_step=None):
         "math": math,
         "_cancel_and_reap": cancel_and_reap,
         "POLICY_PHASE_TIMEOUT_S": 600.0,
+        "adapter_stage_timeout_seconds": 600.0,
         "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
         "LORA_STAGE_ATTEMPT_TIMEOUT_S": 30.0,
         "LORA_STAGE_TOTAL_TIMEOUT_S": 30.0,
@@ -549,7 +551,7 @@ class StageLoraAdapterTest(unittest.TestCase):
     def test_adapter_stage_limits_are_exact_at_step_boundaries(self):
         _stage_lora_adapter, namespace = _load_stage_function()
         limit = namespace["adapter_stage_limit_seconds"]
-        self.assertEqual([limit(step) for step in (1, 2, 3, 4)], [600.0, 600.0, 300.0, 300.0])
+        self.assertEqual([limit(step) for step in (1, 2, 3, 4)], [600.0, 600.0, 600.0, 600.0])
 
     def test_distinct_ports_each_stage(self):
         stage_lora_adapter, namespace = _load_stage_function()
@@ -595,13 +597,13 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(calls, [clients[0]])
         self.assertEqual(result["host_count"], 1)
 
-    def test_configured_origin_stages_before_peer(self):
+    def test_configured_origin_and_peer_metrics_do_not_sum_overlap(self):
         stage_lora_adapter, namespace = _load_stage_function()
         calls = []
 
         class Response:
             def json(self):
-                return {"status": "ok", "stage_seconds": 1.0, "adapter_identity": _adapter_identity()}
+                return {"status": "ok", "stage_seconds": 1.0, "transfer_wall_seconds": 0.5, "adapter_identity": _adapter_identity()}
 
         async def fake_admin_post_response(client, path, **kwargs):
             calls.append(client)
@@ -621,6 +623,60 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(calls, [origin, peer])
         self.assertEqual(result["origin_host_count"], 1)
         self.assertEqual(result["peer_host_count"], 1)
+        self.assertEqual(result["transfer_wall_seconds"], 0.5)
+        self.assertEqual(result["origin_transfer_wall_seconds"], 0.5)
+        self.assertEqual(result["peer_transfer_wall_seconds"], 0.5)
+        self.assertEqual(result["wire_stage_seconds"], 1.0)
+
+    def test_delta_stage_does_not_hide_extra_attempts(self):
+        stage_lora_adapter, namespace = _load_stage_function()
+        budgets = []
+
+        class Response:
+            def json(self):
+                return {"status": "ok", "stage_seconds": 0.8, "adapter_identity": _adapter_identity()}
+
+        async def post(_client, _path, **kwargs):
+            budgets.append(kwargs["json"]["stage_timeout_seconds"])
+            if len(budgets) == 1:
+                raise RuntimeError("connection reset")
+            return Response()
+
+        namespace["_admin_post_response"] = post
+        namespace["_delta_stage_timeout_s"] = lambda: 1.0
+        client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
+        with self.assertRaisesRegex(RuntimeError, "connection reset"):
+            asyncio.run(stage_lora_adapter(
+                [client], "http://adapter/step_1", require_delta=True, policy_step=1
+            ))
+        self.assertEqual(len(budgets), 1)
+
+    def test_stage_wall_times_use_concurrent_group_maxima(self):
+        stage_lora_adapter, namespace = _load_stage_function()
+        clients = [httpx.AsyncClient(base_url=f"http://host{index}:8000") for index in range(3)]
+
+        async def post(client, _path, **_kwargs):
+            duration = clients.index(client) + 1.0
+            return SimpleNamespace(json=lambda: {
+                "status": "ok",
+                "stage_seconds": duration,
+                "transfer_wall_seconds": duration,
+                "reconstruction_wall_seconds": duration,
+                "final_verification_wall_seconds": duration,
+                "bytes_done": 10,
+                "bytes_total": 10,
+                "adapter_identity": _adapter_identity(),
+            })
+
+        namespace["_admin_post_response"] = post
+        result = asyncio.run(stage_lora_adapter(
+            clients, "http://adapter/step_1", origin_base_urls=["http://host0:8000"]
+        ))
+        for name in ("transfer_wall_seconds", "reconstruction_wall_seconds",
+                     "reconstruct_seconds", "final_verification_wall_seconds"):
+            self.assertEqual(result[name], 3.0)
+        self.assertEqual(result["bytes_done"], 30)
+        self.assertEqual(result["bytes_total"], 30)
 
     def test_stage_retries_same_identity_three_times(self):
         stage_lora_adapter, namespace = _load_stage_function()
@@ -657,7 +713,7 @@ class StageLoraAdapterTest(unittest.TestCase):
                 return {"status": "ok", "stage_seconds": 0.03, "adapter_identity": _adapter_identity()}
 
         async def fake_admin_post_response(_client, _path, **_kwargs):
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.06)
             return Response()
 
         namespace["_admin_post_response"] = fake_admin_post_response
@@ -665,19 +721,18 @@ class StageLoraAdapterTest(unittest.TestCase):
         origin = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
         peer = httpx.AsyncClient(base_url="http://127.0.0.1:18049")
 
-        result = asyncio.run(
-            stage_lora_adapter(
-                [origin, peer],
-                "http://adapter/step_1",
-                require_delta=True,
-                policy_step=1,
-                origin_base_urls=["http://127.0.0.1:8000"],
+        with self.assertRaisesRegex(TimeoutError, "exceeded its time limit"):
+            asyncio.run(
+                stage_lora_adapter(
+                    [origin, peer],
+                    "http://adapter/step_1",
+                    require_delta=True,
+                    policy_step=1,
+                    origin_base_urls=["http://127.0.0.1:8000"],
+                )
             )
-        )
-        self.assertEqual(result["host_count"], 2)
-        self.assertLess(result["total_stage_wall_seconds"], 0.05)
 
-    def test_delta_accepts_a_late_response_for_work_finished_in_time(self):
+    def test_delta_rejects_response_after_caller_absolute_deadline(self):
         stage_lora_adapter, namespace = _load_stage_function()
 
         class Response:
@@ -696,16 +751,15 @@ class StageLoraAdapterTest(unittest.TestCase):
         namespace["_delta_stage_timeout_s"] = lambda: 0.05
         client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
 
-        result = asyncio.run(
-            stage_lora_adapter(
-                [client],
-                "http://adapter/step_1",
-                require_delta=True,
-                policy_step=1,
+        with self.assertRaisesRegex(TimeoutError, "time limit"):
+            asyncio.run(
+                stage_lora_adapter(
+                    [client],
+                    "http://adapter/step_1",
+                    require_delta=True,
+                    policy_step=1,
+                )
             )
-        )
-
-        self.assertEqual(result["host_count"], 1)
 
     def test_delta_origin_and_peer_receive_one_shared_deadline(self):
         stage_lora_adapter, namespace = _load_stage_function()
@@ -751,28 +805,33 @@ class StageLoraAdapterTest(unittest.TestCase):
         )
         self.assertEqual(origin_request["total_timeout_s"], origin_request["timeout_s"])
         self.assertEqual(peer_request["total_timeout_s"], peer_request["timeout_s"])
-        self.assertAlmostEqual(
+        self.assertLess(
             peer_request["json"]["stage_timeout_seconds"],
             origin_request["json"]["stage_timeout_seconds"],
-            delta=0.01,
         )
         self.assertLessEqual(
             origin_request["json"]["stage_timeout_seconds"], 0.15
         )
         self.assertLessEqual(peer_request["json"]["stage_timeout_seconds"], 0.15)
 
-    def test_predictive_origin_and_peer_start_together(self):
+    def test_predictive_peer_starts_before_origin_finishes(self):
         _ManifestProbeClient.requests.clear()
         stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
         calls = []
+        origin_finished = False
 
         class Response:
             def json(self):
                 return {"status": "ok", "stage_seconds": 0.03, "adapter_identity": _adapter_identity(2)}
 
         async def fake_admin_post_response(client, _path, **_kwargs):
+            nonlocal origin_finished
             calls.append((client, time.perf_counter()))
+            if client is peer:
+                self.assertFalse(origin_finished)
             await asyncio.sleep(0.03)
+            if client is origin:
+                origin_finished = True
             return Response()
 
         namespace["_admin_post_response"] = fake_admin_post_response
@@ -789,14 +848,15 @@ class StageLoraAdapterTest(unittest.TestCase):
         )
 
         self.assertEqual([client for client, _ in calls], [origin, peer])
-        self.assertLess(abs(calls[1][1] - calls[0][1]), 0.01)
+        self.assertGreater(calls[1][1], calls[0][1])
         self.assertEqual(result["origin_host_count"], 1)
         self.assertEqual(result["peer_host_count"], 1)
-        self.assertLess(result["wire_stage_seconds"], 0.10)
+        self.assertGreaterEqual(result["total_stage_wall_seconds"], 0.03)
         self.assertEqual(_ManifestProbeClient.requests, [])
 
-    def test_peer_failure_does_not_cancel_origin_progress(self):
+    def test_peer_error_propagates_after_cached_origin(self):
         stage_lora_adapter, namespace = _load_stage_function(probe_version=2)
+        calls = []
         finished = []
 
         class Response:
@@ -804,6 +864,7 @@ class StageLoraAdapterTest(unittest.TestCase):
                 return {
                     "status": "ok",
                     "stage_seconds": 0.05,
+                    "cache_hit": True,
                     "adapter_identity": _adapter_identity(2),
                 }
 
@@ -811,28 +872,120 @@ class StageLoraAdapterTest(unittest.TestCase):
         peer = httpx.AsyncClient(base_url="http://127.0.0.1:18049")
 
         async def fake_admin_post_response(client, _path, **_kwargs):
+            calls.append(client)
             if client is peer:
-                await asyncio.sleep(0.01)
+                self.assertEqual(finished, [])
                 raise RuntimeError("adapter identity mismatch")
             await asyncio.sleep(0.05)
             finished.append(client)
             return Response()
 
         namespace["_admin_post_response"] = fake_admin_post_response
-        with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
-            asyncio.run(
-                stage_lora_adapter(
+        async def exercise():
+            with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                await stage_lora_adapter(
                     [peer, origin],
                     "http://adapter/step_2",
                     require_delta=True,
                     policy_step=2,
                     origin_base_urls=["http://127.0.0.1:8000"],
                 )
-            )
+            self.assertFalse([task for task in asyncio.all_tasks()
+                              if task is not asyncio.current_task() and not task.done()])
+
+        asyncio.run(exercise())
+        self.assertEqual(calls, [origin, peer])
         self.assertEqual(finished, [origin])
 
+    def test_origin_failure_cancels_and_reaps_peer(self):
+        stage_lora_adapter, namespace = _load_stage_function()
+        origin = httpx.AsyncClient(base_url="http://origin:8000")
+        peer = httpx.AsyncClient(base_url="http://peer:8000")
+        events = []
+
+        async def exercise():
+            peer_started = asyncio.Event()
+
+            async def post(client, _path, **_kwargs):
+                if client is origin:
+                    await peer_started.wait()
+                    raise RuntimeError("adapter identity mismatch")
+                peer_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("peer stopped")
+
+            namespace["_admin_post_response"] = post
+            with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
+                await asyncio.wait_for(stage_lora_adapter(
+                    [origin, peer], "http://adapter/step_1",
+                    origin_base_urls=["http://origin:8000"],
+                ), 1)
+            self.assertFalse([task for task in asyncio.all_tasks()
+                              if task is not asyncio.current_task() and not task.done()])
+
+        asyncio.run(exercise())
+        self.assertEqual(events, ["peer stopped"])
+
+    def test_peer_fatal_error_is_not_hidden_by_origin_timeout(self):
+        stage_lora_adapter, namespace = _load_stage_function()
+        clients = [httpx.AsyncClient(base_url=f"http://host{index}:8000") for index in range(2)]
+        calls = []
+
+        async def exercise():
+            peer_failed = asyncio.Event()
+
+            async def post(client, _path, **_kwargs):
+                calls.append(client)
+                if client is clients[0]:
+                    await peer_failed.wait()
+                    raise TimeoutError("origin timeout")
+                peer_failed.set()
+                raise RuntimeError("peer checksum mismatch")
+
+            namespace["_admin_post_response"] = post
+            with self.assertRaisesRegex(RuntimeError, "peer checksum mismatch"):
+                await stage_lora_adapter(clients, "http://adapter/step_1", require_delta=True,
+                    policy_step=1, origin_base_urls=["http://host0:8000"])
+            self.assertFalse([task for task in asyncio.all_tasks()
+                              if task is not asyncio.current_task() and not task.done()])
+
+        asyncio.run(exercise())
+        self.assertEqual(calls, clients)
+
+    def test_caller_cancellation_reaps_origin_and_peer(self):
+        stage_lora_adapter, namespace = _load_stage_function()
+        clients = [httpx.AsyncClient(base_url=f"http://host{index}:8000") for index in range(2)]
+        stopped = []
+
+        async def exercise():
+            started = [asyncio.Event(), asyncio.Event()]
+
+            async def post(client, _path, **_kwargs):
+                index = clients.index(client)
+                started[index].set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.append(index)
+
+            namespace["_admin_post_response"] = post
+            task = asyncio.create_task(stage_lora_adapter(
+                clients, "http://adapter/step_1", origin_base_urls=["http://host0:8000"],
+            ))
+            await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertFalse([task for task in asyncio.all_tasks()
+                              if task is not asyncio.current_task() and not task.done()])
+
+        asyncio.run(exercise())
+        self.assertEqual(sorted(stopped), [0, 1])
+
     def test_server_receives_selected_policy_step_limit_without_client_probe(self):
-        for policy_step, expected_limit in ((2, 600.0), (3, 300.0)):
+        for policy_step, expected_limit in ((1, 600.0), (2, 600.0), (3, 600.0)):
             with self.subTest(policy_step=policy_step):
                 _ManifestProbeClient.requests.clear()
                 stage_lora_adapter, namespace = _load_stage_function(

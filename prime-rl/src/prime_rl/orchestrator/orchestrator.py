@@ -24,8 +24,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from typing import TYPE_CHECKING
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import tomli_w
@@ -75,7 +77,9 @@ from prime_rl.orchestrator.utils import (
 from prime_rl.orchestrator.watcher import (
     WeightWatcher,
     _adapter_file_records,
+    _read_remote_adapter_manifest,
     _write_receivers_ready,
+    adapter_manifest_max_bytes,
     inference_weight_path,
     validate_adapter_manifest,
 )
@@ -147,6 +151,21 @@ def rollout_budget(
             budget = max(budget, refill)
     return budget
 
+
+def token_batch_rollout_budget(
+    *,
+    current_tokens: int,
+    target_tokens: int,
+    live: int,
+    group_size: int,
+    max_inflight: int,
+) -> int:
+    if current_tokens >= target_tokens:
+        return 0
+    group_size = max(1, group_size)
+    refill = max(0, max_inflight - live)
+    return ((refill + group_size - 1) // group_size) * group_size
+
 # Let a valid old-policy batch finish before an adapter update.
 POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S = 1200
 
@@ -156,17 +175,23 @@ POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S = 1200
 STARTUP_WEIGHT_WAIT_TIMEOUT_S = 1200
 
 
-def _verify_startup_adapter_delta(
+async def _verify_startup_adapter_delta(
     config: OrchestratorConfig,
     lora_name: str | None,
     step: int,
     target_path,
     target_url: str | None = None,
     deadline: float | None = None,
-) -> None:
+    *,
+    previous_identity: dict[str, object] | None = None,
+    previous_previous_identity: dict[str, object] | None = None,
+    return_predecessors: bool = False,
+) -> dict[str, object] | tuple[dict[str, object], dict[str, object], dict[str, object]] | None:
     """Reject a positive resume unless its published adjacent delta is exact."""
     if lora_name is None or step <= 0:
         return
+    if deadline is None:
+        deadline = time.monotonic() + adapter_stage_limit_seconds(step)
     broadcast_dir = get_broadcast_dir(config.output_dir)
     previous_path = get_step_path(broadcast_dir, step - 1)
     previous_url = inference_weight_path(config, previous_path, lora_name)
@@ -182,24 +207,20 @@ def _verify_startup_adapter_delta(
             raise RuntimeError(
                 f"cannot resume LoRA policy v{step}: second predecessor has no source URL"
             )
-    def read_manifest(path, url: str | None) -> dict[str, object]:
+    async def read_manifest(path, url: str | None) -> dict[str, object]:
         try:
             if url is None:
-                with (path / "adapter_manifest.json").open("r", encoding="utf-8") as source:
-                    value = json.load(source)
+                with (path / "adapter_manifest.json").open("rb") as source:
+                    payload = source.read(adapter_manifest_max_bytes + 1)
+                if len(payload) > adapter_manifest_max_bytes:
+                    raise RuntimeError("published adapter manifest exceeds the size limit")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("published adapter manifest deadline expired")
+                value = json.loads(payload)
             else:
-                timeout = adapter_stage_limit_seconds(step)
-                if deadline is not None:
-                    timeout = deadline - time.monotonic()
-                    if timeout <= 0:
-                        raise RuntimeError(
-                            f"cannot resume LoRA policy v{step}: staging deadline expired"
-                        )
-                with urlopen(
-                    f"{url.rstrip('/')}/adapter_manifest.json",
-                    timeout=timeout,
-                ) as source:
-                    value = json.load(source)
+                value, _ = await _read_remote_adapter_manifest(url, deadline)
+        except TimeoutError:
+            raise
         except (FileNotFoundError, OSError, ValueError) as exc:
             raise RuntimeError(
                 f"cannot resume LoRA policy v{step}: adapter manifest is unavailable"
@@ -208,7 +229,41 @@ def _verify_startup_adapter_delta(
             raise RuntimeError(f"cannot resume LoRA policy v{step}: adapter manifest is not an object")
         return value
 
-    manifest = read_manifest(target_path, target_url)
+    def staged_files(
+        identity: dict[str, object],
+        expected_url: str | None,
+    ) -> dict[str, dict[str, object]]:
+        target_sha256 = identity.get("target_sha256")
+        target_size = identity.get("target_size")
+        config_sha256 = identity.get("config_sha256")
+        config_size = identity.get("config_size")
+        if (
+            not isinstance(expected_url, str)
+            or identity.get("source_url") != expected_url
+            or type(target_size) is not int
+            or target_size <= 0
+            or not isinstance(target_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", target_sha256) is None
+            or type(config_size) is not int
+            or config_size <= 0
+            or not isinstance(config_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", config_sha256) is None
+        ):
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: staged predecessor identity is invalid"
+            )
+        return {
+            "adapter_model.safetensors": {
+                "size": target_size,
+                "sha256": target_sha256,
+            },
+            "adapter_config.json": {
+                "size": config_size,
+                "sha256": config_sha256,
+            },
+        }
+
+    manifest = await read_manifest(target_path, target_url)
     try:
         validate_adapter_manifest(
             manifest,
@@ -221,19 +276,58 @@ def _verify_startup_adapter_delta(
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: {exc}"
         ) from exc
-    if manifest.get("version") == 2:
-        # Version-two manifests carry exact identities for both predecessor
-        # adapters. The receiver checks the corresponding cached files.
-        return
-
-    if not (previous_path / "STABLE").is_file():
+    if manifest.get("version") == 1 and not (previous_path / "STABLE").is_file():
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: exact predecessor v{step - 1} is not STABLE"
         )
-    previous_manifest = read_manifest(
-        previous_path, previous_url if isinstance(previous_url, str) else None
+    previous_manifest = (
+        None
+        if previous_identity is not None
+        else await read_manifest(previous_path, previous_url if isinstance(previous_url, str) else None)
     )
-    if step == 1:
+    try:
+        previous_files = (
+            staged_files(previous_identity, previous_url)
+            if previous_identity is not None
+            else _adapter_file_records(previous_manifest)
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
+    if manifest.get("version") == 2:
+        previous_previous_manifest = (
+            None
+            if previous_previous_identity is not None
+            else await read_manifest(previous_previous_path, previous_previous_url)
+        )
+        try:
+            previous_previous_files = (
+                staged_files(previous_previous_identity, previous_previous_url)
+                if previous_previous_identity is not None
+                else _adapter_file_records(previous_previous_manifest)
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
+        if (
+            manifest.get("base_size") != previous_files["adapter_model.safetensors"].get("size")
+            or manifest.get("base_sha256") != previous_files["adapter_model.safetensors"].get("sha256")
+            or manifest.get("base_config_size") != previous_files["adapter_config.json"].get("size")
+            or manifest.get("base_config_sha256") != previous_files["adapter_config.json"].get("sha256")
+            or manifest.get("base2_size") != previous_previous_files["adapter_model.safetensors"].get("size")
+            or manifest.get("base2_sha256") != previous_previous_files["adapter_model.safetensors"].get("sha256")
+            or manifest.get("base2_config_size") != previous_previous_files["adapter_config.json"].get("size")
+            or manifest.get("base2_config_sha256") != previous_previous_files["adapter_config.json"].get("sha256")
+        ):
+            raise RuntimeError(
+                f"cannot resume LoRA policy v{step}: adjacent adapter base or SHA-256 identity differs"
+            )
+        if return_predecessors:
+            assert previous_manifest is not None and previous_previous_manifest is not None
+            return manifest, previous_manifest, previous_previous_manifest
+        return manifest
+
+    if previous_identity is not None:
+        valid_previous = True
+    elif step == 1:
         valid_previous = (
             previous_manifest.get("version") in {1, 2}
             and previous_manifest.get("kind") == "lora-adapter"
@@ -265,7 +359,6 @@ def _verify_startup_adapter_delta(
         )
     try:
         target_files = _adapter_file_records(manifest)
-        previous_files = _adapter_file_records(previous_manifest)
     except RuntimeError as exc:
         raise RuntimeError(f"cannot resume LoRA policy v{step}: {exc}") from exc
     target_weights = target_files["adapter_model.safetensors"]
@@ -284,6 +377,141 @@ def _verify_startup_adapter_delta(
         raise RuntimeError(
             f"cannot resume LoRA policy v{step}: adjacent adapter base or SHA-256 identity differs"
         )
+    return manifest
+
+
+async def _find_loaded_resume_policy(
+    admin_clients,
+    lora_name: str,
+    final_sync_version: int,
+) -> tuple[str | None, dict[str, object] | None]:
+    """Find the current rotating slot, preferring the incoming policy slot."""
+    if final_sync_version <= 0:
+        slots = (lora_name,)
+    else:
+        slots = (
+            f"{lora_name}-slot{final_sync_version % 2}",
+            f"{lora_name}-slot{(final_sync_version - 1) % 2}",
+        )
+    for slot in slots:
+        receipt = await common_loaded_lora_receipt(admin_clients, slot)
+        if receipt is not None:
+            return slot, receipt
+    return None, None
+
+
+def _select_pruned_resume_tail(
+    config: OrchestratorConfig,
+    lora_name: str | None,
+    final_sync_version: int,
+    sync_versions: tuple[int, ...],
+    loaded_receipt: dict[str, object] | None,
+) -> tuple[int, ...]:
+    """Use a verified second-order tail only after a definitive policy-zero 404."""
+    if loaded_receipt is not None or lora_name is None or not sync_versions:
+        return sync_versions
+    broadcast_dir = get_broadcast_dir(config.output_dir)
+    policy_zero_url = inference_weight_path(
+        config, get_step_path(broadcast_dir, 0), lora_name
+    )
+    if not isinstance(policy_zero_url, str):
+        if sync_versions[0] > 0:
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: saved adapter chain is incomplete"
+            )
+        return sync_versions
+    try:
+        with urlopen(
+            f"{policy_zero_url.rstrip('/')}/adapter_manifest.json",
+            timeout=30,
+        ):
+            if sync_versions[0] > 0:
+                raise RuntimeError(
+                    f"cannot resume policy {final_sync_version}: saved adapter chain is incomplete"
+                )
+            return sync_versions
+    except HTTPError as exc:
+        if exc.code != 404:
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: leading adapter manifest probe failed"
+            ) from exc
+
+    if final_sync_version < 4:
+        raise RuntimeError(
+            f"cannot resume policy {final_sync_version}: retained adapter tail is too short"
+        )
+    tail = tuple(range(final_sync_version - 2, final_sync_version + 1))
+    if sync_versions[-3:] != tail:
+        raise RuntimeError(
+            f"cannot resume policy {final_sync_version}: retained adapter tail is not contiguous"
+        )
+    def retained_manifest(step: int) -> tuple[str, dict[str, object]]:
+        manifest_url = inference_weight_path(
+            config, get_step_path(broadcast_dir, step), lora_name
+        )
+        base_url = inference_weight_path(
+            config, get_step_path(broadcast_dir, step - 1), lora_name
+        )
+        base2_url = inference_weight_path(
+            config, get_step_path(broadcast_dir, step - 2), lora_name
+        )
+        if not all(isinstance(url, str) for url in (manifest_url, base_url, base2_url)):
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: retained adapter has no source URL"
+            )
+        try:
+            with urlopen(
+                f"{manifest_url.rstrip('/')}/adapter_manifest.json",
+                timeout=30,
+            ) as source:
+                manifest = json.load(source)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: retained adapter v{step} manifest is unavailable"
+            ) from exc
+        if not isinstance(manifest, dict):
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: retained adapter v{step} manifest is invalid"
+            )
+        try:
+            validate_adapter_manifest(
+                manifest,
+                target_step=step,
+                target_url=manifest_url,
+                base_url=base_url,
+                base2_url=base2_url,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"cannot resume policy {final_sync_version}: retained adapter v{step} is invalid"
+            ) from exc
+        return manifest_url, manifest
+
+    retained = {step: retained_manifest(step) for step in tail}
+    target_manifest = retained[tail[2]][1]
+    previous_manifest = retained[tail[1]][1]
+    base_manifest = retained[tail[0]][1]
+
+    def identity_matches(
+        manifest: dict[str, object], prefix: str, target: dict[str, object]
+    ) -> bool:
+        fields = (
+            (f"{prefix}_size", "target_size"),
+            (f"{prefix}_sha256", "target_sha256"),
+            (f"{prefix}_config_size", "config_size"),
+            (f"{prefix}_config_sha256", "config_sha256"),
+        )
+        return all(manifest.get(source) == target.get(expected) for source, expected in fields)
+
+    if (
+        not identity_matches(target_manifest, "base", previous_manifest)
+        or not identity_matches(target_manifest, "base2", base_manifest)
+        or not identity_matches(previous_manifest, "base", base_manifest)
+    ):
+        raise RuntimeError(
+            f"cannot resume policy {final_sync_version}: retained adapter identities differ"
+        )
+    return tail
 
 
 class Orchestrator:
@@ -558,11 +786,22 @@ class Orchestrator:
         else:
             get_logger().info("Training from scratch")
 
-        # Sync inference to the incoming policy before the first step when resuming or when using
-        # an in-memory transport, which rendezvouses with the trainer's startup broadcast.
-        if self.resume_policy_step is not None or config.weight_broadcast.type in ("nccl", "nixl"):
+        # Sync inference to the incoming policy before the first step when resuming, when using
+        # an in-memory transport, or when a filesystem LoRA needs an exact policy-zero receipt.
+        initial_filesystem_lora = (
+            self.lora_name is not None
+            and config.weight_broadcast.type == "filesystem"
+        )
+        if (
+            self.resume_policy_step is not None
+            or config.weight_broadcast.type in ("nccl", "nixl")
+            or initial_filesystem_lora
+        ):
             final_sync_version = self.resume_policy_step if self.resume_policy_step is not None else 0
             sync_versions = (final_sync_version,)
+            loaded_slot = None
+            using_pruned_resume_tail = False
+            resume_seed_identities: dict[int, dict[str, object]] = {}
             if (
                 self.lora_name is not None
                 and config.weight_broadcast.type == "filesystem"
@@ -579,17 +818,26 @@ class Orchestrator:
                     raise RuntimeError(
                         f"cannot resume policy v{final_sync_version}: saved adapter chain is incomplete"
                     )
-                loaded_receipt = await common_loaded_lora_receipt(
-                    self.policy_inference.admin_clients, self.lora_name
+                loaded_slot, loaded_receipt = await _find_loaded_resume_policy(
+                    self.policy_inference.admin_clients,
+                    self.lora_name,
+                    final_sync_version,
                 )
                 if loaded_receipt is None:
-                    if sync_versions[0] > 0:
-                        raise RuntimeError(
-                            "cannot resume adapter transfer: inference has no common loaded "
-                            "policy and the initial policy is no longer saved"
-                        )
+                    sync_versions = _select_pruned_resume_tail(
+                        config,
+                        self.lora_name,
+                        final_sync_version,
+                        sync_versions,
+                        loaded_receipt,
+                    )
+                    using_pruned_resume_tail = sync_versions[0] > 0
                 else:
-                    loaded_source_url = loaded_receipt["source_url"]
+                    loaded_source_url = loaded_receipt.get("source_url")
+                    if not isinstance(loaded_source_url, str):
+                        raise RuntimeError(
+                            "cannot resume adapter transfer: loaded policy source URL is invalid"
+                        )
                     matching_steps = tuple(
                         step
                         for step in sync_versions
@@ -606,12 +854,49 @@ class Orchestrator:
                             "one saved policy in this run"
                         )
                     loaded_step = matching_steps[0]
+                    expected_loaded_slot = (
+                        self.lora_name
+                        if loaded_step == 0
+                        else f"{self.lora_name}-slot{loaded_step % 2}"
+                    )
+                    if loaded_slot != expected_loaded_slot:
+                        raise RuntimeError(
+                            "cannot resume adapter transfer: loaded policy slot does not match its policy step"
+                        )
                     try:
                         with urlopen(
                             f"{loaded_source_url.rstrip('/')}/adapter_manifest.json",
                             timeout=30,
                         ) as source:
                             loaded_manifest = json.load(source)
+                        if not isinstance(loaded_manifest, dict):
+                            raise RuntimeError("saved policy manifest is invalid")
+                        loaded_base_url = inference_weight_path(
+                            config,
+                            get_step_path(broadcast_dir, loaded_step - 1),
+                            self.lora_name,
+                        )
+                        loaded_base2_url = inference_weight_path(
+                            config,
+                            get_step_path(broadcast_dir, loaded_step - 2),
+                            self.lora_name,
+                        )
+                        if not all(
+                            isinstance(url, str)
+                            for url in (loaded_base_url, loaded_base2_url)
+                        ):
+                            raise RuntimeError("saved policy predecessor URL is invalid")
+                        validate_adapter_manifest(
+                            loaded_manifest,
+                            target_step=loaded_step,
+                            target_url=loaded_source_url,
+                            base_url=loaded_base_url,
+                            base2_url=loaded_base2_url,
+                        )
+                        if final_sync_version >= 4 and loaded_manifest.get("version") != 2:
+                            raise RuntimeError(
+                                "saved policy manifest is not a version-two delta"
+                            )
                         loaded_files = _adapter_file_records(loaded_manifest)
                     except (OSError, ValueError, RuntimeError) as exc:
                         raise RuntimeError(
@@ -632,12 +917,48 @@ class Orchestrator:
                         raise RuntimeError(
                             "cannot resume adapter transfer: loaded and saved policy identities differ"
                         )
-                    sync_versions = tuple(step for step in sync_versions if step >= loaded_step)
+                    if final_sync_version >= 4:
+                        retained_tail = tuple(
+                            range(final_sync_version - 2, final_sync_version + 1)
+                        )
+                        if loaded_step not in retained_tail:
+                            raise RuntimeError(
+                                "cannot resume adapter transfer: loaded policy is outside the retained adapter tail"
+                            )
+                        resume_seed_identities[loaded_step] = {
+                            "source_url": loaded_source_url,
+                            **expected_identity,
+                        }
+                        missing_predecessors = {
+                            step
+                            for step in retained_tail[:2]
+                            if step != loaded_step and step not in sync_versions
+                        }
+                        if missing_predecessors:
+                            raise RuntimeError(
+                                "cannot resume adapter transfer: retained adapter predecessor is missing"
+                            )
+                        if loaded_step == retained_tail[0]:
+                            sync_versions = (retained_tail[1], final_sync_version)
+                        elif loaded_step == retained_tail[1]:
+                            sync_versions = (retained_tail[0], final_sync_version)
+                        else:
+                            sync_versions = retained_tail
+                        using_pruned_resume_tail = True
+                    else:
+                        sync_versions = tuple(
+                            step for step in sync_versions if step >= loaded_step
+                        )
                     get_logger().info(
                         f"All inference endpoints have policy v{loaded_step}; "
                         f"resuming adapter transfer there"
                     )
+                    self.policy_inference.update_model_name(loaded_slot)
+                    self.policy.model_name = loaded_slot
 
+            staged_adapter_identities: dict[int, dict[str, object]] = dict(
+                resume_seed_identities
+            )
             for sync_version in sync_versions:
                 require_delta = self.lora_name is not None and sync_version > 0
                 startup_delta_deadline = None
@@ -650,11 +971,12 @@ class Orchestrator:
                         )
                 else:
                     check_exists = config.weight_broadcast.type == "filesystem"
-                    wait_timeout = (
+                    configured_wait = (
                         config.ckpt.wait_for_weights_timeout
                         if config.ckpt
-                        else STARTUP_WEIGHT_WAIT_TIMEOUT_S
+                        else None
                     )
+                    wait_timeout = configured_wait or STARTUP_WEIGHT_WAIT_TIMEOUT_S
                     weights_path = get_weight_dir(
                         config.output_dir,
                         sync_version,
@@ -665,17 +987,22 @@ class Orchestrator:
                     source_weights_path = inference_weight_path(
                         config, weights_path, self.lora_name
                     )
-                    _verify_startup_adapter_delta(
-                        config,
-                        self.lora_name,
-                        sync_version,
-                        weights_path,
-                        source_weights_path if isinstance(source_weights_path, str) else None,
-                        deadline=startup_delta_deadline,
-                    )
                     if require_delta:
                         startup_delta_deadline = (
                             time.monotonic() + adapter_stage_limit_seconds(sync_version)
+                        )
+                    if not (
+                        using_pruned_resume_tail and sync_version < final_sync_version
+                    ):
+                        await _verify_startup_adapter_delta(
+                            config,
+                            self.lora_name,
+                            sync_version,
+                            weights_path,
+                            source_weights_path if isinstance(source_weights_path, str) else None,
+                            deadline=startup_delta_deadline,
+                            previous_identity=staged_adapter_identities.get(sync_version - 1),
+                            previous_previous_identity=staged_adapter_identities.get(sync_version - 2),
                         )
                     weights_path = source_weights_path
                 if self.model_express is not None:
@@ -686,25 +1013,27 @@ class Orchestrator:
                 adapter_identity = None
                 if self.lora_name is not None and isinstance(weights_path, str):
                     stage_attempts = 2 if require_delta else 1
-                    stage_limit = (
-                        adapter_stage_limit_seconds(sync_version)
-                        if require_delta
-                        else None
-                    )
-                    stage_total_deadline = (
-                        time.monotonic() + stage_attempts * stage_limit
-                        if stage_limit is not None
+                    # Keep verification and retry bookkeeping inside 900s total.
+                    # Each attempt keeps its 600s cap; the client adds response grace.
+                    stage_retry_deadline = (
+                        startup_delta_deadline
+                        - adapter_stage_limit_seconds(sync_version)
+                        + 900.0
+                        if startup_delta_deadline is not None
                         else None
                     )
                     for stage_attempt in range(1, stage_attempts + 1):
-                        if stage_limit is not None and stage_total_deadline is not None:
-                            remaining_total = stage_total_deadline - time.monotonic()
-                            if remaining_total <= 0:
-                                raise TimeoutError(
-                                    "adapter restart staging exceeded its ten-minute limit"
-                                )
-                            startup_delta_deadline = time.monotonic() + min(
-                                stage_limit, remaining_total
+                        if stage_attempt > 1 and startup_delta_deadline is not None:
+                            startup_delta_deadline = min(
+                                time.monotonic() + adapter_stage_limit_seconds(sync_version),
+                                stage_retry_deadline,
+                            )
+                        if (
+                            startup_delta_deadline is not None
+                            and time.monotonic() >= startup_delta_deadline
+                        ):
+                            raise TimeoutError(
+                                "adapter restart staging deadline expired"
                             )
                         try:
                             stage_result = await stage_lora_adapter(
@@ -730,6 +1059,19 @@ class Orchestrator:
                                 "resuming its saved partial once"
                             )
                     adapter_identity = stage_result["adapter_identity"]
+                    if not isinstance(adapter_identity, dict):
+                        raise RuntimeError(
+                            f"cannot resume LoRA policy v{sync_version}: staged adapter identity is unavailable"
+                        )
+                    if (
+                        using_pruned_resume_tail
+                        and sync_version < final_sync_version
+                        and stage_result.get("cache_hit") is not True
+                    ):
+                        raise RuntimeError(
+                            f"cannot resume LoRA policy v{sync_version}: retained adapter cache is not ready"
+                        )
+                    staged_adapter_identities[sync_version] = adapter_identity
                     prefetched = True
                     if require_delta:
                         get_logger().info(
@@ -742,9 +1084,14 @@ class Orchestrator:
                         f"Adapter v{sync_version} cache ready for resume"
                     )
                     continue
+                final_lora_name = (
+                    f"{self.lora_name}-slot{sync_version % 2}"
+                    if self.lora_name is not None and sync_version > 0
+                    else self.lora_name
+                )
                 receipts = await self.policy_inference.update_weights(
                     weights_path,
-                    lora_name=self.lora_name,
+                    lora_name=final_lora_name,
                     step=sync_version,
                     require_delta=require_delta,
                     prefetched=prefetched,
@@ -757,7 +1104,7 @@ class Orchestrator:
                         run_name=config.output_dir.name,
                         step=sync_version,
                         source_url=weights_path,
-                        slot=self.lora_name,
+                        slot=final_lora_name,
                         adapter_identity=adapter_identity,
                         admin_clients=self.policy_inference.admin_clients,
                         receipts=receipts,
@@ -775,8 +1122,8 @@ class Orchestrator:
                         timeout=config.weight_broadcast.timeout,
                     )
                 if self.lora_name is not None:
-                    self.policy_inference.update_model_name(self.lora_name)
-                    self.policy.model_name = self.lora_name
+                    self.policy_inference.update_model_name(final_lora_name)
+                    self.policy.model_name = final_lora_name
                 self.policy.version = sync_version
                 await self.policy_inference.wait_for_ready(self.policy.model_name)
 
@@ -1355,16 +1702,25 @@ class Orchestrator:
         return time.perf_counter() - t
 
     def update_rollout_budget(self) -> None:
-        if self.config.batch_size is None:
-            return
-        current, _, _ = self.train_sink.batch_progress()
+        current, target, _ = self.train_sink.batch_progress()
         live = (
             self.dispatcher.queued_train_count
             + self.dispatcher.inflight_train_count
             + self.dispatcher.pending_train_schedule_count
         )
-        buffered = self.train_sink.buffered_count()
         group = max(1, getattr(self.config, "group_size", 1))
+        if self.config.batch_size is None:
+            budget = token_batch_rollout_budget(
+                current_tokens=current,
+                target_tokens=target,
+                live=live,
+                group_size=group,
+                max_inflight=self.config.max_inflight_rollouts,
+            )
+            self.dispatcher.set_fresh_train_rollout_budget(budget)
+            return
+
+        buffered = self.train_sink.buffered_count()
         # Full-group overflow carries into the next step.
         budget = rollout_budget(
             batch_size=self.config.batch_size,

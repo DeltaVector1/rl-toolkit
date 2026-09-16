@@ -81,7 +81,7 @@ deployment_scp_timeout_seconds = 300
 deployment_bundle_scp_timeout_seconds = 60
 large_file_transfer_timeout_seconds = 7200
 adapter_update_engine_startup_timeout_seconds = 900
-adapter_delta_stage_timeout_seconds = 300
+adapter_delta_stage_timeout_seconds = 600
 adapter_stage_acceptance_target_seconds = 300
 trainer_seconds_max = 600
 rollout_seconds_max = 720
@@ -96,10 +96,6 @@ _dependency_remote_archive_pattern = re.compile(
 def _adapter_stage_limit_seconds(policy_step: int) -> int:
     if type(policy_step) is not int or policy_step <= 0:
         raise Refused("adapter policy step must be a positive integer")
-    if policy_step == 1:
-        return 900
-    if policy_step == 2:
-        return 600
     return adapter_delta_stage_timeout_seconds
 
 if set(inference_hosts) != set(inference_settings):
@@ -1011,6 +1007,7 @@ def _head_script() -> str:
         .replace("__ORCH__", orchestrator_container)
         .replace("__ADAPTER__", str(adapter_port))
         .replace("__ADAPTER_CONTAINER__", adapter_container)
+        + f"\nif python3 {runtime_root}/china/direct_adapter_route.py status {remote_repo}/configs/nodes.toml >/dev/null 2>&1; then echo DIRECT_ROUTE ready; else echo DIRECT_ROUTE failed; fi\n"
     )
 
 
@@ -1203,6 +1200,7 @@ class Status:
     judge: str = "000"
     secondary_judge: str = "unused"
     adapter: str = "000"
+    direct_route: str = "unknown"
     zmq_tunnel: bool = False
     nodes: list[NodeState] = field(default_factory=list)
     engines: list[EngineState] = field(default_factory=list)
@@ -1240,7 +1238,7 @@ class Status:
                 f"orchestrator "
                 f"{'failed' if self.orch_failed else 'up' if self.orch_up else 'finished' if self.trainer_finished else 'down'} | "
                 f"scoring judge {self.judge} | "
-                f"follow-up judge {self.secondary_judge} | adapter {self.adapter}"
+                f"follow-up judge {self.secondary_judge} | adapter {self.adapter} | direct route {self.direct_route}"
             )
         L.append(
             f"run steps {self.trainer_steps} | rollout failures in 5m {self.fails_5m} | "
@@ -2254,6 +2252,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
         "SECONDARY_JUDGE", "000" if secondary_judge_used else "unused"
     )
     s.adapter = h.get("ADAPTER", "000")
+    s.direct_route = h.get("DIRECT_ROUTE", "unknown")
     s.zmq_tunnel = h.get("ZMQ_TUNNEL", "0") == "1"
 
     for host, (rc, out) in nodes_out.items():
@@ -2337,6 +2336,8 @@ def _warnings(s: Status) -> list[str]:
         detail = f" on {', '.join(failed_nodes)}" if failed_nodes else ""
         w.append(f"trainer cluster is not complete{detail}")
     trainer_only = s.mode == "trainer-only"
+    if not trainer_only and s.direct_route != "ready":
+        w.append("direct adapter source route is not ready; use adapter-tunnels repair")
     if not trainer_only and s.orch_failed:
         w.append("orchestrator process failed")
     elif not trainer_only and not s.orch_up and not s.trainer_finished:
@@ -3739,56 +3740,72 @@ def _adapter_transport_failure_reason(error: str) -> str | None:
     message = error.strip().lower()
     if re.search(r"\b(?:checksum|sha256|digest|identity|semantic)\b", message):
         return None
-    if re.search(
-        r"connection\s*(?:reset|refused|aborted)|"
-        r"remote end closed|broken pipe",
-        message,
-    ):
-        return "connection reset/refused"
-    if re.search(
-        r"(?:http(?:error| status)?|status(?:[_ ]code)?)[^0-9]{0,12}503\b|"
-        r"\b503\s+(?:service unavailable|temporarily unavailable)",
-        message,
-    ):
-        return "HTTP 503"
-    if re.search(
-        r"(?:retry|attempt).*(?:exhaust|budget|bounded)|"
-        r"(?:exhaust|budget|bounded).*(?:retry|attempt)|"
-        r"attempt\s+\d+\s*/\s*\d+\s*;?\s*(?:stopping|exhausted)",
-        message,
-    ):
-        return "bounded retry exhaustion"
-    if re.search(r"timeout(?:error)?|timed out|time limit", message):
-        return "timeout"
-    if re.fullmatch(
-        r"(?:oserror: )?adapter manifest request failed with http status 500",
-        message,
-    ):
-        return "manifest HTTP 500"
-    return None
-
-
-def _validate_adapter_stage_log(log: str) -> str:
-    """Require a current adapter transfer failure, not a generic error."""
-    failures = list(
-        re.finditer(
-            r"(?:Failed to apply policy update \d+|Policy update \d+ failed on attempt (?P<attempt>\d+)/(?P=attempt); stopping)",
-            log,
-        )
+    prefix = r"(?:oserror|_persistenttransporterror): "
+    typed_failures = (
+        (
+            r"connectionreseterror: (?:\[errno [0-9]+\] )?connection reset by peer",
+            "connection reset",
+        ),
+        (
+            r"connectionrefusederror: (?:\[errno [0-9]+\] )?connection refused",
+            "connection refused",
+        ),
+        (
+            r"connectionabortederror: (?:\[errno [0-9]+\] )?"
+            r"(?:software caused connection abort|connection aborted)",
+            "connection aborted",
+        ),
+        (
+            r"remotedisconnected: remote end closed connection without response",
+            "remote end closed",
+        ),
+        (
+            r"brokenpipeerror: (?:\[errno [0-9]+\] )?broken pipe",
+            "broken pipe",
+        ),
+        (
+            r"timeouterror: adapter (?:delta staging exceeded its time limit|"
+            r"persistent request exceeded its stage time limit|"
+            r"download exceeded its time limit)",
+            "timeout",
+        ),
+        (
+            r"oserror: adapter manifest request failed with http status 500",
+            "manifest HTTP 500",
+        ),
     )
-    if not failures:
-        raise Refused("no failed adapter policy update is present in the orchestrator log")
-    latest_failure = failures[-1]
-    successes = list(re.finditer(r"Staged policy v\d+ on every inference host", log))
-    if successes and successes[-1].start() > latest_failure.start():
-        raise Refused("the latest adapter policy update already succeeded")
-    window = log[max(0, latest_failure.start() - 4000) : latest_failure.end() + 20000]
-    transfer_words = ("stage_lora_adapter", "adapter", "lora")
-    if not any(word.lower() in window.lower() for word in transfer_words):
-        raise Refused("latest policy failure has no adapter staging evidence")
-    if _adapter_transport_failure_reason(window) is None:
-        raise Refused("latest adapter failure has no transfer timeout evidence")
-    return latest_failure.group(0)
+    exact_failures = (
+        (r"adapter network request failed", "network request failed"),
+        (r"adapter network read failed", "network read failed"),
+        (r"adapter response ended early", "response ended early"),
+        (
+            r"adapter response read timeout setup failed",
+            "response read timeout setup failed",
+        ),
+        (
+            r"adapter manifest is missing; transfer mode is unknown",
+            "manifest is missing; transfer mode is unknown",
+        ),
+        (r"adapter persistent request failed", "persistent request failed"),
+        (r"adapter response ended during read", "response ended during read"),
+        (r"adapter response body ended early", "response body ended early"),
+        (r"incomplete adapter transport chunk", "incomplete transport chunk"),
+        (
+            r"none of [1-9][0-9]* adapter source lanes responded",
+            "no adapter source lanes responded",
+        ),
+        (
+            r"adapter persistent download retries exhausted",
+            "persistent download retries exhausted",
+        ),
+    )
+    for pattern, reason in typed_failures:
+        if re.fullmatch(pattern, message):
+            return reason
+    for pattern, reason in exact_failures:
+        if re.fullmatch(rf"(?:{prefix})?{pattern}", message):
+            return reason
+    return None
 
 
 def _adapter_stage_status_script(status_path: str) -> str:
@@ -3886,6 +3903,7 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
         raise Refused("latest adapter broadcast is not a positive policy update")
     stage_limit = _adapter_stage_limit_seconds(latest.step)
     target_exceeded = []
+    overruns = []
     for host, record in records.items():
         state = record.get("status")
         if state not in {"ready", "failed"}:
@@ -3898,7 +3916,6 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
             or not isinstance(elapsed, (int, float))
             or not math.isfinite(elapsed)
             or elapsed < 0
-            or elapsed > stage_limit
         ):
             raise Refused(f"adapter stage duration on {host} is invalid")
         if record.get("policy_step") != latest.step:
@@ -3907,6 +3924,10 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
             raise Refused(f"adapter stage status on {host} has the wrong operational limit")
         if record.get("acceptance_target_seconds") != adapter_stage_acceptance_target_seconds:
             raise Refused(f"adapter stage status on {host} has the wrong acceptance target")
+        if elapsed > stage_limit:
+            if state == "ready":
+                raise Refused(f"adapter stage on {host} completed after its {stage_limit:g}s operational limit")
+            overruns.append(f"{host} ({elapsed:g}s, {elapsed - stage_limit:g}s over)")
         if elapsed > adapter_stage_acceptance_target_seconds:
             target_exceeded.append(host)
         if state == "failed":
@@ -3927,23 +3948,18 @@ def _adapter_stage_status_evidence(run: str, config: dict, log: str) -> str:
     )
     return (
         f"policy update {latest.step} failed on {failure_details}; "
-        f"operational limit {stage_limit:g}s; "
+        f"operational limit {stage_limit:g}s{' exceeded on ' + ', '.join(overruns) if overruns else ''}; "
         f"300s acceptance target {'exceeded on ' + ', '.join(target_exceeded) if target_exceeded else 'not exceeded'}; "
         "exact terminal stage status matched every inference host"
     )
 
 
 def _adapter_stage_evidence(run: str, config: dict) -> str:
-    code, output = _ssh(
+    _, output = _ssh(
         orchestrator_host,
         f"sudo docker logs --tail 10000 {shlex.quote(orchestrator_container)} 2>&1",
         timeout=180,
     )
-    if not code:
-        try:
-            return _validate_adapter_stage_log(output)
-        except Refused:
-            pass
     return _adapter_stage_status_evidence(run, config, output)
 
 
@@ -4355,7 +4371,13 @@ def repair(what: str) -> str:
     if what.startswith("engine-watchdog:"):
         return _repair_engine_watchdog(what.split(":", 1)[1])
     if what.startswith("engine:"):
-        return _repair_engine(what.split(":", 1)[1])
+        target = what.split(":", 1)[1]
+        host, separator, config_dir = target.partition(":")
+        if not host:
+            raise Refused("engine repair requires a host")
+        if separator and not config_dir:
+            raise Refused("engine repair config directory cannot be empty")
+        return _repair_engine(host, config_dir=config_dir if separator else None)
     if what == "supervisors":
         return _repair_supervisors()
     if what == "microbatch-sync":
@@ -4370,13 +4392,20 @@ def repair(what: str) -> str:
         return _repair_orchestrator()
     if what == "adapter-tunnels":
         return _repair_adapter_tunnels()
+    if what == "adapter-tunnels-reset":
+        return _repair_adapter_tunnels(reset=True)
     if what.startswith("adapter-tunnels:"):
         config_dir = what.split(":", 1)[1]
         if not config_dir:
             raise Refused("adapter-tunnels requires a run config directory")
         return _repair_adapter_tunnels(config_dir)
+    if what.startswith("adapter-tunnels-reset:"):
+        config_dir = what.split(":", 1)[1]
+        if not config_dir:
+            raise Refused("adapter-tunnels-reset requires a run config directory")
+        return _repair_adapter_tunnels(config_dir, reset=True)
     raise Refused(
-        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>, supervisors, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, or adapter-tunnels[:config-dir]."
+        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>[:config-dir], supervisors, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, adapter-tunnels[:config-dir], or adapter-tunnels-reset[:config-dir]."
     )
 
 
@@ -4724,7 +4753,7 @@ def _repair_orchestrator() -> str:
     return result
 
 
-def _repair_adapter_tunnels(config_dir: str | None = None) -> str:
+def _repair_adapter_tunnels(config_dir: str | None = None, *, reset: bool = False) -> str:
     """Reconcile the configured adapter tunnels without starting services."""
     if config_dir:
         profile = _config_dir(config_dir, require_orchestrator=True)
@@ -4750,19 +4779,25 @@ def _repair_adapter_tunnels(config_dir: str | None = None) -> str:
     trainer_addresses = _trainer_addresses(trainer_nodes)
     if not trainer_addresses:
         raise Refused("configured trainer addresses are empty")
-    if not deploy(
-        "training_ops/runtime/h200/start_orchestrator.sh",
-        nodes=[orchestrator_host],
+    for path in (orchestrator_config, "training_ops/runtime/h200/start_orchestrator.sh"):
+        if not deploy(path, nodes=[orchestrator_host]):
+            raise RuntimeError(f"adapter tunnel deployment failed: {path}")
+    for path, destinations in (
+        ("configs/nodes.toml", [trainer_head, orchestrator_host]),
+        ("training_ops/runtime/china/direct_adapter_route.py", [trainer_head, orchestrator_host]),
     ):
-        raise RuntimeError("adapter tunnel launcher deployment failed")
+        if not deploy(path, nodes=destinations):
+            raise RuntimeError(f"direct adapter route deployment failed: {path}")
+    tunnel_mode = "--restart-tunnels --tunnels-only" if reset else "--tunnels-only"
     command = (
         f"RUN={shlex.quote(run)} RUN_NAME={shlex.quote(run_name)} "
         f"ORCH_CONFIG={shlex.quote(f'{remote_repo}/{orchestrator_config}')} "
         f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
         f"TRAINER_CT={shlex.quote(trainer_container)} ORCH_CT={shlex.quote(orchestrator_container)} "
-        f"bash {shlex.quote(orchestrator_launcher)} --restart-tunnels --tunnels-only"
+        f"TUNNEL_REPAIR_DEADLINE_S=300 timeout --signal=TERM --kill-after=5s 305s "
+        f"bash {shlex.quote(orchestrator_launcher)} {tunnel_mode}"
     )
-    code, output = _ssh(orchestrator_host, command, timeout=180)
+    code, output = _ssh(orchestrator_host, command, timeout=330)
     if code:
         raise RuntimeError(f"adapter tunnel reconciliation failed: {output.strip() or f'exit {code}'}")
     result = output.strip().splitlines()[-1] if output.strip() else "adapter tunnel reconciliation complete"
@@ -4925,15 +4960,21 @@ def _engine_watchdog_identity_script(
     return "\n".join(lines) + "\n"
 
 
-def _repair_engine(host: str) -> str:
+def _repair_engine(host: str, config_dir: str | None = None) -> str:
     _check_host(host)
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
-    selected = _config_for_run(current_run())
+    if config_dir is None:
+        selected = _config_for_run(current_run())
+    else:
+        selected = _config_dir(config_dir, require_inference=True)
     inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     engine_container = glm_inference_container
     engine_model = glm_model
     start_script = f"{runtime_root}/h200/start_inference.sh"
+    for path in ("configs/nodes.toml", "training_ops/runtime/h200/start_inference.sh", _selected_inference_config(selected)):
+        if not deploy(path, nodes=[host]):
+            raise RuntimeError(f"inference configuration deployment failed on {host}: {path}")
     startup_grace = 600
     print(
         f"{host}: removing and restarting {engine_container}. The model load needs 5 to 10 minutes."
@@ -5984,6 +6025,9 @@ def _start_dependency_inventory(
         "training_ops/runtime/h200",
         inference_hosts,
     )
+    add("training_ops/runtime/china/resume_state.py", [orchestrator_host])
+    add("training_ops/runtime/h200/drain_rollout_publisher.py", [trainer_head])
+    add("training_ops/runtime/china/direct_adapter_route.py", [orchestrator_host])
 
     configured_hosts = list(dict.fromkeys([*trainer_hosts, *inference_hosts]))
     add("configs/nodes.toml", configured_hosts)
@@ -6542,6 +6586,21 @@ def _cold_adapter_cache_cleanup(
         print(f"cold adapter cleanup on {host}: {output.strip()}")
 
 
+def _check_adapter_restart(host: str, service_dir: str, step: int, role: str, adapter: str, digest: str = "") -> dict:
+    source = (repo_root / "training_ops/runtime/china/resume_state.py").read_text()
+    arguments = " ".join(shlex.quote(str(value)) for value in (service_dir, step, role, adapter, digest))
+    code, output = _ssh(host, f"python3 - {arguments} <<'PY'\n{source}\nPY", timeout=600)
+    if code:
+        raise Refused(f"adapter restart state check failed on {host}: {output.strip()}")
+    try:
+        result = json.loads(output)
+    except (TypeError, ValueError) as error:
+        raise Refused(f"invalid adapter restart state on {host}") from error
+    if not isinstance(result, dict) or result.get("policy_step") != step or result.get("next_batch") != step + 1:
+        raise Refused(f"adapter restart progress differs on {host}")
+    return result
+
+
 def start(
     run: str,
     mode: str = "cold",
@@ -6565,11 +6624,33 @@ def start(
     if resume_adapter is not None:
         if not resume_adapter.startswith(f"{run_root}/"):
             raise Refused(f"resume adapter must be below {run_root}")
-        if resume_step is None or resume_step < 0:
+        if type(resume_step) is not int or resume_step < 0:
             raise Refused("resume_step must be zero or greater")
+        if mode != "restart":
+            raise Refused("an explicit resume adapter requires restart mode")
     nodes = [_check_host(h) for h in (nodes or trainer_hosts)]
     if trainer_head in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [trainer_head] + [n for n in nodes if n != trainer_head]
+    resume_digest = ""
+    if mode == "restart" and resume_adapter is not None:
+        if trainer_head not in nodes:
+            raise Refused(f"adapter restart requires trainer head {trainer_head} in nodes")
+        control_file = f"{service_run_dir}/control/orch.toml"
+        # The orchestrator sends saved control only to the trainer head.
+        # Peer trainers consume synchronized rollout files, not this control.
+        code, _output = _ssh(
+            trainer_head,
+            f"test -f {shlex.quote(control_file)} && test -s {shlex.quote(control_file)}",
+        )
+        if code:
+            raise Refused(
+                f"adapter restart requires a non-empty control file {control_file} on {trainer_head}"
+            )
+        identity = _check_adapter_restart(trainer_head, service_run_dir, resume_step, "origin", resume_adapter)
+        resume_digest = identity.get("sha256", "")
+        if not isinstance(resume_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", resume_digest):
+            raise Refused("stable restart adapter has no exact SHA-256 identity")
+        _check_adapter_restart(orchestrator_host, service_run_dir, resume_step, "orchestrator", resume_adapter)
     required_files = _start_dependency_inventory(selected, nodes)
     _deploy_dependencies(required_files)
     name = f"run_{run}"
@@ -6723,7 +6804,8 @@ def start(
             f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
             f"TRAINER_CT={shlex.quote(trainer_container)} "
             f"ORCH_CT={shlex.quote(orchestrator_container)} "
-            f"bash {orchestrator_launcher}",
+            + (f"adapter_resume_step={resume_step} " if resume_adapter is not None else "")
+            + f"bash {orchestrator_launcher}",
             300,
         )
         if rc:
@@ -6732,7 +6814,7 @@ def start(
     def wait_for_orchestrator_control() -> None:
         control_file = f"{service_run_dir}/control/orch.toml"
         script = f"""set -eu
-for _ in $(seq 1 60); do
+for _ in $(seq 1 {adapter_update_engine_startup_timeout_seconds}); do
   if [ -s {shlex.quote(control_file)} ]; then
     echo ready
     exit 0
@@ -6742,7 +6824,11 @@ done
 echo "orchestrator control file did not arrive" >&2
 exit 1
 """
-        code, output = _ssh(trainer_head, script, timeout=70)
+        code, output = _ssh(
+            trainer_head,
+            script,
+            timeout=adapter_update_engine_startup_timeout_seconds + 30,
+        )
         if code:
             detail = output.strip() or "no output"
             raise RuntimeError(
@@ -6799,8 +6885,8 @@ exit 1
     )
     _remote_ok(
         orchestrator_host,
-        f"pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; "
-        f"sudo docker rm -f {orchestrator_container} {adapter_relay_container} >/dev/null 2>&1; echo done",
+        ("" if resume_adapter is not None else "pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; ")
+        + f"sudo docker rm -f {orchestrator_container} {adapter_relay_container} >/dev/null 2>&1; echo done",
         "old orchestrator stop",
     )
     _remote_ok(
@@ -6823,16 +6909,57 @@ exit 1
     if mode == "cold":
         _cold_start_cleanup(run, nodes)
         _cold_adapter_cache_cleanup(initial_adapter_identity)
-    launch_adapter()
     if mode == "cold":
+        launch_adapter()
         launch_orch()
         wait_for_orchestrator_control()
         launch_trainer()
     elif resume_adapter is not None:
-        launch_orch()
-        wait_for_orchestrator_control()
-        launch_trainer()
+        try:
+            drain_publisher = (
+                f"python3 {runtime_root}/h200/drain_rollout_publisher.py "
+                f"{shlex.quote(service_run_dir)} "
+                f"{runtime_root}/h200/sync_rollout_batches.sh"
+            )
+            _remote_ok(orchestrator_host, drain_publisher, "restart rollout publisher drain", timeout=60)
+            _remote_ok(
+                trainer_head,
+                f"python3 {runtime_root}/h200/drain_rollout_publisher.py "
+                f"{shlex.quote(service_run_dir)} "
+                f"{runtime_root}/china/sync_microbatches.sh --microbatch",
+                "restart microbatch publisher drain",
+                timeout=90,
+            )
+            final_identity = _check_adapter_restart(trainer_head, service_run_dir, resume_step, "origin", resume_adapter)
+            if final_identity != identity:
+                raise Refused("stable adapter identity changed while stopping the old run")
+            for host in nodes:
+                _check_adapter_restart(host, service_run_dir, resume_step, "trainer", resume_adapter, resume_digest)
+            _check_adapter_restart(orchestrator_host, service_run_dir, resume_step, "orchestrator", resume_adapter)
+            launch_adapter()
+            launch_trainer()
+            # The next trainer step needs a fresh batch from the orchestrator.
+            launch_orch()
+        except Exception as error:
+            cleanup_commands = [
+                (
+                    orchestrator_host,
+                    f"{drain_publisher}; "
+                    f"sudo docker rm -f {orchestrator_container} {adapter_relay_container}",
+                ),
+                *((host, f"sudo docker rm -f {trainer_container}") for host in nodes),
+                (trainer_head, f"sudo docker rm -f {adapter_container}"),
+            ]
+            for host, command in cleanup_commands:
+                try:
+                    code, output = _ssh(host, command, timeout=60)
+                    if code:
+                        error.add_note(f"restart cleanup failed on {host}: {output.strip()}")
+                except Exception as cleanup_error:
+                    error.add_note(f"restart cleanup failed on {host}: {cleanup_error}")
+            raise
     else:
+        launch_adapter()
         mark_restart_start()
         launch_trainer()
         wait_for_fresh_broadcast()
@@ -6959,11 +7086,28 @@ def qualify(
 
 def stop() -> None:
     """Stop the edge orchestrator, then the trainer. Supervisors stop first."""
+    try:
+        run = current_run()
+    except RuntimeError:
+        selected = _config_dir(default_config_dir)
+        with (repo_root / selected["trainer"]).open("rb") as stream:
+            trainer_config = tomllib.load(stream)
+        output_dir = trainer_config.get("output_dir")
+        run = Path(output_dir).name if isinstance(output_dir, str) else ""
+        expected_output_dir = f"{run_root.rstrip('/')}/{run}" if run else ""
+        if output_dir != expected_output_dir:
+            raise Refused("cannot identify the run whose batch publisher must stop")
     _remote_ok(
         trainer_head,
         "pkill -f 'bash .*[r]un_supervisor.sh' 2>/dev/null || true; "
         "pkill -f 'bash .*[t]unnel_watchdog.sh' 2>/dev/null || true; echo done",
         "supervisor stop",
+    )
+    _remote_ok(
+        trainer_head,
+        _cold_cleanup_script(run, stop_only=True),
+        "batch publisher stop",
+        timeout=300,
     )
     _remote_ok(
         orchestrator_host,

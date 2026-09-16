@@ -1,5 +1,7 @@
+import errno
 import fcntl
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -7,12 +9,19 @@ import re
 import shutil
 import socket
 import stat
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
 from urllib.error import HTTPError, URLError
-from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import ExitStack, contextmanager
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    wait,
+)
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,6 +32,7 @@ from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loade
 
 from prime_rl.utils.checkpoint_delta import (
     DELTA_MANIFEST,
+    adapter_stage_timeout_seconds,
     apply_xor_delta_file,
 )
 
@@ -36,7 +46,7 @@ _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
 _MAX_DOWNLOAD_STREAMS = 128
 full_download_streams = 48
-default_delta_stage_timeout_s = 600.0
+default_delta_stage_timeout_s = adapter_stage_timeout_seconds
 full_adapter_stage_timeout_s = 1800.0
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
@@ -46,6 +56,7 @@ _RELAYING_MARKER = "RELAYING"
 _WIRE_READY_SUFFIX = ".wire-ready"
 _COMPLETED_SUFFIX = ".done"
 _ADAPTER_STATUS = ".adapter-stage-status.json"
+_ADAPTER_LOADED_RECEIPTS = ".adapter-loaded-receipts.json"
 _ADAPTER_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
 _ADAPTER_FULL_TRANSPORT = "chunked-full-zstd"
 _ADAPTER_LINEAR_TRANSPORT = "chunked-bf16-linear-zigzag-sparse-zstd"
@@ -65,6 +76,8 @@ _ADAPTER_MARKER_MAX_BYTES = 4 * 1024
 _ADAPTER_CLEANUP_ENTRY_LIMIT = 256
 _ADAPTER_DIRECTORY_ENTRY_LIMIT = 8192
 _ADAPTER_CLEANUP_CANDIDATE_LIMIT = 64
+_RETRYABLE_ADAPTER_HTTP_STATUSES = frozenset({404, 429, *range(500, 600)})
+persistent_connection_idle_seconds = 30.0
 lane_rotation_delay_seconds = 0.1
 _JSON_LOCK = threading.Lock()
 _adapter_stage_publish_lock = threading.Lock()
@@ -78,11 +91,7 @@ def adapter_stage_limit_seconds(policy_step: int) -> float:
     """Return the bounded operational staging limit for one adapter step."""
     if type(policy_step) is not int or policy_step <= 0:
         raise OSError("adapter policy step must be a positive integer")
-    if policy_step == 1:
-        return 600.0
-    if policy_step == 2:
-        return 600.0
-    return 300.0
+    return adapter_stage_timeout_seconds
 
 
 def _adapter_step_from_source_url(source_url: str) -> int:
@@ -90,8 +99,8 @@ def _adapter_step_from_source_url(source_url: str) -> int:
     if match is None:
         raise OSError("adapter source URL does not identify one policy step")
     step = int(match.group(1))
-    if step <= 0:
-        raise OSError("adapter source URL does not identify a positive policy step")
+    if step < 0:
+        raise OSError("adapter source URL does not identify a non-negative policy step")
     return step
 
 
@@ -213,6 +222,7 @@ def _write_text_atomic(
     *,
     encoding: str,
     parent_fd: int | None = None,
+    sync: bool = True,
 ) -> None:
     owns_parent_fd = parent_fd is None
     if owns_parent_fd:
@@ -237,7 +247,8 @@ def _write_text_atomic(
         try:
             output.write(value.encode(encoding))
             output.flush()
-            os.fsync(output.fileno())
+            if sync:
+                os.fsync(output.fileno())
         finally:
             output.close()
         try:
@@ -573,6 +584,18 @@ def _replace_paths(source: Path, destination: Path, label: str) -> None:
         os.close(parent_fd)
 
 
+def _fsync_directory(path: Path) -> None:
+    directory_fd = _open_directory_nofollow(
+        path,
+        create=False,
+        label="adapter publish directory",
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _unlink_path(path: Path, label: str) -> None:
     parent_fd = _open_directory_nofollow(
         path.parent,
@@ -725,6 +748,64 @@ def _check_deadline(
         raise TimeoutError("adapter delta staging exceeded its time limit")
 
 
+@contextmanager
+def _adapter_socket_deadline(sock, deadline, cancel_event):
+    """Interrupt buffered HTTP reads and finish the guard before socket reuse."""
+    _check_deadline(deadline, cancel_event)
+    if sock is None or (deadline is None and cancel_event is None):
+        yield
+        _check_deadline(deadline, cancel_event)
+        return
+    stopped = threading.Event()
+    guard_lock = threading.Lock()
+    failure = None
+
+    def guard():
+        nonlocal failure
+        while not stopped.is_set():
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            wait_seconds = remaining
+            if cancel_event is not None:
+                wait_seconds = 0.02 if remaining is None else min(0.02, remaining)
+            if stopped.wait(wait_seconds):
+                return
+            with guard_lock:
+                if stopped.is_set():
+                    return
+                try:
+                    _check_deadline(deadline, cancel_event)
+                except TimeoutError as exc:
+                    failure = exc
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    return
+
+    thread = threading.Thread(target=guard, name="adapter-socket-deadline", daemon=True)
+    thread.start()
+    read_error = None
+    try:
+        yield
+    except BaseException as exc:
+        read_error = exc
+        raise
+    finally:
+        # Serialize completion with abort. A guard that lost this race cannot
+        # touch the socket, and a guard that won must finish before reuse.
+        with guard_lock:
+            stopped.set()
+        thread.join()
+        local_io_error = isinstance(read_error, OSError) and read_error.errno in {
+            errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.EACCES, errno.EPERM,
+        }
+        if failure is not None and not local_io_error and not isinstance(
+            read_error, (_PersistentLocalError, _PersistentProtocolError, _AdapterMetadataError)
+        ):
+            raise failure
+    _check_deadline(deadline, cancel_event)
+
+
 def _acquire_stage_lock(
     lock,
     deadline: float | None,
@@ -774,7 +855,7 @@ def _request_timeout(
 
 
 def _configured_chunk_timeout() -> float:
-    """Return the total time limit for one resumable chunk request."""
+    """Return the configured timeout for one resumable chunk request."""
     if not _is_finite_number(_ADAPTER_CHUNK_TIMEOUT_S) or _ADAPTER_CHUNK_TIMEOUT_S <= 0:
         raise OSError("PRIME_LORA_CHUNK_TIMEOUT_S must be positive")
     if not _is_finite_number(_ADAPTER_LANE_TIMEOUT_S) or _ADAPTER_LANE_TIMEOUT_S <= 0:
@@ -788,7 +869,7 @@ def _chunk_request_timeout(
     configured_timeout: float,
     cancel_event: threading.Event | None = None,
 ) -> float:
-    """Bound one chunk attempt without extending the whole stage."""
+    """Bound one chunk timeout by the remaining stage time."""
     timeout = configured_timeout
     if not _is_finite_number(timeout) or timeout <= 0:
         raise OSError("adapter request timeout must be positive")
@@ -828,8 +909,66 @@ def _wait_for_futures(
         for future in futures:
             future.cancel()
         # Do not let the caller clean a path while a worker can still write it.
-        # Socket reads and retry sleeps check the cancellation event and have
-        # bounded timeouts, so this join completes after cancellation.
+        # Socket reads and retry sleeps stop on cancellation. A stuck disk or
+        # native decoder needs the API server's whole-stage process deadline.
+        executor.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+
+
+def _run_bounded_futures(
+    items,
+    worker,
+    width: int,
+    deadline: float | None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Run bounded tasks and reuse each lane as its task completes."""
+    if width < 1:
+        raise OSError("adapter download stream width must be positive")
+    entries = iter(enumerate(items))
+    pending = {}
+    executor = ThreadPoolExecutor(max_workers=min(width, len(items))) if items else None
+    if executor is None:
+        return
+    try:
+        while len(pending) < width:
+            try:
+                index, item = next(entries)
+            except StopIteration:
+                break
+            lane = len(pending)
+            pending[executor.submit(worker, index, item, lane)] = lane
+        while pending:
+            _check_deadline(deadline, cancel_event)
+            timeout = None
+            if deadline is not None:
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise TimeoutError("adapter delta staging exceeded its time limit")
+            done, _ = wait(
+                pending,
+                timeout=timeout,
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError("adapter delta staging exceeded its time limit")
+            for future in done:
+                lane = pending.pop(future)
+                future.result()
+                _check_cancelled(cancel_event)
+                try:
+                    index, item = next(entries)
+                except StopIteration:
+                    continue
+                pending[executor.submit(worker, index, item, lane)] = lane
+        _check_cancelled(cancel_event)
+    except BaseException:
+        if cancel_event is not None:
+            cancel_event.set()
+        for future in pending:
+            future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
         raise
     else:
@@ -845,13 +984,15 @@ def _content_length(
     for candidate in _metadata_source_urls(source_url):
         _check_deadline(deadline, cancel_event)
         try:
-            with urllib.request.urlopen(
+            with _adapter_http_open(
                 urllib.request.Request(candidate, method="HEAD"),
                 timeout=_request_timeout(
                     deadline,
                     cancel_event,
                     maximum=_configured_chunk_timeout(),
                 ),
+                deadline=deadline,
+                cancel_event=cancel_event,
             ) as response:
                 _check_deadline(deadline, cancel_event)
                 try:
@@ -867,7 +1008,8 @@ def _content_length(
         except OSError as exc:
             if not _is_retryable_metadata_error(exc):
                 raise
-            last_error = exc
+            last_error = _PersistentTransportError("adapter metadata HEAD request failed")
+            last_error.__cause__ = exc
     assert last_error is not None
     raise last_error
 
@@ -887,6 +1029,166 @@ def _read_source_text(
     ).decode("utf-8")
 
 
+class _AdapterRequestSockets:
+    """Register sockets before connect so a deadline can interrupt all I/O."""
+
+    def __init__(self, deadline, cancel_event):
+        self.deadline = deadline
+        self.cancel_event = cancel_event
+        self.sockets = []
+        self.lock = threading.Lock()
+        self.aborted = False
+
+    def register(self, sock):
+        with self.lock:
+            try:
+                _check_deadline(self.deadline, self.cancel_event)
+                if self.aborted:
+                    raise TimeoutError("adapter request was aborted")
+            except BaseException:
+                sock.close()
+                raise
+            self.sockets.append(sock)
+        return sock
+
+    def shutdown(self, how):
+        with self.lock:
+            self.aborted = True
+            for sock in self.sockets:
+                try:
+                    sock.shutdown(how)
+                except OSError:
+                    pass
+
+    def connect(self, address, timeout=None, source_address=None):
+        _check_deadline(self.deadline, self.cancel_event)
+        last_error = None
+        for family, kind, protocol, _name, target in _adapter_address_info(
+            address, self.deadline, self.cancel_event
+        ):
+            sock = self.register(socket.socket(family, kind, protocol))
+            try:
+                remaining = self.deadline - time.monotonic()
+                _check_deadline(self.deadline, self.cancel_event)
+                sock.settimeout(remaining if timeout is None else min(timeout, remaining))
+                if source_address is not None:
+                    sock.bind(source_address)
+                sock.connect(tuple(target))
+                _check_deadline(self.deadline, self.cancel_event)
+                return sock
+            except OSError as exc:
+                sock.close()
+                last_error = exc
+                _check_deadline(self.deadline, self.cancel_event)
+        if last_error is not None:
+            raise last_error
+        raise OSError("adapter host has no socket address")
+
+
+class _SecureAdapterConnection(http.client.HTTPSConnection):
+    def connect(self):
+        http.client.HTTPConnection.connect(self)
+        self.sock = self.register_socket(self._context.wrap_socket(
+            self.sock,
+            server_hostname=self._tunnel_host or self.host,
+            do_handshake_on_connect=False,
+        ))
+        self.sock.do_handshake()
+
+
+@contextmanager
+def _adapter_http_open(source_url, *, timeout, deadline=None, cancel_event=None, attempt_timeout=None):
+    """Bound DNS, connect, redirects, headers, and body with one attempt guard."""
+    url = source_url.full_url if isinstance(source_url, urllib.request.Request) else source_url
+    if urlsplit(url).scheme not in {"http", "https"}:
+        raise _PersistentProtocolError("adapter metadata URL must use HTTP or HTTPS")
+    attempt_end = time.monotonic() + (timeout if attempt_timeout is None else attempt_timeout)
+    deadline = min(deadline, attempt_end) if deadline is not None else attempt_end
+    sockets = _AdapterRequestSockets(deadline, cancel_event)
+
+    def connection(connection_type, host, **kwargs):
+        result = connection_type(host, **kwargs)
+        result._create_connection = sockets.connect
+        result.register_socket = sockets.register
+        return result
+
+    class HttpHandler(urllib.request.HTTPHandler):
+        def http_open(self, request):
+            return self.do_open(
+                lambda host, **kwargs: connection(http.client.HTTPConnection, host, **kwargs),
+                request,
+            )
+
+    class HttpsHandler(urllib.request.HTTPSHandler):
+        def __init__(self):
+            # Build the verified TLS context only if an HTTPS request is made.
+            urllib.request.AbstractHTTPHandler.__init__(self)
+
+        def https_open(self, request):
+            return self.do_open(
+                lambda host, **kwargs: connection(_SecureAdapterConnection, host, **kwargs),
+                request,
+            )
+
+    class RedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, response, code, message, headers, new_url):
+            if urlsplit(new_url).scheme not in {"http", "https"}:
+                response.close()
+                raise _PersistentProtocolError("adapter metadata redirect must use HTTP or HTTPS")
+            return super().redirect_request(request, response, code, message, headers, new_url)
+
+    opener = urllib.request.build_opener(HttpHandler(), HttpsHandler(), RedirectHandler())
+    try:
+        with _adapter_socket_deadline(sockets, deadline, cancel_event):
+            try:
+                with opener.open(source_url, timeout=timeout) as response:
+                    yield response
+            except HTTPError as exc:
+                exc.close()
+                raise
+    finally:
+        for sock in sockets.sockets:
+            sock.close()
+
+
+def _adapter_address_info(address, deadline, cancel_event):
+    """Keep numeric lanes local; reap a stalled name lookup on cancellation."""
+    host, port = address
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, host)
+        except OSError:
+            continue
+        target = (host, port) if family == socket.AF_INET else (host, port, 0, 0)
+        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", target)]
+    _check_deadline(deadline, cancel_event)
+    script = (
+        "import json, socket, sys\n"
+        "print(json.dumps(socket.getaddrinfo(sys.argv[1], int(sys.argv[2]), 0, socket.SOCK_STREAM)))\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, host, str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        while True:
+            _check_deadline(deadline, cancel_event)
+            try:
+                stdout, _stderr = process.communicate(timeout=min(0.02, max(0.0, deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        _check_deadline(deadline, cancel_event)
+        if process.returncode:
+            raise _PersistentTransportError("adapter host name lookup failed")
+        return json.loads(stdout)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=1)
+
+
 def _read_source_bytes(
     source_url: str,
     deadline: float | None = None,
@@ -899,14 +1201,16 @@ def _read_source_bytes(
     last_error: OSError | None = None
     for candidate in _metadata_source_urls(source_url):
         _check_deadline(deadline, cancel_event)
+        timeout = _request_timeout(deadline, cancel_event, maximum=_configured_chunk_timeout())
+        request_deadline = time.monotonic() + timeout
+        if deadline is not None:
+            request_deadline = min(request_deadline, deadline)
         try:
-            with urllib.request.urlopen(
+            with _adapter_http_open(
                 candidate,
-                timeout=_request_timeout(
-                    deadline,
-                    cancel_event,
-                    maximum=_configured_chunk_timeout(),
-                ),
+                timeout=timeout,
+                deadline=request_deadline,
+                cancel_event=cancel_event,
             ) as response:
                 headers = getattr(response, "headers", {})
                 content_length = (
@@ -929,12 +1233,16 @@ def _read_source_bytes(
                         )
                 chunks = []
                 total = 0
+                read_available = getattr(response, "read1", None) or response.read
                 while True:
-                    _check_deadline(deadline, cancel_event)
+                    _check_deadline(request_deadline, cancel_event)
                     read_size = 16 * 1024 * 1024
                     if max_bytes is not None:
                         read_size = min(read_size, max_bytes - total + 1)
-                    chunk = response.read(read_size)
+                    try:
+                        chunk = read_available(read_size)
+                    except http.client.IncompleteRead as exc:
+                        raise _PersistentTransportError("adapter metadata body ended early") from exc
                     if not chunk:
                         break
                     chunks.append(chunk)
@@ -944,6 +1252,8 @@ def _read_source_bytes(
                             f"source exceeds the {max_bytes}-byte read limit: {source_url}"
                         )
                 _check_deadline(deadline, cancel_event)
+                if content_length is not None and total != content_length_value:
+                    raise _PersistentTransportError("adapter metadata body ended early")
                 return b"".join(chunks)
         except HTTPError as exc:
             if not _is_retryable_metadata_error(exc):
@@ -952,7 +1262,8 @@ def _read_source_bytes(
         except OSError as exc:
             if not _is_retryable_metadata_error(exc):
                 raise
-            last_error = exc
+            last_error = _PersistentTransportError("adapter metadata request failed")
+            last_error.__cause__ = exc
     assert last_error is not None
     raise last_error
 
@@ -1109,10 +1420,10 @@ def _is_retryable_metadata_error(exception: BaseException) -> bool:
     ):
         return False
     if isinstance(exception, HTTPError):
-        return exception.code in {404, 503}
+        return _retryable_adapter_http_status(exception.code)
     if isinstance(exception, _AdapterMetadataError):
         return False
-    if isinstance(exception, (TimeoutError, ConnectionError, socket.timeout)):
+    if isinstance(exception, (_PersistentTransportError, TimeoutError, ConnectionError, socket.timeout)):
         return True
     if isinstance(exception, URLError):
         reason = exception.reason
@@ -1135,18 +1446,20 @@ def _responsive_adapter_source_urls(
     def probe(candidate: str) -> bool:
         config_url = f"{candidate.rstrip('/')}/{_ADAPTER_FILES[0]}"
         try:
-            with urllib.request.urlopen(
+            with _adapter_http_open(
                 urllib.request.Request(config_url, method="HEAD"),
                 timeout=_request_timeout(
                     deadline,
                     cancel_event,
                     maximum=_configured_chunk_timeout(),
                 ),
+                deadline=deadline,
+                cancel_event=cancel_event,
             ) as response:
                 status = int(response.status)
                 if 200 <= status < 400:
                     return True
-                if status in {404, 503}:
+                if status in _RETRYABLE_ADAPTER_HTTP_STATUSES:
                     return False
                 raise OSError(f"adapter source probe returned HTTP status {status}")
         except HTTPError as exc:
@@ -1166,7 +1479,9 @@ def _responsive_adapter_source_urls(
     _check_deadline(deadline, cancel_event)
     responsive = [url for url, ready in zip(source_urls, results, strict=True) if ready]
     if not responsive:
-        raise OSError(f"none of {len(source_urls)} adapter source lanes responded")
+        raise _PersistentTransportError(
+            f"none of {len(source_urls)} adapter source lanes responded"
+        )
     return responsive, len(source_urls)
 
 
@@ -1258,8 +1573,10 @@ def _read_chunked_v1_manifest(
             )
         )
     except HTTPError as exc:
-        if exc.code in {404, 503}:
-            raise OSError("adapter manifest is missing; transfer mode is unknown") from exc
+        if _retryable_adapter_http_status(exc.code):
+            raise _PersistentTransportError(
+                "adapter manifest is missing; transfer mode is unknown"
+            ) from exc
         raise
     if not isinstance(value, dict) or value.get("version") != 1:
         raise OSError("invalid adapter transport manifest")
@@ -1408,8 +1725,10 @@ def _read_chunked_linear_manifest(
             )
         )
     except HTTPError as exc:
-        if exc.code in {404, 503}:
-            raise OSError("adapter manifest is missing; transfer mode is unknown") from exc
+        if _retryable_adapter_http_status(exc.code):
+            raise _PersistentTransportError(
+                "adapter manifest is missing; transfer mode is unknown"
+            ) from exc
         raise
     if not isinstance(value, dict) or value.get("version") != 2:
         raise OSError("invalid version-two adapter transport manifest")
@@ -1637,8 +1956,10 @@ def _read_chunked_xor_manifest(
             )
         )
     except HTTPError as exc:
-        if exc.code in {404, 503}:
-            raise OSError("adapter manifest is missing; transfer mode is unknown") from exc
+        if _retryable_adapter_http_status(exc.code):
+            raise _PersistentTransportError(
+                "adapter manifest is missing; transfer mode is unknown"
+            ) from exc
         raise OSError(f"adapter manifest request failed with HTTP status {exc.code}") from exc
     if not isinstance(raw, dict):
         raise OSError("invalid adapter transport manifest")
@@ -1656,7 +1977,10 @@ def _read_delta_manifest_with_visibility_wait(
     cancel_event: threading.Event | None,
 ) -> dict[str, object]:
     """Wait for the origin to publish a v2 manifest under one deadline."""
-    for attempt in range(_ADAPTER_VISIBILITY_RETRIES):
+    attempt = 0
+    while deadline is not None or attempt < _ADAPTER_VISIBILITY_RETRIES:
+        _check_deadline(deadline, cancel_event)
+        attempt += 1
         try:
             return _read_chunked_xor_manifest(
                 source_url,
@@ -1667,7 +1991,7 @@ def _read_delta_manifest_with_visibility_wait(
             if "adapter manifest is missing" not in str(exc):
                 raise
             _check_deadline(deadline, cancel_event)
-            if attempt + 1 == _ADAPTER_VISIBILITY_RETRIES:
+            if deadline is None and attempt == _ADAPTER_VISIBILITY_RETRIES:
                 raise
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
@@ -1685,12 +2009,44 @@ def _write_json(
     value: dict[str, object],
     *,
     parent_fd: int | None = None,
+    sync: bool = True,
 ) -> None:
     _write_text_atomic(
         path,
         json.dumps(value, separators=(",", ":")),
         encoding="utf-8",
         parent_fd=parent_fd,
+        sync=sync,
+    )
+
+
+def _process_start_time(pid: int) -> int | None:
+    try:
+        value = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = value[value.rfind(") ") + 2 :].split()
+        start_time = int(fields[19])
+    except (FileNotFoundError, OSError, UnicodeError, ValueError, IndexError):
+        return None
+    return start_time if start_time > 0 else None
+
+
+def write_loaded_adapter_receipts(receipts: dict[str, dict[str, object]]) -> None:
+    """Persist the loaded policy lease used by cache cleanup."""
+    cache_root = Path(os.environ.get("PRIME_LORA_CACHE_DIR", "/tmp/prime-rl-lora"))
+    path = cache_root / _ADAPTER_LOADED_RECEIPTS
+    if not receipts:
+        try:
+            _unlink_path(path, "loaded adapter receipts")
+        except FileNotFoundError:
+            pass
+        return
+    start_time = _process_start_time(os.getpid())
+    if start_time is None:
+        return
+    _ensure_directory(cache_root, "adapter cache directory")
+    _write_json(
+        path,
+        {"pid": os.getpid(), "start_time": start_time, "receipts": receipts},
     )
 
 
@@ -2139,7 +2495,7 @@ def _write_stage_status(
             except (OSError, TypeError, ValueError):
                 value.pop("file_stats", None)
     with _JSON_LOCK:
-        _write_json(cache_root / _ADAPTER_STATUS, value, parent_fd=cache_fd)
+        _write_json(cache_root / _ADAPTER_STATUS, value, parent_fd=cache_fd, sync=False)
 
 
 def adapter_stage_status() -> dict[str, object]:
@@ -2452,6 +2808,8 @@ def _cleanup_previous_adapter_caches(
     cache_root: Path,
     active: Path,
     *,
+    preserve_names: set[str] | None = None,
+    preserve_active_bases: bool = True,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> None:
@@ -2468,9 +2826,9 @@ def _cleanup_previous_adapter_caches(
     try:
         active_name = active.name
         ready_candidates: list[str] = []
-        candidate_steps: dict[str, int] = {}
+        candidate_steps: dict[str, tuple[str, int]] = {}
 
-        def cached_step(directory_fd: int) -> int | None:
+        def cached_step(directory_fd: int) -> tuple[str, int] | None:
             for metadata_name in ("transport.json", "manifest.json"):
                 try:
                     metadata = json.loads(
@@ -2486,12 +2844,18 @@ def _cleanup_previous_adapter_caches(
                 source_url = metadata.get("source_url") if isinstance(metadata, dict) else None
                 if not isinstance(source_url, str):
                     continue
+                parsed = urlsplit(source_url)
                 match = re.fullmatch(
                     r"step_(\d+)",
-                    Path(urlsplit(source_url).path.rstrip("/")).name,
+                    Path(parsed.path.rstrip("/")).name,
                 )
                 if match is not None:
-                    return int(match.group(1))
+                    run_url = urlunsplit(parsed._replace(
+                        path=str(Path(parsed.path.rstrip("/")).parent),
+                        query="",
+                        fragment="",
+                    ))
+                    return run_url, int(match.group(1))
             return None
 
         entry_count = 0
@@ -2536,7 +2900,8 @@ def _cleanup_previous_adapter_caches(
             finally:
                 os.close(candidate_fd)
 
-        keep = {active_name}
+        keep = {active_name, *(preserve_names or set())}
+        keep.update(adapter_cache_path(url).name for url in _loaded_adapter_source_urls(cache_root))
         active_step = None
         try:
             active_fd = _open_directory_entry_nofollow(
@@ -2558,18 +2923,19 @@ def _cleanup_previous_adapter_caches(
                 os.close(active_fd)
         except (FileNotFoundError, OSError, ValueError):
             transport = None
-        for key in ("base_url", "base2_url"):
-            predecessor_url = transport.get(key) if isinstance(transport, dict) else None
-            if isinstance(predecessor_url, str):
-                predecessor_name = adapter_cache_path(predecessor_url).name
-                if predecessor_name in ready_candidates:
-                    keep.add(predecessor_name)
+        if preserve_active_bases:
+            for key in ("base_url", "base2_url"):
+                predecessor_url = transport.get(key) if isinstance(transport, dict) else None
+                if isinstance(predecessor_url, str):
+                    predecessor_name = adapter_cache_path(predecessor_url).name
+                    if predecessor_name in ready_candidates:
+                        keep.add(predecessor_name)
 
         if active_step is not None:
             keep.update(
                 name
                 for name, step in candidate_steps.items()
-                if step > active_step
+                if step[0] == active_step[0] and step[1] > active_step[1]
             )
 
         for name in ready_candidates:
@@ -2598,6 +2964,159 @@ def _cleanup_previous_adapter_caches(
         os.close(cache_fd)
 
 
+def _cleanup_obsolete_adapter_partials(
+    cache_root: Path,
+    preserve_names: set[str],
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Remove abandoned adapter partials while preserving resumable stages."""
+    try:
+        cache_fd = _open_directory_nofollow(
+            cache_root,
+            create=False,
+            label="adapter cache directory",
+        )
+    except FileNotFoundError:
+        return
+
+    try:
+        names: list[str] = []
+        entry_count = 0
+        with os.scandir(cache_fd) as entries:
+            for entry in entries:
+                _check_deadline(deadline, cancel_event)
+                entry_count += 1
+                if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                    raise OSError("adapter cache has too many cleanup entries")
+                if entry.name.endswith(".partial") and re.fullmatch(
+                    r"[0-9a-f]{64}", entry.name[: -len(".partial")]
+                ):
+                    names.append(entry.name)
+    finally:
+        os.close(cache_fd)
+    for name in names:
+        _check_deadline(deadline, cancel_event)
+        if name[: -len(".partial")] in preserve_names:
+            continue
+        _cleanup_delta_stage_artifacts(
+            cache_root / name[: -len(".partial")],
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+
+
+def _loaded_adapter_source_urls(cache_root: Path) -> list[str]:
+    try:
+        cache_fd = _open_directory_nofollow(
+            cache_root,
+            create=False,
+            label="adapter cache directory",
+        )
+        try:
+            value = json.loads(
+                _read_text_nofollow(
+                    _ADAPTER_LOADED_RECEIPTS,
+                    encoding="utf-8",
+                    dir_fd=cache_fd,
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
+            )
+        finally:
+            os.close(cache_fd)
+    except (FileNotFoundError, OSError, ValueError):
+        return []
+    pid = value.get("pid") if isinstance(value, dict) else None
+    start_time = value.get("start_time") if isinstance(value, dict) else None
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or type(start_time) is not int
+        or start_time <= 0
+        or _process_start_time(pid) != start_time
+    ):
+        return []
+    try:
+        os.kill(pid, 0)
+    except (OSError, OverflowError):
+        return []
+    receipts = value.get("receipts") if isinstance(value, dict) else None
+    if not isinstance(receipts, dict):
+        return []
+    return [
+        receipt["source_url"]
+        for receipt in receipts.values()
+        if isinstance(receipt, dict) and isinstance(receipt.get("source_url"), str)
+    ]
+
+
+def _cleanup_adapter_space_before_stage(
+    cache_root: Path,
+    destination: Path,
+    transport: dict[str, object],
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Prune old receiver state before reserving the next adapter stage."""
+    cleanup_deadline = time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S
+    if deadline is not None:
+        cleanup_deadline = min(cleanup_deadline, deadline)
+    preserve_names = {destination.name}
+    loaded_urls = _loaded_adapter_source_urls(cache_root)
+    if not loaded_urls:
+        return
+    active_urls = list(loaded_urls)
+    for key in ("base_url", "base2_url"):
+        predecessor_url = transport.get(key)
+        if isinstance(predecessor_url, str):
+            preserve_names.add(adapter_cache_path(predecessor_url).name)
+
+    active: Path | None = None
+    for active_url in active_urls:
+        candidate = adapter_cache_path(active_url)
+        if candidate.parent != cache_root or candidate.name == destination.name:
+            continue
+        try:
+            ready = _path_regular_size(candidate / "READY", "active adapter ready marker")
+        except OSError:
+            ready = None
+        if ready is not None:
+            preserve_names.add(candidate.name)
+            if active is None:
+                active = candidate
+    if active is None:
+        try:
+            ready = _path_regular_size(destination / "READY", "target adapter ready marker")
+        except OSError:
+            ready = None
+        if ready is None:
+            return
+        active = destination
+
+    _cleanup_retired_adapters(
+        cache_root,
+        destination.name,
+        deadline=cleanup_deadline,
+        cancel_event=cancel_event,
+    )
+    _cleanup_previous_adapter_caches(
+        cache_root,
+        active,
+        preserve_names=preserve_names,
+        preserve_active_bases=False,
+        deadline=cleanup_deadline,
+        cancel_event=cancel_event,
+    )
+    _cleanup_obsolete_adapter_partials(
+        cache_root,
+        preserve_names,
+        deadline=cleanup_deadline,
+        cancel_event=cancel_event,
+    )
+
+
 def _cleanup_adapter_caches(
     cache_root: Path,
     active: Path,
@@ -2624,6 +3143,8 @@ def _full_cache_matches_manifest(
     files: dict[str, object],
     *,
     verify_files: bool = True,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> bool:
     """Check a READY full cache using its already-published file proof."""
     _reject_symlink_path(candidate, "cached adapter path")
@@ -2677,18 +3198,178 @@ def _full_cache_matches_manifest(
         for filename, spec in files.items():
             if not isinstance(spec, dict) or type(spec.get("size")) is not int:
                 return False
+            if filename == _ADAPTER_FILES[1] and spec["size"] <= 0:
+                return False
             entry = _stat_regular_entry(directory_fd, filename, "cached adapter file")
             if entry is None or entry.st_size != spec["size"]:
                 return False
-            if verify_files and _sha256_entry(
-                directory_fd,
-                filename,
-                "cached adapter file",
+            if verify_files and _sha256(
+                Path(filename),
+                deadline,
+                cancel_event,
+                parent_fd=directory_fd,
             ) != spec.get("sha256"):
                 return False
         return True
     finally:
         os.close(directory_fd)
+
+
+def _verified_local_full_adapter_cache(
+    source_url: str,
+    destination: Path,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, object] | None:
+    """Return a complete local cache proof without reading the remote source."""
+    if destination != adapter_cache_path(source_url):
+        return None
+    try:
+        if _adapter_step_from_source_url(source_url) != 0:
+            return None
+    except OSError:
+        return None
+    _reject_symlink_path(destination, "cached adapter path")
+    try:
+        manifest = json.loads(
+            _read_text_nofollow(
+                destination / "manifest.json",
+                encoding="utf-8",
+                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+            )
+        )
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("version") != 1
+            or manifest.get("source_url") != source_url
+        ):
+            return None
+        files = manifest.get("files")
+        if not isinstance(files, dict) or set(files) != set(_ADAPTER_FILES):
+            return None
+        for name in _ADAPTER_FILES:
+            spec = files.get(name)
+            if (
+                not isinstance(spec, dict)
+                or type(spec.get("size")) is not int
+                or (
+                    spec["size"] <= 0
+                    if name == _ADAPTER_FILES[1]
+                    else spec["size"] < 0
+                )
+                or not isinstance(spec.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", spec["sha256"]) is None
+            ):
+                return None
+
+        adapter_manifest = json.loads(
+            _read_text_nofollow(
+                destination / _ADAPTER_MANIFEST,
+                encoding="utf-8",
+                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+            )
+        )
+        if (
+            not isinstance(adapter_manifest, dict)
+            or type(adapter_manifest.get("version")) is not int
+            or adapter_manifest.get("version") not in {1, 2}
+            or adapter_manifest.get("kind") != "lora-adapter"
+            or adapter_manifest.get("mode") != "full"
+            or adapter_manifest.get("target_step") != 0
+            or "base_step" not in adapter_manifest
+            or adapter_manifest.get("base_step") is not None
+            or (
+                "source_url" in adapter_manifest
+                and adapter_manifest.get("source_url") != source_url
+            )
+        ):
+            return None
+        target_spec = files[_ADAPTER_FILES[1]]
+        config_spec = files[_ADAPTER_FILES[0]]
+        if any(
+            adapter_manifest.get(name) != expected
+            for name, expected in {
+                "full_size": target_spec["size"],
+                "full_sha256": target_spec["sha256"],
+                "target_size": target_spec["size"],
+                "target_sha256": target_spec["sha256"],
+                "config_size": config_spec["size"],
+                "config_sha256": config_spec["sha256"],
+            }.items()
+        ):
+            return None
+        raw_files = adapter_manifest.get("files")
+        if not isinstance(raw_files, list) or len(raw_files) != len(_ADAPTER_FILES):
+            return None
+        adapter_files = {
+            item.get("name"): item
+            for item in raw_files
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        if set(adapter_files) != set(_ADAPTER_FILES):
+            return None
+        for name in _ADAPTER_FILES:
+            adapter_spec = adapter_files[name]
+            local_spec = files[name]
+            if (
+                adapter_spec.get("size") != local_spec["size"]
+                or adapter_spec.get("sha256") != local_spec["sha256"]
+            ):
+                return None
+
+        relay_transport = {
+            "mode": "full",
+            "source_manifest": adapter_manifest,
+            "config_size": files[_ADAPTER_FILES[0]]["size"],
+            "config_sha256": files[_ADAPTER_FILES[0]]["sha256"],
+            "target_size": files[_ADAPTER_FILES[1]]["size"],
+            "target_sha256": files[_ADAPTER_FILES[1]]["sha256"],
+        }
+        if not _relay_manifest_matches(destination, source_url, relay_transport):
+            return None
+        if not _full_cache_matches_manifest(
+            destination,
+            files,
+            verify_files=True,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        ):
+            return None
+
+        try:
+            transport = json.loads(
+                _read_text_nofollow(
+                    destination / "transport.json",
+                    encoding="utf-8",
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
+            )
+        except FileNotFoundError:
+            transport = None
+        if transport is not None and (
+            not isinstance(transport, dict)
+            or transport.get("mode") != "full"
+            or transport.get("transport") not in (None, _ADAPTER_FULL_TRANSPORT)
+            or transport.get("source_url") != source_url
+            or transport.get("target_sha256") != files[_ADAPTER_FILES[1]]["sha256"]
+            or transport.get("config_sha256") not in (None, files[_ADAPTER_FILES[0]]["sha256"])
+            or any(
+                name in transport
+                for name in (
+                    "base_url",
+                    "base_sha256",
+                    "base2_url",
+                    "base2_sha256",
+                    "base_step",
+                    "base2_step",
+                )
+            )
+        ):
+            return None
+        return {"files": files}
+    except (FileNotFoundError, OSError, UnicodeError, TypeError, ValueError, KeyError):
+        return None
 
 
 def _reuse_full_adapter_cache(
@@ -2800,6 +3481,7 @@ def _reuse_full_adapter_cache(
                     with _adapter_stage_publish_lock:
                         _check_cancelled(cancel_event)
                         _write_text_atomic(temporary / "READY", "ready\n", encoding="ascii")
+                        _fsync_directory(temporary)
                         with os.fdopen(
                             _open_nofollow(
                                 _adapter_reader_lock(destination),
@@ -2814,6 +3496,7 @@ def _reuse_full_adapter_cache(
                                 )
                                 _replace_paths(destination, retired, "retired adapter")
                             _replace_paths(temporary, destination, "adapter cache reuse")
+                            _fsync_directory(destination.parent)
                             if committed_event is not None:
                                 committed_event.set()
                             fcntl.flock(reader_lock, fcntl.LOCK_UN)
@@ -2856,6 +3539,9 @@ def _download_range(
     progress=None,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
+    typed_transport: bool = False,
+    retry_http_statuses: set[int] | None = None,
+    per_request_timeout_seconds: float | None = None,
 ) -> None:
     """Download one inclusive byte range and resume its local part file."""
     destination_name = destination.name
@@ -2867,6 +3553,19 @@ def _download_range(
     )
     for attempt in range(attempt_limit):
         _check_deadline(deadline, cancel_event)
+        attempt_deadline = deadline
+        active_timeout = None
+        if per_request_timeout_seconds is not None:
+            active_timeout = _chunk_request_timeout(
+                deadline,
+                attempt,
+                per_request_timeout_seconds,
+                cancel_event,
+            )
+            if not typed_transport:
+                attempt_deadline = time.monotonic() + active_timeout
+                if deadline is not None:
+                    attempt_deadline = min(attempt_deadline, deadline)
         try:
             source_url = source_urls[(source_index + attempt) % len(source_urls)]
             entry_stat = _stat_regular_entry(parent_fd, destination_name, "adapter range file")
@@ -2880,11 +3579,35 @@ def _download_range(
                 source_url,
                 headers={"Range": f"bytes={start + present}-{end}"},
             )
-            with urllib.request.urlopen(
-                request,
-                timeout=_request_timeout(deadline, cancel_event),
-            ) as response:
+            if per_request_timeout_seconds is None:
+                request_timeout = _request_timeout(deadline, cancel_event)
+            elif typed_transport:
+                request_timeout = min(active_timeout, _ADAPTER_LANE_TIMEOUT_S)
+            else:
+                request_timeout = _request_timeout(
+                    attempt_deadline,
+                    cancel_event,
+                    maximum=_ADAPTER_LANE_TIMEOUT_S,
+                )
+            response_open = (
+                _adapter_urlopen(
+                    request, request_timeout, deadline=attempt_deadline,
+                    cancel_event=cancel_event,
+                    attempt_timeout=active_timeout or _configured_chunk_timeout(),
+                )
+                if typed_transport
+                else _adapter_http_open(
+                    request, timeout=request_timeout, deadline=attempt_deadline,
+                    cancel_event=cancel_event,
+                    attempt_timeout=active_timeout or _configured_chunk_timeout(),
+                )
+            )
+            with response_open as response:
                 if response.status != 206:
+                    if typed_transport:
+                        raise _PersistentProtocolError(
+                            "adapter server did not honor byte range"
+                        )
                     raise OSError("adapter server did not honor byte range")
                 with os.fdopen(
                     _open_nofollow(
@@ -2895,22 +3618,72 @@ def _download_range(
                     ),
                     "ab" if present else "wb",
                 ) as output:
-                    while present < size:
-                        _check_deadline(deadline, cancel_event)
-                        chunk = response.read(min(16 * 1024 * 1024, size - present))
-                        if not chunk:
-                            raise OSError(f"adapter range ended early: {destination.name}")
-                        _check_deadline(deadline, cancel_event)
-                        output.write(chunk)
-                        present += len(chunk)
-                        _check_deadline(deadline, cancel_event)
-                        if progress is not None:
-                            progress(source_index, len(chunk))
+                    if typed_transport:
+                        chunks = _adapter_response_chunks(
+                            response,
+                            size - present,
+                            deadline,
+                            cancel_event,
+                        )
+                    else:
+                        chunks = iter(())
+                    if typed_transport:
+                        for chunk in chunks:
+                            output.write(chunk)
+                            present += len(chunk)
+                            _check_deadline(deadline, cancel_event)
+                            if progress is not None:
+                                progress(source_index, len(chunk))
+                    else:
+                        while present < size:
+                            _check_deadline(attempt_deadline, cancel_event)
+                            chunk = response.read(min(16 * 1024 * 1024, size - present))
+                            if not chunk:
+                                raise OSError(f"adapter range ended early: {destination.name}")
+                            _check_deadline(attempt_deadline, cancel_event)
+                            output.write(chunk)
+                            present += len(chunk)
+                            _check_deadline(attempt_deadline, cancel_event)
+                            if progress is not None:
+                                progress(source_index, len(chunk))
             entry_stat = _stat_regular_entry(parent_fd, destination_name, "adapter range file")
             if entry_stat is None or entry_stat.st_size != size:
                 raise OSError(f"incomplete adapter range: {destination.name}")
             return
+        except _PersistentTransportError as exc:
+            if not typed_transport:
+                raise
+            if not _adapter_retry_wait(
+                attempt,
+                attempt_limit,
+                len(source_urls),
+                deadline,
+                cancel_event,
+            ):
+                if typed_transport:
+                    raise _PersistentTransportError(
+                        "adapter persistent download retries exhausted"
+                    ) from exc
+                raise
+        except HTTPError as exc:
+            if typed_transport and not _retryable_adapter_http_status(exc.code):
+                raise
+            if not _adapter_retry_wait(
+                attempt,
+                attempt_limit,
+                len(source_urls),
+                deadline,
+                cancel_event,
+                exc.code if typed_transport else None,
+            ):
+                if typed_transport:
+                    raise _PersistentTransportError(
+                        "adapter persistent download retries exhausted"
+                    ) from exc
+                raise
         except OSError:
+            if typed_transport:
+                raise
             # socket.timeout is retryable; only the absolute stage deadline
             # remains terminal.
             _check_deadline(deadline, cancel_event)
@@ -2931,6 +3704,609 @@ def _download_range(
                 time.sleep(sleep_for)
             else:
                 cancel_event.wait(sleep_for)
+
+
+class _PersistentTransportError(OSError):
+    """A connection or response body failed before the requested bytes arrived."""
+
+
+class _PersistentProtocolError(OSError):
+    """A response violated the adapter transport contract."""
+
+
+class _PersistentLocalError(OSError):
+    """A local adapter destination failed and must not be retried."""
+
+
+def _retryable_adapter_http_status(status: int) -> bool:
+    """Return whether a temporary adapter HTTP response can be retried."""
+    return status in _RETRYABLE_ADAPTER_HTTP_STATUSES
+
+
+@contextmanager
+def _adapter_urlopen(request, timeout: float, **kwargs):
+    # Classify open failures only. A caller's disk or validation error must
+    # never become a retryable network error.
+    try:
+        with ExitStack() as stack:
+            try:
+                response = stack.enter_context(_adapter_http_open(request, timeout=timeout, **kwargs))
+            except HTTPError:
+                raise
+            except (OSError, http.client.HTTPException, EOFError) as exc:
+                raise _PersistentTransportError("adapter network request failed") from exc
+            yield response
+    except TimeoutError as exc:
+        # The guard can fire as headers finish or during the body. In either
+        # case retain the prefix and rotate, unless the stage itself expired.
+        raise _PersistentTransportError("adapter request exceeded its attempt time limit") from exc
+
+
+def _adapter_response_chunks(
+    response,
+    size: int,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+):
+    read_available = getattr(response, "read1", None) or response.read
+    remaining = size
+    while remaining:
+        _check_deadline(deadline, cancel_event)
+        try:
+            chunk = read_available(min(1024 * 1024, remaining))
+        except (OSError, http.client.HTTPException, EOFError) as exc:
+            raise _PersistentTransportError("adapter network read failed") from exc
+        _check_deadline(deadline, cancel_event)
+        if not chunk:
+            raise _PersistentTransportError("adapter response ended early")
+        if len(chunk) > remaining:
+            raise _PersistentProtocolError("adapter response body is too long")
+        yield chunk
+        remaining -= len(chunk)
+
+
+def _adapter_retry_wait(
+    attempt: int,
+    attempt_limit: int,
+    source_count: int,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+    status_code: int | None = None,
+) -> bool:
+    _check_deadline(deadline, cancel_event)
+    if attempt + 1 == attempt_limit:
+        return False
+    sleep_for = (
+        1.0
+        if status_code is not None and _retryable_adapter_http_status(status_code)
+        else (lane_rotation_delay_seconds if source_count > 1 else min(2**attempt, 10))
+    )
+    _check_cancelled(cancel_event)
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("adapter download exceeded its time limit")
+        sleep_for = min(sleep_for, remaining)
+    if cancel_event is None:
+        time.sleep(sleep_for)
+    else:
+        cancel_event.wait(sleep_for)
+    return True
+
+
+class _PersistentAdapterConnection:
+    """One private HTTP connection that is used by one adapter lane at a time."""
+
+    def __init__(self) -> None:
+        self._connection = None
+        self._origin = None
+        self._last_completed_at = None
+
+    def close(self) -> None:
+        connection = self._connection
+        self._connection = None
+        self._origin = None
+        self._last_completed_at = None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def _open(self, source_url: str, timeout: float):
+        parsed = urlsplit(source_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise _PersistentProtocolError("adapter source URL is not HTTP or HTTPS")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise _PersistentProtocolError("adapter source URL has an invalid port") from exc
+        origin = (parsed.scheme, parsed.hostname, port)
+        if (
+            self._connection is not None
+            and self._last_completed_at is not None
+            and time.monotonic() - self._last_completed_at
+            >= persistent_connection_idle_seconds
+        ):
+            self.close()
+        if self._connection is not None and self._origin != origin:
+            self.close()
+        if self._connection is None:
+            connection_type = (
+                _SecureAdapterConnection
+                if parsed.scheme == "https"
+                else http.client.HTTPConnection
+            )
+            self._connection = connection_type(
+                parsed.hostname,
+                port,
+                timeout=timeout,
+            )
+            self._origin = origin
+        else:
+            self._connection.timeout = timeout
+            if self._connection.sock is not None:
+                self._connection.sock.settimeout(timeout)
+        return self._connection, parsed
+
+    def read_range(
+        self,
+        source_url: str,
+        *,
+        start: int,
+        end: int,
+        total: int,
+        expected_sha256: str | None,
+        timeout: float,
+        stage_deadline: float | None = None,
+        attempt_deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        consume,
+    ) -> None:
+        if timeout <= 0:
+            raise OSError("adapter persistent read timeout must be positive")
+        def remaining_timeout() -> float:
+            _check_cancelled(cancel_event)
+            remaining = timeout
+            now = time.monotonic()
+            for bound, label in ((stage_deadline, "stage"), (attempt_deadline, "attempt")):
+                if bound is not None:
+                    if now >= bound:
+                        raise TimeoutError(f"adapter persistent request exceeded its {label} time limit")
+                    remaining = min(remaining, bound - now)
+            return remaining
+
+        try:
+            connection, parsed = self._open(source_url, remaining_timeout())
+        except _PersistentProtocolError:
+            raise
+        except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
+            self.close()
+            raise _PersistentTransportError("adapter persistent request failed") from exc
+        request_path = parsed.path or "/"
+        if parsed.query:
+            request_path += f"?{parsed.query}"
+        response = None
+        read_deadline = min(
+            (value for value in (stage_deadline, attempt_deadline) if value is not None),
+            default=time.monotonic() + timeout,
+        )
+        connect_deadline = time.monotonic() + remaining_timeout()
+        sockets = _AdapterRequestSockets(connect_deadline, cancel_event)
+        try:
+            connection._create_connection = sockets.connect
+            connection.register_socket = sockets.register
+            if connection.sock is not None:
+                sockets.register(connection.sock)
+            with _adapter_socket_deadline(sockets, connect_deadline, cancel_event):
+                connection.request(
+                    "GET",
+                    request_path,
+                    headers={
+                        "Connection": "keep-alive",
+                        "Range": f"bytes={start}-{end}",
+                    },
+                )
+                if connection.sock is not None:
+                    connection.sock.settimeout(remaining_timeout())
+                request_socket = connection.sock
+                response = connection.getresponse()
+                remaining_timeout()
+        except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
+            if response is not None:
+                try:
+                    response.close()
+                except OSError:
+                    pass
+            self.close()
+            raise _PersistentTransportError("adapter persistent request failed") from exc
+
+        response_closed = False
+
+        def close_response() -> None:
+            nonlocal response_closed
+            if response_closed:
+                return
+            response_closed = True
+            try:
+                response.close()
+            except OSError:
+                pass
+
+        read_available = getattr(response, "read1", None) or response.read
+
+        try:
+            if _retryable_adapter_http_status(response.status):
+                status = response.status
+                reason = response.reason or "adapter source unavailable"
+                raise HTTPError(source_url, status, reason, response.headers, None)
+            if response.status != 206:
+                raise _PersistentProtocolError(
+                    f"adapter server returned unexpected HTTP status {response.status}"
+                )
+
+            expected_length = end - start + 1
+            content_length = response.getheader("Content-Length")
+            if content_length is None or not content_length.isdigit() or int(content_length) != expected_length:
+                raise _PersistentProtocolError("adapter response Content-Length differs")
+            content_range = response.getheader("Content-Range")
+            expected_range = f"bytes {start}-{end}/{total}"
+            if content_range != expected_range:
+                raise _PersistentProtocolError("adapter response Content-Range differs")
+            etag = response.getheader("ETag")
+            if etag is not None:
+                normalized_etag = etag.strip()
+                if (
+                    len(normalized_etag) < 2
+                    or normalized_etag[0] != '"'
+                    or normalized_etag[-1] != '"'
+                    or expected_sha256 is None
+                    or normalized_etag[1:-1] != expected_sha256
+                ):
+                    raise _PersistentProtocolError("adapter response ETag differs")
+        except BaseException:
+            close_response()
+            self.close()
+            raise
+
+        if connection.sock is not None:
+            try:
+                connection.sock.settimeout(remaining_timeout())
+            except (OSError, TimeoutError) as exc:
+                close_response()
+                self.close()
+                raise _PersistentTransportError(
+                    "adapter response read timeout setup failed"
+                ) from exc
+        remaining = expected_length
+        try:
+            with _adapter_socket_deadline(request_socket, read_deadline, cancel_event):
+                while remaining:
+                    if connection.sock is not None:
+                        try:
+                            connection.sock.settimeout(remaining_timeout())
+                        except (OSError, TimeoutError) as exc:
+                            raise _PersistentTransportError(
+                                "adapter response read timeout setup failed"
+                            ) from exc
+                    try:
+                        chunk = read_available(min(1024 * 1024, remaining))
+                    except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
+                        raise _PersistentTransportError("adapter response ended during read") from exc
+                    remaining_timeout()
+                    if not chunk:
+                        raise _PersistentTransportError("adapter response body ended early")
+                    if len(chunk) > remaining:
+                        raise _PersistentProtocolError("adapter response body is too long")
+                    try:
+                        consume(chunk)
+                    except OSError as exc:
+                        if isinstance(exc, (TimeoutError, socket.timeout)):
+                            raise
+                        raise _PersistentLocalError(
+                            f"adapter local destination write failed: {exc}"
+                        ) from exc
+                    except BaseException:
+                        raise
+                    remaining -= len(chunk)
+                    remaining_timeout()
+            self._last_completed_at = time.monotonic()
+        except BaseException:
+            close_response()
+            self.close()
+            raise
+        finally:
+            close_response()
+
+
+class _PersistentAdapterLanePool:
+    """Keep one locked connection per source lane and bound retries to that lane."""
+
+    def __init__(
+        self,
+        source_urls_or_count: list[str] | int,
+        width: int | None = None,
+    ) -> None:
+        if isinstance(source_urls_or_count, int):
+            self._source_urls = []
+            primary_urls = [None] * max(1, source_urls_or_count)
+        else:
+            self._source_urls = list(source_urls_or_count)
+            lane_count = len(self._source_urls) if width is None else width
+            if lane_count < 1 or lane_count > len(self._source_urls):
+                raise OSError("persistent adapter lane width is invalid")
+            primary_urls = self._source_urls[:lane_count]
+        self._primary_urls = primary_urls
+        self._lanes = [
+            (threading.Lock(), _PersistentAdapterConnection())
+            for _ in primary_urls
+        ]
+
+    @property
+    def slot_count(self) -> int:
+        return len(self._lanes)
+
+    def urls_for_lane(self, lane: int, name: str) -> list[str]:
+        if not self._source_urls:
+            raise OSError("persistent adapter lane URLs are unavailable")
+        primary = self._primary_urls[lane % self.slot_count]
+        assert isinstance(primary, str)
+        start = self._source_urls.index(primary)
+        sources = self._source_urls[start:] + self._source_urls[:start]
+        return [f"{source.rstrip('/')}/{name}" for source in sources]
+
+    def close(self) -> None:
+        for _lock, connection in self._lanes:
+            with _lock:
+                connection.close()
+
+    def download(
+        self,
+        source_urls: list[str],
+        lane: int,
+        destination: Path,
+        parent_fd: int,
+        *,
+        expected_size: int,
+        expected_sha256: str,
+        progress=None,
+        deadline: float | None = None,
+        cancel_event: threading.Event | None = None,
+        per_request_timeout_seconds: float | None = None,
+    ) -> None:
+        if not source_urls:
+            raise OSError("adapter download has no source lane")
+        lock, connection = self._lanes[lane % len(self._lanes)]
+        attempt_limit = max(_ADAPTER_LANE_RETRIES, len(source_urls))
+        if deadline is not None and len(source_urls) > 1:
+            remaining = max(0.0, deadline - time.monotonic())
+            attempt_limit = max(
+                attempt_limit,
+                math.ceil(remaining / lane_rotation_delay_seconds) + 1,
+            )
+        bad_sources: set[str] = set()
+        checksum_error: OSError | None = None
+        reported_bytes = 0
+        source_cursor = 0
+        retry_cursor = 0
+        with lock:
+            for attempt in range(attempt_limit):
+                _check_deadline(deadline, cancel_event)
+                entry_stat = _stat_regular_entry(
+                    parent_fd,
+                    destination.name,
+                    "adapter transport chunk",
+                )
+                present = entry_stat.st_size if entry_stat is not None else 0
+                if present > expected_size:
+                    os.unlink(destination.name, dir_fd=parent_fd)
+                    if progress is not None and reported_bytes:
+                        progress(lane, -reported_bytes)
+                    reported_bytes = 0
+                    present = 0
+                elif present == expected_size:
+                    if _sha256(
+                        destination,
+                        deadline,
+                        cancel_event,
+                        parent_fd=parent_fd,
+                    ) == expected_sha256:
+                        if progress is not None and present != reported_bytes:
+                            progress(lane, present - reported_bytes)
+                        return
+                    os.unlink(destination.name, dir_fd=parent_fd)
+                    if progress is not None and reported_bytes:
+                        progress(lane, -reported_bytes)
+                    reported_bytes = 0
+                    present = 0
+
+                if present != reported_bytes:
+                    if progress is not None:
+                        progress(lane, present - reported_bytes)
+                    reported_bytes = present
+                while source_cursor < len(source_urls):
+                    source_url = source_urls[source_cursor]
+                    source_cursor += 1
+                    if source_url not in bad_sources:
+                        break
+                else:
+                    available_sources = [
+                        source for source in source_urls if source not in bad_sources
+                    ]
+                    if not available_sources:
+                        assert checksum_error is not None
+                        raise checksum_error
+                    source_url = available_sources[retry_cursor % len(available_sources)]
+                    retry_cursor += 1
+                if per_request_timeout_seconds is None:
+                    timeout = _request_timeout(deadline, cancel_event)
+                else:
+                    timeout = min(
+                        _chunk_request_timeout(
+                            deadline,
+                            attempt,
+                            per_request_timeout_seconds,
+                            cancel_event,
+                        ),
+                        _ADAPTER_LANE_TIMEOUT_S,
+                    )
+                attempt_timeout = _configured_chunk_timeout()
+                if per_request_timeout_seconds is not None:
+                    attempt_timeout = min(attempt_timeout, per_request_timeout_seconds)
+                attempt_deadline = time.monotonic() + attempt_timeout
+                if deadline is not None:
+                    attempt_deadline = min(attempt_deadline, deadline)
+                try:
+                    with os.fdopen(
+                        _open_nofollow(
+                            destination.name,
+                            os.O_WRONLY
+                            | os.O_CREAT
+                            | (os.O_APPEND if present else os.O_TRUNC),
+                            dir_fd=parent_fd,
+                            label="adapter transport chunk",
+                        ),
+                        "ab" if present else "wb",
+                    ) as output:
+                        offset = present
+
+                        def consume(chunk: bytes) -> None:
+                            nonlocal offset, reported_bytes
+                            _check_deadline(deadline, cancel_event)
+                            output.write(chunk)
+                            offset += len(chunk)
+                            reported_bytes += len(chunk)
+                            if progress is not None:
+                                progress(lane, len(chunk))
+
+                        connection.read_range(
+                            source_url,
+                            start=present,
+                            end=expected_size - 1,
+                            total=expected_size,
+                            expected_sha256=expected_sha256,
+                            timeout=timeout,
+                            stage_deadline=deadline,
+                            attempt_deadline=attempt_deadline,
+                            cancel_event=cancel_event,
+                            consume=consume,
+                        )
+                except HTTPError as exc:
+                    connection.close()
+                    if not _retryable_adapter_http_status(exc.code):
+                        raise
+                    if attempt + 1 == attempt_limit:
+                        raise _PersistentTransportError(
+                            "adapter persistent download retries exhausted"
+                        ) from exc
+                except _PersistentTransportError as exc:
+                    connection.close()
+                    if attempt + 1 == attempt_limit:
+                        raise _PersistentTransportError(
+                            "adapter persistent download retries exhausted"
+                        ) from exc
+                except (TimeoutError, socket.timeout) as exc:
+                    connection.close()
+                    if attempt + 1 == attempt_limit:
+                        raise _PersistentTransportError(
+                            "adapter persistent download retries exhausted"
+                        ) from exc
+                except _PersistentProtocolError:
+                    connection.close()
+                    raise
+                except _PersistentLocalError:
+                    connection.close()
+                    raise
+                else:
+                    entry_stat = _stat_regular_entry(
+                        parent_fd,
+                        destination.name,
+                        "adapter transport chunk",
+                    )
+                    if entry_stat is None or entry_stat.st_size != expected_size:
+                        connection.close()
+                        if attempt + 1 == attempt_limit:
+                            raise _PersistentTransportError(
+                                "incomplete adapter transport chunk"
+                            )
+                    elif _sha256(
+                        destination,
+                        deadline,
+                        cancel_event,
+                        parent_fd=parent_fd,
+                    ) != expected_sha256:
+                        connection.close()
+                        os.unlink(destination.name, dir_fd=parent_fd)
+                        if progress is not None and reported_bytes:
+                            progress(lane, -reported_bytes)
+                        reported_bytes = 0
+                        if present == 0:
+                            bad_sources.add(source_url)
+                        checksum_error = OSError(
+                            "adapter transport chunk checksum mismatch"
+                        )
+                        if bad_sources.issuperset(source_urls):
+                            raise checksum_error
+                    else:
+                        return
+
+                _check_deadline(deadline, cancel_event)
+                sleep_for = (
+                    lane_rotation_delay_seconds
+                    if len(source_urls) > 1
+                    else min(2**attempt, 10)
+                )
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("adapter delta staging exceeded its time limit")
+                    sleep_for = min(sleep_for, remaining)
+                _check_cancelled(cancel_event)
+                if cancel_event is None:
+                    time.sleep(sleep_for)
+                else:
+                    cancel_event.wait(sleep_for)
+        if checksum_error is not None:
+            raise checksum_error
+        raise OSError("adapter persistent download retries exhausted")
+
+
+def _download_persistent_file(
+    source_urls: list[str],
+    destination: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    progress=None,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    per_request_timeout_seconds: float | None = None,
+) -> None:
+    """Download one small adapter file with typed persistent retries."""
+    if not source_urls:
+        raise OSError("adapter download has no source lane")
+    pool = _PersistentAdapterLanePool(source_urls, width=1)
+    parent_fd = _open_directory_nofollow(
+        destination.parent,
+        create=False,
+        label="adapter download parent",
+    )
+    try:
+        pool.download(
+            source_urls,
+            0,
+            destination,
+            parent_fd,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            progress=progress,
+            deadline=deadline,
+            cancel_event=cancel_event,
+            per_request_timeout_seconds=per_request_timeout_seconds,
+        )
+    finally:
+        pool.close()
+        os.close(parent_fd)
 
 
 def _sha256(
@@ -2958,6 +4334,58 @@ def _sha256(
             digest.update(chunk)
     _check_deadline(deadline, cancel_event)
     return digest.hexdigest()
+
+
+def _sha256_region(
+    path: Path,
+    offset: int,
+    size: int,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> str:
+    if offset < 0 or size < 0:
+        raise OSError("adapter output region is invalid")
+    digest = hashlib.sha256()
+    file_descriptor = _open_nofollow(path, os.O_RDONLY, label="adapter output checksum file")
+    try:
+        position = offset
+        remaining = size
+        while remaining:
+            _check_deadline(deadline, cancel_event)
+            chunk = os.pread(file_descriptor, min(16 * 1024 * 1024, remaining), position)
+            if not chunk:
+                raise OSError("adapter output ended before proof region")
+            digest.update(chunk)
+            position += len(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(file_descriptor)
+    _check_deadline(deadline, cancel_event)
+    return digest.hexdigest()
+
+
+def _output_proof_matches(
+    output_path: Path,
+    item: dict[str, object],
+    proof: dict[str, object] | None,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+) -> bool:
+    if proof is None:
+        return False
+    try:
+        return (
+            _sha256_region(
+                output_path,
+                int(item["offset"]),
+                int(item["raw_size"]),
+                deadline,
+                cancel_event,
+            )
+            == proof["output_sha256"]
+        )
+    except (KeyError, FileNotFoundError, OSError):
+        return False
 
 
 def _decode_transport_chunk(payload: bytes, *, codec: str, raw_size: int) -> bytes:
@@ -3356,9 +4784,12 @@ def _stage_chunked_linear_adapter(
     _write_text_atomic(identity_path, transport_identity, encoding="utf-8")
     chunk_root = temporary / "transport-chunks"
     _ensure_directory(chunk_root, "adapter transport chunk directory")
+    output_path = temporary / _ADAPTER_FILES[1]
+    config_path = temporary / _ADAPTER_FILES[0]
     total_wire_bytes = sum(int(item["wire_size"]) for item in chunks) + config_size
     progress_lock = threading.Lock()
     progress_bytes = 0
+    credited_wire_names: set[str] = set()
     for item in chunks:
         if not isinstance(item, dict) or not isinstance(item.get("file"), str):
             continue
@@ -3366,12 +4797,9 @@ def _stage_chunked_linear_adapter(
         _reject_symlink_path(chunk_path, "adapter transport chunk")
         if _path_regular_size(chunk_path, "adapter transport chunk") != int(item["wire_size"]):
             continue
-        done_path = _proof_path(chunk_path, _COMPLETED_SUFFIX)
-        wire_ready_path = _proof_path(chunk_path, _WIRE_READY_SUFFIX)
-        done_valid, _ = _proof_identity_matches(done_path, item, completed=True)
-        wire_ready_valid, _ = _proof_identity_matches(wire_ready_path, item, completed=False)
-        if done_valid or wire_ready_valid:
+        if _sha256(chunk_path, deadline, cancel_event) == str(item["wire_sha256"]):
             progress_bytes += int(item["wire_size"])
+            credited_wire_names.add(str(item["file"]))
     reconstruct_lock = threading.Lock()
     reconstruct_worker_seconds = 0.0
     reconstruction_started = None
@@ -3407,7 +4835,7 @@ def _stage_chunked_linear_adapter(
         with progress_lock:
             progress_bytes += amount
             now = time.monotonic()
-            if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
+            if amount >= 0 and now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
                 return
             last_status = now
             write_stage_status(
@@ -3447,8 +4875,6 @@ def _stage_chunked_linear_adapter(
         "source_connections": source_connection_count,
         "responsive_source_connections": len(lane_urls),
     }
-    output_path = temporary / _ADAPTER_FILES[1]
-    config_path = temporary / _ADAPTER_FILES[0]
     config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
     _reject_symlink_path(output_path, "adapter output")
     _reject_symlink_path(config_path, "adapter configuration file")
@@ -3460,26 +4886,7 @@ def _stage_chunked_linear_adapter(
         _reject_symlink_path(chunk_path, "adapter transport chunk")
         _reject_symlink_path(incoming_path, "adapter chunk incoming file")
         wire_size = int(item["wire_size"])
-        reusable = False
-        for proof_path, completed in (
-            (_proof_path(chunk_path, _COMPLETED_SUFFIX), True),
-            (_proof_path(chunk_path, _WIRE_READY_SUFFIX), False),
-        ):
-            proof_valid, _ = _proof_identity_matches(
-                proof_path, item, completed=completed
-            )
-            if not proof_valid:
-                continue
-            try:
-                reusable = (
-                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
-                    and _sha256(chunk_path, deadline, cancel_event)
-                    == str(item["wire_sha256"])
-                )
-            except (FileNotFoundError, OSError):
-                reusable = False
-            if reusable:
-                break
+        reusable = str(item["file"]) in credited_wire_names
         if not reusable:
             # The old final wire file remains until incoming is atomically
             # renamed over it, so reserve the incoming allocation as peak use.
@@ -3496,20 +4903,29 @@ def _stage_chunked_linear_adapter(
     # never observe a relay index that points at an unfinished config file.
     with reconstruct_lock:
         transfer_started = time.monotonic()
-    download(
-        f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+    config_urls = [
+        f"{lane_url.rstrip('/')}/{_ADAPTER_FILES[0]}"
+        for lane_url in lane_urls
+    ]
+    _download_persistent_file(
+        config_urls,
         config_incoming_path,
         expected_size=config_size,
         expected_sha256=config_sha256,
         progress=report,
         deadline=deadline,
         cancel_event=cancel_event,
-        retry_http_statuses={404, 503},
+        per_request_timeout_seconds=_configured_chunk_timeout(),
     )
     with reconstruct_lock:
         transfer_finished = time.monotonic()
     _reject_symlink_path(config_path, "adapter configuration file")
     _replace_paths(config_incoming_path, config_path, "adapter configuration")
+    config_fd = _open_nofollow(config_path, os.O_RDONLY)
+    try:
+        os.fsync(config_fd)
+    finally:
+        os.close(config_fd)
 
     # The origin publishes the exact v2 index before transfer workers start.
     # The relay uses RELAYING to expose manifests, configuration, and verified
@@ -3535,7 +4951,11 @@ def _stage_chunked_linear_adapter(
     )
     _write_marker(temporary / _RELAYING_MARKER, "relaying\n")
 
-    def fetch_wire(index: int, item: dict[str, object]) -> None:
+    def fetch_wire(
+        index: int,
+        item: dict[str, object],
+        assigned_lane: int,
+    ) -> None:
         nonlocal transfer_started, transfer_finished
         _check_cancelled(cancel_event)
         name = item["file"]
@@ -3553,7 +4973,7 @@ def _stage_chunked_linear_adapter(
         _reject_symlink_path(chunk_path, "adapter transport chunk")
         _reject_symlink_path(completed_path, "adapter completed proof")
         _reject_symlink_path(wire_ready_path, "adapter wire proof")
-        completed_valid, _ = _proof_identity_matches(
+        completed_valid, completed_proof = _proof_identity_matches(
             completed_path, item, completed=True
         )
         if completed_valid:
@@ -3561,6 +4981,9 @@ def _stage_chunked_linear_adapter(
                 completed_valid = (
                     _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
                     and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                    and _output_proof_matches(
+                        output_path, item, completed_proof, deadline, cancel_event
+                    )
                 )
             except (FileNotFoundError, OSError):
                 completed_valid = False
@@ -3589,31 +5012,40 @@ def _stage_chunked_linear_adapter(
         if not wire_ready_valid:
             if _path_stat(wire_ready_path, "adapter wire proof") is not None:
                 _discard_proof(wire_ready_path)
+            try:
+                wire_ready_valid = (
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                )
+            except (FileNotFoundError, OSError):
+                wire_ready_valid = False
 
-            chunk_lane = index % len(lane_urls)
+        if not wire_ready_valid:
+            chunk_lane = assigned_lane
+            if name in credited_wire_names:
+                report(chunk_lane, -wire_size)
+                credited_wire_names.remove(name)
 
             def lane_report(_lane: int, amount: int) -> None:
                 report(chunk_lane, amount)
 
-            chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
-            chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
+            chunk_urls = persistent_pool.urls_for_lane(chunk_lane, name)
             incoming_path = chunk_path.with_name(f".{chunk_path.name}.incoming")
             transfer_started_at = time.monotonic()
             with reconstruct_lock:
                 if transfer_started is None or transfer_started_at < transfer_started:
                     transfer_started = transfer_started_at
-            download(
-                chunk_urls[0],
+            persistent_pool.download(
+                chunk_urls,
+                chunk_lane,
                 incoming_path,
+                chunk_root_fd,
                 expected_size=wire_size,
                 expected_sha256=wire_sha256,
                 progress=lane_report,
-                source_urls=chunk_urls,
-                parallel_ranges=False,
                 deadline=deadline,
                 cancel_event=cancel_event,
                 per_request_timeout_seconds=_configured_chunk_timeout(),
-                retry_http_statuses={404, 503},
             )
             transfer_finished_at = time.monotonic()
             with reconstruct_lock:
@@ -3640,6 +5072,7 @@ def _stage_chunked_linear_adapter(
                     "wire_sha256": wire_sha256,
                     "raw_sha256": raw_sha256,
                 },
+                sync=False,
             )
 
     def reconstruct(index: int, item: dict[str, object]) -> None:
@@ -3657,7 +5090,7 @@ def _stage_chunked_linear_adapter(
         raw_sha256 = str(item["raw_sha256"])
         completed_path = _proof_path(chunk_path, _COMPLETED_SUFFIX)
         wire_ready_path = _proof_path(chunk_path, _WIRE_READY_SUFFIX)
-        completed_valid, _ = _proof_identity_matches(
+        completed_valid, completed_proof = _proof_identity_matches(
             completed_path, item, completed=True
         )
         if completed_valid:
@@ -3665,20 +5098,36 @@ def _stage_chunked_linear_adapter(
                 completed_valid = (
                     _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
                     and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                    and _output_proof_matches(
+                        output_path, item, completed_proof, deadline, cancel_event
+                    )
                 )
             except (FileNotFoundError, OSError):
                 completed_valid = False
         if completed_valid:
             _discard_proof(wire_ready_path)
             return
-        if not _proof_identity_matches(wire_ready_path, item, completed=False)[0]:
+        wire_ready_valid, _ = _proof_identity_matches(
+            wire_ready_path, item, completed=False
+        )
+        if not wire_ready_valid:
+            try:
+                wire_ready_valid = (
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                )
+            except (FileNotFoundError, OSError):
+                wire_ready_valid = False
+        if not wire_ready_valid:
             raise OSError("version-two adapter wire proof is missing")
         if (
             _path_regular_size(chunk_path, "adapter transport chunk") != wire_size
             or _sha256(chunk_path, deadline, cancel_event) != wire_sha256
         ):
             raise OSError("version-two adapter transport chunk checksum mismatch")
+        _check_deadline(deadline, cancel_event)
         encoded = _read_bytes_nofollow(chunk_path)
+        _check_deadline(deadline, cancel_event)
         reconstruction_started_at = time.monotonic()
         with reconstruct_lock:
             if reconstruction_started is None or reconstruction_started_at < reconstruction_started:
@@ -3689,7 +5138,9 @@ def _stage_chunked_linear_adapter(
             base_fd1 = _open_nofollow(base1_model, os.O_RDONLY)
             output_fd = _open_nofollow(output_path, os.O_RDWR)
             base2_chunk = os.pread(base_fd2, raw_size, offset)
+            _check_deadline(deadline, cancel_event)
             base1_chunk = os.pread(base_fd1, raw_size, offset)
+            _check_deadline(deadline, cancel_event)
             if len(base2_chunk) != raw_size or len(base1_chunk) != raw_size:
                 raise OSError("cached version-two base ended before transport chunk")
             reconstructed, correction_sha256 = _decode_linear_transport_chunk(
@@ -3701,11 +5152,13 @@ def _stage_chunked_linear_adapter(
                 raw_size=raw_size,
                 codec=str(item["codec"]),
             )
+            _check_deadline(deadline, cancel_event)
             if correction_sha256 != raw_sha256:
                 raise OSError("version-two adapter correction checksum mismatch")
             if len(reconstructed) != raw_size:
                 raise OSError("version-two adapter chunk has the wrong size")
             _pwrite_all(output_fd, reconstructed, offset)
+            _check_deadline(deadline, cancel_event)
             output_sha256 = hashlib.sha256(reconstructed).hexdigest()
         finally:
             for file_descriptor in (output_fd, base_fd1, base_fd2):
@@ -3730,6 +5183,7 @@ def _stage_chunked_linear_adapter(
                 "correction_sha256": correction_sha256,
                 "output_sha256": output_sha256,
             },
+            sync=False,
         )
         # Keep the completed proof visible before removing the earlier proof.
         # This prevents a relay visibility gap between reconstruction and the
@@ -3737,36 +5191,65 @@ def _stage_chunked_linear_adapter(
         _discard_proof(wire_ready_path)
 
     download_streams = _configured_download_streams()
-    reconstruct_executor = ThreadPoolExecutor(
-        max_workers=min(len(chunks), _PREDICTIVE_RECONSTRUCT_WORKERS)
+    download_width = min(download_streams, len(lane_urls), len(chunks))
+    status_metadata["active_persistent_connections"] = download_width
+    chunk_root_fd = _open_directory_nofollow(
+        chunk_root,
+        create=False,
+        label="adapter transport chunk directory",
     )
+    try:
+        persistent_pool = _PersistentAdapterLanePool(
+            lane_urls,
+            width=download_width,
+        )
+    except BaseException:
+        os.close(chunk_root_fd)
+        raise
+    try:
+        reconstruct_executor = ThreadPoolExecutor(
+            max_workers=min(len(chunks), _PREDICTIVE_RECONSTRUCT_WORKERS)
+        )
+    except BaseException:
+        persistent_pool.close()
+        os.close(chunk_root_fd)
+        raise
     reconstruct_futures = []
     reconstruct_futures_lock = threading.Lock()
 
-    def fetch_and_reconstruct(index: int, item: dict[str, object]) -> None:
-        fetch_wire(index, item)
+    def fetch_and_reconstruct(
+        index: int,
+        item: dict[str, object],
+        assigned_lane: int,
+    ) -> None:
+        fetch_wire(index, item, assigned_lane)
         future = reconstruct_executor.submit(reconstruct, index, item)
         with reconstruct_futures_lock:
             reconstruct_futures.append(future)
 
-    download_executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
-    download_futures = [
-        download_executor.submit(fetch_and_reconstruct, index, item)
-        for index, item in enumerate(chunks)
-    ]
     try:
-        _wait_for_futures(download_executor, download_futures, deadline, cancel_event)
-    except BaseException:
-        reconstruct_executor.shutdown(wait=True, cancel_futures=True)
-        raise
-    with reconstruct_futures_lock:
-        pending_reconstruction = list(reconstruct_futures)
-    _wait_for_futures(
-        reconstruct_executor,
-        pending_reconstruction,
-        deadline,
-        cancel_event,
-    )
+        try:
+            _run_bounded_futures(
+                chunks,
+                fetch_and_reconstruct,
+                download_width,
+                deadline,
+                cancel_event,
+            )
+        except BaseException:
+            reconstruct_executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        with reconstruct_futures_lock:
+            pending_reconstruction = list(reconstruct_futures)
+        _wait_for_futures(
+            reconstruct_executor,
+            pending_reconstruction,
+            deadline,
+            cancel_event,
+        )
+    finally:
+        persistent_pool.close()
+        os.close(chunk_root_fd)
     output_fd = _open_nofollow(output_path, os.O_RDONLY)
     try:
         os.fsync(output_fd)
@@ -3814,6 +5297,7 @@ def _stage_chunked_linear_adapter(
         _unlink_path(temporary / _RELAYING_MARKER, "adapter relaying marker")
         ready = temporary / "READY"
         _write_text_atomic(ready, "ready\n", encoding="utf-8")
+        _fsync_directory(temporary)
         with os.fdopen(
             _open_nofollow(_adapter_reader_lock(destination), os.O_RDWR | os.O_CREAT),
             "a+",
@@ -3824,6 +5308,7 @@ def _stage_chunked_linear_adapter(
                 retired = destination.with_name(f"{destination.name}.retired-{time.time_ns()}-{os.getpid()}")
                 _replace_paths(destination, retired, "retired adapter")
             _replace_paths(temporary, destination, "adapter publish")
+            _fsync_directory(destination.parent)
             if committed_event is not None:
                 committed_event.set()
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
@@ -3921,59 +5406,16 @@ def _cleanup_delta_stage_artifacts(
 
 
 def _preserve_adapter_stage_partial(exception: BaseException) -> bool:
-    """Keep matching private stage data across retryable transport errors."""
-    message = str(exception).lower()
-    if any(
-        marker in message
-        for marker in (
-            "manifest is missing",
-            "transfer mode is unknown",
-            "manifest is not visible",
-        )
-    ):
+    """Keep matching private stage data only for typed network failures."""
+    if isinstance(exception, _PersistentTransportError):
         return True
-    if any(
-        marker in message
-        for marker in (
-            "checksum",
-            "digest",
-            "identity",
-            "protocol",
-            "manifest",
-            "symbolic link",
-            "symlink",
-            "unsafe",
-            "path",
-            "corrupt",
-            "invalid",
-            "malformed",
-            "wrong size",
-            "size mismatch",
-            "did not honor byte range",
-        )
-    ):
-        return False
-    if isinstance(exception, TimeoutError):
+    if isinstance(exception, (TimeoutError, socket.timeout)):
         return True
     if isinstance(exception, HTTPError):
-        return exception.code in {404, 429} or 500 <= exception.code <= 599
-    if not isinstance(exception, OSError):
-        return False
-    return any(
-        marker in message
-        for marker in (
-            "connection reset",
-            "connection refused",
-            "connection aborted",
-            "timed out",
-            "temporary failure",
-            "adapter range ended early",
-            "adapter file ended early",
-            "incomplete adapter range",
-            "incomplete adapter file",
-            "remote end closed",
-        )
-    )
+        return _retryable_adapter_http_status(exception.code)
+    if isinstance(exception, URLError):
+        return _is_retryable_metadata_error(exception)
+    return False
 
 
 def _stage_chunked_xor_adapter(
@@ -4046,13 +5488,6 @@ def _stage_chunked_xor_adapter(
     reconstruction_worker_seconds = 0.0
     verification_started = None
     verification_finished = None
-    for item in chunks:
-        if not isinstance(item, dict) or not isinstance(item.get("file"), str):
-            continue
-        chunk_path = chunk_root / Path(str(item["file"])).name
-        _reject_symlink_path(chunk_path, "adapter transport chunk")
-        if _path_regular_size(chunk_path, "adapter transport chunk") == int(item["wire_size"]):
-            progress_bytes += int(item["wire_size"])
     last_status = 0.0
 
     def write_stage_status(value: dict[str, object]) -> None:
@@ -4080,7 +5515,7 @@ def _stage_chunked_xor_adapter(
         with progress_lock:
             progress_bytes += amount
             now = time.monotonic()
-            if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
+            if amount >= 0 and now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
                 return
             last_status = now
             write_stage_status(
@@ -4120,9 +5555,17 @@ def _stage_chunked_xor_adapter(
         **(status_metadata or {}),
         "source_connections": source_connection_count,
         "responsive_source_connections": len(lane_urls),
+        "available_source_lanes": len(lane_urls),
     }
+    download_streams = _configured_download_streams()
+    persistent_width = min(download_streams, len(lane_urls))
+    status_metadata["active_persistent_connections"] = persistent_width
     output_path = temporary / _ADAPTER_FILES[1]
     config_path = temporary / _ADAPTER_FILES[0]
+    persistent_pool = _PersistentAdapterLanePool(
+        lane_urls,
+        width=persistent_width,
+    )
     _reject_symlink_path(output_path, "adapter output")
     _reject_symlink_path(config_path, "adapter configuration file")
     allocations = [(output_path, target_size)] + [
@@ -4143,20 +5586,29 @@ def _stage_chunked_xor_adapter(
         with timing_lock:
             if transfer_started is None or config_transfer_started < transfer_started:
                 transfer_started = config_transfer_started
-        download(
-            f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+        config_urls = [
+            f"{lane_url.rstrip('/')}/{_ADAPTER_FILES[0]}"
+            for lane_url in lane_urls
+        ]
+        _download_persistent_file(
+            config_urls,
             config_path,
-            expected_size=(config_size if isinstance(config_size, int) else None),
+            expected_size=config_size,
             expected_sha256=config_sha256,
             progress=report,
             deadline=deadline,
             cancel_event=cancel_event,
-            retry_http_statuses={404, 503},
+            per_request_timeout_seconds=_configured_chunk_timeout(),
         )
         config_transfer_finished = time.monotonic()
         with timing_lock:
             if transfer_finished is None or config_transfer_finished > transfer_finished:
                 transfer_finished = config_transfer_finished
+        config_fd = _open_nofollow(config_path, os.O_RDONLY)
+        try:
+            os.fsync(config_fd)
+        finally:
+            os.close(config_fd)
         if _sha256(config_path, deadline, cancel_event) != config_sha256:
             raise OSError("adapter configuration checksum mismatch")
         with os.fdopen(
@@ -4176,7 +5628,11 @@ def _stage_chunked_xor_adapter(
         )
         _write_marker(temporary / _RELAYING_MARKER, "relaying\n")
 
-    def fetch(index: int, item: dict[str, object]) -> None:
+    def fetch(
+        index: int,
+        item: dict[str, object],
+        assigned_lane: int | None = None,
+    ) -> None:
         nonlocal transfer_started, transfer_finished
         nonlocal reconstruction_started, reconstruction_finished
         nonlocal reconstruction_worker_seconds
@@ -4195,6 +5651,14 @@ def _stage_chunked_xor_adapter(
         completed_path = chunk_path.with_name(f"{chunk_path.name}.done")
         _reject_symlink_path(completed_path, "adapter completed proof")
 
+        if assigned_lane is not None:
+            chunk_lane = assigned_lane
+        elif persistent_pool is not None:
+            chunk_lane = index % persistent_pool.slot_count
+        else:
+            chunk_lane = index % len(lane_urls)
+
+        wire_reusable = False
         if _path_regular_size(completed_path, "adapter completed proof") is not None:
             try:
                 proof = json.loads(
@@ -4218,38 +5682,73 @@ def _stage_chunked_xor_adapter(
             except (OSError, ValueError):
                 proof_matches = False
             if proof_matches:
-                # The final file checksum validates all resumed regions together.
-                return
+                try:
+                    proof_matches = (
+                        _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                        and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                        and _output_proof_matches(
+                            output_path, item, proof, deadline, cancel_event
+                        )
+                    )
+                except (FileNotFoundError, OSError):
+                    proof_matches = False
+                if proof_matches:
+                    # The final file checksum validates all resumed regions together.
+                    report(chunk_lane, wire_size)
+                    return
             _unlink_path(completed_path, "adapter completed proof")
 
-        chunk_lane = index % len(lane_urls)
+        try:
+            wire_reusable = (
+                _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+            )
+        except (FileNotFoundError, OSError):
+            wire_reusable = False
 
         def lane_report(_lane: int, amount: int) -> None:
             report(chunk_lane, amount)
 
-        chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
-        chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
-        transfer_started_at = time.monotonic()
-        with timing_lock:
-            if transfer_started is None or transfer_started_at < transfer_started:
-                transfer_started = transfer_started_at
-        download(
-            chunk_urls[0],
-            chunk_path,
-            expected_size=int(item["wire_size"]),
-            expected_sha256=wire_sha256,
-            progress=lane_report,
-            source_urls=chunk_urls,
-            parallel_ranges=False,
-            deadline=deadline,
-            cancel_event=cancel_event,
-            per_request_timeout_seconds=_configured_chunk_timeout(),
-            retry_http_statuses=({404, 503} if not full_zstd else None),
-        )
-        transfer_finished_at = time.monotonic()
-        with timing_lock:
-            if transfer_finished is None or transfer_finished_at > transfer_finished:
-                transfer_finished = transfer_finished_at
+        if not wire_reusable and persistent_pool is not None:
+            chunk_urls = persistent_pool.urls_for_lane(chunk_lane, name)
+        elif not wire_reusable:
+            chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
+            chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
+        if not wire_reusable:
+            transfer_started_at = time.monotonic()
+            with timing_lock:
+                if transfer_started is None or transfer_started_at < transfer_started:
+                    transfer_started = transfer_started_at
+            if persistent_pool is not None:
+                persistent_pool.download(
+                    chunk_urls,
+                    chunk_lane,
+                    chunk_path,
+                    chunk_root_fd,
+                    expected_size=int(item["wire_size"]),
+                    expected_sha256=wire_sha256,
+                    progress=lane_report,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    per_request_timeout_seconds=_configured_chunk_timeout(),
+                )
+            else:
+                _download_persistent_file(
+                    chunk_urls,
+                    chunk_path,
+                    expected_size=int(item["wire_size"]),
+                    expected_sha256=wire_sha256,
+                    progress=lane_report,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    per_request_timeout_seconds=_configured_chunk_timeout(),
+                )
+            transfer_finished_at = time.monotonic()
+            with timing_lock:
+                if transfer_finished is None or transfer_finished_at > transfer_finished:
+                    transfer_finished = transfer_finished_at
+        else:
+            report(chunk_lane, wire_size)
 
         _check_deadline(deadline, cancel_event)
         encoded = _read_bytes_nofollow(chunk_path)
@@ -4293,7 +5792,6 @@ def _stage_chunked_xor_adapter(
             if len(reconstructed) != raw_size:
                 raise OSError("adapter transport reconstructed chunk has the wrong size")
             _pwrite_all(output_fd, reconstructed, offset)
-            os.fsync(output_fd)
         finally:
             os.close(output_fd)
         reconstruction_finished_at = time.monotonic()
@@ -4313,14 +5811,33 @@ def _stage_chunked_xor_adapter(
                 "raw_sha256": raw_sha256,
                 "output_sha256": hashlib.sha256(reconstructed).hexdigest(),
             },
+            sync=False,
         )
 
-    download_streams = _configured_download_streams()
-    executor = ThreadPoolExecutor(max_workers=min(len(chunks), download_streams))
-    futures = [executor.submit(fetch, index, item) for index, item in enumerate(chunks)]
-    _wait_for_futures(executor, futures, deadline, cancel_event)
+    chunk_root_fd = _open_directory_nofollow(
+        chunk_root,
+        create=False,
+        label="adapter transport chunk directory",
+    )
+    try:
+        _run_bounded_futures(
+            chunks,
+            fetch,
+            persistent_width,
+            deadline,
+            cancel_event,
+        )
+    finally:
+        if persistent_pool is not None:
+            persistent_pool.close()
+        os.close(chunk_root_fd)
 
     _reject_symlink_path(output_path, "adapter output")
+    output_fd = _open_nofollow(output_path, os.O_RDONLY)
+    try:
+        os.fsync(output_fd)
+    finally:
+        os.close(output_fd)
     verification_started = time.monotonic()
     if _sha256(output_path, deadline, cancel_event) != target_sha256:
         raise OSError("reconstructed adapter checksum mismatch")
@@ -4329,23 +5846,35 @@ def _stage_chunked_xor_adapter(
     verification_finished = time.monotonic()
 
     if full_zstd:
+        if not isinstance(config_size, int) or config_size < 1:
+            raise OSError("full adapter configuration size is invalid")
         config_transfer_started = time.monotonic()
         with timing_lock:
             if transfer_started is None or config_transfer_started < transfer_started:
                 transfer_started = config_transfer_started
-        download(
-            f"{source_url.rstrip('/')}/{_ADAPTER_FILES[0]}",
+        config_urls = [
+            f"{lane_url.rstrip('/')}/{_ADAPTER_FILES[0]}"
+            for lane_url in lane_urls
+        ]
+        _download_persistent_file(
+            config_urls,
             config_path,
-            expected_size=(config_size if isinstance(config_size, int) else None),
+            expected_size=config_size,
             expected_sha256=config_sha256,
             progress=report,
             deadline=deadline,
             cancel_event=cancel_event,
+            per_request_timeout_seconds=_configured_chunk_timeout(),
         )
         config_transfer_finished = time.monotonic()
         with timing_lock:
             if transfer_finished is None or config_transfer_finished > transfer_finished:
                 transfer_finished = config_transfer_finished
+        config_fd = _open_nofollow(config_path, os.O_RDONLY)
+        try:
+            os.fsync(config_fd)
+        finally:
+            os.close(config_fd)
         if _sha256(config_path, deadline, cancel_event) != config_sha256:
             raise OSError("adapter configuration checksum mismatch")
     _publish_relay_manifest(
@@ -4379,6 +5908,7 @@ def _stage_chunked_xor_adapter(
             )
             _unlink_path(temporary / _RELAYING_MARKER, "adapter relaying marker")
         _write_text_atomic(ready, "ready\n", encoding="utf-8")
+        _fsync_directory(temporary)
         with os.fdopen(
             _open_nofollow(_adapter_reader_lock(destination), os.O_RDWR | os.O_CREAT),
             "a+",
@@ -4391,6 +5921,7 @@ def _stage_chunked_xor_adapter(
                 )
                 _replace_paths(destination, retired, "retired adapter")
             _replace_paths(temporary, destination, "adapter publish")
+            _fsync_directory(destination.parent)
             if committed_event is not None:
                 committed_event.set()
             fcntl.flock(reader_lock, fcntl.LOCK_UN)
@@ -4470,6 +6001,7 @@ def _download_with_parent(
     per_request_timeout_seconds: float | None = None,
     retry_http_statuses: set[int] | None = None,
     stream_cap: int | None = None,
+    typed_transport: bool = False,
     parent_fd: int,
 ) -> None:
     _check_deadline(deadline, cancel_event)
@@ -4541,6 +6073,7 @@ def _download_with_parent(
         for attempt in range(attempt_limit):
             _check_deadline(deadline, cancel_event)
             attempt_deadline = deadline
+            active_timeout = None
             if per_request_timeout_seconds is not None:
                 active_timeout = _chunk_request_timeout(
                     deadline,
@@ -4548,9 +6081,10 @@ def _download_with_parent(
                     per_request_timeout_seconds,
                     cancel_event,
                 )
-                attempt_deadline = time.monotonic() + active_timeout
-                if deadline is not None:
-                    attempt_deadline = min(attempt_deadline, deadline)
+                if not typed_transport:
+                    attempt_deadline = time.monotonic() + active_timeout
+                    if deadline is not None:
+                        attempt_deadline = min(attempt_deadline, deadline)
             try:
                 destination_stat = _stat_regular_entry(
                     parent_fd,
@@ -4575,19 +6109,35 @@ def _download_with_parent(
                     source_urls[attempt % len(source_urls)],
                     headers={"Range": f"bytes={offset}-"} if offset else {},
                 )
-                with urllib.request.urlopen(
-                    request,
-                    timeout=(
-                        _request_timeout(deadline, cancel_event)
-                        if per_request_timeout_seconds is None
-                        else _request_timeout(
-                            attempt_deadline,
-                            cancel_event,
-                            maximum=_ADAPTER_LANE_TIMEOUT_S,
-                        )
-                    ),
-                ) as response:
+                if per_request_timeout_seconds is None:
+                    request_timeout = _request_timeout(deadline, cancel_event)
+                elif typed_transport:
+                    request_timeout = min(active_timeout, _ADAPTER_LANE_TIMEOUT_S)
+                else:
+                    request_timeout = _request_timeout(
+                        attempt_deadline,
+                        cancel_event,
+                        maximum=_ADAPTER_LANE_TIMEOUT_S,
+                    )
+                response_open = (
+                    _adapter_urlopen(
+                        request, request_timeout, deadline=attempt_deadline,
+                        cancel_event=cancel_event,
+                        attempt_timeout=active_timeout or _configured_chunk_timeout(),
+                    )
+                    if typed_transport
+                    else _adapter_http_open(
+                        request, timeout=request_timeout, deadline=attempt_deadline,
+                        cancel_event=cancel_event,
+                        attempt_timeout=active_timeout or _configured_chunk_timeout(),
+                    )
+                )
+                with response_open as response:
                     if offset and response.status != 206:
+                        if typed_transport:
+                            raise _PersistentProtocolError(
+                                "adapter server did not honor byte range"
+                            )
                         os.unlink(destination.name, dir_fd=parent_fd)
                         raise OSError("adapter server did not honor byte range")
                     with os.fdopen(
@@ -4604,19 +6154,32 @@ def _download_with_parent(
                         read_available = getattr(response, "read1", None)
                         if read_available is None:
                             read_available = response.read
-                        while offset < total:
-                            _check_deadline(attempt_deadline, cancel_event)
-                            chunk = read_available(
-                                min(16 * 1024 * 1024, total - offset)
+                        if typed_transport:
+                            chunks = _adapter_response_chunks(
+                                response,
+                                total - offset,
+                                deadline,
+                                cancel_event,
                             )
-                            if not chunk:
-                                raise OSError(f"adapter file ended early: {destination.name}")
-                            output.write(chunk)
-                            offset += len(chunk)
-                            if progress is not None:
-                                progress(0, len(chunk))
-                            if offset < total:
+                            for chunk in chunks:
+                                output.write(chunk)
+                                offset += len(chunk)
+                                if progress is not None:
+                                    progress(0, len(chunk))
+                        else:
+                            while offset < total:
                                 _check_deadline(attempt_deadline, cancel_event)
+                                chunk = read_available(
+                                    min(16 * 1024 * 1024, total - offset)
+                                )
+                                if not chunk:
+                                    raise OSError(f"adapter file ended early: {destination.name}")
+                                output.write(chunk)
+                                offset += len(chunk)
+                                if progress is not None:
+                                    progress(0, len(chunk))
+                                if offset < total:
+                                    _check_deadline(attempt_deadline, cancel_event)
                 destination_stat = _stat_regular_entry(
                     parent_fd,
                     destination.name,
@@ -4635,15 +6198,48 @@ def _download_with_parent(
                     os.unlink(destination.name, dir_fd=parent_fd)
                     raise OSError(f"adapter checksum mismatch: {destination.name}")
                 return
-            except HTTPError as exc:
-                if retry_http_statuses is None or exc.code not in retry_http_statuses:
+            except _PersistentTransportError as exc:
+                if not typed_transport:
                     raise
                 _check_deadline(deadline, cancel_event)
                 if attempt + 1 == attempt_limit:
+                    if typed_transport:
+                        raise _PersistentTransportError(
+                            "adapter persistent download retries exhausted"
+                        ) from exc
+                    raise
+                sleep_for = (
+                    lane_rotation_delay_seconds
+                    if len(source_urls) > 1
+                    else min(2**attempt, 10)
+                )
+                _check_cancelled(cancel_event)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("adapter delta staging exceeded its time limit")
+                    sleep_for = min(sleep_for, remaining)
+                if cancel_event is None:
+                    time.sleep(sleep_for)
+                else:
+                    cancel_event.wait(sleep_for)
+            except HTTPError as exc:
+                if typed_transport:
+                    retryable = _retryable_adapter_http_status(exc.code)
+                else:
+                    retryable = retry_http_statuses is not None and exc.code in retry_http_statuses
+                if not retryable:
+                    raise
+                _check_deadline(deadline, cancel_event)
+                if attempt + 1 == attempt_limit:
+                    if typed_transport:
+                        raise _PersistentTransportError(
+                            "adapter persistent download retries exhausted"
+                        ) from exc
                     raise
                 sleep_for = (
                     1.0
-                    if exc.code in {404, 503}
+                    if _retryable_adapter_http_status(exc.code)
                     else (
                         lane_rotation_delay_seconds
                         if len(source_urls) > 1
@@ -4661,6 +6257,8 @@ def _download_with_parent(
                 else:
                     cancel_event.wait(sleep_for)
             except OSError:
+                if typed_transport:
+                    raise
                 # Retry network timeouts; keep the absolute stage limit.
                 _check_deadline(deadline, cancel_event)
                 if attempt + 1 == attempt_limit:
@@ -4755,6 +6353,9 @@ def _download_with_parent(
                 progress,
                 deadline,
                 cancel_event,
+                typed_transport=typed_transport,
+                retry_http_statuses=retry_http_statuses,
+                per_request_timeout_seconds=per_request_timeout_seconds,
             )
             for index, start, end in ranges
         ]
@@ -4893,14 +6494,13 @@ def stage_lora_adapter_files(
         }
     if stage_timeout_seconds is not None:
         if (
-            not require_delta
-            or isinstance(stage_timeout_seconds, bool)
+            isinstance(stage_timeout_seconds, bool)
             or not isinstance(stage_timeout_seconds, (int, float))
             or not _is_finite_number(stage_timeout_seconds)
             or stage_timeout_seconds <= 0
-            or configured_delta_timeout is None
-            or stage_timeout_seconds > configured_delta_timeout
-            or stage_timeout_seconds > stage_limit
+            or stage_timeout_seconds > (
+                configured_delta_timeout if require_delta else full_adapter_stage_timeout_s
+            )
         ):
             raise OSError("adapter delta stage timeout is invalid")
         configured_delta_timeout = float(stage_timeout_seconds)
@@ -4960,6 +6560,40 @@ def stage_lora_adapter_files(
         _acquire_stage_lock(host_lock, operation_deadline, cancel_event)
         transport: dict[str, object] | None = None
         try:
+            if not require_delta:
+                local_cache = _verified_local_full_adapter_cache(
+                    source_url,
+                    destination,
+                    deadline=operation_deadline,
+                    cancel_event=cancel_event,
+                )
+                if local_cache is not None:
+                    files = local_cache["files"]
+                    assert isinstance(files, dict)
+                    cache_hit = True
+                    write_stage_status(
+                        {
+                            "status": "ready",
+                            "source_url": source_url,
+                            "path": destination.as_posix(),
+                            "transport": "full",
+                            "verified_files": files,
+                            "bytes_done": 0,
+                            "bytes_total": 0,
+                            "updated_at": time.time(),
+                            "elapsed_seconds": round(time.monotonic() - started, 3),
+                        },
+                    )
+                    _cleanup_adapter_caches(
+                        destination.parent,
+                        destination,
+                        deadline=operation_deadline,
+                        cancel_event=cancel_event,
+                    )
+                    if committed_event is not None:
+                        with _adapter_stage_publish_lock:
+                            committed_event.set()
+                    return destination
             if require_delta:
                 transport = _read_delta_manifest_with_visibility_wait(
                     source_url,
@@ -5009,6 +6643,13 @@ def stage_lora_adapter_files(
                     or config_spec.get("size") != transport["config_size"]
                 ):
                     raise OSError("adapter transport target differs from source manifest")
+                _cleanup_adapter_space_before_stage(
+                    destination.parent,
+                    destination,
+                    transport,
+                    deadline=operation_deadline,
+                    cancel_event=cancel_event,
+                )
                 _reject_symlink_path(destination / "READY", "adapter ready marker")
                 if _path_regular_size(destination / "READY", "adapter ready marker") is not None:
                     try:
@@ -5160,21 +6801,6 @@ def stage_lora_adapter_files(
             if (
                 isinstance(transport, dict)
                 and transport.get("mode") == "full"
-                and transport.get("transport") == _ADAPTER_FULL_TRANSPORT
-            ):
-                return _stage_chunked_xor_adapter(
-                    source_url,
-                    transport,
-                    manifest,
-                    deadline=operation_deadline,
-                    cancel_event=cancel_event,
-                    committed_event=committed_event,
-                    status_metadata=status_metadata,
-                )
-
-            if (
-                isinstance(transport, dict)
-                and transport.get("mode") == "full"
                 and _reuse_full_adapter_cache(
                     source_url,
                     destination,
@@ -5209,6 +6835,21 @@ def stage_lora_adapter_files(
                     )
                     return destination
 
+            if (
+                isinstance(transport, dict)
+                and transport.get("mode") == "full"
+                and transport.get("transport") == _ADAPTER_FULL_TRANSPORT
+            ):
+                return _stage_chunked_xor_adapter(
+                    source_url,
+                    transport,
+                    manifest,
+                    deadline=operation_deadline,
+                    cancel_event=cancel_event,
+                    committed_event=committed_event,
+                    status_metadata=status_metadata,
+                )
+
             total_bytes = sum(int(item["size"]) for item in files.values())
             _preflight_full_adapter_download_space(
                 destination.with_name(f"{destination.name}.partial"),
@@ -5223,7 +6864,7 @@ def stage_lora_adapter_files(
                 with progress_lock:
                     progress_bytes += amount
                     now = time.monotonic()
-                    if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_bytes:
+                    if amount >= 0 and now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_bytes:
                         return
                     last_status = now
                     write_stage_status(
@@ -5277,22 +6918,35 @@ def stage_lora_adapter_files(
                         progress=report,
                         cancel_event=cancel_event,
                         deadline=operation_deadline,
+                        per_request_timeout_seconds=_configured_chunk_timeout(),
                         stream_cap=full_download_streams,
                         parent_fd=temporary_fd,
+                        typed_transport=True,
                     )
                     if expected_sha256 is None:
                         item["sha256"] = _sha256(
                             destination_path,
                             cancel_event=cancel_event,
                         )
-                    progress_bytes = 0
+                    completed_bytes = 0
                     for name in _ADAPTER_FILES:
                         path = temporary / name
                         _reject_symlink_path(path, "adapter file")
                         if _path_regular_size(path, "adapter file") == int(files[name]["size"]):
-                            progress_bytes += int(files[name]["size"])
+                            completed_bytes += int(files[name]["size"])
+                    progress_bytes = max(progress_bytes, completed_bytes)
             finally:
                 os.close(temporary_fd)
+            for filename in _ADAPTER_FILES:
+                file_fd = _open_nofollow(
+                    temporary / filename,
+                    os.O_RDONLY,
+                    label="adapter downloaded file",
+                )
+                try:
+                    os.fsync(file_fd)
+                finally:
+                    os.close(file_fd)
             transfer_finished = time.monotonic()
             verification_started = transfer_finished
             _write_json(temporary / "manifest.json", manifest)
@@ -5321,6 +6975,7 @@ def stage_lora_adapter_files(
                 ready = temporary / "READY"
                 _check_cancelled(cancel_event)
                 _write_text_atomic(ready, "ready\n", encoding="utf-8")
+                _fsync_directory(temporary)
 
                 # Keep the exclusive lease through both renames. This removes the
                 # short missing-path window between retiring the old directory and
@@ -5337,6 +6992,7 @@ def stage_lora_adapter_files(
                         )
                         _replace_paths(destination, retired, "retired adapter")
                     _replace_paths(temporary, destination, "adapter publish")
+                    _fsync_directory(destination.parent)
                     if committed_event is not None:
                         committed_event.set()
                     fcntl.flock(reader_lock, fcntl.LOCK_UN)

@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-8"
+output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-9"
 max_steps = 50
 dist_timeout_seconds = 5400
 enable_router_replay = false
@@ -19,12 +19,12 @@ ranks_filter = [0]
 
 [swanlab]
 project = "glm-runs"
-name = "trainer-glm-decensor-difficulty-8"
+name = "trainer-glm-decensor-difficulty-9"
 group = "glm-runs"
-tags = ["decensor-diff-8", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
+tags = ["decensor-diff-9", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
 
 [file_monitor]
-filename = "run_glm-decensor-difficulty-8/trainer-metrics.jsonl"
+filename = "run_glm-decensor-difficulty-9/trainer-metrics.jsonl"
 
 [model]
 name = "/data/ZiphuAI/GLM-5.2-FP8"
@@ -72,6 +72,7 @@ rank = 32
 alpha = 64
 dropout = 0.0
 freeze_a = true
+initial_adapter_path = "/data/glm52-rl/runs/glm52-rank32-initial-adapter/adapter_model.safetensors"
 target_modules = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "shared_expert", "experts"]
 
 [model.ac]

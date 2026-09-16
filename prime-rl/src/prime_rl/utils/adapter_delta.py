@@ -24,6 +24,7 @@ full_transport_name = "chunked-full-zstd"
 predictive_transport_name = "chunked-bf16-linear-zigzag-sparse-zstd"
 default_chunk_size = 16 * 1024 * 1024
 predictive_chunk_size = 16 * 1024 * 1024
+max_transport_chunk_size = 16 * 1024 * 1024
 default_workers = 8
 max_workers_limit = 8
 io_chunk_size = 16 * 1024 * 1024
@@ -171,10 +172,12 @@ def _encode_delta_chunk(base: bytes, target: bytes) -> tuple[bytes, bytes]:
 def decode_adapter_chunk(payload: bytes, *, codec: str, max_output_size: int) -> bytes:
     if max_output_size <= 0:
         raise ValueError("adapter chunk output limit must be positive")
-    if max_output_size > default_chunk_size:
+    if max_output_size > max_transport_chunk_size:
         raise ValueError("adapter chunk output limit exceeds the 16 MiB chunk ceiling")
     transport = codec
-    decoded = _decompress_bounded(payload, max_output_size, maximum=default_chunk_size)
+    decoded = _decompress_bounded(
+        payload, max_output_size, maximum=max_transport_chunk_size
+    )
     if not transport.startswith(full_transport_name):
         decoded = unshuffle_bf16_bytes(decoded)
     if len(decoded) != max_output_size:

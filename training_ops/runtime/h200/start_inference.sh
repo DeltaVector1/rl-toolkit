@@ -8,7 +8,17 @@ test -f "$inference_config" || {
   echo "inference config is missing: $inference_config" >&2
   exit 2
 }
-download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-96}
+download_streams=$(python3 - "$deployment/configs/nodes.toml" <<'PY'
+import sys
+import tomllib
+with open(sys.argv[1], "rb") as stream:
+    print(tomllib.load(stream)["adapter_transport"]["download_streams"])
+PY
+) || exit 2
+if [ -n "${PRIME_LORA_DOWNLOAD_STREAMS+x}" ] && [ "$PRIME_LORA_DOWNLOAD_STREAMS" != "$download_streams" ]; then
+  echo "PRIME_LORA_DOWNLOAD_STREAMS differs from nodes.toml" >&2
+  exit 2
+fi
 case "$download_streams" in
   ''|*[!0-9]*)
     echo "PRIME_LORA_DOWNLOAD_STREAMS must be an integer" >&2
@@ -128,7 +138,8 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   -e VLLM_ENGINE_READY_TIMEOUT_S=7200 \
   -e PRIME_LORA_CACHE_DIR="$adapter_cache_dir" \
   -e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams" \
-  -e PRIME_LORA_CHUNK_TIMEOUT_S=45 \
+  -e PRIME_LORA_LANE_TIMEOUT_S=90 \
+  -e PRIME_LORA_CHUNK_TIMEOUT_S=90 \
   -e PRIME_LORA_SOURCE_PORTS="$lora_source_port_list" \
   --entrypoint /bin/bash \
   prime-rl:glm52-v080-glm52-h200-router \

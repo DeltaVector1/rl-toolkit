@@ -191,3 +191,13 @@ only after measured learning.
 - With exclusion enabled, all-refusal groups create no optimizer samples.
 - Use 40-50 completed trainer steps unless a hard failure occurs.
 - Compare each difficulty separately and require reward movement beyond noise.
+
+- Prefill-2 step 1 reward was 0.1819 with 0% errors; rollout plus judge took
+  24m15s. The collected batch had 1,980 sequences, 4,236,410 tokens, and 130
+  packed microbatches; forward/backward stopped at 610.70s. Cause: fixed-rollout
+  batching. Next test: 1.5M-token cap. One point gives no reward trend claim.
+
+- Prefill-3 measured rewards were .2002/.1457/.2261/.1663; F/B was
+  430.98/404.30/403.49/330.93s; v2 stages were 415.193/406.830s. It stopped
+  at 3 completed steps on the H200A free-space guard. Retention fix and cleanup
+  evidence were recorded; no reward trend claim.

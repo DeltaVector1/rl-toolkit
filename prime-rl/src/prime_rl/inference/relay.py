@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import fcntl
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import socket
+import stat
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 from urllib.parse import unquote, urlsplit
 
 
@@ -26,10 +30,11 @@ digest_pattern = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class RelayRequestError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, *, resource_size: int | None = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.resource_size = resource_size
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,7 @@ class RelayFile:
     path: Path
     size: int
     sha256: str
+    source: BinaryIO | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,9 @@ class RelayIndex:
 _relay_index_cache_lock = threading.Lock()
 _relay_index_cache: dict[str, tuple[tuple[object, ...], RelayIndex]] = {}
 _MAX_RELAY_INDEX_CACHE_ENTRIES = 8
+_relay_digest_cache_lock = threading.Lock()
+_relay_digest_cache: OrderedDict[tuple[str, tuple[int, int, int, int, int]], None] = OrderedDict()
+_MAX_RELAY_DIGEST_CACHE_ENTRIES = 128
 relay_socket_idle_timeout_seconds = 30.0
 relay_reader_lock_timeout_seconds = 5.0
 
@@ -250,6 +259,80 @@ def _stat_identity(path: Path) -> tuple[int, int, int, int] | None:
     except OSError as exc:
         raise RelayRequestError(500, "relay cache metadata cannot be read") from exc
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _file_identity(source: BinaryIO) -> tuple[int, int, int, int, int]:
+    try:
+        observed = os.fstat(source.fileno())
+    except OSError as exc:
+        raise RelayRequestError(503, "relay file cannot be inspected") from exc
+    if not stat.S_ISREG(observed.st_mode):
+        raise RelayRequestError(503, "relay file is not regular")
+    return (
+        observed.st_dev,
+        observed.st_ino,
+        observed.st_size,
+        observed.st_mtime_ns,
+        observed.st_ctime_ns,
+    )
+
+
+def _open_regular_file(path: Path) -> tuple[BinaryIO, tuple[int, int, int, int, int]]:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise RelayRequestError(503, "relay file is unavailable") from exc
+    try:
+        source = os.fdopen(fd, "rb")
+    except OSError as exc:
+        os.close(fd)
+        raise RelayRequestError(503, "relay file is unavailable") from exc
+    try:
+        identity = _file_identity(source)
+    except RelayRequestError:
+        source.close()
+        raise
+    return source, identity
+
+
+def _sha256_source(source: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    try:
+        source.seek(0)
+        while chunk := source.read(16 * 1024 * 1024):
+            digest.update(chunk)
+        source.seek(0)
+    except OSError as exc:
+        raise RelayRequestError(503, "relay file cannot be read") from exc
+    return digest.hexdigest()
+
+
+def _verify_relay_file(
+    source: BinaryIO,
+    expected_digest: str,
+    expected_size: int,
+    identity: tuple[int, int, int, int, int],
+) -> None:
+    if identity[2] != expected_size:
+        raise RelayRequestError(503, "relay file is incomplete")
+    key = (expected_digest, identity)
+    with _relay_digest_cache_lock:
+        if key in _relay_digest_cache:
+            _relay_digest_cache.move_to_end(key)
+            return
+    actual_digest = _sha256_source(source)
+    if _file_identity(source) != identity:
+        raise RelayRequestError(503, "relay file changed during validation")
+    if actual_digest != expected_digest:
+        raise RelayRequestError(503, "relay file checksum differs")
+    with _relay_digest_cache_lock:
+        if key in _relay_digest_cache:
+            _relay_digest_cache.move_to_end(key)
+            return
+        _relay_digest_cache[key] = None
+        _relay_digest_cache.move_to_end(key)
+        while len(_relay_digest_cache) > _MAX_RELAY_DIGEST_CACHE_ENTRIES:
+            _relay_digest_cache.popitem(last=False)
 
 
 def _relay_index_signature(
@@ -460,27 +543,33 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
                 break
         if not proof_valid:
             raise RelayRequestError(503, "relay chunk proof is unavailable or invalid")
-    return RelayFile(path=candidate, size=size, sha256=digest)
+    source, identity = _open_regular_file(candidate)
+    try:
+        _verify_relay_file(source, digest, size, identity)
+    except RelayRequestError:
+        source.close()
+        raise
+    return RelayFile(path=candidate, size=size, sha256=digest, source=source)
 
 
 def _byte_range(value: str | None, size: int) -> tuple[int, int, int]:
     if value is None:
         return 200, 0, max(0, size - 1)
     if not value.startswith("bytes=") or "," in value:
-        raise RelayRequestError(416, "only one byte range is supported")
+        raise RelayRequestError(416, "only one byte range is supported", resource_size=size)
     match = re.fullmatch(r"bytes=(\d*)-(\d*)", value)
     if match is None or size == 0:
-        raise RelayRequestError(416, "byte range is invalid")
+        raise RelayRequestError(416, "byte range is invalid", resource_size=size)
     first, last = match.groups()
     if not first and not last:
-        raise RelayRequestError(416, "byte range is invalid")
+        raise RelayRequestError(416, "byte range is invalid", resource_size=size)
     if not first:
         try:
             count = int(last)
         except ValueError as exc:
-            raise RelayRequestError(416, "byte range is invalid") from exc
+            raise RelayRequestError(416, "byte range is invalid", resource_size=size) from exc
         if count <= 0:
-            raise RelayRequestError(416, "byte range is invalid")
+            raise RelayRequestError(416, "byte range is invalid", resource_size=size)
         start = max(0, size - count)
         end = size - 1
     else:
@@ -488,12 +577,12 @@ def _byte_range(value: str | None, size: int) -> tuple[int, int, int]:
             start = int(first)
             requested_last = int(last) if last else None
         except ValueError as exc:
-            raise RelayRequestError(416, "byte range is invalid") from exc
+            raise RelayRequestError(416, "byte range is invalid", resource_size=size) from exc
         if start >= size:
-            raise RelayRequestError(416, "byte range starts after the file")
+            raise RelayRequestError(416, "byte range starts after the file", resource_size=size)
         end = min(size - 1, requested_last) if requested_last is not None else size - 1
         if end < start:
-            raise RelayRequestError(416, "byte range ends before it starts")
+            raise RelayRequestError(416, "byte range ends before it starts", resource_size=size)
     return 206, start, end
 
 
@@ -509,8 +598,11 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.send_response(error.status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if error.status == 416 and error.resource_size is not None:
+            self.send_header("Content-Range", f"bytes */{error.resource_size}")
         self.send_header("Connection", "close")
         self.end_headers()
+        self.close_connection = True
         if self.command == "GET":
             self.wfile.write(body)
 
@@ -529,26 +621,49 @@ class RelayHandler(BaseHTTPRequestHandler):
         cache_path = config.cache_path(source_url)
         with reader_lock(cache_path):
             selected = _load_file(cache_path, source_url, filename)
-            status, start, end = _byte_range(self.headers.get("Range"), selected.size)
-            length = end - start + 1 if selected.size else 0
-            self.send_response(status)
-            self.send_header("Content-Type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
-            self.send_header("Content-Length", str(length))
-            self.send_header("Accept-Ranges", "bytes")
-            if status == 206:
-                self.send_header("Content-Range", f"bytes {start}-{end}/{selected.size}")
-            self.end_headers()
-            if self.command != "GET" or length == 0:
-                return
-            with selected.path.open("rb") as source:
-                source.seek(start)
+            source = selected.source
+            if source is None:
+                source, identity = _open_regular_file(selected.path)
+                try:
+                    _verify_relay_file(source, selected.sha256, selected.size, identity)
+                except RelayRequestError:
+                    source.close()
+                    raise
+            try:
+                status, start, end = _byte_range(self.headers.get("Range"), selected.size)
+                length = end - start + 1 if selected.size else 0
+                self.send_response(status)
+                self.send_header("Content-Type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
+                self.send_header("Content-Length", str(length))
+                self.send_header("Accept-Ranges", "bytes")
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{selected.size}")
+                self.end_headers()
+                if self.command != "GET" or length == 0:
+                    return
+                try:
+                    source.seek(start)
+                except OSError:
+                    self.close_connection = True
+                    return
                 remaining = length
                 while remaining:
-                    chunk = source.read(min(1024 * 1024, remaining))
+                    try:
+                        chunk = source.read(min(1024 * 1024, remaining))
+                    except OSError:
+                        self.close_connection = True
+                        return
                     if not chunk:
-                        raise RelayRequestError(503, "relay file ended before its declared size")
-                    self.wfile.write(chunk)
+                        self.close_connection = True
+                        return
+                    try:
+                        self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        self.close_connection = True
+                        return
                     remaining -= len(chunk)
+            finally:
+                source.close()
 
     def do_GET(self) -> None:
         try:
