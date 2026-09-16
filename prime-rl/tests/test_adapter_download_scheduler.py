@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import ssl
 import socketserver
 import sys
 import tempfile
@@ -64,6 +65,308 @@ def load_filesystem_module():
 
 
 class DownloadSchedulerTest(unittest.TestCase):
+    def test_fallback_download_headers_share_deadline_and_resume(self):
+        for ranged in (False, True):
+            with self.subTest(ranged=ranged), tempfile.TemporaryDirectory() as temporary:
+                filesystem = load_filesystem_module()
+                filesystem.lane_rotation_delay_seconds = 0.001
+                payload = b"bounded-fallback-body"
+                finished = threading.Event()
+
+                def slow_header(request, number):
+                    if number != 1:
+                        return False
+                    try:
+                        request.connection.sendall(b"HTTP/1.1 206 Partial Content\r\nX-Slow: ")
+                        for _ in range(30):
+                            request.connection.sendall(b"x")
+                            time.sleep(0.02)
+                    except OSError:
+                        pass
+                    finally:
+                        request.close_connection = True
+                        finished.set()
+                    return True
+
+                server, thread, handler = self._persistent_server(filesystem, payload, slow_header)
+                root = Path(temporary)
+                destination = root / "part"
+                destination.write_bytes(payload[:3])
+                parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    urls = [f"http://127.0.0.1:{server.server_address[1]}/{lane}" for lane in ("slow", "fast")]
+                    started = time.monotonic()
+                    kwargs = dict(deadline=started + 0.3, per_request_timeout_seconds=0.06, typed_transport=True)
+                    if ranged:
+                        filesystem._download_range(urls, 0, destination, parent_fd, 0, len(payload) - 1, **kwargs)
+                    else:
+                        filesystem._download_with_parent(
+                            urls[0], destination, parent_fd=parent_fd, source_urls=urls,
+                            expected_size=len(payload), expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            parallel_ranges=False, **kwargs)
+                    elapsed = time.monotonic() - started
+                    self.assertLess(elapsed, 0.18)
+                    self.assertEqual(destination.read_bytes(), payload)
+                    self.assertEqual(handler.paths, ["/slow", "/fast"])
+                    self.assertTrue(all(value.startswith("bytes=3-") for value in handler.ranges))
+                    self.assert_no_socket_guards()
+                    print(f"fallback headers: {elapsed:.3f}s; range={ranged}; 3-byte prefix resumed")
+                finally:
+                    os.close(parent_fd)
+                    finished.wait(1)
+                    server.shutdown()
+                    thread.join(1)
+                    server.server_close()
+
+    def test_metadata_https_redirects_and_completed_guard_reuse(self):
+        filesystem = load_filesystem_module()
+        payload = b"verified-https-metadata"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            certificate, key = root / "certificate.pem", root / "key.pem"
+            filesystem.subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                 "-keyout", str(key), "-out", str(certificate), "-subj", "/CN=127.0.0.1",
+                 "-addext", "subjectAltName=IP:127.0.0.1"],
+                check=True, stdout=filesystem.subprocess.DEVNULL, stderr=filesystem.subprocess.DEVNULL,
+            )
+
+            def redirect(request, _number):
+                if request.path != "/redirect":
+                    return False
+                request.send_response(302)
+                request.send_header("Location", "/metadata")
+                request.send_header("Content-Length", "0")
+                request.end_headers()
+                return True
+
+            server, thread, handler = self._persistent_server(filesystem, payload, redirect)
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(certificate, key)
+            server.socket = server_context.wrap_socket(server.socket, server_side=True)
+            client_context = ssl.create_default_context(cafile=str(certificate))
+            try:
+                url = f"https://127.0.0.1:{server.server_address[1]}/redirect"
+                with mock.patch.object(filesystem.http.client, "_create_https_context", return_value=client_context):
+                    for attempt in range(2):
+                        self.assertEqual(filesystem._read_source_bytes(url, deadline=time.monotonic() + 0.2), payload)
+                        self.assert_no_socket_guards()
+                        if attempt == 0:
+                            time.sleep(0.22)
+                self.assertEqual(handler.paths, ["/redirect", "/metadata"] * 2)
+            finally:
+                server.shutdown()
+                thread.join(1)
+                server.server_close()
+
+    def test_metadata_rejects_unguarded_schemes(self):
+        filesystem = load_filesystem_module()
+        for source in ("file:///no-metadata", "ftp://source/metadata", "data:text/plain,metadata"):
+            with self.subTest(source=source), self.assertRaisesRegex(filesystem._PersistentProtocolError, "HTTP or HTTPS"):
+                with filesystem._adapter_http_open(source, timeout=1):
+                    self.fail("unsupported metadata source was opened")
+
+    def test_metadata_connect_is_registered_before_cancellation(self):
+        filesystem = load_filesystem_module()
+        cancelled = threading.Event()
+        entered, aborted = threading.Event(), threading.Event()
+
+        class Socket:
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _address):
+                entered.set()
+                aborted.wait(1)
+                raise ConnectionResetError("cancelled connect")
+
+            def shutdown(self, _how):
+                aborted.set()
+
+            def close(self):
+                pass
+
+        def cancel_connect():
+            if entered.wait(1):
+                cancelled.set()
+
+        cancelling = threading.Thread(target=cancel_connect)
+        cancelling.start()
+        started = time.monotonic()
+        try:
+            with mock.patch.object(filesystem.socket, "socket", return_value=Socket()):
+                with self.assertRaises(filesystem._PersistentTransportError):
+                    filesystem._read_source_bytes(
+                        "http://127.0.0.1:8100/metadata", deadline=started + 1, cancel_event=cancelled,
+                    )
+            self.assertLess(time.monotonic() - started, 0.15)
+            self.assertTrue(aborted.is_set())
+            self.assert_no_socket_guards()
+        finally:
+            aborted.set()
+            cancelling.join(1)
+
+    def test_metadata_header_trickle_has_one_attempt_deadline_and_cancellation(self):
+        payload = b"complete-metadata"
+        for mode in ("retry", "stage", "cancel"):
+            with self.subTest(mode=mode):
+                filesystem = load_filesystem_module()
+                entered, finished, cancelled = threading.Event(), threading.Event(), threading.Event()
+
+                def trickle(request, number):
+                    if number != 1:
+                        return False
+                    try:
+                        request.connection.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+                        entered.set()
+                        for _ in range(50):
+                            request.connection.sendall(b"x")
+                            time.sleep(0.02)
+                    except OSError:
+                        pass
+                    finally:
+                        request.close_connection = True
+                        finished.set()
+                    return True
+
+                server, thread, handler = self._persistent_server(filesystem, payload, trickle)
+                cancelling = None
+                if mode == "cancel":
+                    def cancel_headers():
+                        if entered.wait(1):
+                            cancelled.set()
+                    cancelling = threading.Thread(target=cancel_headers)
+                    cancelling.start()
+                try:
+                    urls = [f"http://127.0.0.1:{server.server_address[1]}/{lane}" for lane in ("slow", "fast")]
+                    started = time.monotonic()
+                    limit = 0.06 if mode == "stage" else 1
+                    with mock.patch.object(filesystem, "_metadata_source_urls", return_value=urls), mock.patch.object(
+                        filesystem, "_configured_chunk_timeout", return_value=0.06 if mode == "retry" else 1
+                    ):
+                        if mode == "retry":
+                            self.assertEqual(filesystem._read_source_bytes(urls[0], deadline=started + limit), payload)
+                        else:
+                            with self.assertRaises((TimeoutError, filesystem._PersistentTransportError)):
+                                filesystem._read_source_bytes(urls[0], deadline=started + limit, cancel_event=cancelled)
+                    elapsed = time.monotonic() - started
+                    self.assertLess(elapsed, 0.18)
+                    self.assertEqual(handler.paths, ["/slow", "/fast"] if mode == "retry" else ["/slow"])
+                    self.assert_no_socket_guards()
+                    print(f"metadata headers: {elapsed:.3f}s, mode={mode}, lanes={len(handler.paths)}")
+                finally:
+                    completed = finished.wait(1)
+                    if cancelling is not None:
+                        cancelling.join(1)
+                    server.shutdown()
+                    thread.join(1)
+                    server.server_close()
+                    self.assertTrue(completed)
+
+    def test_metadata_dns_stall_is_killed_and_reaped(self):
+        filesystem = load_filesystem_module()
+        real_popen = filesystem.subprocess.Popen
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                children = []
+                cancelled = threading.Event()
+
+                def stalled_lookup(_args, **kwargs):
+                    child = real_popen([sys.executable, "-c", "import time; time.sleep(5)"], **kwargs)
+                    children.append(child)
+                    if cancel:
+                        cancelled.set()
+                    return child
+
+                started = time.monotonic()
+                with mock.patch.object(filesystem.subprocess, "Popen", side_effect=stalled_lookup):
+                    with self.assertRaises(TimeoutError):
+                        filesystem._adapter_address_info(("resolver.invalid", 80), started + 0.06, cancelled)
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 0.15)
+                self.assertEqual(len(children), 1)
+                self.assertIsNotNone(children[0].returncode)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(children[0].pid, 0)
+                self.assert_no_socket_guards()
+                print(f"metadata DNS: {elapsed:.3f}s, cancellation={cancel}, child reaped")
+
+    def test_metadata_head_and_lane_probes_abort_header_trickle(self):
+        for probe in (False, True):
+            with self.subTest(probe=probe):
+                filesystem = load_filesystem_module()
+                finished = threading.Event()
+
+                class Handler(http.server.BaseHTTPRequestHandler):
+                    def do_HEAD(self):
+                        try:
+                            self.connection.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+                            for _ in range(50):
+                                self.connection.sendall(b"x")
+                                time.sleep(0.02)
+                        except OSError:
+                            pass
+                        finally:
+                            self.close_connection = True
+                            finished.set()
+
+                    def log_message(self, *_args):
+                        pass
+
+                server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+                thread = threading.Thread(target=server.serve_forever)
+                thread.start()
+                try:
+                    url = f"http://127.0.0.1:{server.server_address[1]}/step_1"
+                    started = time.monotonic()
+                    with mock.patch.object(filesystem, "_adapter_source_urls", return_value=[url, url]):
+                        with self.assertRaises((TimeoutError, filesystem._PersistentTransportError)):
+                            if probe:
+                                filesystem._responsive_adapter_source_urls(url, started + 0.06, None)
+                            else:
+                                filesystem._content_length(url, started + 0.06)
+                    elapsed = time.monotonic() - started
+                    self.assertLess(elapsed, 0.18)
+                    self.assert_no_socket_guards()
+                    print(f"metadata HEAD: {elapsed:.3f}s, lane_probe={probe}")
+                finally:
+                    finished.wait(1)
+                    server.shutdown()
+                    thread.join(1)
+                    server.server_close()
+
+    def test_visibility_wait_uses_deadline_instead_of_attempt_limit(self):
+        filesystem = load_filesystem_module()
+        clock = [0.0]
+        attempts = []
+
+        def manifest(*_args, **_kwargs):
+            attempts.append(clock[0])
+            if len(attempts) <= 301:
+                raise filesystem._PersistentTransportError("adapter manifest is missing")
+            return {"version": 2}
+
+        with mock.patch.object(filesystem.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(
+            filesystem.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+        ), mock.patch.object(filesystem, "_read_chunked_xor_manifest", side_effect=manifest):
+            self.assertEqual(filesystem._read_delta_manifest_with_visibility_wait(
+                "http://source/step_2", deadline=600, cancel_event=None,
+            ), {"version": 2})
+        self.assertEqual(len(attempts), 302)
+        self.assertEqual(clock[0], 301)
+        clock[0] = 0
+        with mock.patch.object(filesystem.time, "monotonic", side_effect=lambda: clock[0]), mock.patch.object(
+            filesystem.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+        ), mock.patch.object(filesystem, "_read_chunked_xor_manifest", side_effect=filesystem._PersistentTransportError(
+            "adapter manifest is missing"
+        )) as read_manifest:
+            with self.assertRaises(TimeoutError):
+                filesystem._read_delta_manifest_with_visibility_wait(
+                    "http://source/step_2", deadline=5, cancel_event=None,
+                )
+        self.assertEqual(clock[0], 5)
+        self.assertEqual(read_manifest.call_count, 5)
+
     def assert_no_socket_guards(self):
         self.assertFalse([thread for thread in threading.enumerate()
                           if thread.name == "adapter-socket-deadline"])
@@ -257,6 +560,7 @@ class DownloadSchedulerTest(unittest.TestCase):
     def test_socket_guard_joins_an_abort_that_won_the_completion_race(self):
         filesystem = load_filesystem_module()
         for local_error in (None, filesystem._PersistentLocalError("disk failed"),
+                            OSError(errno.ENOSPC, "No space left on device"),
                             filesystem._PersistentProtocolError("checksum differs"),
                             filesystem._AdapterMetadataError("invalid manifest")):
             with self.subTest(local_error=local_error):
@@ -412,7 +716,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 responses = [self._metadata_response(payload[:5], declared=len(payload), chunked=chunked),
                              self._metadata_response(payload)]
                 with mock.patch.object(filesystem, "_metadata_source_urls", return_value=urls), mock.patch.object(
-                    filesystem.urllib.request, "urlopen", side_effect=responses
+                    filesystem, "_adapter_http_open", side_effect=responses
                 ) as request:
                     self.assertEqual(filesystem._read_source_bytes(urls[0], max_bytes=1024), payload)
                 self.assertEqual([call.args[0] for call in request.call_args_list], urls)
@@ -424,7 +728,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 source = "http://source/run/step_1"
                 calls = []
 
-                def request(url, timeout):
+                def request(url, timeout, **_kwargs):
                     calls.append(url)
                     if failure == "reset":
                         raise ConnectionResetError("connection reset by peer")
@@ -436,7 +740,7 @@ class DownloadSchedulerTest(unittest.TestCase):
 
                 with mock.patch.dict(os.environ, {"PRIME_LORA_CACHE_DIR": temporary}), mock.patch.object(
                     filesystem, "_metadata_source_urls", return_value=["http://lane0/meta", "http://lane1/meta"]
-                ), mock.patch.object(filesystem.urllib.request, "urlopen", side_effect=request):
+                ), mock.patch.object(filesystem, "_adapter_http_open", side_effect=request):
                     destination = filesystem.adapter_cache_path(source)
                     partial = destination.with_name(destination.name + ".partial")
                     partial.mkdir()
@@ -1065,7 +1369,7 @@ class DownloadSchedulerTest(unittest.TestCase):
 
     def test_typed_sequential_retry_exhaustion_wraps_only_retryable_http(self):
         filesystem = load_filesystem_module()
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_sleep = filesystem.time.sleep
         old_retries = filesystem._ADAPTER_LANE_RETRIES
         filesystem.time.sleep = lambda _seconds: None
@@ -1079,7 +1383,7 @@ class DownloadSchedulerTest(unittest.TestCase):
         try:
             for status in (503, 400):
                 calls.clear()
-                filesystem.urllib.request.urlopen = lambda request, timeout, status=status: always_status(
+                filesystem._adapter_http_open = lambda request, timeout, status=status, **_kwargs: always_status(
                     request, timeout, status
                 )
                 with tempfile.TemporaryDirectory() as temporary:
@@ -1120,13 +1424,13 @@ class DownloadSchedulerTest(unittest.TestCase):
                     finally:
                         os.close(parent_fd)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.time.sleep = old_sleep
             filesystem._ADAPTER_LANE_RETRIES = old_retries
 
     def test_typed_sequential_transport_exhaustion_binds_original_error(self):
         filesystem = load_filesystem_module()
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_sleep = filesystem.time.sleep
         old_retries = filesystem._ADAPTER_LANE_RETRIES
         filesystem.time.sleep = lambda _seconds: None
@@ -1139,7 +1443,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 "adapter network request failed"
             )
 
-        filesystem.urllib.request.urlopen = always_transport_failure
+        filesystem._adapter_http_open = always_transport_failure
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 destination = Path(temporary) / "adapter"
@@ -1170,13 +1474,13 @@ class DownloadSchedulerTest(unittest.TestCase):
                 finally:
                     os.close(parent_fd)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.time.sleep = old_sleep
             filesystem._ADAPTER_LANE_RETRIES = old_retries
 
     def test_typed_range_transport_exhaustion_binds_original_error(self):
         filesystem = load_filesystem_module()
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_sleep = filesystem.time.sleep
         old_retries = filesystem._ADAPTER_LANE_RETRIES
         filesystem.time.sleep = lambda _seconds: None
@@ -1187,7 +1491,7 @@ class DownloadSchedulerTest(unittest.TestCase):
             calls.append(True)
             raise OSError("socket failure")
 
-        filesystem.urllib.request.urlopen = always_transport_failure
+        filesystem._adapter_http_open = always_transport_failure
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 chunks = Path(temporary) / "chunks"
@@ -1218,7 +1522,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 finally:
                     os.close(parent_fd)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.time.sleep = old_sleep
             filesystem._ADAPTER_LANE_RETRIES = old_retries
 
@@ -2341,13 +2645,13 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        def fake_urlopen(_request, timeout):
+        def fake_urlopen(_request, timeout, **_kwargs):
             self.assertGreater(timeout, 0)
             return Response(payload)
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_open = filesystem.os.open
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         triggered = False
         try:
             with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
@@ -2377,7 +2681,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 self.assertEqual((cache_original / "output").read_bytes(), payload)
                 self.assertFalse((outside / "output").exists())
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.os.open = old_open
 
     def test_sequential_download_resumes_existing_output(self):
@@ -2398,8 +2702,8 @@ class DownloadSchedulerTest(unittest.TestCase):
             calls.append(request.headers.get("Range"))
             return Response(payload[2:])
 
-        old_urlopen = filesystem.urllib.request.urlopen
-        filesystem.urllib.request.urlopen = fake_urlopen
+        old_urlopen = filesystem._adapter_http_open
+        filesystem._adapter_http_open = fake_urlopen
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 destination = Path(temporary) / "output"
@@ -2413,7 +2717,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 )
                 self.assertEqual(destination.read_bytes(), payload)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
         self.assertEqual(calls, ["bytes=2-"])
 
     def test_glm_stream_count_accepts_24_lanes(self):
@@ -2467,16 +2771,16 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, **_kwargs):
             url = request.full_url if hasattr(request, "full_url") else request
             calls.append((url, timeout))
             if url.startswith("http://lane-1/"):
                 raise TimeoutError("stalled")
             return Response(b"safe")
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_lanes = filesystem._adapter_source_urls
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem._adapter_source_urls = lambda _source: [
             "http://lane-1/manifest",
             "http://lane-2/manifest",
@@ -2490,7 +2794,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 b"safe",
             )
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem._adapter_source_urls = old_lanes
 
         self.assertEqual([call[0] for call in calls], [
@@ -2524,9 +2828,9 @@ class DownloadSchedulerTest(unittest.TestCase):
                 raise ConnectionResetError("connection reset by peer")
             return Response(b"safe")
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_lanes = filesystem._adapter_source_urls
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem._adapter_source_urls = lambda _source: source_urls
         try:
             self.assertEqual(
@@ -2538,7 +2842,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 b"safe",
             )
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem._adapter_source_urls = old_lanes
 
         self.assertEqual(calls, source_urls)
@@ -2560,9 +2864,9 @@ class DownloadSchedulerTest(unittest.TestCase):
             calls.append(request.full_url if hasattr(request, "full_url") else request)
             return Response()
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_lanes = filesystem._adapter_source_urls
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem._adapter_source_urls = lambda _source: [
             "http://lane-1/manifest",
             "http://lane-2/manifest",
@@ -2574,7 +2878,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                     max_bytes=16,
                 )
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem._adapter_source_urls = old_lanes
 
         self.assertEqual(calls, ["http://lane-1/manifest"])
@@ -2587,9 +2891,9 @@ class DownloadSchedulerTest(unittest.TestCase):
             calls.append(request.full_url if hasattr(request, "full_url") else request)
             raise OSError("adapter identity differs")
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_lanes = filesystem._adapter_source_urls
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem._adapter_source_urls = lambda _source: [
             "http://lane-1/manifest",
             "http://lane-2/manifest",
@@ -2598,7 +2902,7 @@ class DownloadSchedulerTest(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "identity differs"):
                 filesystem._read_source_bytes("http://lane-1/manifest")
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem._adapter_source_urls = old_lanes
 
         self.assertEqual(calls, ["http://lane-1/manifest"])
@@ -2654,9 +2958,9 @@ class DownloadSchedulerTest(unittest.TestCase):
                 raise TimeoutError("stalled")
             return Response()
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_lanes = filesystem._adapter_source_urls
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem._adapter_source_urls = lambda _source: [
             "http://lane-1/adapter",
             "http://lane-2/adapter",
@@ -2669,7 +2973,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 None,
             )
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem._adapter_source_urls = old_lanes
 
         self.assertEqual(total, 3)
@@ -2696,7 +3000,7 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, **_kwargs):
             value = request.headers["Range"]
             start, end = (int(part) for part in value.removeprefix("bytes=").split("-"))
             calls.append((request.full_url, start, end, timeout))
@@ -2715,10 +3019,10 @@ class DownloadSchedulerTest(unittest.TestCase):
             def shutdown(self, *args, **kwargs):
                 return self.executor.shutdown(*args, **kwargs)
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_executor = filesystem.ThreadPoolExecutor
         old_streams = filesystem._configured_download_streams
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem.ThreadPoolExecutor = RecordingExecutor
         filesystem._configured_download_streams = lambda: 2
         try:
@@ -2738,7 +3042,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 )
                 self.assertEqual(destination.read_bytes(), payload)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.ThreadPoolExecutor = old_executor
             filesystem._configured_download_streams = old_streams
 
@@ -2761,7 +3065,7 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, **_kwargs):
             value = request.headers.get("Range")
             if value is None:
                 return Response(payload)
@@ -2783,12 +3087,12 @@ class DownloadSchedulerTest(unittest.TestCase):
             def shutdown(self, *args, **kwargs):
                 return self.executor.shutdown(*args, **kwargs)
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_executor = filesystem.ThreadPoolExecutor
         old_threshold = filesystem._PARALLEL_DOWNLOAD_THRESHOLD
         old_lanes = filesystem._adapter_source_urls
         old_streams = filesystem._configured_download_streams
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem.ThreadPoolExecutor = RecordingExecutor
         filesystem._PARALLEL_DOWNLOAD_THRESHOLD = 0
         filesystem._adapter_source_urls = lambda _source: source_urls
@@ -2858,7 +3162,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 self.assertEqual(empty.read_bytes(), b"")
                 self.assertEqual(workers, [48, 48, 3])
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.ThreadPoolExecutor = old_executor
             filesystem._PARALLEL_DOWNLOAD_THRESHOLD = old_threshold
             filesystem._adapter_source_urls = old_lanes
@@ -2887,10 +3191,10 @@ class DownloadSchedulerTest(unittest.TestCase):
             calls.append((start, end))
             return Response(payload[start : end + 1])
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_threshold = filesystem._PARALLEL_DOWNLOAD_THRESHOLD
         old_streams = filesystem._configured_download_streams
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem._PARALLEL_DOWNLOAD_THRESHOLD = 0
         filesystem._configured_download_streams = lambda: 2
         try:
@@ -2920,7 +3224,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 self.assertEqual(destination.read_bytes(), payload)
                 self.assertFalse(parts.exists())
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem._PARALLEL_DOWNLOAD_THRESHOLD = old_threshold
             filesystem._configured_download_streams = old_streams
         self.assertEqual(sorted(calls), [(2, 3), (4, 7)])
@@ -2940,15 +3244,15 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, **_kwargs):
             calls.append((request.full_url, timeout))
             if len(calls) == 1:
                 raise TimeoutError("lane read timed out")
             return Response(payload)
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_sleep = filesystem.time.sleep
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem.time.sleep = sleeps.append
         try:
             with tempfile.TemporaryDirectory() as temporary:
@@ -2965,7 +3269,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 )
                 self.assertEqual(destination.read_bytes(), payload)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.time.sleep = old_sleep
 
         self.assertEqual([call[0] for call in calls], [
@@ -3003,16 +3307,16 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, **_kwargs):
             calls.append((request.full_url, request.headers.get("Range"), timeout))
             if len(calls) == 1:
                 return SlowResponse()
             return FastResponse(payload[3:])
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_monotonic = filesystem.time.monotonic
         old_sleep = filesystem.time.sleep
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem.time.monotonic = lambda: clock[0]
         filesystem.time.sleep = lambda _seconds: None
         try:
@@ -3030,7 +3334,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 )
                 self.assertEqual(destination.read_bytes(), payload)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.time.monotonic = old_monotonic
             filesystem.time.sleep = old_sleep
 
@@ -3067,16 +3371,16 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, **_kwargs):
             calls.append((request.full_url, request.headers.get("Range"), timeout))
             if len(calls) == 1:
                 return SlowResponse()
             return FastResponse(payload[3:])
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_monotonic = filesystem.time.monotonic
         old_sleep = filesystem.time.sleep
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem.time.monotonic = lambda: clock[0]
         filesystem.time.sleep = lambda _seconds: None
         try:
@@ -3094,7 +3398,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 )
                 self.assertEqual(destination.read_bytes(), payload)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.time.monotonic = old_monotonic
             filesystem.time.sleep = old_sleep
 
@@ -3117,15 +3421,15 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, **_kwargs):
             calls.append((request.full_url, timeout))
             if len(calls) < len(source_urls):
                 raise TimeoutError("lane read timed out")
             return Response(payload)
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_sleep = filesystem.time.sleep
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem.time.sleep = lambda _seconds: None
         try:
             with tempfile.TemporaryDirectory() as temporary:
@@ -3142,7 +3446,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 )
                 self.assertEqual(destination.read_bytes(), payload)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.time.sleep = old_sleep
 
         self.assertEqual([call[0] for call in calls], source_urls)
@@ -3162,16 +3466,16 @@ class DownloadSchedulerTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, **_kwargs):
             calls.append((request.full_url, timeout))
             if len(calls) <= 70:
                 raise filesystem.HTTPError(request.full_url, 503, "not ready", None, None)
             return Response(payload)
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_monotonic = filesystem.time.monotonic
         old_sleep = filesystem.time.sleep
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem.time.monotonic = lambda: clock[0]
         filesystem.time.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
         try:
@@ -3190,7 +3494,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 )
                 self.assertEqual(destination.read_bytes(), payload)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.time.monotonic = old_monotonic
             filesystem.time.sleep = old_sleep
 
@@ -3224,9 +3528,9 @@ class DownloadSchedulerTest(unittest.TestCase):
                 raise OSError("first tunnel is unavailable")
             return Response(payload)
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_sleep = filesystem.time.sleep
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem.time.sleep = lambda _seconds: None
         try:
             with tempfile.TemporaryDirectory() as temporary:
@@ -3244,7 +3548,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                 finally:
                     filesystem.os.close(parent_fd)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.time.sleep = old_sleep
 
         self.assertEqual(calls, [source_urls[23], source_urls[24]])

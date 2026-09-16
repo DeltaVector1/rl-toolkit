@@ -1,3 +1,4 @@
+import errno
 import fcntl
 import hashlib
 import http.client
@@ -8,11 +9,13 @@ import re
 import shutil
 import socket
 import stat
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
 from urllib.error import HTTPError, URLError
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from concurrent.futures import (
     FIRST_COMPLETED,
     ThreadPoolExecutor,
@@ -793,7 +796,10 @@ def _adapter_socket_deadline(sock, deadline, cancel_event):
         with guard_lock:
             stopped.set()
         thread.join()
-        if failure is not None and not isinstance(
+        local_io_error = isinstance(read_error, OSError) and read_error.errno in {
+            errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.EACCES, errno.EPERM,
+        }
+        if failure is not None and not local_io_error and not isinstance(
             read_error, (_PersistentLocalError, _PersistentProtocolError, _AdapterMetadataError)
         ):
             raise failure
@@ -903,8 +909,8 @@ def _wait_for_futures(
         for future in futures:
             future.cancel()
         # Do not let the caller clean a path while a worker can still write it.
-        # Socket reads and retry sleeps check the cancellation event and have
-        # bounded timeouts, so this join completes after cancellation.
+        # Socket reads and retry sleeps stop on cancellation. A stuck disk or
+        # native decoder needs the API server's whole-stage process deadline.
         executor.shutdown(wait=True, cancel_futures=True)
         raise
     else:
@@ -978,13 +984,15 @@ def _content_length(
     for candidate in _metadata_source_urls(source_url):
         _check_deadline(deadline, cancel_event)
         try:
-            with urllib.request.urlopen(
+            with _adapter_http_open(
                 urllib.request.Request(candidate, method="HEAD"),
                 timeout=_request_timeout(
                     deadline,
                     cancel_event,
                     maximum=_configured_chunk_timeout(),
                 ),
+                deadline=deadline,
+                cancel_event=cancel_event,
             ) as response:
                 _check_deadline(deadline, cancel_event)
                 try:
@@ -1000,7 +1008,8 @@ def _content_length(
         except OSError as exc:
             if not _is_retryable_metadata_error(exc):
                 raise
-            last_error = exc
+            last_error = _PersistentTransportError("adapter metadata HEAD request failed")
+            last_error.__cause__ = exc
     assert last_error is not None
     raise last_error
 
@@ -1020,6 +1029,166 @@ def _read_source_text(
     ).decode("utf-8")
 
 
+class _AdapterRequestSockets:
+    """Register sockets before connect so a deadline can interrupt all I/O."""
+
+    def __init__(self, deadline, cancel_event):
+        self.deadline = deadline
+        self.cancel_event = cancel_event
+        self.sockets = []
+        self.lock = threading.Lock()
+        self.aborted = False
+
+    def register(self, sock):
+        with self.lock:
+            try:
+                _check_deadline(self.deadline, self.cancel_event)
+                if self.aborted:
+                    raise TimeoutError("adapter request was aborted")
+            except BaseException:
+                sock.close()
+                raise
+            self.sockets.append(sock)
+        return sock
+
+    def shutdown(self, how):
+        with self.lock:
+            self.aborted = True
+            for sock in self.sockets:
+                try:
+                    sock.shutdown(how)
+                except OSError:
+                    pass
+
+    def connect(self, address, timeout=None, source_address=None):
+        _check_deadline(self.deadline, self.cancel_event)
+        last_error = None
+        for family, kind, protocol, _name, target in _adapter_address_info(
+            address, self.deadline, self.cancel_event
+        ):
+            sock = self.register(socket.socket(family, kind, protocol))
+            try:
+                remaining = self.deadline - time.monotonic()
+                _check_deadline(self.deadline, self.cancel_event)
+                sock.settimeout(remaining if timeout is None else min(timeout, remaining))
+                if source_address is not None:
+                    sock.bind(source_address)
+                sock.connect(tuple(target))
+                _check_deadline(self.deadline, self.cancel_event)
+                return sock
+            except OSError as exc:
+                sock.close()
+                last_error = exc
+                _check_deadline(self.deadline, self.cancel_event)
+        if last_error is not None:
+            raise last_error
+        raise OSError("adapter host has no socket address")
+
+
+class _SecureAdapterConnection(http.client.HTTPSConnection):
+    def connect(self):
+        http.client.HTTPConnection.connect(self)
+        self.sock = self.register_socket(self._context.wrap_socket(
+            self.sock,
+            server_hostname=self._tunnel_host or self.host,
+            do_handshake_on_connect=False,
+        ))
+        self.sock.do_handshake()
+
+
+@contextmanager
+def _adapter_http_open(source_url, *, timeout, deadline=None, cancel_event=None, attempt_timeout=None):
+    """Bound DNS, connect, redirects, headers, and body with one attempt guard."""
+    url = source_url.full_url if isinstance(source_url, urllib.request.Request) else source_url
+    if urlsplit(url).scheme not in {"http", "https"}:
+        raise _PersistentProtocolError("adapter metadata URL must use HTTP or HTTPS")
+    attempt_end = time.monotonic() + (timeout if attempt_timeout is None else attempt_timeout)
+    deadline = min(deadline, attempt_end) if deadline is not None else attempt_end
+    sockets = _AdapterRequestSockets(deadline, cancel_event)
+
+    def connection(connection_type, host, **kwargs):
+        result = connection_type(host, **kwargs)
+        result._create_connection = sockets.connect
+        result.register_socket = sockets.register
+        return result
+
+    class HttpHandler(urllib.request.HTTPHandler):
+        def http_open(self, request):
+            return self.do_open(
+                lambda host, **kwargs: connection(http.client.HTTPConnection, host, **kwargs),
+                request,
+            )
+
+    class HttpsHandler(urllib.request.HTTPSHandler):
+        def __init__(self):
+            # Build the verified TLS context only if an HTTPS request is made.
+            urllib.request.AbstractHTTPHandler.__init__(self)
+
+        def https_open(self, request):
+            return self.do_open(
+                lambda host, **kwargs: connection(_SecureAdapterConnection, host, **kwargs),
+                request,
+            )
+
+    class RedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, response, code, message, headers, new_url):
+            if urlsplit(new_url).scheme not in {"http", "https"}:
+                response.close()
+                raise _PersistentProtocolError("adapter metadata redirect must use HTTP or HTTPS")
+            return super().redirect_request(request, response, code, message, headers, new_url)
+
+    opener = urllib.request.build_opener(HttpHandler(), HttpsHandler(), RedirectHandler())
+    try:
+        with _adapter_socket_deadline(sockets, deadline, cancel_event):
+            try:
+                with opener.open(source_url, timeout=timeout) as response:
+                    yield response
+            except HTTPError as exc:
+                exc.close()
+                raise
+    finally:
+        for sock in sockets.sockets:
+            sock.close()
+
+
+def _adapter_address_info(address, deadline, cancel_event):
+    """Keep numeric lanes local; reap a stalled name lookup on cancellation."""
+    host, port = address
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, host)
+        except OSError:
+            continue
+        target = (host, port) if family == socket.AF_INET else (host, port, 0, 0)
+        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", target)]
+    _check_deadline(deadline, cancel_event)
+    script = (
+        "import json, socket, sys\n"
+        "print(json.dumps(socket.getaddrinfo(sys.argv[1], int(sys.argv[2]), 0, socket.SOCK_STREAM)))\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, host, str(port)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        while True:
+            _check_deadline(deadline, cancel_event)
+            try:
+                stdout, _stderr = process.communicate(timeout=min(0.02, max(0.0, deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        _check_deadline(deadline, cancel_event)
+        if process.returncode:
+            raise _PersistentTransportError("adapter host name lookup failed")
+        return json.loads(stdout)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=1)
+
+
 def _read_source_bytes(
     source_url: str,
     deadline: float | None = None,
@@ -1037,9 +1206,11 @@ def _read_source_bytes(
         if deadline is not None:
             request_deadline = min(request_deadline, deadline)
         try:
-            with urllib.request.urlopen(
+            with _adapter_http_open(
                 candidate,
                 timeout=timeout,
+                deadline=request_deadline,
+                cancel_event=cancel_event,
             ) as response:
                 headers = getattr(response, "headers", {})
                 content_length = (
@@ -1063,25 +1234,23 @@ def _read_source_bytes(
                 chunks = []
                 total = 0
                 read_available = getattr(response, "read1", None) or response.read
-                response_socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
-                with _adapter_socket_deadline(response_socket, request_deadline, cancel_event):
-                    while True:
-                        _check_deadline(request_deadline, cancel_event)
-                        read_size = 16 * 1024 * 1024
-                        if max_bytes is not None:
-                            read_size = min(read_size, max_bytes - total + 1)
-                        try:
-                            chunk = read_available(read_size)
-                        except http.client.IncompleteRead as exc:
-                            raise _PersistentTransportError("adapter metadata body ended early") from exc
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        total += len(chunk)
-                        if max_bytes is not None and total > max_bytes:
-                            raise _AdapterMetadataError(
-                                f"source exceeds the {max_bytes}-byte read limit: {source_url}"
-                            )
+                while True:
+                    _check_deadline(request_deadline, cancel_event)
+                    read_size = 16 * 1024 * 1024
+                    if max_bytes is not None:
+                        read_size = min(read_size, max_bytes - total + 1)
+                    try:
+                        chunk = read_available(read_size)
+                    except http.client.IncompleteRead as exc:
+                        raise _PersistentTransportError("adapter metadata body ended early") from exc
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if max_bytes is not None and total > max_bytes:
+                        raise _AdapterMetadataError(
+                            f"source exceeds the {max_bytes}-byte read limit: {source_url}"
+                        )
                 _check_deadline(deadline, cancel_event)
                 if content_length is not None and total != content_length_value:
                     raise _PersistentTransportError("adapter metadata body ended early")
@@ -1277,13 +1446,15 @@ def _responsive_adapter_source_urls(
     def probe(candidate: str) -> bool:
         config_url = f"{candidate.rstrip('/')}/{_ADAPTER_FILES[0]}"
         try:
-            with urllib.request.urlopen(
+            with _adapter_http_open(
                 urllib.request.Request(config_url, method="HEAD"),
                 timeout=_request_timeout(
                     deadline,
                     cancel_event,
                     maximum=_configured_chunk_timeout(),
                 ),
+                deadline=deadline,
+                cancel_event=cancel_event,
             ) as response:
                 status = int(response.status)
                 if 200 <= status < 400:
@@ -1806,7 +1977,10 @@ def _read_delta_manifest_with_visibility_wait(
     cancel_event: threading.Event | None,
 ) -> dict[str, object]:
     """Wait for the origin to publish a v2 manifest under one deadline."""
-    for attempt in range(_ADAPTER_VISIBILITY_RETRIES):
+    attempt = 0
+    while deadline is not None or attempt < _ADAPTER_VISIBILITY_RETRIES:
+        _check_deadline(deadline, cancel_event)
+        attempt += 1
         try:
             return _read_chunked_xor_manifest(
                 source_url,
@@ -1817,7 +1991,7 @@ def _read_delta_manifest_with_visibility_wait(
             if "adapter manifest is missing" not in str(exc):
                 raise
             _check_deadline(deadline, cancel_event)
-            if attempt + 1 == _ADAPTER_VISIBILITY_RETRIES:
+            if deadline is None and attempt == _ADAPTER_VISIBILITY_RETRIES:
                 raise
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
@@ -3416,11 +3590,16 @@ def _download_range(
                     maximum=_ADAPTER_LANE_TIMEOUT_S,
                 )
             response_open = (
-                _adapter_urlopen(request, request_timeout)
+                _adapter_urlopen(
+                    request, request_timeout, deadline=attempt_deadline,
+                    cancel_event=cancel_event,
+                    attempt_timeout=active_timeout or _configured_chunk_timeout(),
+                )
                 if typed_transport
-                else urllib.request.urlopen(
-                    request,
-                    timeout=request_timeout,
+                else _adapter_http_open(
+                    request, timeout=request_timeout, deadline=attempt_deadline,
+                    cancel_event=cancel_event,
+                    attempt_timeout=active_timeout or _configured_chunk_timeout(),
                 )
             )
             with response_open as response:
@@ -3544,13 +3723,23 @@ def _retryable_adapter_http_status(status: int) -> bool:
     return status in _RETRYABLE_ADAPTER_HTTP_STATUSES
 
 
-def _adapter_urlopen(request, timeout: float):
+@contextmanager
+def _adapter_urlopen(request, timeout: float, **kwargs):
+    # Classify open failures only. A caller's disk or validation error must
+    # never become a retryable network error.
     try:
-        return urllib.request.urlopen(request, timeout=timeout)
-    except HTTPError:
-        raise
-    except (OSError, http.client.HTTPException, EOFError) as exc:
-        raise _PersistentTransportError("adapter network request failed") from exc
+        with ExitStack() as stack:
+            try:
+                response = stack.enter_context(_adapter_http_open(request, timeout=timeout, **kwargs))
+            except HTTPError:
+                raise
+            except (OSError, http.client.HTTPException, EOFError) as exc:
+                raise _PersistentTransportError("adapter network request failed") from exc
+            yield response
+    except TimeoutError as exc:
+        # The guard can fire as headers finish or during the body. In either
+        # case retain the prefix and rotate, unless the stage itself expired.
+        raise _PersistentTransportError("adapter request exceeded its attempt time limit") from exc
 
 
 def _adapter_response_chunks(
@@ -3644,7 +3833,7 @@ class _PersistentAdapterConnection:
             self.close()
         if self._connection is None:
             connection_type = (
-                http.client.HTTPSConnection
+                _SecureAdapterConnection
                 if parsed.scheme == "https"
                 else http.client.HTTPConnection
             )
@@ -3700,21 +3889,27 @@ class _PersistentAdapterConnection:
         response = None
         read_deadline = min(
             (value for value in (stage_deadline, attempt_deadline) if value is not None),
-            default=None,
+            default=time.monotonic() + timeout,
         )
+        connect_deadline = time.monotonic() + remaining_timeout()
+        sockets = _AdapterRequestSockets(connect_deadline, cancel_event)
         try:
-            connection.request(
-                "GET",
-                request_path,
-                headers={
-                    "Connection": "keep-alive",
-                    "Range": f"bytes={start}-{end}",
-                },
-            )
+            connection._create_connection = sockets.connect
+            connection.register_socket = sockets.register
             if connection.sock is not None:
-                connection.sock.settimeout(remaining_timeout())
-            request_socket = connection.sock
-            with _adapter_socket_deadline(request_socket, read_deadline, cancel_event):
+                sockets.register(connection.sock)
+            with _adapter_socket_deadline(sockets, connect_deadline, cancel_event):
+                connection.request(
+                    "GET",
+                    request_path,
+                    headers={
+                        "Connection": "keep-alive",
+                        "Range": f"bytes={start}-{end}",
+                    },
+                )
+                if connection.sock is not None:
+                    connection.sock.settimeout(remaining_timeout())
+                request_socket = connection.sock
                 response = connection.getresponse()
                 remaining_timeout()
         except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
@@ -4930,7 +5125,9 @@ def _stage_chunked_linear_adapter(
             or _sha256(chunk_path, deadline, cancel_event) != wire_sha256
         ):
             raise OSError("version-two adapter transport chunk checksum mismatch")
+        _check_deadline(deadline, cancel_event)
         encoded = _read_bytes_nofollow(chunk_path)
+        _check_deadline(deadline, cancel_event)
         reconstruction_started_at = time.monotonic()
         with reconstruct_lock:
             if reconstruction_started is None or reconstruction_started_at < reconstruction_started:
@@ -4941,7 +5138,9 @@ def _stage_chunked_linear_adapter(
             base_fd1 = _open_nofollow(base1_model, os.O_RDONLY)
             output_fd = _open_nofollow(output_path, os.O_RDWR)
             base2_chunk = os.pread(base_fd2, raw_size, offset)
+            _check_deadline(deadline, cancel_event)
             base1_chunk = os.pread(base_fd1, raw_size, offset)
+            _check_deadline(deadline, cancel_event)
             if len(base2_chunk) != raw_size or len(base1_chunk) != raw_size:
                 raise OSError("cached version-two base ended before transport chunk")
             reconstructed, correction_sha256 = _decode_linear_transport_chunk(
@@ -4953,11 +5152,13 @@ def _stage_chunked_linear_adapter(
                 raw_size=raw_size,
                 codec=str(item["codec"]),
             )
+            _check_deadline(deadline, cancel_event)
             if correction_sha256 != raw_sha256:
                 raise OSError("version-two adapter correction checksum mismatch")
             if len(reconstructed) != raw_size:
                 raise OSError("version-two adapter chunk has the wrong size")
             _pwrite_all(output_fd, reconstructed, offset)
+            _check_deadline(deadline, cancel_event)
             output_sha256 = hashlib.sha256(reconstructed).hexdigest()
         finally:
             for file_descriptor in (output_fd, base_fd1, base_fd2):
@@ -5919,9 +6120,17 @@ def _download_with_parent(
                         maximum=_ADAPTER_LANE_TIMEOUT_S,
                     )
                 response_open = (
-                    _adapter_urlopen(request, request_timeout)
+                    _adapter_urlopen(
+                        request, request_timeout, deadline=attempt_deadline,
+                        cancel_event=cancel_event,
+                        attempt_timeout=active_timeout or _configured_chunk_timeout(),
+                    )
                     if typed_transport
-                    else urllib.request.urlopen(request, timeout=request_timeout)
+                    else _adapter_http_open(
+                        request, timeout=request_timeout, deadline=attempt_deadline,
+                        cancel_event=cancel_event,
+                        attempt_timeout=active_timeout or _configured_chunk_timeout(),
+                    )
                 )
                 with response_open as response:
                     if offset and response.status != 206:

@@ -1518,7 +1518,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         filesystem = load_filesystem()
         source_url = "http://source/checkpoint"
         old_cache = os.environ.get("PRIME_FULL_CHECKPOINT_CACHE_DIR")
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_download = filesystem.download
         try:
             with tempfile.TemporaryDirectory() as temporary:
@@ -1541,7 +1541,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(index_bytes if path.name.endswith(".json") else shard_bytes)
 
-                filesystem.urllib.request.urlopen = no_delta_manifest
+                filesystem._adapter_http_open = no_delta_manifest
                 filesystem.download = fake_download
                 result = filesystem.stage_full_checkpoint_files(
                     source_url,
@@ -1566,7 +1566,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 finally:
                     os.close(parent_fd)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.download = old_download
             if old_cache is None:
                 os.environ.pop("PRIME_FULL_CHECKPOINT_CACHE_DIR", None)

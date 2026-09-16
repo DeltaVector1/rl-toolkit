@@ -1080,7 +1080,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 def __exit__(self, *_args):
                     self.close()
 
-            def fake_urlopen(url, timeout):
+            def fake_urlopen(url, timeout, **_kwargs):
                 calls.append((url, timeout))
                 return Response(json.dumps(manifest).encode("utf-8"))
 
@@ -1126,7 +1126,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                     def __exit__(self, *_args):
                         self.close()
 
-                def fake_urlopen(url, timeout):
+                def fake_urlopen(url, timeout, **_kwargs):
                     calls.append((url, timeout))
                     return Response(json.dumps(manifest).encode("utf-8"))
 
@@ -1171,7 +1171,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 def __exit__(self, *_args):
                     self.close()
 
-            def fake_urlopen(url, timeout):
+            def fake_urlopen(url, timeout, **_kwargs):
                 calls.append((url, timeout))
                 return Response(json.dumps(remote_manifest).encode("utf-8"))
 
@@ -1597,7 +1597,7 @@ class AdapterTransportStateTest(unittest.TestCase):
     def test_all_unresponsive_lanes_keep_partial_data_retryable(self):
         filesystem = load_filesystem_module()
         old_lanes = filesystem._adapter_source_urls
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
 
         def unavailable(*_args, **_kwargs):
             raise filesystem.HTTPError("http://relay/config", 503, "starting", None, None)
@@ -1606,14 +1606,14 @@ class AdapterTransportStateTest(unittest.TestCase):
             "http://relay/lane-a",
             "http://relay/lane-b",
         ]
-        filesystem.urllib.request.urlopen = unavailable
+        filesystem._adapter_http_open = unavailable
         try:
             with self.assertRaises(filesystem._PersistentTransportError) as raised:
                 filesystem._responsive_adapter_source_urls("http://relay/step_2", None, None)
             self.assertTrue(filesystem._preserve_adapter_stage_partial(raised.exception))
         finally:
             filesystem._adapter_source_urls = old_lanes
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
 
     def test_relay_unavailable_is_temporary_for_both_delta_versions(self):
         filesystem = load_filesystem_module()
@@ -2336,6 +2336,106 @@ class AdapterTransportStateTest(unittest.TestCase):
             time.sleep(0.02)
             self.assertFalse(ready.exists())
 
+    def test_public_stage_kills_stalled_decode_thread_and_resumes_partial(self):
+        stage_method, response_type = load_server_stage_method(None)
+        namespace = stage_method.__globals__
+        server_path = ROOT / "src/prime_rl/inference/vllm/server.py"
+        kill_function = next(node for node in ast.parse(server_path.read_text()).body
+                             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_kill_stage_process")
+        namespace["os"] = os
+        exec(compile(ast.Module(body=[kill_function], type_ignores=[]), str(server_path), "exec"), namespace)
+        children = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state.json"
+            destination = root / "adapter"
+            destination.mkdir()
+            payload = b"verified-partial-and-remainder"
+            digest = hashlib.sha256(payload).hexdigest()
+            namespace["adapter_cache_path"] = lambda _source: destination
+            namespace["adapter_stage_status"] = lambda: json.loads(state.read_text()) if state.exists() else {}
+            def verified_identity(_source, path, *, expected_stage_id, expected_pid):
+                actual_digest = hashlib.sha256((path / "model").read_bytes()).hexdigest()
+                self.assertEqual(actual_digest, digest)
+                identity = json.loads(state.read_text())
+                self.assertEqual(identity["stage_id"], expected_stage_id)
+                self.assertEqual(identity["pid"], expected_pid)
+                return {"target_sha256": actual_digest}
+
+            namespace["_read_verified_adapter_identity"] = verified_identity
+            scheduler_path = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
+            scheduler_source = scheduler_path.read_text()
+            scheduler = "\n\n".join(ast.get_source_segment(scheduler_source, node)
+                for node in ast.parse(scheduler_source).body
+                if isinstance(node, ast.FunctionDef)
+                and node.name in {"_run_bounded_futures", "_check_deadline", "_check_cancelled"})
+            script = """
+import hashlib, json, os, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from pathlib import Path
+exec(sys.argv[1])
+request = json.loads(sys.stdin.read())
+root = Path(sys.argv[2])
+destination = root / 'adapter'
+partial = root / 'chunk.partial'
+payload = b'verified-partial-and-remainder'
+if not partial.exists():
+    partial.write_bytes(payload[:8])
+    def stalled_decode(*_args):
+        (root / 'entered').touch()
+        time.sleep(5)
+        (root / 'late-write').touch()
+    _run_bounded_futures([1], stalled_decode, 1, time.monotonic() + 0.01)
+else:
+    assert partial.read_bytes() == payload[:8]
+    (destination / 'model').write_bytes(partial.read_bytes() + payload[8:])
+    (destination / 'READY').touch()
+    state = dict(status='ready', stage_id=request['stage_id'], pid=os.getpid(),
+                 source_url=request['source_url'], path=str(destination),
+                 target_sha256=hashlib.sha256(payload).hexdigest(), ready_at_monotonic=time.monotonic())
+    (root / 'state.json').write_text(json.dumps(state))
+    print(json.dumps(dict(status='ok', stage_id=request['stage_id'], pid=os.getpid(), path=str(destination))))
+"""
+
+            async def start_child(*_args, **kwargs):
+                child = await asyncio.create_subprocess_exec(
+                    sys.executable, "-c", script, scheduler, str(root), **kwargs)
+                children.append(child)
+                return child
+
+            namespace["asyncio"].create_subprocess_exec = start_child
+            namespace["asyncio"].subprocess = asyncio.subprocess
+
+            class Request:
+                async def json(self):
+                    return {"lora_path": "http://source/step_2", "require_delta": True,
+                            "policy_step": 2, "stage_timeout_seconds": 0.25}
+
+                async def is_disconnected(self):
+                    return False
+
+            async def check_boundary():
+                started = time.monotonic()
+                response = await stage_method(Request())
+                elapsed = time.monotonic() - started
+                self.assertIsInstance(response, response_type)
+                self.assertEqual(response.status_code, 504)
+                self.assertLess(elapsed, 0.5)
+                self.assertTrue((root / "entered").exists())
+                self.assertEqual((root / "chunk.partial").read_bytes(), payload[:8])
+                self.assertEqual(children[0].returncode, -signal.SIGTERM)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(children[0].pid, 0)
+                self.assertFalse((destination / "READY").exists())
+                result = await stage_method(Request())
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual((destination / "model").read_bytes(), payload)
+                self.assertEqual(children[1].returncode, 0)
+                self.assertFalse((root / "late-write").exists())
+                print(f"public stage stalled decode: {elapsed:.3f}s; child reaped; 8-byte partial resumed")
+
+            asyncio.run(check_boundary())
+
     def test_publish_wins_timeout_race_returns_success(self):
         for _ in range(10):
             with tempfile.TemporaryDirectory() as temporary:
@@ -2772,7 +2872,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             def __exit__(self, *_args):
                 self.close()
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, **_kwargs):
             calls.append((request.full_url, request.headers.get("Range"), timeout))
             if len(calls) == 1:
                 raise OSError("first lane is unavailable")
@@ -2782,10 +2882,10 @@ class AdapterTransportStateTest(unittest.TestCase):
             def __init__(self, *_args, **_kwargs):
                 raise AssertionError("one chunk must not start nested range workers")
 
-        old_urlopen = filesystem.urllib.request.urlopen
+        old_urlopen = filesystem._adapter_http_open
         old_executor = filesystem.ThreadPoolExecutor
         old_sleep = filesystem.time.sleep
-        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem._adapter_http_open = fake_urlopen
         filesystem.ThreadPoolExecutor = UnexpectedRangeExecutor
         filesystem.time.sleep = lambda _seconds: None
         try:
@@ -2801,7 +2901,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 )
                 self.assertEqual(destination.read_bytes(), payload)
         finally:
-            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem._adapter_http_open = old_urlopen
             filesystem.ThreadPoolExecutor = old_executor
             filesystem.time.sleep = old_sleep
 
