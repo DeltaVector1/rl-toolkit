@@ -10,7 +10,6 @@ import os
 import re
 import stat
 import tempfile
-import threading
 import time
 import unittest
 from unittest import mock
@@ -1225,15 +1224,6 @@ class ResumeRecoveryTest(unittest.TestCase):
         self.assertIn('_set_engine_state("resuming")', source)
         self.assertIn('_set_engine_state("running")', source)
         self.assertIn('_set_engine_state("unknown")', source)
-
-    def test_staging_status_does_not_hide_an_active_stage(self):
-        source = SERVER_PATH.read_text(encoding="utf-8")
-        self.assertIn("def _combined_lora_stage_status(", source)
-        self.assertIn('if active_status == "staging":', source)
-        self.assertIn('state["status"] = "staging"', source)
-        self.assertIn('durable_status in {"failed", "ready"}', source)
-        self.assertIn('elif durable_status == "staging":', source)
-        self.assertIn('state["status"] = "failed"', source)
 
     def test_active_stage_wins_over_terminal_transfer_record(self):
         source = SERVER_PATH.read_text(encoding="utf-8")

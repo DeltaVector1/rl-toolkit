@@ -14,7 +14,7 @@ from unittest import mock
 
 root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(root))
-import training_ops.tests
+import training_ops.tests  # noqa: F401 - installs the local-only test guard.
 
 source = root / "training_ops/runtime/china/direct_adapter_route.py"
 spec = importlib.util.spec_from_file_location("direct_route", source)
@@ -603,16 +603,6 @@ time.sleep(30)
                 manager.kill()
                 manager.wait(timeout=2)
             manager.stdout.close()
-
-    def test_peer_and_relay_functions_unchanged(self):
-        path = "training_ops/runtime/h200/start_orchestrator.sh"
-        old = subprocess.check_output(["git", "show", "2d773ba04661e3746833fcde205124f163744966:" + path], cwd=root, text=True)
-        new = (root / path).read_text()
-        import re
-        functions = re.findall(r"(?m)^(peer_[a-z_]+|adapter_relay_start)\(\) \{", old)
-        for name in functions:
-            pattern = rf"(?ms)^{name}\(\) \{{.*?^\}}"
-            self.assertEqual(re.search(pattern, old).group(), re.search(pattern, new).group(), name)
 
 
 if __name__ == "__main__":

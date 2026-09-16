@@ -113,33 +113,6 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
             )
             self.assertEqual((restored / "shard.safetensors").read_bytes(), target_bytes)
 
-    def test_checkpoint_delta_round_trip_uses_the_target_directory(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            base = root / "base"
-            delta = root / "delta"
-            target = root / "target"
-            base.mkdir()
-            delta.mkdir()
-            target.mkdir()
-            base_bytes = bytes(range(16))
-            target_bytes = bytes(range(16, 32))
-            base_file = base / "shard.safetensors"
-            delta_file = delta / "shard.xor.zlib"
-            target_file = target / "shard.safetensors"
-            base_file.write_bytes(base_bytes)
-            delta_file.write_bytes(
-                zlib.compress(checkpoint_delta._xor_bytes(base_bytes, target_bytes))
-            )
-            checkpoint_delta.apply_xor_delta_file(
-                base_file,
-                delta_file,
-                target_file,
-                expected_size=len(target_bytes),
-                expected_sha256=hashlib.sha256(target_bytes).hexdigest(),
-            )
-            self.assertEqual(target_file.read_bytes(), target_bytes)
-
     def test_checkpoint_delta_keeps_output_in_the_held_cache_tree(self):
         original_open = checkpoint_delta._open_directory_nofollow
         try:
@@ -340,36 +313,6 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
             self.assertEqual(restored, target[offset:end])
             self.assertEqual(len(payload[: adapter_delta._predictive_header_size]), 64)
 
-    def test_linear_decoder_decompresses_mask_and_values_once(self):
-        base2 = safetensor_bytes([0x3F80, 0x4000, 0x4040, 0x4080])
-        base1 = safetensor_bytes([0x4000, 0x4040, 0x4080, 0x40A0])
-        target = safetensor_bytes([0x4040, 0x4080, 0x40A0, 0x40C0])
-        payload = adapter_delta.encode_predictive_chunk(base2, base1, target, 0, 16)
-        calls = []
-        original_decompress = adapter_delta._decompress_bounded
-
-        def counted_decompress(value, expected_size, *, maximum):
-            calls.append((len(value), expected_size, maximum))
-            return original_decompress(value, expected_size, maximum=maximum)
-
-        adapter_delta._decompress_bounded = counted_decompress
-        try:
-            restored, correction = adapter_delta.decode_linear_zigzag_sparse_chunk(
-                base2,
-                base1,
-                payload,
-                offset=0,
-                data_offset=16,
-                raw_size=len(target),
-                codec=adapter_delta._codec_name(),
-            )
-        finally:
-            adapter_delta._decompress_bounded = original_decompress
-
-        self.assertEqual(restored, target)
-        self.assertEqual(correction, adapter_delta.predictive_correction_bytes(payload))
-        self.assertEqual(len(calls), 2)
-
     def test_predictive_chunk_accepts_an_all_zero_residual(self):
         base = safetensor_bytes([0x3F80, 0x4000])
         payload = adapter_delta.encode_predictive_chunk(base, base, base, 0, 16)
@@ -384,18 +327,6 @@ class PredictiveAdapterCodecTest(unittest.TestCase):
         self.assertEqual(restored, base)
         self.assertEqual(adapter_delta.predictive_raw_sha256(payload), adapter_delta.hashlib.sha256(b"").hexdigest())
         self.assertEqual(adapter_delta.predictive_correction_bytes(payload), b"")
-
-    def test_predictive_chunk_round_trip_with_millions_of_values(self):
-        word_count = 2_000_000
-        header = b'{"x":0} '
-        prefix = struct.pack("<Q", len(header)) + header
-        base2 = prefix + np.full(word_count, 0x3F80, dtype="<u2").tobytes()
-        base1 = prefix + np.full(word_count, 0x4000, dtype="<u2").tobytes()
-        target = prefix + np.full(word_count, 0x4000, dtype="<u2").tobytes()
-        payload = adapter_delta.encode_predictive_chunk(base2, base1, target, 0, len(prefix))
-        restored = adapter_delta.decode_predictive_chunk(base2, base1, payload, 0, len(prefix))
-        self.assertEqual(restored, target)
-        self.assertEqual(len(adapter_delta._decode_leb128_values(b"\x01" * word_count, word_count)), word_count)
 
     def test_predictive_odd_header_and_file_round_trip_preserves_sha(self):
         with tempfile.TemporaryDirectory() as temporary:

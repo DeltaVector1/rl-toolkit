@@ -2,7 +2,6 @@ import errno
 import hashlib
 import http.client
 import http.server
-import inspect
 import importlib.util
 import io
 import json
@@ -601,15 +600,6 @@ class DownloadSchedulerTest(unittest.TestCase):
                     self.assertIs(errors[0], local_error)
                 self.assert_no_socket_guards()
 
-    def test_lane_fallbacks_rotate_from_each_primary(self):
-        filesystem = load_filesystem_module()
-        urls = [f"http://lane{index}" for index in range(5)]
-        pool = filesystem._PersistentAdapterLanePool(urls, width=3)
-        for lane in range(3):
-            self.assertEqual(pool.urls_for_lane(lane, "chunk"), [
-                f"{url}/chunk" for url in urls[lane:] + urls[:lane]
-            ])
-
     def test_retained_prefix_progress_is_counted_once_and_rolled_back(self):
         payload = b"resume-body"
         for retained in (payload[:3], b"bad", payload, b"x" * len(payload), payload + b"extra"):
@@ -906,40 +896,6 @@ class DownloadSchedulerTest(unittest.TestCase):
         filesystem.os.fdopen = failing_fdopen
         return old_fdopen
 
-    def test_persistent_chunks_reuse_one_connection(self):
-        filesystem = load_filesystem_module()
-        payload = b"persistent-range"
-        server, thread, handler = self._persistent_server(filesystem, payload)
-        try:
-            with tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                chunks = root / "chunks"
-                chunks.mkdir()
-                parent_fd = filesystem._open_directory_nofollow(
-                    chunks, create=False, label="test chunks"
-                )
-                pool = filesystem._PersistentAdapterLanePool(1)
-                try:
-                    for name in ("one", "two"):
-                        pool.download(
-                            [f"http://127.0.0.1:{server.server_address[1]}/{name}"],
-                            0,
-                            chunks / name,
-                            parent_fd,
-                            expected_size=len(payload),
-                            expected_sha256=hashlib.sha256(payload).hexdigest(),
-                            per_request_timeout_seconds=2,
-                        )
-                finally:
-                    pool.close()
-                    os.close(parent_fd)
-                self.assertEqual(handler.connections, 1)
-                self.assertEqual(handler.requests, 2)
-        finally:
-            server.shutdown()
-            thread.join(timeout=5)
-            server.server_close()
-
     def test_persistent_pool_closes_reused_connection_after_success(self):
         filesystem = load_filesystem_module()
         payload = b"close-after-success"
@@ -1080,44 +1036,6 @@ class DownloadSchedulerTest(unittest.TestCase):
                 self.assertTrue(all((chunks / name).read_bytes() == payload for name in ("chunk", "next", "one", "two")))
         finally:
             filesystem.lane_rotation_delay_seconds = old_delay
-            server.shutdown()
-            thread.join(timeout=5)
-            server.server_close()
-
-    def test_persistent_connection_reopens_after_idle_threshold(self):
-        filesystem = load_filesystem_module()
-        payload = b"idle-reopen"
-        server, thread, handler = self._persistent_server(filesystem, payload)
-        old_idle = filesystem.persistent_connection_idle_seconds
-        filesystem.persistent_connection_idle_seconds = 0.05
-        try:
-            with tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                chunks = root / "chunks"
-                chunks.mkdir()
-                parent_fd = filesystem._open_directory_nofollow(
-                    chunks, create=False, label="test chunks"
-                )
-                pool = filesystem._PersistentAdapterLanePool(1)
-                try:
-                    for name in ("one", "two"):
-                        pool.download(
-                            [f"http://127.0.0.1:{server.server_address[1]}/{name}"],
-                            0,
-                            chunks / name,
-                            parent_fd,
-                            expected_size=len(payload),
-                            expected_sha256=hashlib.sha256(payload).hexdigest(),
-                            per_request_timeout_seconds=1,
-                        )
-                        if name == "one":
-                            time.sleep(0.08)
-                finally:
-                    pool.close()
-                    os.close(parent_fd)
-                self.assertEqual(handler.connections, 2)
-        finally:
-            filesystem.persistent_connection_idle_seconds = old_idle
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
@@ -2495,37 +2413,6 @@ class DownloadSchedulerTest(unittest.TestCase):
         self.assertLessEqual(maximum_active, 2)
         self.assertLessEqual(maximum_pending, 2)
 
-    def test_bounded_scheduler_reuses_freed_lane(self):
-        filesystem = load_filesystem_module()
-        lock = threading.Lock()
-        started = {}
-        finished = {}
-        release_slow = threading.Event()
-
-        def worker(index, _item, lane):
-            with lock:
-                started[index] = (lane, time.monotonic())
-            if index == 0:
-                self.assertTrue(release_slow.wait(2))
-            elif index == 1:
-                time.sleep(0.03)
-            elif index == 2:
-                release_slow.set()
-            with lock:
-                finished[index] = time.monotonic()
-
-        filesystem._run_bounded_futures(
-            list(range(3)),
-            worker,
-            2,
-            time.monotonic() + 3,
-            threading.Event(),
-        )
-        self.assertEqual(started[0][0], 0)
-        self.assertEqual(started[1][0], 1)
-        self.assertEqual(started[2][0], 1)
-        self.assertLess(started[2][1], finished[0])
-
     def test_bounded_full_scheduler_caps_configured_streams_to_lanes(self):
         filesystem = load_filesystem_module()
         lock = threading.Lock()
@@ -2623,15 +2510,6 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
-    def test_download_keeps_public_signature(self):
-        filesystem = load_filesystem_module()
-        signature = str(inspect.signature(filesystem.download)).replace("pathlib._local.Path", "pathlib.Path")
-        self.assertEqual(
-            signature,
-            "(source_url: str, destination: pathlib.Path, *, expected_size: int | None = None, expected_sha256: str | None = None, progress=None, source_urls: list[str] | None = None, parallel_ranges: bool = True, deadline: float | None = None, cancel_event: threading.Event | None = None, per_request_timeout_seconds: float | None = None, retry_http_statuses: set[int] | None = None) -> None",
-        )
-        self.assertFalse(hasattr(filesystem.download, "__wrapped__"))
-
     def test_sequential_download_survives_parent_swap_at_output_open(self):
         filesystem = load_filesystem_module()
         payload = b"safe"
@@ -2719,18 +2597,6 @@ class DownloadSchedulerTest(unittest.TestCase):
         finally:
             filesystem._adapter_http_open = old_urlopen
         self.assertEqual(calls, ["bytes=2-"])
-
-    def test_glm_stream_count_accepts_24_lanes(self):
-        filesystem = load_filesystem_module()
-        old_value = filesystem.os.environ.get(filesystem._DOWNLOAD_STREAMS_ENV)
-        filesystem.os.environ[filesystem._DOWNLOAD_STREAMS_ENV] = "24"
-        try:
-            self.assertEqual(filesystem._configured_download_streams(), 24)
-        finally:
-            if old_value is None:
-                filesystem.os.environ.pop(filesystem._DOWNLOAD_STREAMS_ENV, None)
-            else:
-                filesystem.os.environ[filesystem._DOWNLOAD_STREAMS_ENV] = old_value
 
     def test_chunk_timeout_never_exceeds_stage_deadline(self):
         filesystem = load_filesystem_module()

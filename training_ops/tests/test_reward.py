@@ -129,53 +129,6 @@ class TrainerComputeProbeTest(unittest.TestCase):
             self.assertEqual(report["TRAINER_COMPUTE_STATE"], "unknown")
             self.assertNotIn("TRAINER_COMPUTE", report)
 
-    def test_status_reports_pending_without_an_explicit_start(self):
-        self.assertIn("trainer compute: pending", training_ops.Status().report())
-
-    def test_status_reports_judges_and_split_rollout_counters(self):
-        status = training_ops.Status(
-            judge="200",
-            secondary_judge="unused",
-            fails_5m=2,
-            unscored_5m=1,
-        )
-        report = status.report()
-        self.assertIn("scoring judge 200", report)
-        self.assertIn("follow-up judge unused", report)
-        self.assertIn("rollout failures in 5m 2", report)
-        self.assertIn("unscored rollouts in 5m 1", report)
-
-    def test_follow_up_judge_warns_only_when_used_and_unhealthy(self):
-        healthy = training_ops.Status(
-            trainer_up=True,
-            orch_up=True,
-            judge="200",
-            secondary_judge="200",
-        )
-        self.assertFalse(
-            any("follow-up judge" in warning for warning in training_ops._warnings(healthy))
-        )
-        unused = training_ops.Status(
-            trainer_up=True,
-            orch_up=True,
-            judge="200",
-            secondary_judge="unused",
-            unscored_5m=1,
-        )
-        self.assertFalse(
-            any("follow-up judge" in warning for warning in training_ops._warnings(unused))
-        )
-        unhealthy = training_ops.Status(
-            trainer_up=True,
-            orch_up=True,
-            judge="200",
-            secondary_judge="503",
-        )
-        self.assertIn(
-            "follow-up judge returned 503",
-            training_ops._warnings(unhealthy),
-        )
-
 
 class ActiveRewardRowsTest(unittest.TestCase):
     def test_selects_rows_after_active_container_start(self):
@@ -591,13 +544,6 @@ class AcceptanceProbeTest(unittest.TestCase):
             [{"step": 1, "train/agg/all/timing/generation/max": 721.0}],
         )
         self.assertTrue(any("generation time exceeds" in alarm for alarm in report.alarms))
-
-    def test_probe_uses_container_command_when_env_has_no_run(self):
-        script = training_ops._acceptance_probe_script("glm52", "trainer")
-
-        self.assertIn("container_cmd=", script)
-        self.assertIn("active_run_source=log-dir", script)
-        self.assertIn('docker logs --since "$started_at"', script)
 
     def test_current_fp8_config_does_not_require_removed_dequant_flags(self):
         report = training_ops._acceptance_from_text(

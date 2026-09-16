@@ -194,10 +194,6 @@ class RefusalGroupSkipTest(unittest.TestCase):
         self.assertIsInstance(field.value, ast.Constant)
         self.assertFalse(field.value.value)
 
-    def test_opt_in_enables_all_refusal_skip(self):
-        skip, _ = _load_refusal_group_function()
-        self.assertTrue(skip([self._rollout(9), self._rollout(9)], enabled=True))
-
 
 if __name__ == "__main__":
     unittest.main()

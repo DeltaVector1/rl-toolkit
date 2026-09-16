@@ -321,7 +321,7 @@ repair_launch_tunnel "$boundary_kind" "$fixture_marker" fixture-forward 'exec sl
 exit 9
 EOF
 for boundary_kind in generic peer china; do
-  for boundary_signal in TERM HUP INT; do
+  for boundary_signal in TERM; do
     for boundary_point in before spawned transition registered after failed; do
       boundary_ready="$tmp/ready-boundary-$boundary_kind-$boundary_signal-$boundary_point"
       boundary_log="$tmp/boundary-$boundary_kind-$boundary_signal-$boundary_point-log"

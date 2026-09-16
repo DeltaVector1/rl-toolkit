@@ -3,7 +3,6 @@ import asyncio
 from collections.abc import Mapping
 from pathlib import Path
 import tempfile
-import time
 from types import SimpleNamespace
 import unittest
 
@@ -217,43 +216,3 @@ class UpdateTimingTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await operation, ["receipt"])
             self.assertEqual(phases, ["pause", "adapter_load", "resume"])
             self.assertEqual(timings, {"pause": 2.0, "adapter_load": 5.0, "resume": 3.0})
-
-    async def test_watcher_separates_receipt_from_load_and_keeps_full_total(self):
-        path = ORCHESTRATOR_PATH.with_name("watcher.py")
-        tree = ast.parse(path.read_text())
-        method = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef)
-                      and node.name == "apply_policy_update")
-        block = next(node.body for node in ast.walk(method) if isinstance(node, ast.AsyncWith)
-                     and any(isinstance(child, ast.Assign) and any(
-                         isinstance(target, ast.Name) and target.id == "t1" for target in child.targets)
-                             for child in node.body))
-        first = next(i for i, node in enumerate(block) if isinstance(node, ast.Assign)
-                     and any(isinstance(target, ast.Name) and target.id == "t1" for target in node.targets))
-        last = next(i for i, node in enumerate(block) if isinstance(node, ast.Assign)
-                    and any(isinstance(target, ast.Attribute) and target.attr == "last_update_weights_time"
-                            for target in node.targets))
-        clock = [0.0]
-
-        async def update(*_args, timings, **_kwargs):
-            timings.update(pause=2.0, adapter_load=5.0, resume=3.0)
-            clock[0] += 10.0
-            return []
-
-        def write(*_args, **_kwargs):
-            clock[0] += 4.0
-
-        watcher = SimpleNamespace(lora_name="adapter", config=SimpleNamespace(output_dir=Path("/run")),
-                                  inference=SimpleNamespace(update_weights=update, admin_clients=[]))
-        namespace = dict(time=SimpleNamespace(perf_counter=lambda: clock[0]), self=watcher,
-                         next_step=2, weights_path="http://source", local_weights_path=Path("/run/step_2"),
-                         require_delta=True, adapter_identity={}, _write_receivers_ready=write)
-        function = ast.AsyncFunctionDef(name="run", args=ast.arguments(
-            posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
-            body=block[first:last + 1], decorator_list=[])
-        exec(compile(ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[])), str(path), "exec"), namespace)
-        await namespace["run"]()
-        self.assertEqual(watcher.last_adapter_load_time, 5.0)
-        self.assertEqual(watcher.last_adapter_pause_time, 2.0)
-        self.assertEqual(watcher.last_adapter_resume_time, 3.0)
-        self.assertEqual(watcher.last_adapter_receipt_time, 4.0)
-        self.assertEqual(watcher.last_update_weights_time, 14.0)

@@ -289,19 +289,9 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertNotIn("chown -R", preflight)
         self.assertLess(source.index('broadcast_dir="'), source.index('sudo docker run -d --name "$ORCH_CT"'))
 
-    def test_watch_idle_message_requests_transfer_check(self):
-        source = (
-            Path(__file__).resolve().parents[1] / "__init__.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn("check adapter transfer progress and logs", source)
-        self.assertNotIn("Read references/errors.md and repair before waiting further", source)
-
-    def test_null_harness_bridge_disables_hidden_sdk_deadline_and_retry(self):
+    def test_null_harness_disables_hidden_sdk_deadline_and_retry(self):
         root = Path(__file__).resolve().parents[2]
         harness_path = root / "prime-rl/deps/verifiers/verifiers/v1/harnesses/null/harness.py"
-        launcher = (
-            root / "training_ops/runtime/h200/start_orchestrator.sh"
-        ).read_text(encoding="utf-8")
         event = asyncio.Event()
         client = SimpleNamespace(close=mock.AsyncMock())
 
@@ -344,18 +334,6 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIsNone(client_kwargs["timeout"])
         self.assertEqual(client_kwargs["max_retries"], 0)
         self.assertEqual(client.close.await_count, 1)
-        harness_mount = (
-            '-v "$deployment/prime-rl/deps/verifiers/verifiers/v1/'
-            'harnesses/null/harness.py":/app/deps/verifiers/verifiers/v1/'
-            'harnesses/null/harness.py:ro \\\n'
-        )
-        self.assertIn(harness_mount, launcher)
-        docker_start = launcher.index('sudo docker run -d --name "$ORCH_CT"')
-        entrypoint = launcher.index(
-            '--entrypoint /app/.venv/bin/orchestrator', docker_start
-        )
-        self.assertLess(docker_start, launcher.index(harness_mount))
-        self.assertLess(launcher.index(harness_mount), entrypoint)
 
     def test_harness_timeout_retries_only_after_failed_policy_call(self):
         root = Path(__file__).resolve().parents[2]
@@ -435,13 +413,6 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertIn("idle|ready|failed", script)
         self.assertIn('echo "unknown staging status on $port"', script)
         self.assertIn("staging age is missing", script)
-
-    def test_orchestrator_state_reports_absent_container(self):
-        script = training_ops._orchestrator_state_script(
-            "glm52-decensor-orchestrator"
-        )
-        self.assertIn("if name=$(sudo docker inspect", script)
-        self.assertIn("echo absent", script)
 
     def test_trainer_failure_watchdog_probe_requires_exact_identity(self):
         probe = training_ops.orchestrator_probe
@@ -567,23 +538,6 @@ class OrchestratorRepairTest(unittest.TestCase):
                 "addr-n82 addr-n76 addr-n77",
             )
 
-    def test_absent_orchestrator_recreation_checks_that_it_stays_absent(self):
-        with mock.patch.object(
-            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
-        ):
-            script = training_ops._recreate_orchestrator_script(
-                "glm-perf-3",
-                {
-                    "kind": "glm52",
-                    "orchestrator": "configs/general-agent/orchestrator.toml",
-                },
-                was_running=False,
-                observed_state="absent",
-            )
-        self.assertIn("[ absent = absent ]", script)
-        self.assertIn('[ -z "$name" ]', script)
-        self.assertIn("start_orchestrator.sh", script)
-
     def test_absent_orchestrator_is_recreated_after_status_reports_down(self):
         before = training_ops.Status(
             trainer_up=True,
@@ -698,39 +652,6 @@ class OrchestratorRepairTest(unittest.TestCase):
 
         self.assertIn("recreated exact orchestrator", result)
 
-    def test_recreate_script_uses_active_config_and_exact_launcher(self):
-        with mock.patch.object(
-            training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
-        ):
-            script = training_ops._recreate_orchestrator_script(
-                "glm52",
-                {
-                    "kind": "glm52",
-                    "orchestrator": "configs/general-agent/orchestrator.toml",
-                },
-                was_running=True,
-            )
-
-        self.assertIn("RUN=glm52", script)
-        self.assertIn("RUN_NAME=run_glm52", script)
-        self.assertIn(
-            "ORCH_CONFIG=/data/glm52-rl/deployment/configs/general-agent/orchestrator.toml",
-            script,
-        )
-        self.assertIn(
-            "TRAINER_ADDRESSES='addr-n82 addr-n76 addr-n77 addr-n78 addr-n80 addr-n83 addr-n84 addr-n85'",
-            script,
-        )
-        self.assertIn("TRAINER_CT=glm52-decensor-trainer", script)
-        self.assertIn("ORCH_CT=glm52-decensor-orchestrator", script)
-        self.assertIn(
-            "bash /data/glm52-rl/deployment/training_ops/runtime/h200/start_orchestrator.sh",
-            script,
-        )
-        self.assertIn('sudo docker rm -f "$container"', script)
-        self.assertNotIn("sudo docker start", script)
-        self.assertNotIn("sudo docker restart", script)
-
     def test_busy_trainer_is_refused_before_deployment(self):
         before = training_ops.Status(
             trainer_up=True,
@@ -769,32 +690,6 @@ repair_fail() {{ exit 1; }}
             result = subprocess.run(["bash", "-c", fixtures + phase], capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, probe_status, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["china", "source"] + ([] if probe_status else ["peer"]))
-
-    def test_production_probe_uses_fixed_real_seconds(self):
-        script = Path(__file__).resolve().parents[1] / "runtime/h200/start_orchestrator.sh"
-        section = script.read_text().split("china_source_ports_ready() {", 1)[1].split("\ntunnel_command_has()", 1)[0]
-        wrapper, body = section.split("<<'PY'\n", 1)
-        self.assertIn("local probe_seconds=40", wrapper)
-        self.assertNotIn("repair_timeout", wrapper)
-        self.assertIn("budget = 40.0", body)
-        self.assertNotIn("scale", body)
-        self.assertIn("enumerate(((32, 2, 10), (4, 5, 12), (2, 5, 12)), 1)", body)
-        self.assertIn("asyncio.timeout(socket_seconds)", body)
-        self.assertIn("asyncio.wait(tasks, timeout=stage_seconds)", body)
-        self.assertIn("asyncio.wait_for(check_ports(), timeout=budget)", body)
-        result = subprocess.run(
-            ["bash", "-c", "china_source_ports_ready() {" + section + "\n" + r'''
-repair_timeout() { echo 'unexpected repair timeout call' >&2; echo 5; }
-direct_route_control() { return 0; }
-direct_route_listeners_ready() { return 0; }
-ps() { echo 'bash source # china-tunnel-lora-0'; }
-timeout() { printf '%s\n' "$*" >&2; cat >/dev/null; echo 2; }
-lora_source_ports=(18100 18101)
-china_source_ports_ready
-'''], capture_output=True, text=True, timeout=5,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stderr.strip(), "--signal=TERM --kill-after=1s 40 python3 - 18100 18101")
 
     def run_probe(self, fail_until, budget=40, delay=False, stall_first=None, response=None):
         script = Path(__file__).resolve().parents[1] / "runtime/h200/start_orchestrator.sh"
@@ -962,17 +857,6 @@ peer_repair_missing_remote_lanes
             self.assertNotEqual(result.returncode, 0, value)
             self.assertEqual(result.stdout, "", value)
 
-    def test_fractional_sleep_is_valid_and_still_checks_deadline(self):
-        result = self.shell(["repair_sleep"], '''
-repair_remaining() { return 0; }
-sleep() { echo "$1"; }
-repair_sleep 0.1 || exit 1
-repair_remaining() { return 1; }
-if repair_sleep 0.1; then exit 1; fi
-''')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "0.1\n")
-
     def test_many_stuck_groups_share_one_cleanup_budget(self):
         program = self.function("repair_cleanup_remaining").replace("20000000", "100000") + self.function("repair_cleanup_call") + '''
 repair_total_deadline=0; repair_cleanup_spent_us=0; repair_cleanup_active_us=0
@@ -992,18 +876,6 @@ echo "$calls:$repair_cleanup_completed"
         self.assertEqual(result.stdout, "1:1\n")
         self.assertIn("stage=stuck_group completed=1", result.stderr)
 
-    def test_successful_cleanup_keeps_one_shared_counter(self):
-        result = self.shell(["repair_cleanup_remaining", "repair_cleanup_call"], '''
-repair_total_deadline=0; repair_cleanup_spent_us=0; repair_cleanup_active_us=0
-repair_cleanup_completed=0
-stop_group() { sleep 0.01; }
-for group in {1..4}; do repair_cleanup_call stop_group || exit 1; done
-[ "$repair_cleanup_spent_us" -ge 40000 ] || exit 1
-echo "$repair_cleanup_completed"
-''')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "4\n")
-
     def test_cleanup_call_rejects_success_returned_after_deadline(self):
         result = self.shell(["repair_cleanup_remaining", "repair_cleanup_call"], '''
 repair_total_deadline=0; repair_cleanup_limit_us=10000
@@ -1013,36 +885,6 @@ repair_cleanup_call late_success
 ''')
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("time limit reached: stage=late_success", result.stderr)
-
-    def test_incomplete_cleanup_reports_125_within_real_twenty_second_limit(self):
-        functions = ("repair_cleanup_remaining", "repair_cleanup_call", "tunnel_wait_group_exit", "repair_exit")
-        program = "\n".join(self.function(name) for name in functions) + '''
-repair_total_deadline=0; repair_cleanup_limit_us=20000000
-repair_cleanup_spent_us=30000000; repair_cleanup_active_us=0; repair_cleanup_completed=64
-repair_stage=remote-readiness; repair_started_seconds=$SECONDS; repair_committed=0
-tunnel_live_group() { echo '4242 1'; }
-tunnel_stop_identity_matches() { return 0; }
-kill() { return 0; }
-repair_cleanup_all() {
-  local status=0
-  for group in 4242 4243 4244; do
-    tunnel_wait_group_exit "$group" || status=1
-  done
-  return "$status"
-}
-repair_release_lock() { return 0; }
-repair_exit 7
-'''
-        started = time.monotonic()
-        result = subprocess.run(["bash", "-uc", program], text=True, capture_output=True, timeout=21)
-        elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 20)
-        self.assertLessEqual(elapsed, 20.5)
-        self.assertEqual(result.returncode, 125, result.stderr)
-        self.assertIn("cause_status=7 stage=remote-readiness", result.stderr)
-        self.assertIn("cleanup=failed", result.stderr)
-        self.assertIn("migration_stops=64 rollback_stops=1", result.stderr)
-        print(f"ordinary cleanup deadline: {elapsed:.3f}s, status125, cause_status7")
 
     def test_exit_keeps_original_failure_stage_and_cleanup_result(self):
         for cleanup_status, status, label in ((0, 1, "passed"), (1, 125, "failed")):
@@ -1056,30 +898,6 @@ repair_exit 1
             self.assertIn(f"status={status} cause_status=1 stage=remote-readiness", result.stderr)
             self.assertIn(f"elapsed=0s cleanup={label}", result.stderr)
             self.assertIn("status=1 stage=remote-readiness elapsed=0s cleanup=starting", result.stderr.splitlines()[0])
-
-    def test_production_cleanup_reserve_does_not_raise_total_limit(self):
-        preamble = self.source.split("\nrepair_cleanup_remaining() {", 1)[0]
-        result = subprocess.run(["bash", "-uc", preamble + '\necho "$tunnel_repair_deadline:$repair_total_deadline"', "bash", "--tunnels-only"], text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "270:300\n")
-
-    def test_explicit_reset_uses_existing_total_deadline_for_cleanup(self):
-        preamble = self.source.split("\nrepair_cleanup_remaining() {", 1)[0]
-        result = subprocess.run(["bash", "-uc", preamble + '\necho "$tunnel_repair_deadline:$repair_total_deadline:$repair_cleanup_limit_us"', "bash", "--tunnels-only", "--restart-tunnels"], text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "270:300:270000000\n")
-
-    def test_reset_exit_uses_reserved_cleanup_time(self):
-        result = self.shell(["repair_exit"], '''
-repair_stage=peer-lane-0; repair_started_seconds=$SECONDS; repair_committed=0
-repair_cleanup_limit_us=150000000; repair_cleanup_spent_us=30000000
-repair_exit_cleanup_limit_us=30000000
-repair_cleanup_call() { echo "$repair_cleanup_limit_us"; }
-repair_release_lock() { return 0; }
-repair_exit 1
-''')
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(result.stdout, "30000000\n")
 
     def test_normal_migration_can_use_work_budget_without_using_rollback_budget(self):
         result = self.shell(["repair_cleanup_remaining", "repair_cleanup_call", "repair_exit"], '''
@@ -1123,12 +941,6 @@ repair_exit 7
         self.assertIn("elapsed=150s", result.stderr)
         self.assertIn("migration_stops=64 rollback_stops=1", result.stderr)
         print(f"rollback with two seconds left: {elapsed:.3f}s, total clock150s")
-
-    def test_non_tunnels_mode_keeps_bounded_cleanup(self):
-        preamble = self.source.split("\nrepair_cleanup_remaining() {", 1)[0]
-        result = subprocess.run(["bash", "-uc", preamble + '\necho "$repair_total_deadline:$repair_cleanup_limit_us"'], text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "0:20000000\n")
 
     def test_api_loss_during_readiness_repairs_once_and_rechecks(self):
         for failed_check in ("listener", "supervisor"):

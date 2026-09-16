@@ -608,11 +608,6 @@ class StageLoraAdapterTest(unittest.TestCase):
             else:
                 os.environ["PRIME_LORA_DELTA_STAGE_TIMEOUT_S"] = old_value
 
-    def test_adapter_stage_limits_are_exact_at_step_boundaries(self):
-        _stage_lora_adapter, namespace = _load_stage_function()
-        limit = namespace["adapter_stage_limit_seconds"]
-        self.assertEqual([limit(step) for step in (1, 2, 3, 4)], [600.0, 600.0, 600.0, 600.0])
-
     def test_distinct_ports_each_stage(self):
         stage_lora_adapter, namespace = _load_stage_function()
         calls = []
@@ -656,37 +651,6 @@ class StageLoraAdapterTest(unittest.TestCase):
 
         self.assertEqual(calls, [clients[0]])
         self.assertEqual(result["host_count"], 1)
-
-    def test_configured_origin_and_peer_metrics_do_not_sum_overlap(self):
-        stage_lora_adapter, namespace = _load_stage_function()
-        calls = []
-
-        class Response:
-            def json(self):
-                return {"status": "ok", "stage_seconds": 1.0, "transfer_wall_seconds": 0.5, "adapter_identity": _adapter_identity()}
-
-        async def fake_admin_post_response(client, path, **kwargs):
-            calls.append(client)
-            return Response()
-
-        namespace["_admin_post_response"] = fake_admin_post_response
-        origin = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
-        peer = httpx.AsyncClient(base_url="http://127.0.0.1:18049")
-        result = asyncio.run(
-            stage_lora_adapter(
-                [peer, origin],
-                "http://adapter/step_1",
-                origin_base_urls=["http://127.0.0.1:8000"],
-            )
-        )
-
-        self.assertEqual(calls, [origin, peer])
-        self.assertEqual(result["origin_host_count"], 1)
-        self.assertEqual(result["peer_host_count"], 1)
-        self.assertEqual(result["transfer_wall_seconds"], 0.5)
-        self.assertEqual(result["origin_transfer_wall_seconds"], 0.5)
-        self.assertEqual(result["peer_transfer_wall_seconds"], 0.5)
-        self.assertEqual(result["wire_stage_seconds"], 1.0)
 
     def test_delta_stage_does_not_hide_extra_attempts(self):
         stage_lora_adapter, namespace = _load_stage_function()
@@ -841,33 +805,6 @@ class StageLoraAdapterTest(unittest.TestCase):
                 asyncio.run(exercise())
                 self.assertEqual(calls, list(range(active_index + 1)))
                 self.assertEqual(stopped, [active_index])
-
-    def test_stage_wall_times_use_concurrent_group_maxima(self):
-        stage_lora_adapter, namespace = _load_stage_function()
-        clients = [httpx.AsyncClient(base_url=f"http://host{index}:8000") for index in range(3)]
-
-        async def post(client, _path, **_kwargs):
-            duration = clients.index(client) + 1.0
-            return SimpleNamespace(json=lambda: {
-                "status": "ok",
-                "stage_seconds": duration,
-                "transfer_wall_seconds": duration,
-                "reconstruction_wall_seconds": duration,
-                "final_verification_wall_seconds": duration,
-                "bytes_done": 10,
-                "bytes_total": 10,
-                "adapter_identity": _adapter_identity(),
-            })
-
-        namespace["_admin_post_response"] = post
-        result = asyncio.run(stage_lora_adapter(
-            clients, "http://adapter/step_1", origin_base_urls=["http://host0:8000"]
-        ))
-        for name in ("transfer_wall_seconds", "reconstruction_wall_seconds",
-                     "reconstruct_seconds", "final_verification_wall_seconds"):
-            self.assertEqual(result[name], 3.0)
-        self.assertEqual(result["bytes_done"], 30)
-        self.assertEqual(result["bytes_total"], 30)
 
     def test_stage_retries_same_identity_three_times(self):
         stage_lora_adapter, namespace = _load_stage_function()

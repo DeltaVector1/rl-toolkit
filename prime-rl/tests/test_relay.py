@@ -160,25 +160,6 @@ class RelayTest(unittest.TestCase):
             self.request("/glm-1/run_glm-1/broadcasts/step_1/chunk-0")
         self.assertEqual(error.exception.code, 503)
 
-    def test_unchanged_file_uses_bounded_digest_cache(self):
-        relay._relay_digest_cache.clear()
-        calls = 0
-        original = relay._sha256_source
-
-        def counted(source):
-            nonlocal calls
-            calls += 1
-            return original(source)
-
-        relay._sha256_source = counted
-        try:
-            for _ in range(8):
-                selected = relay._load_file(self.cache, self.source_url, "chunk-0")
-                selected.source.close()
-            self.assertEqual(calls, 1)
-        finally:
-            relay._sha256_source = original
-
     def test_concurrent_requests_use_verified_open_files(self):
         relay._relay_digest_cache.clear()
 

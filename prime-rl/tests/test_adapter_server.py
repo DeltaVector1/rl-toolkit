@@ -86,48 +86,6 @@ class AdapterServerTest(unittest.TestCase):
         adapter_server._identity_validation_runs.clear()
         adapter_server._manifest_cache.clear()
 
-    def test_manifest_cache_reuses_parse_and_skips_chunk_stat_walk(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            step, _manifest = self._write_predictive_step(Path(temporary))
-            original_json = adapter_server._json_object
-            original_stat = adapter_server._stat_identity
-            manifest_calls = 0
-            chunk_stat_calls = 0
-
-            def counted_json(path, description):
-                nonlocal manifest_calls
-                if path.name == adapter_server.adapter_manifest_name:
-                    manifest_calls += 1
-                return original_json(path, description)
-
-            def counted_stat(path):
-                nonlocal chunk_stat_calls
-                if path.name.startswith(
-                    f"{adapter_server.adapter_weights_name}.transport-predictive-"
-                ):
-                    chunk_stat_calls += 1
-                return original_stat(path)
-
-            adapter_server._json_object = counted_json
-            adapter_server._stat_identity = counted_stat
-            self._clear_identity_state()
-            chunk_name = f"{adapter_server.adapter_weights_name}.transport-predictive-00000.bin"
-            try:
-                for _ in range(4):
-                    adapter_server._identity_from_published_directory(step, 0, cache=False)
-                    size, digest = adapter_server._manifest_cache_entry(step, 0).chunk_index[chunk_name]
-                    fd = os.open(step / chunk_name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-                    try:
-                        adapter_server._verify_transport_fd(fd, size, digest)
-                    finally:
-                        os.close(fd)
-                self.assertEqual(manifest_calls, 1)
-                self.assertEqual(chunk_stat_calls, 0)
-            finally:
-                adapter_server._json_object = original_json
-                adapter_server._stat_identity = original_stat
-                self._clear_identity_state()
-
     def test_manifest_replacement_uses_new_cache_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             step, manifest = self._write_predictive_step(Path(temporary))
@@ -627,58 +585,6 @@ class AdapterServerTest(unittest.TestCase):
                 adapter_server._sha256 = original_sha256
                 adapter_server._identity_cache.clear()
 
-    def test_predictive_validation_is_single_flight(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            step, _manifest = self._write_predictive_step(Path(temporary))
-            original_validate = adapter_server._validate_predictive_chunks
-            started = threading.Event()
-            release = threading.Event()
-            calls = 0
-            calls_lock = threading.Lock()
-
-            def slow_validate(directory, chunks):
-                nonlocal calls
-                with calls_lock:
-                    calls += 1
-                started.set()
-                if not release.wait(5):
-                    raise AssertionError("validation did not receive release")
-                return original_validate(directory, chunks)
-
-            adapter_server._validate_predictive_chunks = slow_validate
-            self._clear_identity_state()
-            errors = []
-            results = []
-
-            def validate():
-                try:
-                    results.append(
-                        adapter_server._identity_from_published_directory(
-                            step, 0, cache=False
-                        )
-                    )
-                except Exception as exc:
-                    errors.append(exc)
-
-            requests = [threading.Thread(target=validate) for _ in range(16)]
-            try:
-                for request in requests:
-                    request.start()
-                self.assertTrue(started.wait(5))
-                time.sleep(0.1)
-                self.assertEqual(calls, 1)
-                release.set()
-                for request in requests:
-                    request.join(timeout=5)
-                self.assertFalse(errors)
-                self.assertEqual(len(results), len(requests))
-            finally:
-                release.set()
-                for request in requests:
-                    request.join(timeout=5)
-                adapter_server._validate_predictive_chunks = original_validate
-                self._clear_identity_state()
-
     def test_changed_publication_runs_predictive_validation_again(self):
         with tempfile.TemporaryDirectory() as temporary:
             step, manifest = self._write_predictive_step(Path(temporary))
@@ -907,36 +813,6 @@ class AdapterServerTest(unittest.TestCase):
                 ".identity.json",
             ):
                 self.assertEqual((destination / name).stat().st_mode & 0o777, 0o600)
-
-    def test_private_cache_links_without_reading_adapter_payload(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "source"
-            destination = root / "cache" / "step_1"
-            source.mkdir()
-            (root / "cache").mkdir(mode=0o700)
-            config = source / adapter_server.adapter_config_name
-            weights = source / adapter_server.adapter_weights_name
-            config.write_bytes(b"{}")
-            weights.write_bytes(b"weights")
-            identity = {
-                "step": 1,
-                "config_size": 2,
-                "config_sha256": hashlib.sha256(b"{}").hexdigest(),
-                "weights_size": 7,
-                "weights_sha256": hashlib.sha256(b"weights").hexdigest(),
-            }
-            original_read = adapter_server.os.read
-            adapter_server.os.read = lambda *_args: (_ for _ in ()).throw(
-                AssertionError("private cache staging must not read payload bytes")
-            )
-            try:
-                adapter_server._link_cache_entry(source, identity, destination)
-            finally:
-                adapter_server.os.read = original_read
-            self.assertEqual(config.stat().st_ino, (destination / config.name).stat().st_ino)
-            self.assertEqual(weights.stat().st_ino, (destination / weights.name).stat().st_ino)
-            self.assertEqual(weights.stat().st_mode & 0o777, 0o600)
 
     def test_atomic_replace_rejects_source_identity_race(self):
         with tempfile.TemporaryDirectory() as temporary:

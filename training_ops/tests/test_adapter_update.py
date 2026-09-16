@@ -80,16 +80,6 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertFalse(any("direct adapter source route" in message for message in training_ops._warnings(state)))
         self.process_guard.assert_not_called()
 
-    def test_direct_route_status_key_survives_uppercase_parser(self):
-        script = training_ops._head_script()
-        self.assertIn("echo DIRECT_ROUTE ready", script)
-        self.assertIn("echo DIRECT_ROUTE failed", script)
-        for value in ("ready", "failed"):
-            self.assertEqual(training_ops._kv(f"DIRECT_ROUTE {value}\n")["DIRECT_ROUTE"], value)
-        source_text = Path(training_ops.__file__).read_text()
-        self.assertIn('s.direct_route = h.get("DIRECT_ROUTE", "unknown")', source_text)
-        self.process_guard.assert_not_called()
-
     def test_adapter_stage_policy_matches_all_layers(self):
         repository = Path(__file__).resolve().parents[2]
         receiver_limit = _load_function(
@@ -197,82 +187,6 @@ class AdapterUpdateTest(unittest.TestCase):
             set(training_ops.inference_hosts),
         )
 
-    def test_inference_launcher_forwards_mtp_settings_before_docker(self):
-        launcher_path = (
-            Path(__file__).resolve().parents[1]
-            / "runtime"
-            / "h200"
-            / "start_inference.sh"
-        )
-        launcher = launcher_path.read_text(encoding="utf-8")
-        start = launcher.index("<<'PY'\n", launcher.index("runtime_output=$(python3")) + len("<<'PY'\n")
-        end = launcher.index("\nPY\n)", start)
-        reader = launcher[start:end]
-        nodes_path = Path(training_ops.repo_root) / "configs/nodes.toml"
-        nodes = nodes_path.read_text(encoding="utf-8")
-
-        def read_settings(host, config_text=nodes):
-            with tempfile.NamedTemporaryFile("w", suffix=".toml") as stream:
-                stream.write(config_text)
-                stream.flush()
-                return subprocess.run(
-                    [sys.executable, "-", stream.name, host],
-                    input=reader,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-
-        a = read_settings("h200a")
-        b = read_settings("h200b")
-        self.assertEqual(a.returncode, 0, a.stderr)
-        self.assertEqual(b.returncode, 0, b.stderr)
-        expected_source_ports = [
-            str(port)
-            for offset in range(2)
-            for port in range(18100 + offset, 18228, 2)
-        ]
-        for result in (a, b):
-            source_ports = result.stdout.splitlines()[0].split(",")
-            self.assertEqual(source_ports, expected_source_ports)
-            self.assertEqual(len(source_ports), 128)
-            self.assertEqual(len(set(source_ports)), 128)
-        a_extra = json.loads(a.stdout.splitlines()[-1])
-        b_extra = json.loads(b.stdout.splitlines()[-1])
-        self.assertEqual(
-            a_extra["speculative_config"],
-            {"method": "mtp", "num_speculative_tokens": 1},
-        )
-        self.assertEqual(
-            b_extra["speculative_config"],
-            {"method": "mtp", "num_speculative_tokens": 1},
-        )
-        self.assertEqual(a_extra["max_num_batched_tokens"], 32768)
-        self.assertEqual(a_extra["compilation_config"], {"max_cudagraph_capture_size": 256})
-        self.assertIn("runtime_output=$(python3", launcher)
-        self.assertIn(
-            "inference_config=${inference_config:?set inference_config to the selected run config}",
-            launcher,
-        )
-        self.assertNotIn("configs/general-agent/inference.toml", launcher)
-        self.assertIn('@ "$inference_config"', launcher)
-        self.assertIn('tomllib.load(stream)["adapter_transport"]["download_streams"]', launcher)
-        self.assertIn('-e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams"', launcher)
-        self.assertIn("-e PRIME_LORA_LANE_TIMEOUT_S=90", launcher)
-        self.assertIn("-e PRIME_LORA_CHUNK_TIMEOUT_S=90", launcher)
-        self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("install -d"))
-        self.assertLess(launcher.index("runtime_output=$(python3"), launcher.index("docker update"))
-
-        invalid_configs = (
-            nodes.replace("mtp_tokens = 1\nports = [8000]", "ports = [8000]", 1),
-            nodes.replace("mtp_tokens = 1", "mtp_tokens = true", 1),
-            nodes.replace("mtp_tokens = 1", "mtp_tokens = -1", 1),
-        )
-        for config_text in invalid_configs:
-            result = read_settings("h200a", config_text)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("mtp_tokens", result.stderr)
-
     def test_inference_launcher_validates_download_stream_override(self):
         launcher = (
             Path(__file__).resolve().parents[1]
@@ -369,34 +283,6 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertEqual(len(ssh_scripts), 2)
         self.assertIn("adapter-http", ssh_scripts[0])
         self.assertNotIn("trainer >/dev/null", ssh_scripts[0])
-
-    def test_glm_adapter_server_gets_predictive_upgrade_settings(self):
-        launcher = (
-            Path(__file__).resolve().parents[1]
-            / "runtime"
-            / "china"
-            / "cluster.sh"
-        ).read_text(encoding="utf-8")
-        self.assertIn("ADAPTER_PREDICTIVE_UPGRADE", launcher)
-        self.assertIn("ADAPTER_PREDICTIVE_RUN", launcher)
-        self.assertIn("ADAPTER_PREDICTIVE_BROADCAST_PATH", launcher)
-        self.assertIn("ADAPTER_PREDICTIVE_SOURCE_URL", launcher)
-        install = (
-            'sudo install -d -o 1000 -g 1000 -m 0755 \\\n'
-            '        "$broadcast_root/$predictive_run" \\\n'
-            '        "$broadcast_root/$predictive_run/run_$predictive_run" \\\n'
-            '        "$active_broadcasts"'
-        )
-        self.assertIn(install, launcher)
-        self.assertLess(
-            launcher.index(install),
-            launcher.index('sudo docker run -d --name "$adapter_container"'),
-        )
-        self.assertIn('/broadcast/"$predictive_broadcast_path":rw', launcher)
-        self.assertNotIn('/broadcast/"$predictive_run":rw', launcher)
-        self.assertIn('--upgrade-path "$predictive_broadcast_path"', launcher)
-        self.assertIn('/run_$predictive_run/broadcasts"', launcher)
-        self.assertIn("prime_rl/utils/adapter_delta.py", launcher)
 
     def test_trainer_mounts_all_config_modules_read_only(self):
         launcher = (

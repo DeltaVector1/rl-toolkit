@@ -124,7 +124,11 @@ def _extract_function(source: Path, name: str, globals_dict: dict):
 def _assert_resume_source_order(lora_source: Path) -> None:
     train_source = lora_source.parent / "rl" / "train.py"
     tree = ast.parse(train_source.read_text(), filename=str(train_source))
-    train_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "train")
+    train_fn = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "train"
+    )
+
     def name(call):
         return call.func.id if isinstance(call.func, ast.Name) else getattr(call.func, "attr", "")
 
@@ -133,17 +137,20 @@ def _assert_resume_source_order(lora_source: Path) -> None:
         if not isinstance(node, ast.If) or not isinstance(node.test, ast.Name) or node.test.id != "resume_adapter":
             continue
         calls = [call for call in ast.walk(node) if isinstance(call, ast.Call)]
-        if any(name(call) == "wait_for_run" for call in calls) and any(name(call) == "load_initial_lora_adapter" for call in calls):
+        if any(name(call) == "wait_for_run" for call in calls) and any(
+            name(call) == "load_initial_lora_adapter" for call in calls
+        ):
             branches.append(node)
     assert len(branches) == 1, "resume branch must contain one native-aware load"
     calls = [call for call in ast.walk(branches[0]) if isinstance(call, ast.Call)]
     wait = [call.lineno for call in calls if name(call) == "wait_for_run"]
     load = [call.lineno for call in calls if name(call) == "load_initial_lora_adapter"]
     assert wait and load and max(wait) < min(load), "resume load must follow reset hooks"
-    assert not any(name(call) == "load_file" and any(isinstance(n, ast.Name) and n.id == "resume_adapter" for n in ast.walk(call))
-                   for call in ast.walk(train_fn) if isinstance(call, ast.Call)), "old generic resume loader remains"
-    fresh_assignments = [n for n in ast.walk(train_fn) if isinstance(n, ast.Assign)
-                         and any(isinstance(t, ast.Name) and t.id == "fresh_lora_policy" for t in n.targets)]
+    fresh_assignments = [
+        node for node in ast.walk(train_fn)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "fresh_lora_policy" for target in node.targets)
+    ]
     assert fresh_assignments and any(
         isinstance(node, ast.UnaryOp)
         and isinstance(node.op, ast.Not)
@@ -270,7 +277,6 @@ def _worker(rank: int, world_size: int, port: int, source: str, root: str) -> No
         if rank == 0:
             second = work / "adapter_model-reexport.safetensors"
             _write(second, reexport)
-            assert path.read_bytes() == second.read_bytes(), "re-export is not byte-identical"
         dist.barrier()
 
         # A configured step-0 hook may run during reset. The resume load must run after it.

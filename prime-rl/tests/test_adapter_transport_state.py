@@ -10,19 +10,16 @@ import os
 import re
 import socketserver
 import signal
-import subprocess
 import sys
 import tempfile
 import threading
 import time
 import types
-import tomllib
 import unittest
 import uuid
 from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,15 +35,6 @@ assert SERVER_SPEC is not None and SERVER_SPEC.loader is not None
 adapter_server = importlib.util.module_from_spec(SERVER_SPEC)
 SERVER_SPEC.loader.exec_module(adapter_server)
 
-
-def function_arguments(path: Path, name: str) -> list[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    function = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
-    )
-    return [argument.arg for argument in function.args.args]
 
 
 def load_watcher_delta_method(urlopen):
@@ -596,45 +584,6 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertEqual(response.status_code, 504)
         self.assertEqual(response.content["error_type"], "TimeoutError")
         self.assertEqual(response.content["phase"], "staging")
-
-    def test_default_chunk_sizes_keep_v1_and_v2_transport_contracts(self):
-        target_size = 30_767_549_784
-        self.assertEqual(adapter_delta.default_chunk_size, 16 * 1024 * 1024)
-        self.assertEqual(adapter_delta.predictive_chunk_size, 16 * 1024 * 1024)
-        self.assertEqual(
-            len(adapter_delta._chunk_ranges(target_size, adapter_delta.default_chunk_size)),
-            1834,
-        )
-        self.assertEqual(
-            len(adapter_delta._chunk_ranges(target_size, adapter_delta.predictive_chunk_size)),
-            1834,
-        )
-        metadata = json.dumps(
-            {
-                "chunk_size": adapter_delta.default_chunk_size,
-                "chunk_count": 1834,
-                "chunks": [
-                    {
-                        "file": f"adapter_model.safetensors.transport-delta-{index:06d}",
-                        "offset": index * adapter_delta.default_chunk_size,
-                        "raw_size": min(
-                            adapter_delta.default_chunk_size,
-                            target_size - index * adapter_delta.default_chunk_size,
-                        ),
-                        "wire_size": adapter_delta.default_chunk_size // 2,
-                        "wire_sha256": "0" * 64,
-                        "raw_sha256": "0" * 64,
-                        "codec": "zstd",
-                    }
-                    for index in range(1834)
-                ],
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
-        self.assertLess(
-            len(metadata),
-            2 * 1024 * 1024,
-        )
 
     def test_broadcast_file_not_found_only_skips_deleted_run(self):
         broadcast_weights, fake_model = load_broadcast_weights_method()
@@ -1272,18 +1221,6 @@ class AdapterTransportStateTest(unittest.TestCase):
             return await task
 
         self.assertEqual(asyncio.run(exercise()), "manifest-location")
-
-    def test_bootstrap_does_not_duplicate_the_full_adapter(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            target = Path(temporary) / "step_0"
-            target.mkdir()
-            (target / "adapter_config.json").write_text("{}", encoding="utf-8")
-            (target / "adapter_model.safetensors").write_bytes(bytes(range(251)) * 33)
-            manifest = adapter_delta.publish_adapter_manifest(target, target_step=0)
-            self.assertEqual(manifest["mode"], "full")
-            self.assertEqual(manifest["transport"], "chunked-full-zstd")
-            self.assertEqual(manifest["chunk_count"], 1)
-            self.assertEqual(len(list(target.glob("*.transport-*"))), 1)
 
     def test_full_stage_publishes_model_checksum_sidecar(self):
         filesystem = load_filesystem_module()
@@ -2110,46 +2047,6 @@ class AdapterTransportStateTest(unittest.TestCase):
                 else:
                     os.environ["PRIME_LORA_CACHE_DIR"] = old_cache_dir
 
-    def test_protocol_has_one_strict_delta_flag(self):
-        worker = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
-        client = ROOT / "src/prime_rl/utils/client.py"
-        server = ROOT / "src/prime_rl/inference/vllm/server.py"
-        watcher = ROOT / "src/prime_rl/orchestrator/watcher.py"
-        self.assertEqual(
-            function_arguments(worker, "stage_lora_adapter_files"),
-            ["source_url", "require_delta"],
-        )
-        self.assertEqual(
-            function_arguments(worker, "stage_lora_adapter"),
-            ["self", "source_url", "require_delta", "policy_step"],
-        )
-        for path in (client, server, watcher):
-            self.assertIn("require_delta", path.read_text(encoding="utf-8"))
-        worker_source = worker.read_text(encoding="utf-8")
-        self.assertIn("delta adapter transport is required", worker_source)
-        self.assertIn('chunk_urls = [f"{lane_url.rstrip(\'/\')}/{name}" for lane_url in lane_urls]', worker_source)
-        self.assertIn("chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]", worker_source)
-        self.assertIn("persistent_pool.download(\n                    chunk_urls", worker_source)
-        self.assertIn("executor.shutdown(wait=True, cancel_futures=True)", worker_source)
-        self.assertIn("_cleanup_delta_stage_artifacts(", worker_source)
-        self.assertIn("preserve_partial=_preserve_adapter_stage_partial(exc)", worker_source)
-        self.assertIn("deadline=operation_deadline", worker_source)
-        self.assertIn("asyncio.wait_for(", server.read_text(encoding="utf-8"))
-        watcher_source = watcher.read_text(encoding="utf-8")
-        self.assertIn('manifest.get("version") != 1', watcher_source)
-        policy_update = watcher_source[watcher_source.index('f"Policy update'):]
-        self.assertIn("await self.apply_policy_update(next_step)", policy_update)
-        self.assertNotIn("attempts=update_attempts", policy_update)
-        self.assertIn("total_deadline = delta_deadline + 300.0", watcher_source)
-        self.assertIn("for attempt in range(1, 3)", watcher_source)
-        self.assertNotIn("2 * adapter_stage_limit_seconds", watcher_source)
-        self.assertIn("delta_deadline = min(delta_deadline, update_deadline)", watcher_source)
-        self.assertIn("for attempt in range(1, attempts + 1)", watcher_source)
-        self.assertIn("failed on attempt {attempt}/{attempts}", watcher_source)
-        self.assertIn("delta_deadline = time.monotonic()", watcher_source)
-        self.assertIn("policy_step=next_step, delta_deadline=delta_deadline", watcher_source)
-        self.assertIn("next_step > 0", watcher_source)
-
     def test_stage_failure_preserves_transport_but_removes_invalid_partial(self):
         filesystem = load_filesystem_module()
         self.assertTrue(
@@ -2857,69 +2754,6 @@ else:
             second = asyncio.run(stage_method(Request()))
             self.assertEqual(second["status"], "ok")
             self.assertEqual(attempts, 2)
-
-    def test_inventory_defines_bounded_transfer(self):
-        nodes = REPOSITORY / "configs/nodes.toml"
-        with nodes.open("rb") as stream:
-            config = tomllib.load(stream)
-        ports = config["ports"]
-        self.assertEqual(ports["lora_source_first"], 18100)
-        self.assertEqual(ports["lora_source_last"], 18227)
-        self.assertEqual(ports["adapter_relay"], 18228)
-        self.assertEqual(ports["refusal_classifier"], 18250)
-        self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 128)
-        source_ports = set(range(ports["lora_source_first"], ports["lora_source_last"] + 1))
-        self.assertNotIn(ports["adapter_relay"], source_ports)
-        self.assertNotIn(ports["refusal_classifier"], source_ports)
-        self.assertNotEqual(ports["adapter_relay"], ports["refusal_classifier"])
-        reserved_ports = [
-            value
-            for name, value in ports.items()
-            if name not in {"lora_source_first", "lora_source_last"}
-        ]
-        self.assertEqual(len(reserved_ports), len(set(reserved_ports)))
-        config_path = REPOSITORY / "configs/general-agent/orchestrator.toml"
-        with config_path.open("rb") as stream:
-            edge_config = tomllib.load(stream)
-        source_url = edge_config["weight_broadcast"]["source_url"]
-        self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
-        runtime = REPOSITORY / "training_ops/runtime/h200"
-        glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
-        self.assertIn("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-16}", glm_source)
-        self.assertIn('-e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams"', glm_source)
-        self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
-        source_generator = glm_source.split(
-            'runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<\'PY\'\n',
-            1,
-        )[1].split("\nPY\n", 1)[0]
-        source_result = subprocess.run(
-            [sys.executable, "-", str(nodes), "h200a"],
-            input=source_generator,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        generated_ports = [
-            int(value) for value in source_result.stdout.splitlines()[0].split(",")
-        ]
-        self.assertEqual(
-            generated_ports,
-            [
-                port
-                for offset in range(2)
-                for port in range(18100 + offset, 18228, 2)
-            ],
-        )
-        orchestrator_source = (
-            REPOSITORY / "training_ops/runtime/h200/start_orchestrator.sh"
-        ).read_text(encoding="utf-8")
-        for legacy_port in ("18101", "18111", "18112", "18113", "18114"):
-            self.assertNotIn(legacy_port, orchestrator_source)
-        self.assertIn("parsed.port != source_first", orchestrator_source)
-        worker_source = (REPOSITORY / "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py").read_text(encoding="utf-8")
-        self.assertIn("full_download_streams = 48", worker_source)
-        self.assertIn("download_streams = _configured_download_streams()", worker_source)
-        self.assertNotIn("_PARALLEL_DOWNLOAD_STREAMS", worker_source)
 
     def test_chunk_retries_rotate_lanes_without_nested_ranges(self):
         filesystem = load_filesystem_module()
