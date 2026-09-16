@@ -25,6 +25,10 @@ spec.loader.exec_module(route_module)
 class DirectRouteTest(unittest.TestCase):
     def setUp(self):
         self.route = route_module.settings(root / "configs/nodes.toml")
+        # operate() tests use mocked Popen children, never a real manager.
+        pin = mock.patch.object(route_module, "pin_child", side_effect=lambda process: os.open("/dev/null", os.O_RDONLY), create=True)
+        pin.start()
+        self.addCleanup(pin.stop)
 
     def write_receipt(self, ssh, output):
         argv = shlex.split(ssh[-1])[1:]
@@ -369,11 +373,109 @@ class DirectRouteTest(unittest.TestCase):
             now = [0]
             def sleep(seconds):
                 now[0] += 100
-            with mock.patch.object(route_module.subprocess, "Popen", return_value=process), mock.patch.object(route_module, "identity", return_value=record), mock.patch.object(route_module, "ready", side_effect=RuntimeError("not ready")), mock.patch.object(route_module, "send") as send, mock.patch.object(route_module.time, "monotonic", side_effect=lambda: now[0]), mock.patch.object(route_module.time, "sleep", side_effect=sleep):
+            with mock.patch.object(route_module.subprocess, "Popen", return_value=process), mock.patch.object(route_module, "identity", return_value=record), mock.patch.object(route_module, "ready", side_effect=RuntimeError("not ready")), mock.patch.object(route_module, "pidfd_signal") as send, mock.patch.object(route_module.time, "monotonic", side_effect=lambda: now[0]), mock.patch.object(route_module.time, "sleep", side_effect=sleep):
                 with self.assertRaisesRegex(RuntimeError, "setup failed"):
                     route_module.operate("start", route)
-            self.assertEqual(send.call_args_list, [mock.call(record, signal.SIGTERM)])
-            self.assertEqual(process.wait.call_count, 2)
+            self.assertEqual([call.args[1] for call in send.call_args_list], [0, signal.SIGTERM])
+            self.assertEqual(process.wait.call_count, 1)
+
+    def test_start_accepts_post_exec_identity_after_transient_cmdline(self):
+        self.start_transition_case(1, 1)
+
+    def test_full_64_owner_ready_at_deadline_is_not_false_timeout(self):
+        self.start_transition_case(182, 100)
+
+    def start_transition_case(self, ready_at, tick):
+        with tempfile.TemporaryDirectory() as directory:
+            route = {**self.route, "state_dir": directory, "ssh_identity_file": str(source), "ssh_known_hosts_file": str(source)}
+            manager = {"pid": 12345, "start": "1", "argv": route_module.manager_argv(route)}
+            identities = {manager["pid"]: manager}
+            state = {"manager": manager, "digest": route["digest"], "status": "starting", "children": [], "receipts": {}}
+            for index, (ports, argv) in enumerate(route_module.commands(route)):
+                token = f"{index:032x}"
+                record = {"pid": 20000 + index, "start": "1", "argv": argv + [route_module.session_command(route, ports, token)]}
+                state["children"].append(record)
+                identities[record["pid"]] = record
+                state["receipts"][str(ports[0])] = {"token": token, "ports": ports, "digest": route["digest"], "session": {"pid": 30000 + index, "start": "1", "argv": route_module.session_argv(route, ports, token)}, "owner": {"pid": 40000 + index, "start": "1", "argv": ["sshd: root@notty"]}, "transport": self.transport(ports)}
+            process = mock.Mock(pid=manager["pid"])
+            process.poll.return_value = None
+            now = [0]
+            def launch(*args, **kwargs):
+                route_module.publish(route, state)
+                return process
+            def identity(pid):
+                if pid == manager["pid"] and now[0] == 0:
+                    return {**manager, "argv": ["transient-pre-exec-parent"]}
+                return identities.get(pid)
+            def sleep(seconds):
+                now[0] += tick
+                if now[0] >= ready_at:
+                    state["status"] = "ready"
+                    route_module.publish(route, state)
+            with mock.patch.object(route_module.subprocess, "Popen", side_effect=launch), mock.patch.object(route_module, "identity", side_effect=identity), mock.patch.object(route_module, "pidfd_signal") as send, mock.patch.object(route_module.time, "monotonic", side_effect=lambda: now[0]), mock.patch.object(route_module.time, "sleep", side_effect=sleep):
+                route_module.operate("start", route)
+                self.assertEqual(len(route_module.ready(route)["children"]), 64)
+            self.assertEqual([call.args[1] for call in send.call_args_list], [0])
+            process.wait.assert_not_called()
+
+    def test_failure_with_transitioning_argv_uses_only_pinned_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            route = {**self.route, "state_dir": directory, "ssh_identity_file": str(source), "ssh_known_hosts_file": str(source)}
+            process = mock.Mock(pid=12345)
+            process.poll.return_value = None
+            with mock.patch.object(route_module.subprocess, "Popen", return_value=process), mock.patch.object(route_module, "ready", side_effect=ValueError("failed receipt")), mock.patch.object(route_module, "identity", return_value={"pid": 99999, "start": "different", "argv": ["unrelated"]}), mock.patch.object(route_module, "send") as numeric_send, mock.patch.object(route_module, "pidfd_signal") as send:
+                with self.assertRaisesRegex(ValueError, "failed receipt"):
+                    route_module.operate("start", route)
+            numeric_send.assert_not_called()
+            self.assertEqual([call.args[1] for call in send.call_args_list], [0, signal.SIGTERM])
+            process.wait.assert_called_once()
+
+    def test_different_exact_ready_manager_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            route = {**self.route, "state_dir": directory, "ssh_identity_file": str(source), "ssh_known_hosts_file": str(source)}
+            process = mock.Mock(pid=12345)
+            process.poll.return_value = None
+            other = {"pid": 54321, "start": "2", "argv": route_module.manager_argv(route)}
+            with mock.patch.object(route_module.subprocess, "Popen", return_value=process), mock.patch.object(route_module, "ready", return_value={"manager": other}) as ready, mock.patch.object(route_module, "send") as numeric_send, mock.patch.object(route_module, "pidfd_signal") as send:
+                route_module.operate("start", route)
+            self.assertEqual(ready.call_count, 2)
+            self.assertEqual([call.args[1] for call in send.call_args_list], [0, signal.SIGTERM])
+            numeric_send.assert_not_called()
+            process.wait.assert_called_once()
+
+    def test_pinned_cleanup_has_one_deadline_and_reaps_after_kill(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("manager", 8), 0]
+        with mock.patch.object(route_module, "pidfd_signal") as send, mock.patch.object(route_module.time, "monotonic", side_effect=[10, 19]):
+            route_module.cleanup_started(process, 99, 10)
+        self.assertEqual(send.call_args_list, [mock.call(99, signal.SIGTERM), mock.call(99, signal.SIGKILL)])
+        self.assertEqual(process.wait.call_args_list, [mock.call(timeout=8), mock.call(timeout=1)])
+
+    def test_pin_failure_reaps_exited_child_but_never_signals_unpinned_pid(self):
+        for result in (1, None):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
+                route = {**self.route, "state_dir": directory, "ssh_identity_file": str(source), "ssh_known_hosts_file": str(source)}
+                process = mock.Mock(pid=12345)
+                process.poll.return_value = result
+                with mock.patch.object(route_module.subprocess, "Popen", return_value=process), mock.patch.object(route_module, "pin_child", side_effect=OSError("pin failed")), mock.patch.object(route_module, "send") as numeric_send, mock.patch.object(route_module, "pidfd_signal") as send:
+                    with self.assertRaisesRegex(OSError if result is not None else RuntimeError, "pin failed" if result is not None else "child may still be active; no signal"):
+                        route_module.operate("start", route)
+                numeric_send.assert_not_called()
+                self.assertEqual([call.args[1] for call in send.call_args_list], [0])
+                self.assertEqual(process.wait.call_count, int(result is not None))
+
+    def test_exited_spawn_is_not_accepted_from_stale_ready_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            route = {**self.route, "state_dir": directory, "ssh_identity_file": str(source), "ssh_known_hosts_file": str(source)}
+            process = mock.Mock(pid=12345)
+            process.poll.return_value = 1
+            record = {"pid": process.pid, "start": "1", "argv": route_module.manager_argv(route)}
+            with mock.patch.object(route_module.subprocess, "Popen", return_value=process), mock.patch.object(route_module, "ready", return_value={"manager": record}), mock.patch.object(route_module, "pidfd_signal") as send:
+                with self.assertRaisesRegex(RuntimeError, "setup failed"):
+                    route_module.operate("start", route)
+            self.assertEqual([call.args[1] for call in send.call_args_list], [0])
+            process.wait.assert_called_once_with(timeout=0)
 
     def test_interrupted_start_reaps_manager(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -384,11 +486,11 @@ class DirectRouteTest(unittest.TestCase):
             handlers = {}
             def interrupt(_):
                 handlers[signal.SIGTERM](signal.SIGTERM, None)
-            with mock.patch.object(route_module.subprocess, "Popen", return_value=process), mock.patch.object(route_module, "identity", return_value=record), mock.patch.object(route_module, "ready", side_effect=interrupt), mock.patch.object(route_module, "send") as send, mock.patch.object(route_module.signal, "signal", side_effect=lambda number, handler: handlers.update({number: handler})):
+            with mock.patch.object(route_module.subprocess, "Popen", return_value=process), mock.patch.object(route_module, "identity", return_value=record), mock.patch.object(route_module, "ready", side_effect=interrupt), mock.patch.object(route_module, "pidfd_signal") as send, mock.patch.object(route_module.signal, "signal", side_effect=lambda number, handler: handlers.update({number: handler})):
                 with self.assertRaisesRegex(InterruptedError, "start interrupted"):
                     route_module.operate("start", route)
-            self.assertEqual(send.call_args_list, [mock.call(record, signal.SIGTERM)])
-            self.assertEqual(process.wait.call_count, 2)
+            self.assertEqual([call.args[1] for call in send.call_args_list], [0, signal.SIGTERM])
+            self.assertEqual(process.wait.call_count, 1)
 
     def test_stopped_exhausted_manager_allows_a_new_bounded_start(self):
         with tempfile.TemporaryDirectory() as directory:

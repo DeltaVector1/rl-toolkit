@@ -80,6 +80,16 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertFalse(any("direct adapter source route" in message for message in training_ops._warnings(state)))
         self.process_guard.assert_not_called()
 
+    def test_direct_route_status_key_survives_uppercase_parser(self):
+        script = training_ops._head_script()
+        self.assertIn("echo DIRECT_ROUTE ready", script)
+        self.assertIn("echo DIRECT_ROUTE failed", script)
+        for value in ("ready", "failed"):
+            self.assertEqual(training_ops._kv(f"DIRECT_ROUTE {value}\n")["DIRECT_ROUTE"], value)
+        source_text = Path(training_ops.__file__).read_text()
+        self.assertIn('s.direct_route = h.get("DIRECT_ROUTE", "unknown")', source_text)
+        self.process_guard.assert_not_called()
+
     def test_adapter_stage_policy_matches_all_layers(self):
         repository = Path(__file__).resolve().parents[2]
         receiver_limit = _load_function(

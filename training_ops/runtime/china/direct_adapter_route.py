@@ -590,6 +590,33 @@ def serve(route):
         os.close(lock)
 
 
+def pin_child(process):
+    # Popen has not been polled/reaped: its PID cannot yet be reused.
+    return pidfd_open(process.pid)
+
+
+def cleanup_started(process, descriptor, seconds):
+    # This descriptor is authority for our own spawned child, even while exec
+    # changes its argv. Never recover this authority from a numeric PID or state.
+    if process.poll() is not None:
+        process.wait(timeout=0)
+        return
+    deadline = time.monotonic() + seconds
+    try:
+        pidfd_signal(descriptor, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=max(0, seconds - min(2, seconds / 2)))
+        return
+    except subprocess.TimeoutExpired:
+        try:
+            pidfd_signal(descriptor, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.wait(timeout=max(0, deadline - time.monotonic()))
+
+
 def operate(action, route):
     directory = Path(route["state_dir"])
     if action in {"status", "snapshot"}:
@@ -622,7 +649,7 @@ def operate(action, route):
             if not Path(route[key]).is_file():
                 raise RuntimeError(f"configured {key} is missing")
         process = None
-        manager_record = None
+        descriptor = None
         spawning = True
         interrupted_during_spawn = False
         handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
@@ -635,35 +662,53 @@ def operate(action, route):
         for number in handlers:
             signal.signal(number, interrupted)
         try:
+            deadline = time.monotonic() + route["setup_timeout_seconds"] + 2
             with os.fdopen(state_open(route, "manager.log", os.O_WRONLY | os.O_APPEND | os.O_CREAT), "ab") as log:
                 process = subprocess.Popen(manager_argv(route), stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, close_fds=True)
-            manager_record = identity(process.pid)
+            descriptor = pin_child(process)
             spawning = False
             if interrupted_during_spawn:
                 raise InterruptedError("direct route start interrupted")
-            deadline = time.monotonic() + route["setup_timeout_seconds"] + 2
-            while process.poll() is None and time.monotonic() < deadline:
+            def accept_ready():
                 try:
                     value = ready(route)
-                    if value["manager"] != manager_record:
-                        raise RuntimeError("started manager identity differs")
-                    return
                 except RuntimeError:
-                    time.sleep(0.1)
+                    return False
+                # ready() proves the exact post-exec argv, config, and all
+                # owner identities. A pre-exec cmdline is never retained.
+                if value["manager"]["pid"] == process.pid:
+                    if process.poll() is not None:
+                        return False
+                else:
+                    cleanup_started(process, descriptor, route["cleanup_timeout_seconds"] + 2)
+                    if ready(route)["manager"] != value["manager"]:
+                        raise RuntimeError("ready manager changed during reconciliation")
+                return True
+            while True:
+                if accept_ready():
+                    return
+                remaining = deadline - time.monotonic()
+                if process.poll() is not None or remaining <= 0:
+                    if accept_ready():
+                        return
+                    break
+                time.sleep(min(0.1, remaining))
             raise RuntimeError("direct route setup failed; see manager.log")
         except BaseException:
             for number in handlers:
                 signal.signal(number, signal.SIG_IGN)
-            if process is not None and process.poll() is None:
-                if manager_record is None:
-                    raise RuntimeError("started manager identity is unavailable")
-                if not matches(manager_record):
-                    raise RuntimeError("started manager identity changed; refusing cleanup")
-                cleanup([(process, [], manager_record["argv"], [], None)], route["cleanup_timeout_seconds"] + 2)
-            elif process is not None:
-                process.wait(timeout=0)
+            if process is not None:
+                if descriptor is None:
+                    if process.poll() is not None:
+                        process.wait(timeout=0)
+                    else:
+                        raise RuntimeError("cannot pin spawned child identity; child may still be active; no signal was sent")
+                else:
+                    cleanup_started(process, descriptor, route["cleanup_timeout_seconds"] + 2)
             raise
         finally:
+            if descriptor is not None:
+                os.close(descriptor)
             for number, handler in handlers.items():
                 signal.signal(number, handler)
     finally:

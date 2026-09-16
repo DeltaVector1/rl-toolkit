@@ -1007,7 +1007,7 @@ def _head_script() -> str:
         .replace("__ORCH__", orchestrator_container)
         .replace("__ADAPTER__", str(adapter_port))
         .replace("__ADAPTER_CONTAINER__", adapter_container)
-        + f"\nif python3 {runtime_root}/china/direct_adapter_route.py status {remote_repo}/configs/nodes.toml >/dev/null 2>&1; then echo direct_route ready; else echo direct_route failed; fi\n"
+        + f"\nif python3 {runtime_root}/china/direct_adapter_route.py status {remote_repo}/configs/nodes.toml >/dev/null 2>&1; then echo DIRECT_ROUTE ready; else echo DIRECT_ROUTE failed; fi\n"
     )
 
 
@@ -2252,7 +2252,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
         "SECONDARY_JUDGE", "000" if secondary_judge_used else "unused"
     )
     s.adapter = h.get("ADAPTER", "000")
-    s.direct_route = h.get("direct_route", "unknown")
+    s.direct_route = h.get("DIRECT_ROUTE", "unknown")
     s.zmq_tunnel = h.get("ZMQ_TUNNEL", "0") == "1"
 
     for host, (rc, out) in nodes_out.items():
