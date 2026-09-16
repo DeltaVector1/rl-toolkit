@@ -147,6 +147,38 @@ if [ -z "$trainer_ssh_target" ]; then
   echo "nodes config has no trainer SSH target" >&2
   exit 2
 fi
+if ! trainer_proxy_settings=$(ssh -G "$trainer_ssh_target" 2>/dev/null | awk '
+  $1 == "hostname" { hostname=$2 }
+  $1 == "port" { port=$2 }
+  $1 == "proxyjump" { proxyjump=$2 }
+  END {
+    if (hostname == "" || port == "" || proxyjump == "") exit 1
+    print hostname, port, proxyjump
+  }
+'); then
+  echo "cannot read the configured ProxyJump for $trainer_ssh_target" >&2
+  exit 2
+fi
+read -r trainer_proxy_host trainer_proxy_port trainer_proxy_jump <<<"$trainer_proxy_settings"
+case "$trainer_proxy_host" in
+  ''|*[!A-Za-z0-9_.:-]*)
+    echo "configured trainer ProxyJump host is invalid" >&2
+    exit 2
+    ;;
+esac
+case "$trainer_proxy_port" in
+  ''|*[!0-9]*)
+    echo "configured trainer ProxyJump port is invalid" >&2
+    exit 2
+    ;;
+esac
+case "$trainer_proxy_jump" in
+  ''|none|*,*|*[!A-Za-z0-9_.@:-]*)
+    echo "configured trainer ProxyJump is invalid" >&2
+    exit 2
+    ;;
+esac
+trainer_proxy_child_target="[$trainer_proxy_host]:$trainer_proxy_port"
 transport=$(awk '
   $0 == "[rollout_transport]" { active=1; next }
   /^\[/ { active=0 }
@@ -927,6 +959,19 @@ china_tunnel_supervisor_match() {
   china_tunnel_ssh_args_match "$ssh_command" "$shape"
 }
 
+china_tunnel_historical_supervisor_match() {
+  local command_line=$1 shape=$2 marker=${3:-}
+  local ssh_command
+  china_tunnel_marker_match "$command_line" "$marker" || return 1
+  case "$command_line" in *"while true; do"*) ;; *) return 1 ;; esac
+  if [ -z "$marker" ]; then
+    marker=$(sed -n 's/.*# \(china-tunnel-lora-[0-9][0-9]*\)$/\1/p' <<<"$command_line")
+  fi
+  [ -n "$marker" ] || return 1
+  ssh_command=$(tunnel_supervisor_ssh_command "$command_line" "$marker") || return 1
+  china_tunnel_historical_ssh_args_match "$ssh_command" "$shape"
+}
+
 china_tunnel_supervisor_forwards_match() {
   local command_line=$1 shape=$2 marker=$3 forward
   shift 3
@@ -945,10 +990,13 @@ china_tunnel_stale_supervisor_match() {
   for forward in "$@"; do
     tunnel_command_has "$command_line" "$forward" || return 1
   done
+  china_tunnel_supervisor_match "$command_line" "$shape" "$marker" || \
+    china_tunnel_historical_supervisor_match "$command_line" "$shape" "$marker"
 }
 
 china_tunnel_ssh_args_match() {
   local command_line=$1 shape=$2
+  local profile=${3:-current}
   local source_port forward_count index
   local -a command_args expected_args
   command_line=$(tunnel_channel_timeout_normalize "$command_line") || return 1
@@ -959,7 +1007,13 @@ china_tunnel_ssh_args_match() {
     -o ExitOnForwardFailure=yes
     -o ServerAliveInterval=10
     -o ServerAliveCountMax=3
-    -o 'ChannelTimeout=*-tcpip=45s'
+  )
+  case "$profile" in
+    current) expected_args+=( -o 'ChannelTimeout=*-tcpip=45s' ) ;;
+    historical) ;;
+    *) return 1 ;;
+  esac
+  expected_args+=(
     -o TCPKeepAlive=yes
     -o IPQoS=none
     -o Compression=no
@@ -985,6 +1039,22 @@ china_tunnel_ssh_args_match() {
   done
 }
 
+china_tunnel_historical_ssh_args_match() {
+  china_tunnel_ssh_args_match "$1" "$2" historical
+}
+
+china_tunnel_proxy_jump_command_match() {
+  local command_line=$1
+  local -a command_args
+  command_line=${command_line% }
+  read -r -a command_args <<<"$command_line"
+  [ "${#command_args[@]}" -eq 4 ] || return 1
+  case "${command_args[0]:-}" in ssh|/usr/bin/ssh) ;; *) return 1 ;; esac
+  [ "${command_args[1]}" = "-W" ] || return 1
+  [ "${command_args[2]}" = "${trainer_proxy_child_target:-}" ] || return 1
+  [ "${command_args[3]}" = "${trainer_proxy_jump:-}" ]
+}
+
 china_tunnel_group_safe() {
   local pgid=$1 expected_marker=${2:-} group_command
   local group_seen=0
@@ -998,7 +1068,8 @@ china_tunnel_group_safe() {
         china_tunnel_supervisor_match "$group_command" cleanup "$expected_marker" || return 1
         ;;
       ssh\ *|/usr/bin/ssh\ *)
-        china_tunnel_ssh_args_match "$group_command" cleanup || return 1
+        china_tunnel_proxy_jump_command_match "$group_command" || \
+          china_tunnel_ssh_args_match "$group_command" cleanup || return 1
         ;;
       "sleep 3") ;;
       *) return 1 ;;
@@ -1024,12 +1095,16 @@ china_tunnel_stale_group_safe() {
         [ "$actual_ssh" = "$expected_ssh" ] || return 1
         ;;
       ssh\ *|/usr/bin/ssh\ *)
-        normalized_command=$group_command
-        case "$normalized_command" in
-          /usr/bin/ssh\ *) normalized_command="ssh ${normalized_command#/usr/bin/ssh }" ;;
-        esac
-        normalized_command=$(tunnel_channel_timeout_normalize "$normalized_command") || return 1
-        [ "$normalized_command" = "$expected_ssh" ] || return 1
+        if china_tunnel_proxy_jump_command_match "$group_command"; then
+          :
+        else
+          normalized_command=$group_command
+          case "$normalized_command" in
+            /usr/bin/ssh\ *) normalized_command="ssh ${normalized_command#/usr/bin/ssh }" ;;
+          esac
+          normalized_command=$(tunnel_channel_timeout_normalize "$normalized_command") || return 1
+          [ "$normalized_command" = "$expected_ssh" ] || return 1
+        fi
         ;;
       "sleep 3") ;;
       *) return 1 ;;
@@ -1078,6 +1153,109 @@ tunnel_listener_ready() {
   esac
 }
 
+china_tunnel_listener_supervisor_pid() {
+  local port=$1 marker=$2 forward_count=$3
+  shift 3
+  local -a forwards=("$@")
+  local listener owner_pid owner_command supervisor_pid supervisor_command
+  listener=$(ss -H -ltnp 2>/dev/null | awk -v port=":$port" '$4 ~ port "$" {print; exit}')
+  [ -n "$listener" ] || return 1
+  owner_pid=$(sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' <<<"$listener")
+  case "$owner_pid" in ''|*[!0-9]*) return 1 ;; esac
+  owner_command=$(ps -o args= -p "$owner_pid" 2>/dev/null || true)
+  china_tunnel_ssh_args_match "$owner_command" current || return 1
+  supervisor_pid=$(ps -o ppid= -p "$owner_pid" 2>/dev/null | tr -d ' ')
+  case "$supervisor_pid" in ''|*[!0-9]*|1) return 1 ;; esac
+  supervisor_command=$(ps -o args= -p "$supervisor_pid" 2>/dev/null || true)
+  china_tunnel_supervisor_forwards_match "$supervisor_command" current "$marker" \
+    "${forwards[@]}" || return 1
+  printf '%s\n' "$supervisor_pid"
+}
+
+china_tunnel_marker_unique_ready() {
+  local marker=$1
+  shift
+  local -a forwards=("$@") current_pids=() owner_pids=()
+  local pid command_line owner="" port forward owner_pid
+  for pid in $(pgrep -f -- "$marker" || true); do
+    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" \
+        "${forwards[@]}"; then
+      current_pids+=("$pid")
+    else
+      echo "unexpected China tunnel process for $marker" >&2
+      return 1
+    fi
+  done
+  [ "${#current_pids[@]}" -eq 1 ] || return 1
+  for forward in "${forwards[@]}"; do
+    port=${forward#-L 127.0.0.1:}
+    port=${port%%:*}
+    owner_pid=$(china_tunnel_listener_supervisor_pid "$port" "$marker" \
+      "${#forwards[@]}" "${forwards[@]}" || true)
+    [ -n "$owner_pid" ] || return 1
+    if [ -n "$owner" ] && [ "$owner" != "$owner_pid" ]; then
+      return 1
+    fi
+    owner=$owner_pid
+  done
+  [ "$owner" = "${current_pids[0]}" ]
+}
+
+china_tunnel_reconcile_marker() {
+  local marker=$1
+  shift
+  local -a forwards=("$@") current_pids=() stale_pids=()
+  local pid command_line owner="" owner_pid port forward
+  for pid in $(pgrep -f -- "$marker" || true); do
+    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" \
+        "${forwards[@]}"; then
+      current_pids+=("$pid")
+    elif china_tunnel_stale_supervisor_match "$command_line" current "$marker" \
+        "${forwards[@]}"; then
+      stale_pids+=("$pid")
+    else
+      echo "unexpected China tunnel process for $marker" >&2
+      return 1
+    fi
+  done
+  for pid in "${stale_pids[@]}"; do
+    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    china_tunnel_stop_supervisor "$pid" "$command_line" "$marker" 1 || return 1
+  done
+  for forward in "${forwards[@]}"; do
+    port=${forward#-L 127.0.0.1:}
+    port=${port%%:*}
+    owner_pid=$(china_tunnel_listener_supervisor_pid "$port" "$marker" \
+      "${#forwards[@]}" "${forwards[@]}" || true)
+    [ -n "$owner_pid" ] || continue
+    if [ -n "$owner" ] && [ "$owner" != "$owner_pid" ]; then
+      echo "ambiguous China tunnel ownership for $marker" >&2
+      return 1
+    fi
+    owner=$owner_pid
+  done
+  if [ -n "$owner" ]; then
+    case " ${current_pids[*]} " in
+      *" $owner "*) ;;
+      *) echo "China tunnel listener has no matching supervisor for $marker" >&2; return 1 ;;
+    esac
+    for pid in "${current_pids[@]}"; do
+      [ "$pid" = "$owner" ] && continue
+      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      china_tunnel_stop_supervisor "$pid" "$command_line" "$marker" 1 || return 1
+    done
+    china_tunnel_marker_unique_ready "$marker" "${forwards[@]}" || return 1
+    return 0
+  fi
+  for pid in "${current_pids[@]}"; do
+    command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    china_tunnel_stop_supervisor "$pid" "$command_line" "$marker" 1 || return 1
+  done
+  return 2
+}
+
 china_tunnel_grouped_legacy_match() {
   local command_line=$1 forward_total
   china_tunnel_marker_match "$command_line" || return 1
@@ -1100,7 +1278,9 @@ china_tunnel_ssh_child_match() {
     *) return 1 ;;
   esac
   command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ') || return 1
-  china_tunnel_ssh_args_match "$command_line" "$shape"
+  china_tunnel_ssh_args_match "$command_line" "$shape" || \
+    china_tunnel_historical_ssh_args_match "$command_line" "$shape" || \
+    china_tunnel_proxy_jump_command_match "$command_line"
 }
 
 china_tunnel_remove_orphan_children() {
@@ -1317,15 +1497,12 @@ china_tunnel_connection() {
   target=$(printf '%q' "$trainer_ssh_target")
   marker="china-tunnel-$connection_name"
   if [ "${restart_tunnels:-0}" = 0 ]; then
-    for pid in $(pgrep -f -- "$marker" || true); do
-      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
-      if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${forwards[@]}"; then
-        return 0
-      fi
-      if china_tunnel_stale_supervisor_match "$command_line" current "$marker" "${forwards[@]}"; then
-        china_tunnel_stop_supervisor "$pid" "$command_line" "$marker" 1 || return 1
-      fi
-    done
+    local reconcile_status=0
+    china_tunnel_reconcile_marker "$marker" "${forwards[@]}" || reconcile_status=$?
+    if [ "$reconcile_status" -eq 0 ]; then
+      return 0
+    fi
+    [ "$reconcile_status" -eq 2 ] || return 1
     china_tunnel_remove_legacy "$marker" "${forwards[@]}"
     ports_clear=0
     for _ in $(seq 1 10); do
@@ -1403,15 +1580,7 @@ china_tunnel_supervisors_ready() {
       lane_forwards+=("-L 127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port")
     done
     marker="china-tunnel-lora-$lane_number"
-    ready=0
-    for pid in $(pgrep -f -- "$marker" || true); do
-      command_line=$(ps -o args= -p "$pid" 2>/dev/null || true)
-      if china_tunnel_supervisor_forwards_match "$command_line" current "$marker" "${lane_forwards[@]}"; then
-        ready=1
-        break
-      fi
-    done
-    [ "$ready" = 1 ] || return 1
+    china_tunnel_marker_unique_ready "$marker" "${lane_forwards[@]}" || return 1
     lane_start=$((lane_start + 2))
     lane_number=$((lane_number + 1))
   done
