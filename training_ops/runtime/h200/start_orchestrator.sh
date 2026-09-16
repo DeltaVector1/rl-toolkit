@@ -718,6 +718,20 @@ test -f "$config_file" || {
   echo "orchestrator config is missing: $config_file" >&2
   exit 2
 }
+if [ -n "${adapter_resume_step:-}" ]; then
+  case "$adapter_resume_step" in
+    *[!0-9]*) echo "adapter resume step must be a non-negative integer" >&2; exit 2 ;;
+  esac
+  # Keep explicit restart control separate from the deployed configuration.
+  # Later saved traces must not select the next production batch.
+  resume_control_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME/control"
+  mkdir -p "$resume_control_dir"
+  resume_config=$(mktemp "$resume_control_dir/orch-restart-XXXXXX.toml")
+  python3 "$deployment/training_ops/runtime/china/resume_state.py" \
+    config "$config_file" "$adapter_resume_step" >"$resume_config"
+  chmod 0644 "$resume_config"
+  config_file=$resume_config
+fi
 image=prime-rl:glm52-decensor
 if ! lora_source_port_output=$(python3 - "$nodes_file" <<'PY'
 import sys

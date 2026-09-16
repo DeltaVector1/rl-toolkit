@@ -6011,6 +6011,7 @@ def _start_dependency_inventory(
         "training_ops/runtime/h200",
         inference_hosts,
     )
+    add("training_ops/runtime/china/resume_state.py", [orchestrator_host])
 
     configured_hosts = list(dict.fromkeys([*trainer_hosts, *inference_hosts]))
     add("configs/nodes.toml", configured_hosts)
@@ -6569,6 +6570,21 @@ def _cold_adapter_cache_cleanup(
         print(f"cold adapter cleanup on {host}: {output.strip()}")
 
 
+def _check_adapter_restart(host: str, service_dir: str, step: int, role: str, adapter: str, digest: str = "") -> dict:
+    source = (repo_root / "training_ops/runtime/china/resume_state.py").read_text()
+    arguments = " ".join(shlex.quote(str(value)) for value in (service_dir, step, role, adapter, digest))
+    code, output = _ssh(host, f"python3 - {arguments} <<'PY'\n{source}\nPY", timeout=600)
+    if code:
+        raise Refused(f"adapter restart state check failed on {host}: {output.strip()}")
+    try:
+        result = json.loads(output)
+    except (TypeError, ValueError) as error:
+        raise Refused(f"invalid adapter restart state on {host}") from error
+    if not isinstance(result, dict) or result.get("policy_step") != step or result.get("next_batch") != step + 1:
+        raise Refused(f"adapter restart progress differs on {host}")
+    return result
+
+
 def start(
     run: str,
     mode: str = "cold",
@@ -6592,11 +6608,14 @@ def start(
     if resume_adapter is not None:
         if not resume_adapter.startswith(f"{run_root}/"):
             raise Refused(f"resume adapter must be below {run_root}")
-        if resume_step is None or resume_step < 0:
+        if type(resume_step) is not int or resume_step < 0:
             raise Refused("resume_step must be zero or greater")
+        if mode != "restart":
+            raise Refused("an explicit resume adapter requires restart mode")
     nodes = [_check_host(h) for h in (nodes or trainer_hosts)]
     if trainer_head in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [trainer_head] + [n for n in nodes if n != trainer_head]
+    resume_digest = ""
     if mode == "restart" and resume_adapter is not None:
         if trainer_head not in nodes:
             raise Refused(f"adapter restart requires trainer head {trainer_head} in nodes")
@@ -6611,6 +6630,11 @@ def start(
             raise Refused(
                 f"adapter restart requires a non-empty control file {control_file} on {trainer_head}"
             )
+        identity = _check_adapter_restart(trainer_head, service_run_dir, resume_step, "origin", resume_adapter)
+        resume_digest = identity.get("sha256", "")
+        if not isinstance(resume_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", resume_digest):
+            raise Refused("stable restart adapter has no exact SHA-256 identity")
+        _check_adapter_restart(orchestrator_host, service_run_dir, resume_step, "orchestrator", resume_adapter)
     required_files = _start_dependency_inventory(selected, nodes)
     _deploy_dependencies(required_files)
     name = f"run_{run}"
@@ -6764,7 +6788,8 @@ def start(
             f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
             f"TRAINER_CT={shlex.quote(trainer_container)} "
             f"ORCH_CT={shlex.quote(orchestrator_container)} "
-            f"bash {orchestrator_launcher}",
+            + (f"adapter_resume_step={resume_step} " if resume_adapter is not None else "")
+            + f"bash {orchestrator_launcher}",
             300,
         )
         if rc:
@@ -6875,6 +6900,15 @@ exit 1
         launch_trainer()
     elif resume_adapter is not None:
         try:
+            _remote_ok(
+                trainer_head,
+                _cold_cleanup_script(run, stop_only=True),
+                "restart batch publisher stop",
+                timeout=300,
+            )
+            for host in nodes:
+                _check_adapter_restart(host, service_run_dir, resume_step, "trainer", resume_adapter, resume_digest)
+            _check_adapter_restart(orchestrator_host, service_run_dir, resume_step, "orchestrator", resume_adapter)
             launch_adapter()
             launch_trainer()
             # The next trainer step needs a fresh batch from the orchestrator.
