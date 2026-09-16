@@ -2367,10 +2367,9 @@ peer_repair_missing_remote_lanes() {
 }
 
 china_source_ports_ready() {
-  local probe_seconds=40 expected_lanes observed_lanes verified_ports
-  expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
-  observed_lanes=$(ps -eo args= | sed -n 's/.*# china-tunnel-lora-\([0-9][0-9]*\)$/\1/p' | sort -n) || return 1
-  [ "$observed_lanes" = "$(seq 0 $((expected_lanes - 1)))" ] || return 1
+  local probe_seconds=40 verified_ports
+  direct_route_control status || return 1
+  direct_route_listeners_ready || return 1
   if ! verified_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
       python3 - "${lora_source_ports[0]}" "${lora_source_ports[-1]}" <<'PY'
 import asyncio
@@ -3490,6 +3489,10 @@ supervisor_lane_inventory_ready() {
 }
 
 china_tunnel_supervisors_ready() {
+  direct_route_control status
+}
+
+china_tunnel_legacy_supervisors_ready() {
   local lane_start=0 lane_number=0 lane_ports=() lane_forwards=() pid command_line
   local marker ready lora_source_port matching_pid matching_command match_count invalid matching_pids
   local expected_lanes=$(( (${#lora_source_ports[@]} + 1) / 2 ))
@@ -3716,6 +3719,8 @@ adapter_tunnel_exact_snapshot() {
 }
 
 adapter_tunnel_stability_snapshot() {
+  direct_route_control status || return 1
+  direct_route_listeners_ready || return 1
   peer_tunnel_supervisors_unchanged || return 1
   peer_tunnel_children_unchanged || return 1
   if [ "$peer_enabled" = 1 ]; then
@@ -3900,6 +3905,42 @@ adapter_relay_start() {
   }
 }
 
+direct_route_control() {
+  local action=$1 probe_seconds
+  case "$action" in start|restart|status) ;; *) return 2 ;; esac
+  probe_seconds=$(repair_timeout 200) || return 1
+  timeout --signal=TERM --kill-after=2s "$probe_seconds" \
+    ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=10 \
+      -o ServerAliveCountMax=3 "$trainer_ssh_target" \
+      "python3 '$deployment/training_ops/runtime/china/direct_adapter_route.py' '$action' '$nodes_file'"
+}
+
+direct_route_listeners_ready() {
+  local listeners
+  listeners=$(sudo ss -H -ltnp) || return 1
+  python3 -c '
+import re, sys
+first, last = map(int, sys.argv[1:])
+owners = {}
+for line in sys.stdin:
+    fields = line.split()
+    if len(fields) < 5 or not fields[3].startswith("127.0.0.1:"):
+        continue
+    port = int(fields[3].rsplit(":", 1)[1])
+    if not first <= port <= last:
+        continue
+    matches = re.findall(r"\(\"sshd(?:-session)?\",pid=(\d+),fd=\d+\)", line)
+    if len(matches) != 1 or port in owners:
+        raise SystemExit("direct route listener ownership differs")
+    owners[port] = matches[0]
+if set(owners) != set(range(first, last + 1)):
+    raise SystemExit("direct route listeners are incomplete")
+groups = [owners[port] for port in range(first, last + 1, 2)]
+if len(set(groups)) != len(groups) or any(owners[port] != owners[port + 1] for port in range(first, last + 1, 2)):
+    raise SystemExit("direct route requires one SSH owner per two listeners")
+' "${lora_source_ports[0]}" "${lora_source_ports[-1]}" <<<"$listeners"
+}
+
 china_legacy_cleanup_required=0
 china_legacy_cleanup_pids=()
 china_legacy_cleanup_pgids=()
@@ -3930,38 +3971,23 @@ if [ "$restart_tunnels" = 0 ]; then
 fi
 if [ "$tunnels_prevalidated" != 1 ]; then
 repair_stage=china-legacy
-if [ "$restart_tunnels" = 1 ]; then
-  china_tunnel_remove_all_owned || repair_fail "full reset cleanup failed"
-else
-  china_tunnel_remove_legacy || repair_fail "legacy cleanup failed"
-fi
+china_tunnel_remove_all_owned || repair_fail "old source route cleanup failed"
 repair_remaining >/dev/null || repair_fail "deadline exceeded during cleanup"
 china_tunnel_remove_orphan_children || repair_fail "orphan China tunnel cleanup failed"
 if [ "$china_legacy_cleanup_required" = 1 ] && ! china_tunnel_wait_legacy_clear; then
   repair_fail "old China tunnel groups did not stop"
 fi
 repair_remaining >/dev/null || repair_fail "deadline exceeded after cleanup"
-china_lane_size=2
-china_lane_start=0 china_lane_number=0
-china_lane_ports=() china_lane_forwards=()
-while [ "$china_lane_start" -lt "${#lora_source_ports[@]}" ]; do
-  repair_stage=china-lane-$china_lane_number
-  china_lane_ports=("${lora_source_ports[@]:china_lane_start:china_lane_size}")
-  china_lane_forwards=()
-  for lora_source_port in "${china_lane_ports[@]}"; do
-    china_lane_forwards+=(
-      -L "127.0.0.1:$lora_source_port:127.0.0.1:$adapter_port"
-    )
-  done
-  china_tunnel_connection "lora-$china_lane_number" \
-    "${china_lane_forwards[@]}" || repair_fail "China lane $china_lane_number failed"
-  china_lane_start=$((china_lane_start + china_lane_size))
-  china_lane_number=$((china_lane_number + 1))
-done
+repair_stage=direct-source
+if [ "$restart_tunnels" = 1 ]; then
+  direct_route_control restart || repair_fail "direct source restart failed"
+else
+  direct_route_control start || repair_fail "direct source start failed"
+fi
 repair_stage=china-source
 china_source_ports_ready || repair_fail "China adapter source check failed"
 if [ "$tunnels_only" = 0 ]; then
-  echo "China adapter forwards ${lora_source_ports[0]}-${lora_source_ports[-1]} in $china_lane_number SSH lanes"
+  echo "Direct adapter forwards ${lora_source_ports[0]}-${lora_source_ports[-1]} ready"
 fi
 if ! peer_tunnel; then
   # Keep established China and peer lanes available when one peer lane fails.
