@@ -77,7 +77,9 @@ from prime_rl.orchestrator.utils import (
 from prime_rl.orchestrator.watcher import (
     WeightWatcher,
     _adapter_file_records,
+    _read_remote_adapter_manifest,
     _write_receivers_ready,
+    adapter_manifest_max_bytes,
     inference_weight_path,
     validate_adapter_manifest,
 )
@@ -173,7 +175,7 @@ POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S = 1200
 STARTUP_WEIGHT_WAIT_TIMEOUT_S = 1200
 
 
-def _verify_startup_adapter_delta(
+async def _verify_startup_adapter_delta(
     config: OrchestratorConfig,
     lora_name: str | None,
     step: int,
@@ -188,6 +190,8 @@ def _verify_startup_adapter_delta(
     """Reject a positive resume unless its published adjacent delta is exact."""
     if lora_name is None or step <= 0:
         return
+    if deadline is None:
+        deadline = time.monotonic() + adapter_stage_limit_seconds(step)
     broadcast_dir = get_broadcast_dir(config.output_dir)
     previous_path = get_step_path(broadcast_dir, step - 1)
     previous_url = inference_weight_path(config, previous_path, lora_name)
@@ -203,24 +207,20 @@ def _verify_startup_adapter_delta(
             raise RuntimeError(
                 f"cannot resume LoRA policy v{step}: second predecessor has no source URL"
             )
-    def read_manifest(path, url: str | None) -> dict[str, object]:
+    async def read_manifest(path, url: str | None) -> dict[str, object]:
         try:
             if url is None:
-                with (path / "adapter_manifest.json").open("r", encoding="utf-8") as source:
-                    value = json.load(source)
+                with (path / "adapter_manifest.json").open("rb") as source:
+                    payload = source.read(adapter_manifest_max_bytes + 1)
+                if len(payload) > adapter_manifest_max_bytes:
+                    raise RuntimeError("published adapter manifest exceeds the size limit")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("published adapter manifest deadline expired")
+                value = json.loads(payload)
             else:
-                timeout = adapter_stage_limit_seconds(step)
-                if deadline is not None:
-                    timeout = deadline - time.monotonic()
-                    if timeout <= 0:
-                        raise RuntimeError(
-                            f"cannot resume LoRA policy v{step}: staging deadline expired"
-                        )
-                with urlopen(
-                    f"{url.rstrip('/')}/adapter_manifest.json",
-                    timeout=timeout,
-                ) as source:
-                    value = json.load(source)
+                value, _ = await _read_remote_adapter_manifest(url, deadline)
+        except TimeoutError:
+            raise
         except (FileNotFoundError, OSError, ValueError) as exc:
             raise RuntimeError(
                 f"cannot resume LoRA policy v{step}: adapter manifest is unavailable"
@@ -263,7 +263,7 @@ def _verify_startup_adapter_delta(
             },
         }
 
-    manifest = read_manifest(target_path, target_url)
+    manifest = await read_manifest(target_path, target_url)
     try:
         validate_adapter_manifest(
             manifest,
@@ -283,7 +283,7 @@ def _verify_startup_adapter_delta(
     previous_manifest = (
         None
         if previous_identity is not None
-        else read_manifest(previous_path, previous_url if isinstance(previous_url, str) else None)
+        else await read_manifest(previous_path, previous_url if isinstance(previous_url, str) else None)
     )
     try:
         previous_files = (
@@ -297,7 +297,7 @@ def _verify_startup_adapter_delta(
         previous_previous_manifest = (
             None
             if previous_previous_identity is not None
-            else read_manifest(previous_previous_path, previous_previous_url)
+            else await read_manifest(previous_previous_path, previous_previous_url)
         )
         try:
             previous_previous_files = (
@@ -987,10 +987,14 @@ class Orchestrator:
                     source_weights_path = inference_weight_path(
                         config, weights_path, self.lora_name
                     )
+                    if require_delta:
+                        startup_delta_deadline = (
+                            time.monotonic() + adapter_stage_limit_seconds(sync_version)
+                        )
                     if not (
                         using_pruned_resume_tail and sync_version < final_sync_version
                     ):
-                        _verify_startup_adapter_delta(
+                        await _verify_startup_adapter_delta(
                             config,
                             self.lora_name,
                             sync_version,
@@ -999,10 +1003,6 @@ class Orchestrator:
                             deadline=startup_delta_deadline,
                             previous_identity=staged_adapter_identities.get(sync_version - 1),
                             previous_previous_identity=staged_adapter_identities.get(sync_version - 2),
-                        )
-                    if require_delta:
-                        startup_delta_deadline = (
-                            time.monotonic() + adapter_stage_limit_seconds(sync_version)
                         )
                     weights_path = source_weights_path
                 if self.model_express is not None:
@@ -1013,25 +1013,13 @@ class Orchestrator:
                 adapter_identity = None
                 if self.lora_name is not None and isinstance(weights_path, str):
                     stage_attempts = 2 if require_delta else 1
-                    stage_limit = (
-                        adapter_stage_limit_seconds(sync_version)
-                        if require_delta
-                        else None
-                    )
-                    stage_total_deadline = (
-                        time.monotonic() + stage_attempts * stage_limit
-                        if stage_limit is not None
-                        else None
-                    )
                     for stage_attempt in range(1, stage_attempts + 1):
-                        if stage_limit is not None and stage_total_deadline is not None:
-                            remaining_total = stage_total_deadline - time.monotonic()
-                            if remaining_total <= 0:
-                                raise TimeoutError(
-                                    "adapter restart staging exceeded its ten-minute limit"
-                                )
-                            startup_delta_deadline = time.monotonic() + min(
-                                stage_limit, remaining_total
+                        if (
+                            startup_delta_deadline is not None
+                            and time.monotonic() >= startup_delta_deadline
+                        ):
+                            raise TimeoutError(
+                                "adapter restart staging exceeded its ten-minute limit"
                             )
                         try:
                             stage_result = await stage_lora_adapter(

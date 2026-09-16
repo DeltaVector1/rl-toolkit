@@ -200,6 +200,7 @@ class InferencePool(Protocol):
         require_delta: bool = False,
         prefetched: bool = False,
         expected_adapter_identity: Mapping[str, object] | None = None,
+        timings: dict[str, float] | None = None,
     ) -> list[AdapterIdentity] | None:
         """Update weights on all inference servers."""
         ...
@@ -327,6 +328,7 @@ class StaticInferencePool:
         require_delta: bool = False,
         prefetched: bool = False,
         expected_adapter_identity: Mapping[str, object] | None = None,
+        timings: dict[str, float] | None = None,
     ) -> list[AdapterIdentity] | None:
         return await update_weights(
             self._admin_clients,
@@ -336,6 +338,7 @@ class StaticInferencePool:
             require_delta=require_delta,
             prefetched=prefetched,
             expected_adapter_identity=expected_adapter_identity,
+            timings=timings,
         )
 
     async def score(self, token_ids: list[int]) -> list[float]:
@@ -1206,6 +1209,7 @@ async def update_weights(
     require_delta: bool = False,
     prefetched: bool = False,
     expected_adapter_identity: Mapping[str, object] | None = None,
+    timings: dict[str, float] | None = None,
 ) -> list[AdapterIdentity] | None:
     """Update weights on static inference servers.
 
@@ -1222,29 +1226,40 @@ async def update_weights(
     weight_dir_posix = str(weight_dir) if weight_dir is not None else None
 
     if lora_name is not None and weight_dir is not None:
+        async def measure(name, operation):
+            started = time.perf_counter()
+            try:
+                return await operation
+            finally:
+                if timings is not None:
+                    timings[name] = time.perf_counter() - started
+
         # Pause admission while the collective LoRA load runs.
         pause_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
-        await _pause_engines(admin_clients, step=step, deadline=pause_deadline)
+        await measure("pause", _pause_engines(admin_clients, step=step, deadline=pause_deadline))
         try:
             load_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
-            receipts = await load_lora_adapter(
-                admin_clients,
-                lora_name,
-                weight_dir,
-                require_delta=require_delta,
-                prefetched=prefetched,
-                expected_identity=expected_adapter_identity,
-                deadline=load_deadline,
+            receipts = await measure(
+                "adapter_load",
+                load_lora_adapter(
+                    admin_clients,
+                    lora_name,
+                    weight_dir,
+                    require_delta=require_delta,
+                    prefetched=prefetched,
+                    expected_identity=expected_adapter_identity,
+                    deadline=load_deadline,
+                ),
             )
         except BaseException as load_error:
             resume_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
             try:
-                await _resume_engines(admin_clients, deadline=resume_deadline)
+                await measure("resume", _resume_engines(admin_clients, deadline=resume_deadline))
             except BaseException as resume_error:
                 raise load_error from resume_error
             raise
         resume_deadline = time.monotonic() + POLICY_PHASE_TIMEOUT_S
-        await _resume_engines(admin_clients, deadline=resume_deadline)
+        await measure("resume", _resume_engines(admin_clients, deadline=resume_deadline))
         return receipts
     else:
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast

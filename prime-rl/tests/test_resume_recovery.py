@@ -49,15 +49,22 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
     function = next(
         node
         for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.FunctionDef)
+        if isinstance(node, ast.AsyncFunctionDef)
         and node.name == "_verify_startup_adapter_delta"
     )
+    async def read_remote(source_url, deadline):
+        with urlopen(source_url.rstrip("/") + "/adapter_manifest.json",
+                     round(deadline - time.monotonic(), 2)) as source:
+            return json.load(source), source_url
+
     namespace = {
         "OrchestratorConfig": object,
         "json": json,
         "re": re,
         "time": time,
         "urlopen": urlopen,
+        "_read_remote_adapter_manifest": read_remote,
+        "adapter_manifest_max_bytes": 2 * 1024 * 1024,
         "get_broadcast_dir": lambda output_dir: output_dir,
         "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
         "inference_weight_path": lambda _config, path, _lora_name: (
@@ -72,7 +79,7 @@ def load_startup_validator(urlopen, validate_manifest, file_records):
         "_adapter_file_records": file_records,
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"), namespace)
-    return namespace["_verify_startup_adapter_delta"]
+    return lambda *args, **kwargs: asyncio.run(namespace["_verify_startup_adapter_delta"](*args, **kwargs))
 
 
 def load_pruned_resume_selector(urlopen, verify, validate_manifest=None):

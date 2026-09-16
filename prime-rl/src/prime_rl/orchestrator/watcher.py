@@ -521,6 +521,9 @@ class WeightWatcher:
         self.last_adapter_wire_stage_time: float = 0.0
         self.last_adapter_reconstruct_time: float = -1.0
         self.last_adapter_load_time: float = 0.0
+        self.last_adapter_pause_time: float = 0.0
+        self.last_adapter_resume_time: float = 0.0
+        self.last_adapter_receipt_time: float = 0.0
         self.last_adapter_policy_step: int = 0
         self.last_adapter_stage_limit_seconds: float = 0.0
         self.last_wait_for_ckpt_time: float = 0.0
@@ -961,6 +964,7 @@ class WeightWatcher:
             get_logger().debug(f"Updating weights to step {next_step}")
             t1 = time.perf_counter()
             lora_name = f"{self.lora_name}-slot{next_step % 2}" if self.lora_name is not None else None
+            timings: dict[str, float] = {}
             receipts = await self.inference.update_weights(
                 weights_path,
                 lora_name=lora_name,
@@ -968,9 +972,15 @@ class WeightWatcher:
                 require_delta=require_delta,
                 prefetched=True,
                 expected_adapter_identity=adapter_identity,
+                timings=timings,
             )
+            self.last_adapter_pause_time = timings.get("pause", 0.0)
+            self.last_adapter_load_time = timings.get("adapter_load", 0.0)
+            self.last_adapter_resume_time = timings.get("resume", 0.0)
+            self.last_adapter_receipt_time = 0.0
             if self.lora_name is not None and isinstance(weights_path, str):
                 assert local_weights_path is not None
+                receipt_started = time.perf_counter()
                 _write_receivers_ready(
                     local_weights_path,
                     run_name=self.config.output_dir.name,
@@ -981,9 +991,8 @@ class WeightWatcher:
                     admin_clients=self.inference.admin_clients,
                     receipts=receipts,
                 )
+                self.last_adapter_receipt_time = time.perf_counter() - receipt_started
             self.last_update_weights_time = time.perf_counter() - t1
-            if self.lora_name is not None:
-                self.last_adapter_load_time = self.last_update_weights_time
             self.update_count += 1
             get_logger().info(f"Updated weights to step {next_step} in {format_time(self.last_update_weights_time)}")
             self.ckpt_step = next_step
@@ -1148,6 +1157,9 @@ class WeightWatcher:
             "watcher/last_adapter_wire_stage_time": self.last_adapter_wire_stage_time,
             "watcher/last_adapter_reconstruct_time": self.last_adapter_reconstruct_time,
             "watcher/last_adapter_load_time": self.last_adapter_load_time,
+            "watcher/last_adapter_pause_time": self.last_adapter_pause_time,
+            "watcher/last_adapter_resume_time": self.last_adapter_resume_time,
+            "watcher/last_adapter_receipt_time": self.last_adapter_receipt_time,
             "watcher/last_adapter_policy_step": float(self.last_adapter_policy_step),
             "watcher/last_adapter_stage_limit_seconds": self.last_adapter_stage_limit_seconds,
             "watcher/adapter_stage_acceptance_target_seconds": 300.0,
