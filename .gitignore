@@ -27,3 +27,6 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 *.egg-info/
+
+# Local generated output; tracked build tests remain in git.
+/build/
