@@ -604,8 +604,9 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
                 _end_lora_stage()
 
 
-async def _stage_lora_adapter_once(raw_request: Request):
+async def _stage_lora_adapter_once(raw_request: Request, *, accepted_at: float | None = None):
     """Prefetch a remote adapter without pausing or calling engine workers."""
+    started = time.monotonic() if accepted_at is None else accepted_at
     data = await raw_request.json()
     source_url = data.get("lora_path")
     if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
@@ -669,7 +670,6 @@ async def _stage_lora_adapter_once(raw_request: Request):
             status_code=500,
         )
     _begin_lora_stage()
-    started = time.monotonic()
     operation_timeout = (
         stage_timeout
         if stage_timeout is not None
@@ -679,6 +679,7 @@ async def _stage_lora_adapter_once(raw_request: Request):
     stage_id = uuid.uuid4().hex
     process = None
     communication = None
+    lock_acquired = False
 
     def success_payload(destination):
         if time.monotonic() > deadline:
@@ -780,6 +781,13 @@ async def _stage_lora_adapter_once(raw_request: Request):
         return result
 
     try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("adapter stage expired before acquiring the stage lock")
+        await asyncio.wait_for(_lora_stage_serial_lock.acquire(), timeout=remaining)
+        lock_acquired = True
+        if time.monotonic() >= deadline:
+            raise TimeoutError("adapter stage expired in the stage queue")
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
@@ -791,11 +799,14 @@ async def _stage_lora_adapter_once(raw_request: Request):
             env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
         )
         _set_lora_stage_process(stage_id, process.pid)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("adapter stage expired while starting its worker")
         request = {
             "source_url": source_url,
             "require_delta": require_delta,
             "policy_step": policy_step,
-            "stage_timeout_seconds": stage_timeout if require_delta else None,
+            "stage_timeout_seconds": remaining,
             "stage_id": stage_id,
         }
         communication = asyncio.create_task(
@@ -844,10 +855,15 @@ async def _stage_lora_adapter_once(raw_request: Request):
             status_code=504,
         )
     finally:
-        if process is not None and communication is not None and process.returncode is None:
-            await _kill_stage_process(process, communication)
-        _set_lora_stage_process(stage_id, None)
-        _end_lora_stage()
+        try:
+            if process is not None and process.returncode is None:
+                await _kill_stage_process(process, communication)
+        finally:
+            if process is not None:
+                _set_lora_stage_process(stage_id, None)
+            _end_lora_stage()
+            if lock_acquired:
+                _lora_stage_serial_lock.release()
 
 
 _lora_stage_tasks: dict[tuple[str, str, bool, int | None], asyncio.Task] = {}
@@ -855,14 +871,22 @@ _lora_stage_tasks_lock = threading.Lock()
 _lora_stage_serial_lock = asyncio.Lock()
 
 
-async def _run_lora_stage_task(raw_request: Request):
-    async with _lora_stage_serial_lock:
-        return await _stage_lora_adapter_once(raw_request)
+async def _run_lora_stage_task(raw_request: Request, accepted_at: float):
+    return await _stage_lora_adapter_once(raw_request, accepted_at=accepted_at)
+
+
+def _finish_lora_stage_task(key, task):
+    with _lora_stage_tasks_lock:
+        if _lora_stage_tasks.get(key) is task:
+            _lora_stage_tasks.pop(key, None)
+    if not task.cancelled():
+        task.exception()
 
 
 @router.post("/stage_lora_adapter")
 async def stage_lora_adapter(raw_request: Request):
     """Join a live stage for the same cache entry and serialize other stages."""
+    accepted_at = time.monotonic()
     data = await raw_request.json()
     source_url = data.get("lora_path")
     require_delta = data.get("require_delta", False)
@@ -887,16 +911,11 @@ async def stage_lora_adapter(raw_request: Request):
     with _lora_stage_tasks_lock:
         task = _lora_stage_tasks.get(key)
         if task is None or task.done():
-            task = asyncio.create_task(_run_lora_stage_task(raw_request))
+            task = asyncio.create_task(_run_lora_stage_task(raw_request, accepted_at))
             _lora_stage_tasks[key] = task
-    try:
-        # A client disconnect must not cancel the shared stage owner.
-        return await asyncio.shield(task)
-    finally:
-        if task.done():
-            with _lora_stage_tasks_lock:
-                if _lora_stage_tasks.get(key) is task:
-                    _lora_stage_tasks.pop(key, None)
+            task.add_done_callback(lambda finished: _finish_lora_stage_task(key, finished))
+    # A client disconnect must not cancel the shared stage owner.
+    return await asyncio.shield(task)
 
 
 @router.get("/staging_status")

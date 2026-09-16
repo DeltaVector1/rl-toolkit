@@ -19,6 +19,7 @@ from renderers import RendererConfig
 from verifiers.v1.clients.config import EvalClientConfig, TrainClientConfig
 
 from prime_rl.configs.shared import ClientConfig
+from prime_rl.utils.checkpoint_delta import adapter_stage_timeout_seconds
 from prime_rl.utils.logger import get_logger
 
 # Identity tuple used by ``select_train_client`` to key load counts. ``base_url``
@@ -940,6 +941,7 @@ async def stage_lora_adapter(
         client: AsyncClient,
         *,
         remaining_delta_seconds: float | None = None,
+        absolute_deadline: float | None = None,
     ) -> dict[str, object]:
         started = time.perf_counter()
         operation_timeout_s = (
@@ -986,8 +988,8 @@ async def stage_lora_adapter(
         if total_stage_seconds is None:
             total_stage_seconds = time.perf_counter() - started
         if (
-            remaining_delta_seconds is not None
-            and total_stage_seconds > remaining_delta_seconds
+            absolute_deadline is not None
+            and time.monotonic() > absolute_deadline
         ):
             raise TimeoutError("adapter delta staging exceeded its time limit")
         transfer_seconds = metric("transfer_wall_seconds")
@@ -1025,6 +1027,7 @@ async def stage_lora_adapter(
                 result = await _stage_one(
                     client,
                     remaining_delta_seconds=remaining if require_delta else None,
+                    absolute_deadline=absolute_deadline,
                 )
                 return result
             except asyncio.CancelledError:
@@ -1061,8 +1064,7 @@ async def stage_lora_adapter(
         match = re.fullmatch(r"step_(\d+)", source_name)
         if match is None or int(match.group(1)) != policy_step:
             raise RuntimeError("adapter source URL differs from its policy step")
-        selected_deadline = time.monotonic() + max(POLICY_PHASE_TIMEOUT_S, stage_limit)
-        selected_deadline = min(selected_deadline, time.monotonic() + min(stage_limit, configured_delta_timeout))
+        selected_deadline = time.monotonic() + min(stage_limit, configured_delta_timeout)
         if delta_deadline is None:
             delta_deadline = selected_deadline
         else:
@@ -1110,16 +1112,17 @@ async def stage_lora_adapter(
     group_seconds = [seconds for _staged, seconds in grouped_results]
     origin_stage_seconds = group_seconds[0] if group_seconds else 0.0
     peer_stage_seconds = max(group_seconds[1:], default=0.0)
-    transfer_values = [
-        float(result["transfer_wall_seconds"])
-        for result in results
-        if result["transfer_wall_seconds"] is not None
-    ]
-    legacy_wire_values = [
-        float(result["wire_stage_seconds"])
-        for result in results
-        if result["wire_stage_seconds"] is not None
-    ]
+
+    def group_wall_times(name):
+        return [
+            max(float(result[name]) for result in staged)
+            if staged and all(result[name] is not None for result in staged)
+            else None
+            for staged, _seconds in grouped_results
+        ]
+
+    transfer_values = group_wall_times("transfer_wall_seconds")
+    legacy_wire_values = group_wall_times("wire_stage_seconds")
     reconstruct_values = [
         float(result["reconstruction_wall_seconds"])
         for result in results
@@ -1141,8 +1144,12 @@ async def stage_lora_adapter(
     adapter_identity = identities[0]
     assert isinstance(adapter_identity, dict)
     return {
-        "wire_stage_seconds": max(legacy_wire_values) if legacy_wire_values else None,
-        "transfer_wall_seconds": max(transfer_values) if transfer_values else None,
+        "wire_stage_seconds": sum(legacy_wire_values) if None not in legacy_wire_values else None,
+        "transfer_wall_seconds": sum(transfer_values) if None not in transfer_values else None,
+        "origin_transfer_wall_seconds": transfer_values[0],
+        "peer_transfer_wall_seconds": (
+            sum(transfer_values[1:]) if None not in transfer_values[1:] else None
+        ),
         "origin_stage_seconds": origin_stage_seconds,
         "peer_stage_seconds": peer_stage_seconds,
         "reconstruction_wall_seconds": max(reconstruct_values) if reconstruct_values else None,
@@ -1303,14 +1310,14 @@ LORA_LOAD_READ_TIMEOUT_S = 600.0
 LORA_LOAD_TOTAL_TIMEOUT_S = 600.0
 LORA_STAGE_ATTEMPT_TIMEOUT_S = 1800.0
 LORA_STAGE_TOTAL_TIMEOUT_S = 1800.0
-default_delta_stage_timeout_s = 960.0
+default_delta_stage_timeout_s = adapter_stage_timeout_seconds
 
 
 def adapter_stage_limit_seconds(policy_step: int) -> float:
     """Return the bounded operational staging limit for one adapter step."""
     if type(policy_step) is not int or policy_step <= 0:
         raise RuntimeError("adapter policy step must be a positive integer")
-    return 960.0
+    return adapter_stage_timeout_seconds
 
 
 def _delta_stage_timeout_s() -> float:

@@ -29,6 +29,7 @@ from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loade
 
 from prime_rl.utils.checkpoint_delta import (
     DELTA_MANIFEST,
+    adapter_stage_timeout_seconds,
     apply_xor_delta_file,
 )
 
@@ -42,7 +43,7 @@ _PARALLEL_DOWNLOAD_THRESHOLD = 16 * 1024 * 1024
 _DOWNLOAD_STREAMS_ENV = "PRIME_LORA_DOWNLOAD_STREAMS"
 _MAX_DOWNLOAD_STREAMS = 128
 full_download_streams = 48
-default_delta_stage_timeout_s = 960.0
+default_delta_stage_timeout_s = adapter_stage_timeout_seconds
 full_adapter_stage_timeout_s = 1800.0
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _ADAPTER_MANIFEST = "adapter_manifest.json"
@@ -87,7 +88,7 @@ def adapter_stage_limit_seconds(policy_step: int) -> float:
     """Return the bounded operational staging limit for one adapter step."""
     if type(policy_step) is not int or policy_step <= 0:
         raise OSError("adapter policy step must be a positive integer")
-    return 960.0
+    return adapter_stage_timeout_seconds
 
 
 def _adapter_step_from_source_url(source_url: str) -> int:
@@ -2587,9 +2588,9 @@ def _cleanup_previous_adapter_caches(
     try:
         active_name = active.name
         ready_candidates: list[str] = []
-        candidate_steps: dict[str, int] = {}
+        candidate_steps: dict[str, tuple[str, int]] = {}
 
-        def cached_step(directory_fd: int) -> int | None:
+        def cached_step(directory_fd: int) -> tuple[str, int] | None:
             for metadata_name in ("transport.json", "manifest.json"):
                 try:
                     metadata = json.loads(
@@ -2610,7 +2611,7 @@ def _cleanup_previous_adapter_caches(
                     Path(urlsplit(source_url).path.rstrip("/")).name,
                 )
                 if match is not None:
-                    return int(match.group(1))
+                    return source_url.rstrip("/").rsplit("/", 1)[0], int(match.group(1))
             return None
 
         entry_count = 0
@@ -2656,6 +2657,7 @@ def _cleanup_previous_adapter_caches(
                 os.close(candidate_fd)
 
         keep = {active_name, *(preserve_names or set())}
+        keep.update(adapter_cache_path(url).name for url in _loaded_adapter_source_urls(cache_root))
         active_step = None
         try:
             active_fd = _open_directory_entry_nofollow(
@@ -2689,7 +2691,7 @@ def _cleanup_previous_adapter_caches(
             keep.update(
                 name
                 for name, step in candidate_steps.items()
-                if step > active_step
+                if step[0] == active_step[0] and step[1] > active_step[1]
             )
 
         for name in ready_candidates:
@@ -3814,6 +3816,7 @@ class _PersistentAdapterLanePool:
             )
         bad_sources: set[str] = set()
         checksum_error: OSError | None = None
+        reported_bytes = 0
         source_cursor = 0
         retry_cursor = 0
         with lock:
@@ -3827,6 +3830,9 @@ class _PersistentAdapterLanePool:
                 present = entry_stat.st_size if entry_stat is not None else 0
                 if present > expected_size:
                     os.unlink(destination.name, dir_fd=parent_fd)
+                    if progress is not None and reported_bytes:
+                        progress(lane, -reported_bytes)
+                    reported_bytes = 0
                     present = 0
                 elif present == expected_size:
                     if _sha256(
@@ -3837,6 +3843,9 @@ class _PersistentAdapterLanePool:
                     ) == expected_sha256:
                         return
                     os.unlink(destination.name, dir_fd=parent_fd)
+                    if progress is not None and reported_bytes:
+                        progress(lane, -reported_bytes)
+                    reported_bytes = 0
                     present = 0
 
                 while source_cursor < len(source_urls):
@@ -3849,7 +3858,8 @@ class _PersistentAdapterLanePool:
                         source for source in source_urls if source not in bad_sources
                     ]
                     if not available_sources:
-                        available_sources = source_urls
+                        assert checksum_error is not None
+                        raise checksum_error
                     source_url = available_sources[retry_cursor % len(available_sources)]
                     retry_cursor += 1
                 if per_request_timeout_seconds is None:
@@ -3879,10 +3889,11 @@ class _PersistentAdapterLanePool:
                         offset = present
 
                         def consume(chunk: bytes) -> None:
-                            nonlocal offset
+                            nonlocal offset, reported_bytes
                             _check_deadline(deadline, cancel_event)
                             output.write(chunk)
                             offset += len(chunk)
+                            reported_bytes += len(chunk)
                             if progress is not None:
                                 progress(lane, len(chunk))
 
@@ -3943,10 +3954,16 @@ class _PersistentAdapterLanePool:
                     ) != expected_sha256:
                         connection.close()
                         os.unlink(destination.name, dir_fd=parent_fd)
-                        bad_sources.add(source_url)
+                        if progress is not None and reported_bytes:
+                            progress(lane, -reported_bytes)
+                        reported_bytes = 0
+                        if present == 0:
+                            bad_sources.add(source_url)
                         checksum_error = OSError(
                             "adapter transport chunk checksum mismatch"
                         )
+                        if bad_sources.issuperset(source_urls):
+                            raise checksum_error
                     else:
                         return
 
@@ -4560,7 +4577,7 @@ def _stage_chunked_linear_adapter(
         with progress_lock:
             progress_bytes += amount
             now = time.monotonic()
-            if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
+            if amount >= 0 and now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
                 return
             last_status = now
             write_stage_status(
@@ -5254,7 +5271,7 @@ def _stage_chunked_xor_adapter(
         with progress_lock:
             progress_bytes += amount
             now = time.monotonic()
-            if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
+            if amount >= 0 and now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
                 return
             last_status = now
             write_stage_status(
@@ -6223,14 +6240,13 @@ def stage_lora_adapter_files(
         }
     if stage_timeout_seconds is not None:
         if (
-            not require_delta
-            or isinstance(stage_timeout_seconds, bool)
+            isinstance(stage_timeout_seconds, bool)
             or not isinstance(stage_timeout_seconds, (int, float))
             or not _is_finite_number(stage_timeout_seconds)
             or stage_timeout_seconds <= 0
-            or configured_delta_timeout is None
-            or stage_timeout_seconds > configured_delta_timeout
-            or stage_timeout_seconds > stage_limit
+            or stage_timeout_seconds > (
+                configured_delta_timeout if require_delta else full_adapter_stage_timeout_s
+            )
         ):
             raise OSError("adapter delta stage timeout is invalid")
         configured_delta_timeout = float(stage_timeout_seconds)
@@ -6594,7 +6610,7 @@ def stage_lora_adapter_files(
                 with progress_lock:
                     progress_bytes += amount
                     now = time.monotonic()
-                    if now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_bytes:
+                    if amount >= 0 and now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_bytes:
                         return
                     last_status = now
                     write_stage_status(

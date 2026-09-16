@@ -39,6 +39,7 @@ def load_filesystem_module():
     modules["vllm.model_executor.model_loader"].get_model_loader = lambda _config: None
     checkpoint_delta = modules["prime_rl.utils.checkpoint_delta"]
     checkpoint_delta.DELTA_MANIFEST = "checkpoint_manifest.json"
+    checkpoint_delta.adapter_stage_timeout_seconds = 600.0
     checkpoint_delta.apply_xor_delta_file = lambda *args, **kwargs: None
     checkpoint_delta.sha256_file = hashlib.sha256
     saved = {name: sys.modules.get(name) for name in modules}
@@ -1399,6 +1400,7 @@ class DownloadSchedulerTest(unittest.TestCase):
         payload = b"checksum-good"
         corrupt = b"checksum-bad!"
         digest = hashlib.sha256(payload).hexdigest()
+        progress_changes = []
 
         def corrupt_primary(request, _number):
             if request.path != "/lane0/chunk":
@@ -1440,12 +1442,19 @@ class DownloadSchedulerTest(unittest.TestCase):
                         parent_fd,
                         expected_size=len(payload),
                         expected_sha256=digest,
+                        progress=lambda _lane, amount: progress_changes.append(amount),
                         per_request_timeout_seconds=1,
                     )
                 finally:
                     pool.close()
                     os.close(parent_fd)
                 self.assertEqual((chunks / "chunk").read_bytes(), payload)
+                self.assertEqual(sum(progress_changes), len(payload))
+                self.assertIn(-len(payload), progress_changes)
+                self.assertTrue(all(
+                    0 <= sum(progress_changes[:index]) <= len(payload)
+                    for index in range(1, len(progress_changes) + 1)
+                ))
                 self.assertEqual(
                     handler.paths[:2], ["/lane0/chunk", "/lane1/chunk"]
                 )
@@ -1621,7 +1630,8 @@ class DownloadSchedulerTest(unittest.TestCase):
                     pool.close()
                     os.close(parent_fd)
                 self.assertFalse((chunks / "chunk").exists())
-                self.assertGreaterEqual(handler.requests, 2)
+                self.assertEqual(handler.requests, 2)
+                self.assertEqual(handler.paths, ["/lane0/chunk", "/lane1/chunk"])
         finally:
             filesystem.lane_rotation_delay_seconds = old_delay
             server.shutdown()

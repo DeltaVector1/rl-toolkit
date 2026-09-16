@@ -118,6 +118,7 @@ def _load_stage_function(probe_version=1, probe_step=None):
         "math": math,
         "_cancel_and_reap": cancel_and_reap,
         "POLICY_PHASE_TIMEOUT_S": 600.0,
+        "adapter_stage_timeout_seconds": 600.0,
         "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
         "LORA_STAGE_ATTEMPT_TIMEOUT_S": 30.0,
         "LORA_STAGE_TOTAL_TIMEOUT_S": 30.0,
@@ -549,7 +550,7 @@ class StageLoraAdapterTest(unittest.TestCase):
     def test_adapter_stage_limits_are_exact_at_step_boundaries(self):
         _stage_lora_adapter, namespace = _load_stage_function()
         limit = namespace["adapter_stage_limit_seconds"]
-        self.assertEqual([limit(step) for step in (1, 2, 3, 4)], [960.0, 960.0, 960.0, 960.0])
+        self.assertEqual([limit(step) for step in (1, 2, 3, 4)], [600.0, 600.0, 600.0, 600.0])
 
     def test_distinct_ports_each_stage(self):
         stage_lora_adapter, namespace = _load_stage_function()
@@ -601,7 +602,7 @@ class StageLoraAdapterTest(unittest.TestCase):
 
         class Response:
             def json(self):
-                return {"status": "ok", "stage_seconds": 1.0, "adapter_identity": _adapter_identity()}
+                return {"status": "ok", "stage_seconds": 1.0, "transfer_wall_seconds": 0.5, "adapter_identity": _adapter_identity()}
 
         async def fake_admin_post_response(client, path, **kwargs):
             calls.append(client)
@@ -621,6 +622,35 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(calls, [origin, peer])
         self.assertEqual(result["origin_host_count"], 1)
         self.assertEqual(result["peer_host_count"], 1)
+        self.assertEqual(result["transfer_wall_seconds"], 1.0)
+        self.assertEqual(result["origin_transfer_wall_seconds"], 0.5)
+        self.assertEqual(result["peer_transfer_wall_seconds"], 0.5)
+        self.assertEqual(result["wire_stage_seconds"], 2.0)
+
+    def test_reconnected_stage_uses_original_deadline_not_worker_age(self):
+        stage_lora_adapter, namespace = _load_stage_function()
+        budgets = []
+
+        class Response:
+            def json(self):
+                return {"status": "ok", "stage_seconds": 0.8, "adapter_identity": _adapter_identity()}
+
+        async def post(_client, _path, **kwargs):
+            budgets.append(kwargs["json"]["stage_timeout_seconds"])
+            if len(budgets) == 1:
+                raise RuntimeError("connection reset")
+            return Response()
+
+        namespace["_admin_post_response"] = post
+        namespace["_delta_stage_timeout_s"] = lambda: 1.0
+        client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
+        result = asyncio.run(stage_lora_adapter(
+            [client], "http://adapter/step_1", require_delta=True, policy_step=1
+        ))
+        self.assertEqual(result["host_count"], 1)
+        self.assertEqual(len(budgets), 2)
+        self.assertLess(budgets[1], budgets[0])
+        self.assertLess(budgets[1], 0.8)
 
     def test_stage_retries_same_identity_three_times(self):
         stage_lora_adapter, namespace = _load_stage_function()
@@ -676,7 +706,7 @@ class StageLoraAdapterTest(unittest.TestCase):
                 )
             )
 
-    def test_delta_accepts_a_late_response_for_work_finished_in_time(self):
+    def test_delta_rejects_response_after_caller_absolute_deadline(self):
         stage_lora_adapter, namespace = _load_stage_function()
 
         class Response:
@@ -695,16 +725,15 @@ class StageLoraAdapterTest(unittest.TestCase):
         namespace["_delta_stage_timeout_s"] = lambda: 0.05
         client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
 
-        result = asyncio.run(
-            stage_lora_adapter(
-                [client],
-                "http://adapter/step_1",
-                require_delta=True,
-                policy_step=1,
+        with self.assertRaisesRegex(TimeoutError, "time limit"):
+            asyncio.run(
+                stage_lora_adapter(
+                    [client],
+                    "http://adapter/step_1",
+                    require_delta=True,
+                    policy_step=1,
+                )
             )
-        )
-
-        self.assertEqual(result["host_count"], 1)
 
     def test_delta_origin_and_peer_receive_one_shared_deadline(self):
         stage_lora_adapter, namespace = _load_stage_function()
@@ -839,13 +868,13 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(finished, [origin])
 
     def test_server_receives_selected_policy_step_limit_without_client_probe(self):
-        for policy_step, expected_limit in ((1, 960.0), (2, 960.0), (3, 960.0)):
+        for policy_step, expected_limit in ((1, 600.0), (2, 600.0), (3, 600.0)):
             with self.subTest(policy_step=policy_step):
                 _ManifestProbeClient.requests.clear()
                 stage_lora_adapter, namespace = _load_stage_function(
                     probe_version=2, probe_step=policy_step
                 )
-                namespace["_delta_stage_timeout_s"] = lambda: 960.0
+                namespace["_delta_stage_timeout_s"] = lambda: 600.0
 
                 class Response:
                     def json(self):

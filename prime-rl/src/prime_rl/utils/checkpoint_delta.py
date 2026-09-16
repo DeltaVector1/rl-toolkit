@@ -14,6 +14,7 @@ import numpy as np
 
 DELTA_MANIFEST = "xor-delta-v1.json"
 IO_CHUNK = 16 * 1024 * 1024
+adapter_stage_timeout_seconds = 600.0
 
 
 def _reject_symlink_path(path: Path, label: str) -> None:

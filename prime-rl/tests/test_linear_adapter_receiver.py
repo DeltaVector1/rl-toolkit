@@ -30,6 +30,7 @@ def load_filesystem():
     modules["vllm.model_executor.model_loader"].get_model_loader = lambda _config: None
     checkpoint_delta = modules["prime_rl.utils.checkpoint_delta"]
     checkpoint_delta.DELTA_MANIFEST = "checkpoint_manifest.json"
+    checkpoint_delta.adapter_stage_timeout_seconds = 600.0
     checkpoint_delta.apply_xor_delta_file = lambda *args, **kwargs: None
     checkpoint_delta.sha256_file = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
     saved = {name: sys.modules.get(name) for name in modules}
@@ -1200,11 +1201,13 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 base_url = "http://source/run/broadcasts/step_0"
                 active_url = "http://source/run/broadcasts/step_1"
                 future_url = "http://source/run/broadcasts/step_3"
-                stale_url = "http://source/old/broadcasts/step_0"
+                stale_url = "http://source/old/broadcasts/step_99"
+                loaded_url = "http://source/older/broadcasts/step_100"
+                leased_url = "http://source/oldest/broadcasts/step_101"
 
                 paths = {
                     url: filesystem.adapter_cache_path(url)
-                    for url in (base_url, active_url, future_url, stale_url)
+                    for url in (base_url, active_url, future_url, stale_url, loaded_url, leased_url)
                 }
                 for url, path in paths.items():
                     path.mkdir(parents=True)
@@ -1217,15 +1220,19 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                         encoding="utf-8",
                     )
 
-                filesystem._cleanup_previous_adapter_caches(
-                    Path(temporary),
-                    paths[active_url],
-                )
+                filesystem.write_loaded_adapter_receipts({"loaded": {"source_url": loaded_url}})
+                with filesystem.adapter_reader_lock(paths[leased_url]):
+                    filesystem._cleanup_previous_adapter_caches(
+                        Path(temporary),
+                        paths[active_url],
+                    )
 
                 self.assertTrue(paths[base_url].is_dir())
                 self.assertTrue(paths[active_url].is_dir())
                 self.assertTrue(paths[future_url].is_dir())
                 self.assertFalse(paths[stale_url].exists())
+                self.assertTrue(paths[loaded_url].is_dir())
+                self.assertTrue(paths[leased_url].is_dir())
         finally:
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)

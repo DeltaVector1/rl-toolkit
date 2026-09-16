@@ -63,9 +63,9 @@ def load_watcher_delta_method(urlopen):
         "urlopen": urlopen,
         "_delta_stage_timeout_s": lambda: 30,
         "adapter_stage_limit_seconds": lambda step: {
-            1: 960.0,
-            2: 960.0,
-        }.get(step, 960.0),
+            1: 600.0,
+            2: 600.0,
+        }.get(step, 600.0),
         "get_broadcast_dir": lambda output_dir: output_dir,
         "get_step_path": lambda broadcast_dir, step: broadcast_dir / f"step_{step}",
         "inference_weight_path": lambda _config, path, _lora_name: f"http://source/{path.name}",
@@ -340,6 +340,7 @@ def load_filesystem_module():
     modules["vllm.model_executor.model_loader"].get_model_loader = lambda _config: None
     checkpoint_delta = modules["prime_rl.utils.checkpoint_delta"]
     checkpoint_delta.DELTA_MANIFEST = "checkpoint_manifest.json"
+    checkpoint_delta.adapter_stage_timeout_seconds = 600.0
     checkpoint_delta.apply_xor_delta_file = lambda *args, **kwargs: None
     checkpoint_delta.sha256_file = hashlib.sha256
     saved = {name: sys.modules.get(name) for name in modules}
@@ -373,9 +374,9 @@ def load_server_stage_method(stage_worker, publish_lock=None, initial_stage_stat
     functions = [
         node
         for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.AsyncFunctionDef)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
         and node.name
-        in {"_stage_lora_adapter_once", "_run_lora_stage_task", "stage_lora_adapter"}
+        in {"_stage_lora_adapter_once", "_run_lora_stage_task", "stage_lora_adapter", "_finish_lora_stage_task"}
     ]
 
     class FakeJSONResponse:
@@ -494,12 +495,12 @@ def load_server_stage_method(stage_worker, publish_lock=None, initial_stage_stat
         "router": FakeRouter(),
         "Request": object,
         "JSONResponse": FakeJSONResponse,
-        "_delta_stage_timeout_s": lambda: 960.0,
+        "_delta_stage_timeout_s": lambda: 600.0,
         "full_adapter_stage_timeout_s": 1800.0,
         "_adapter_step_from_source_url": lambda source_url: int(
             re.fullmatch(r"step_(\d+)", Path(source_url.rstrip("/")).name).group(1)
         ),
-        "adapter_stage_limit_seconds": lambda _step: 960.0,
+        "adapter_stage_limit_seconds": lambda _step: 600.0,
         "_adapter_stage_publish_lock": publish_lock or threading.Lock(),
         "_is_finite_number": lambda value: (
             isinstance(value, (int, float))
@@ -1098,10 +1099,10 @@ class AdapterTransportStateTest(unittest.TestCase):
 
             self.assertEqual(result, f"{target_url}/adapter_manifest.json")
             self.assertEqual(watcher.last_adapter_delta_build_time, 2.5)
-            self.assertEqual(calls, [(f"{target_url}/adapter_manifest.json", 960.0)])
+            self.assertEqual(calls, [(f"{target_url}/adapter_manifest.json", 600.0)])
 
     def test_watcher_manifest_probe_uses_exact_policy_step_limit(self):
-        for target_step, expected_limit in ((1, 960.0), (2, 960.0), (3, 960.0)):
+        for target_step, expected_limit in ((1, 600.0), (2, 600.0), (3, 600.0)):
             with self.subTest(target_step=target_step), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 for step in range(target_step + 1):
@@ -2062,7 +2063,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertIn("delta adapter transport is required", worker_source)
         self.assertIn('chunk_urls = [f"{lane_url.rstrip(\'/\')}/{name}" for lane_url in lane_urls]', worker_source)
         self.assertIn("chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]", worker_source)
-        self.assertIn("_download_persistent_file(\n                chunk_urls", worker_source)
+        self.assertIn("persistent_pool.download(\n                    chunk_urls", worker_source)
         self.assertIn("executor.shutdown(wait=True, cancel_futures=True)", worker_source)
         self.assertIn("_cleanup_delta_stage_artifacts(", worker_source)
         self.assertIn("preserve_partial=_preserve_adapter_stage_partial(exc)", worker_source)
@@ -2071,7 +2072,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         watcher_source = watcher.read_text(encoding="utf-8")
         self.assertIn('manifest.get("version") != 1', watcher_source)
         policy_update = watcher_source[watcher_source.index('f"Policy update'):]
-        self.assertIn("attempts=update_attempts", policy_update[:300])
+        self.assertIn("attempts=update_attempts", policy_update)
         self.assertIn("2 * adapter_stage_limit_seconds", watcher_source)
         self.assertIn("delta_deadline = min(delta_deadline, update_deadline)", watcher_source)
         self.assertIn("for attempt in range(1, attempts + 1)", watcher_source)
@@ -2197,7 +2198,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         old_operations = os.environ.get("PRIME_RL_OPERATIONS_CONFIG")
         try:
             os.environ["PRIME_RL_OPERATIONS_CONFIG"] = "/missing/operations.toml"
-            self.assertEqual(filesystem._delta_stage_timeout_s(), 960.0)
+            self.assertEqual(filesystem._delta_stage_timeout_s(), 600.0)
         finally:
             if old_timeout is not None:
                 os.environ["PRIME_LORA_DELTA_STAGE_TIMEOUT_S"] = old_timeout
@@ -2215,7 +2216,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
                 filesystem._delta_stage_timeout_s = lambda: 30.0
                 invalid_values = (
-                    (False, 1.0),
+                    (False, 1801.0),
                     (True, 0),
                     (True, -1.0),
                     (True, 31.0),
@@ -2248,9 +2249,9 @@ class AdapterTransportStateTest(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
-                filesystem._delta_stage_timeout_s = lambda: 960.0
+                filesystem._delta_stage_timeout_s = lambda: 600.0
                 filesystem._cleanup_delta_stage_artifacts = lambda *_args, **_kwargs: True
-                for step, limit in ((1, 960.0), (2, 960.0), (3, 960.0)):
+                for step, limit in ((1, 600.0), (2, 600.0), (3, 600.0)):
                     deadlines = []
 
                     def fail_manifest(*_args, **kwargs):
@@ -2293,7 +2294,8 @@ class AdapterTransportStateTest(unittest.TestCase):
             ):
                 self.assertTrue(require_delta)
                 self.assertEqual(policy_step, 1)
-                self.assertEqual(stage_timeout_seconds, 0.01)
+                self.assertGreater(stage_timeout_seconds, 0)
+                self.assertLessEqual(stage_timeout_seconds, 0.01)
                 self.assertFalse(committed_event.is_set())
                 started.set()
                 time.sleep(0.04)
@@ -2346,7 +2348,8 @@ class AdapterTransportStateTest(unittest.TestCase):
                 ):
                     self.assertTrue(require_delta)
                     self.assertEqual(policy_step, 1)
-                    self.assertEqual(stage_timeout_seconds, 0.1)
+                    self.assertGreater(stage_timeout_seconds, 0)
+                    self.assertLessEqual(stage_timeout_seconds, 0.1)
                     with publish_lock:
                         started.set()
                         time.sleep(0.02)
@@ -2420,7 +2423,8 @@ class AdapterTransportStateTest(unittest.TestCase):
             ):
                 self.assertFalse(require_delta)
                 self.assertIsNone(policy_step)
-                self.assertIsNone(stage_timeout_seconds)
+                self.assertGreater(stage_timeout_seconds, 0)
+                self.assertLessEqual(stage_timeout_seconds, 1800.0)
                 self.assertFalse(committed_event.is_set())
                 started.set()
                 time.sleep(0.04)
@@ -2475,7 +2479,8 @@ class AdapterTransportStateTest(unittest.TestCase):
             ):
                 self.assertFalse(require_delta)
                 self.assertIsNone(policy_step)
-                self.assertIsNone(stage_timeout_seconds)
+                self.assertGreater(stage_timeout_seconds, 0)
+                self.assertLessEqual(stage_timeout_seconds, 1800.0)
                 self.assertFalse(committed_event.is_set())
                 started.set()
                 time.sleep(0.04)
@@ -2534,6 +2539,75 @@ class AdapterTransportStateTest(unittest.TestCase):
             first, second = asyncio.run(run_requests())
             self.assertEqual(first, second)
             self.assertEqual(calls, ["http://source/step_1"])
+
+    def test_queued_stage_expires_without_starting_worker(self):
+        calls = []
+
+        def worker(source, **kwargs):
+            calls.append((source, kwargs["stage_timeout_seconds"]))
+            time.sleep(0.06)
+            return Path("/tmp/test-stage")
+
+        method, response_type = load_server_stage_method(worker)
+
+        class Request:
+            def __init__(self, step, timeout):
+                self.step, self.timeout = step, timeout
+
+            async def json(self):
+                return {
+                    "lora_path": f"http://source/step_{self.step}",
+                    "require_delta": True, "policy_step": self.step,
+                    "stage_timeout_seconds": self.timeout,
+                }
+
+        async def run():
+            first = asyncio.create_task(method(Request(1, 0.3)))
+            await asyncio.sleep(0.01)
+            expired = await method(Request(2, 0.01))
+            self.assertIsInstance(expired, response_type)
+            self.assertEqual(expired.status_code, 504)
+            await first
+            self.assertEqual(len(calls), 1)
+            self.assertLess(calls[0][1], 0.3)
+            self.assertEqual(method.__globals__["_lora_stage_tasks"], {})
+
+        asyncio.run(run())
+
+    def test_disconnected_stage_reaps_owner_and_exception(self):
+        method, _ = load_server_stage_method(lambda *_args, **_kwargs: None)
+        namespace = method.__globals__
+
+        class Request:
+            async def json(self):
+                return {"lora_path": "http://source/step_1"}
+
+        async def fail(_request, _accepted_at):
+            await asyncio.sleep(0.03)
+            raise RuntimeError("failed without a caller")
+
+        namespace["_run_lora_stage_task"] = fail
+
+        async def run():
+            caller = asyncio.create_task(method(Request()))
+            await asyncio.sleep(0.01)
+            owners = list(namespace["_lora_stage_tasks"].values())
+            caller.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await caller
+            await asyncio.sleep(0.04)
+            self.assertEqual(namespace["_lora_stage_tasks"], {})
+            self.assertFalse(owners[0]._log_traceback)
+            key = ("test",)
+            replacement = asyncio.create_task(asyncio.sleep(1))
+            namespace["_lora_stage_tasks"][key] = replacement
+            namespace["_finish_lora_stage_task"](key, owners[0])
+            self.assertIs(namespace["_lora_stage_tasks"][key], replacement)
+            replacement.cancel()
+            await asyncio.gather(replacement, return_exceptions=True)
+            namespace["_lora_stage_tasks"].clear()
+
+        asyncio.run(run())
 
     def test_different_sources_serialize_stage_workers(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2807,7 +2881,9 @@ class AdapterTransportStateTest(unittest.TestCase):
         old_decode = filesystem._decode_transport_chunk
         old_raw_digest = filesystem._transport_raw_sha256
         old_xor = filesystem._xor_bytes
-        old_persistent_file = filesystem._download_persistent_file
+        old_pool_download = filesystem._PersistentAdapterLanePool.download
+        old_pool_close = filesystem._PersistentAdapterLanePool.close
+        closed_pools = []
         old_cleanup = filesystem._cleanup_delta_stage_artifacts
         downloaded = []
         fail_second_chunk = True
@@ -2817,7 +2893,7 @@ class AdapterTransportStateTest(unittest.TestCase):
             cleanup_contexts.append(kwargs)
             return old_cleanup(*args, **kwargs)
 
-        def fake_download(_source, destination, **kwargs):
+        def fake_download(_pool, _source, _lane, destination, _parent_fd, **kwargs):
             nonlocal fail_second_chunk
             downloaded.append(destination.name)
             payload = config
@@ -2832,6 +2908,10 @@ class AdapterTransportStateTest(unittest.TestCase):
                     "adapter persistent request failed"
                 )
 
+        def record_close(pool):
+            closed_pools.append(pool)
+            return old_pool_close(pool)
+
         filesystem._delta_stage_timeout_s = lambda: 30.0
         filesystem._read_chunked_xor_manifest = lambda *_args, **_kwargs: transport
         filesystem._source_manifest = lambda *_args, **_kwargs: manifest
@@ -2845,7 +2925,8 @@ class AdapterTransportStateTest(unittest.TestCase):
         filesystem._decode_transport_chunk = lambda payload, **_kwargs: payload
         filesystem._transport_raw_sha256 = lambda payload, **_kwargs: hashlib.sha256(payload).hexdigest()
         filesystem._xor_bytes = lambda _base, payload: payload
-        filesystem._download_persistent_file = fake_download
+        filesystem._PersistentAdapterLanePool.download = fake_download
+        filesystem._PersistentAdapterLanePool.close = record_close
         filesystem._cleanup_delta_stage_artifacts = record_cleanup
         try:
             with tempfile.TemporaryDirectory() as temporary:
@@ -2864,6 +2945,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 self.assertFalse(cleanup_contexts[0]["cancel_event"].is_set())
                 self.assertGreater(cleanup_contexts[0]["deadline"], time.monotonic())
                 downloaded_after_failure = list(downloaded)
+                self.assertEqual(len(closed_pools), 2)
 
                 filesystem.stage_lora_adapter_files(source_url, require_delta=True)
                 self.assertTrue((destination / "READY").is_file())
@@ -2875,6 +2957,7 @@ class AdapterTransportStateTest(unittest.TestCase):
                 resumed = downloaded[len(downloaded_after_failure) :]
                 self.assertFalse(any("chunk-0" in name for name in resumed))
                 self.assertFalse(any("chunk-1" in name for name in resumed))
+                self.assertEqual(len(closed_pools), 4)
         finally:
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)
@@ -2890,7 +2973,8 @@ class AdapterTransportStateTest(unittest.TestCase):
             filesystem._decode_transport_chunk = old_decode
             filesystem._transport_raw_sha256 = old_raw_digest
             filesystem._xor_bytes = old_xor
-            filesystem._download_persistent_file = old_persistent_file
+            filesystem._PersistentAdapterLanePool.download = old_pool_download
+            filesystem._PersistentAdapterLanePool.close = old_pool_close
             filesystem._cleanup_delta_stage_artifacts = old_cleanup
             base_directory.cleanup()
 
