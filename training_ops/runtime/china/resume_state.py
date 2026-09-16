@@ -1,8 +1,10 @@
-"""Read-only checks for one explicit adapter restart."""
+"""Validate one adapter restart and create its explicit runtime control."""
 
 import hashlib
 import json
+import os
 import re
+import secrets
 import stat
 import sys
 import tomllib
@@ -49,6 +51,38 @@ def explicit_config(text: str, step: int) -> str:
     return result
 
 
+def write_config(config: str, control: str, step: int) -> str:
+    directory = Path(control)
+    active = directory.parent
+    if not directory.is_absolute() or directory.name != "control" or active.name != f"run_{active.parent.name}":
+        raise ValueError("restart control directory is not exact")
+    if ".." in directory.parts:
+        raise ValueError("restart control directory has a parent traversal")
+    rendered = explicit_config(Path(config).read_text(), step).encode()
+    # Anchor each component with O_NOFOLLOW. Do not use a pathname-based
+    # mkstemp/chmod after checking ancestors: that leaves a symlink race.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in directory.parts[1:]:
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        name = f"orch-restart-{secrets.token_hex(12)}.toml"
+        output = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=descriptor)
+        with os.fdopen(output, "wb") as stream:
+            stream.write(rendered)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o644)
+        return str(directory / name)
+    finally:
+        os.close(descriptor)
+
+
 def check_state(service_dir: str, step: int, role: str, adapter: str, expected: str = "") -> dict:
     if type(step) is not int or step < 0 or role not in {"origin", "trainer", "orchestrator"}:
         raise ValueError("invalid explicit restart state")
@@ -57,7 +91,7 @@ def check_state(service_dir: str, step: int, role: str, adapter: str, expected: 
         raise ValueError("restart run directory is not exact")
     parent = active.parent
     target = active / "broadcasts" / f"step_{step}"
-    for directory in (parent, active, active / "broadcasts", target):
+    for directory in (parent, active, active / "control", active / "broadcasts", target):
         if directory.is_symlink():
             raise ValueError(f"restart directory is a symlink: {directory}")
     weight = target / "adapter_model.safetensors"
@@ -101,6 +135,9 @@ def check_state(service_dir: str, step: int, role: str, adapter: str, expected: 
         if manifest.get("config_sha256") != digest(config) or manifest.get("config_size") != config.stat().st_size:
             raise ValueError("stable adapter config identity differs")
         result["sha256"] = actual
+        result["size"] = weight.stat().st_size
+        result["config_sha256"] = manifest["config_sha256"]
+        result["config_size"] = manifest["config_size"]
     elif role == "trainer":
         if not re.fullmatch(r"[a-f0-9]{64}", expected) or digest(weight) != expected:
             raise ValueError("trainer resume adapter differs from the stable policy")
@@ -111,6 +148,8 @@ if __name__ == "__main__":
     try:
         if sys.argv[1] == "config":
             print(explicit_config(Path(sys.argv[2]).read_text(), int(sys.argv[3])), end="")
+        elif sys.argv[1] == "write-config":
+            print(write_config(sys.argv[2], sys.argv[3], int(sys.argv[4])))
         else:
             value = check_state(sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5])
             print(json.dumps(value, sort_keys=True))

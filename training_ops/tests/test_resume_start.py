@@ -8,8 +8,9 @@ import training_ops
 
 
 class ResumeStartTest(unittest.TestCase):
-    def run_start(self, *, mode="restart", resume=True, failure=None, control_files=None, nodes=None, state_failure=None):
+    def run_start(self, *, mode="restart", resume=True, failure=None, control_files=None, nodes=None, state_failure=None, changed_origin=False):
         calls = []
+        origin_checks = 0
         if control_files is None:
             control_files = {training_ops.trainer_head: "saved control"}
 
@@ -23,10 +24,18 @@ class ResumeStartTest(unittest.TestCase):
             return 0, "ready"
 
         def check_state(host, directory, step, role, adapter, digest=""):
+            nonlocal origin_checks
             calls.append((host, f"check restart {role} step={step}"))
             if role == state_failure:
                 raise training_ops.Refused(f"test {role} state failure")
-            return {"policy_step": step, "next_batch": step + 1, "sha256": "a" * 64}
+            if role == "origin":
+                origin_checks += 1
+            return {"policy_step": step, "next_batch": step + 1, "sha256": "a" * 64, "config_sha256": "b" * 64 if changed_origin and origin_checks > 1 else "c" * 64}
+
+        def remote_ok(host, command, _label, **kwargs):
+            code, output = ssh(host, command)
+            if code:
+                raise RuntimeError(output)
 
         with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
             root = Path(temporary)
@@ -44,7 +53,7 @@ class ResumeStartTest(unittest.TestCase):
                 "_check_adapter_restart": check_state,
                 "_ssh_address": mock.Mock(return_value="127.0.0.1"),
                 "_fan": lambda nodes, function: {host: function(host) for host in nodes},
-                "_remote_ok": lambda host, command, _label, **kwargs: ssh(host, command),
+                "_remote_ok": remote_ok,
                 "_initial_adapter_cache_identity": mock.Mock(return_value=None),
                 "_cold_start_cleanup": mock.Mock(),
                 "_cold_adapter_cache_cleanup": mock.Mock(),
@@ -80,6 +89,11 @@ class ResumeStartTest(unittest.TestCase):
         checks = [i for i, command in enumerate(commands) if command.startswith("check restart trainer")]
         self.assertEqual(len(checks), 2)
         self.assertLess(max(checks), min(trainer))
+        drain = next(i for i, command in enumerate(commands) if "drain_rollout_publisher.py" in command)
+        final_origin = max(i for i, command in enumerate(commands) if command.startswith("check restart origin"))
+        self.assertLess(drain, final_origin)
+        self.assertLess(final_origin, min(checks))
+        self.assertFalse(any("pkill -f '[s]ync_rollout_batches.sh'" in command for command in commands))
         self.assertFalse(any("fresh adapter" in command or ".trainer-restart-started" in command for command in commands))
 
     def test_head_only_saved_control_accepts_missing_peer_control(self):
@@ -171,6 +185,17 @@ class ResumeStartTest(unittest.TestCase):
         calls, error = self.run_start(state_failure="orchestrator")
         self.assertIsInstance(error, training_ops.Refused)
         self.assertFalse(any(command == "deploy dependencies" for _, command in calls))
+
+    def test_publisher_drain_failure_never_scans_final_state_or_starts(self):
+        calls, error = self.run_start(failure=lambda _host, command: "drain_rollout_publisher.py" in command)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertFalse(any(command.startswith("check restart trainer") or command.endswith(" trainer") for _, command in calls))
+
+    def test_origin_mutation_after_first_check_refuses_start(self):
+        calls, error = self.run_start(changed_origin=True)
+        self.assertIsInstance(error, training_ops.Refused)
+        self.assertIn("identity changed", str(error))
+        self.assertFalse(any(command.endswith(" trainer") or command.endswith(training_ops.orchestrator_launcher) for _, command in calls))
 
 
 if __name__ == "__main__":

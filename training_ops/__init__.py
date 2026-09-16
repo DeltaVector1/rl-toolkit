@@ -6869,8 +6869,8 @@ exit 1
     )
     _remote_ok(
         orchestrator_host,
-        f"pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; "
-        f"sudo docker rm -f {orchestrator_container} {adapter_relay_container} >/dev/null 2>&1; echo done",
+        ("" if resume_adapter is not None else "pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; ")
+        + f"sudo docker rm -f {orchestrator_container} {adapter_relay_container} >/dev/null 2>&1; echo done",
         "old orchestrator stop",
     )
     _remote_ok(
@@ -6900,12 +6900,21 @@ exit 1
         launch_trainer()
     elif resume_adapter is not None:
         try:
+            drain_publisher = (
+                f"python3 {runtime_root}/h200/drain_rollout_publisher.py "
+                f"{shlex.quote(service_run_dir)} "
+                f"{runtime_root}/h200/sync_rollout_batches.sh"
+            )
+            _remote_ok(orchestrator_host, drain_publisher, "restart rollout publisher drain", timeout=60)
             _remote_ok(
                 trainer_head,
                 _cold_cleanup_script(run, stop_only=True),
                 "restart batch publisher stop",
                 timeout=300,
             )
+            final_identity = _check_adapter_restart(trainer_head, service_run_dir, resume_step, "origin", resume_adapter)
+            if final_identity != identity:
+                raise Refused("stable adapter identity changed while stopping the old run")
             for host in nodes:
                 _check_adapter_restart(host, service_run_dir, resume_step, "trainer", resume_adapter, resume_digest)
             _check_adapter_restart(orchestrator_host, service_run_dir, resume_step, "orchestrator", resume_adapter)
@@ -6917,7 +6926,7 @@ exit 1
             cleanup_commands = [
                 (
                     orchestrator_host,
-                    "pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null || true; "
+                    f"{drain_publisher}; "
                     f"sudo docker rm -f {orchestrator_container} {adapter_relay_container}",
                 ),
                 *((host, f"sudo docker rm -f {trainer_container}") for host in nodes),

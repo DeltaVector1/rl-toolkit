@@ -725,11 +725,8 @@ if [ -n "${adapter_resume_step:-}" ]; then
   # Keep explicit restart control separate from the deployed configuration.
   # Later saved traces must not select the next production batch.
   resume_control_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME/control"
-  mkdir -p "$resume_control_dir"
-  resume_config=$(mktemp "$resume_control_dir/orch-restart-XXXXXX.toml")
-  python3 "$deployment/training_ops/runtime/china/resume_state.py" \
-    config "$config_file" "$adapter_resume_step" >"$resume_config"
-  chmod 0644 "$resume_config"
+  resume_config=$(python3 "$deployment/training_ops/runtime/china/resume_state.py" \
+    write-config "$config_file" "$resume_control_dir" "$adapter_resume_step")
   config_file=$resume_config
 fi
 image=prime-rl:glm52-decensor
@@ -4098,46 +4095,8 @@ echo "trainer failure watchdog started (pid $trainer_watchdog_pid)"
 ctl=/data/glm52-rl/runs/$RUN/$RUN_NAME/control/orch.toml
 if [ "$transport" = filesystem ]; then
   publisher_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"
-  publisher_pid_file="$publisher_dir/.batch-sync.pid"
-  publisher_lock="$publisher_dir/.batch-sync.lock"
-  if [ -r "$publisher_pid_file" ]; then
-    old_publisher_pid=$(cat "$publisher_pid_file")
-    case "$old_publisher_pid" in
-      ''|*[!0-9]*) ;;
-      *)
-        # The publisher runs under setsid. Stop the complete group so an rsync
-        # child cannot inherit fd 9 and keep the flock after its parent exits.
-        kill -- "-$old_publisher_pid" 2>/dev/null || kill "$old_publisher_pid" 2>/dev/null || true
-        ;;
-    esac
-  fi
-  pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null || true
-  # A terminated publisher can remove its pid file before a timeout/rsync/ssh
-  # child exits. That child inherits fd 9 and keeps the lock, so a normal
-  # process-name kill cannot find it. Stop only process groups that still hold
-  # this exact run's lock before starting the replacement publisher.
-  if ! flock -n "$publisher_lock" -c true && command -v lsof >/dev/null 2>&1; then
-    lock_holders=$(lsof -t -- "$publisher_lock" 2>/dev/null | sort -u || true)
-    for holder in $lock_holders; do
-      holder_pgid=$(ps -o pgid= -p "$holder" 2>/dev/null | tr -d ' ')
-      case "$holder_pgid" in
-        ''|*[!0-9]*) ;;
-        *) kill -- "-$holder_pgid" 2>/dev/null || kill "$holder" 2>/dev/null || true ;;
-      esac
-    done
-  fi
-  publisher_lock_ready=0
-  for _ in $(seq 1 30); do
-    if flock -n "$publisher_lock" -c true; then
-      publisher_lock_ready=1
-      break
-    fi
-    sleep 1
-  done
-  if [ "$publisher_lock_ready" != 1 ]; then
-    echo "ERROR: old durable batch publisher still owns $publisher_lock" >&2
-    exit 1
-  fi
+  python3 "$deployment/training_ops/runtime/h200/drain_rollout_publisher.py" \
+    "$publisher_dir" "$deployment/training_ops/runtime/h200/sync_rollout_batches.sh"
   nohup setsid env SOURCE_RUN_DIR="/data/glm52-rl/runs/$RUN/$RUN_NAME" \
     DEST_HOST="$trainer_ssh_target" \
     "$deployment/training_ops/runtime/h200/sync_rollout_batches.sh" \

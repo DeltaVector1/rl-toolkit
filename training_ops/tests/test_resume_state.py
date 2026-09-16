@@ -32,7 +32,7 @@ class ResumeStateTest(unittest.TestCase):
         return resume.check_state(str(self.active), step, role, str(self.weight), digest)
 
     def test_exact_stable_identity_and_trainer_copy(self):
-        self.assertEqual(self.check(), {"policy_step": 3, "next_batch": 4, "sha256": self.sha})
+        self.assertEqual(self.check(), {"policy_step": 3, "next_batch": 4, "sha256": self.sha, "size": self.weight.stat().st_size, "config_sha256": self.manifest["config_sha256"], "config_size": 2})
         self.assertEqual(self.check("trainer", digest=self.sha)["next_batch"], 4)
 
     def test_unstable_policy_three_cannot_resume_from_stable_two(self):
@@ -113,7 +113,35 @@ class ResumeStateTest(unittest.TestCase):
 
     def test_runtime_state_command_returns_exact_progress(self):
         result = subprocess.run([sys.executable, spec.origin, str(self.active), "3", "origin", str(self.weight), ""], capture_output=True, text=True, check=True)
-        self.assertEqual(json.loads(result.stdout), {"next_batch": 4, "policy_step": 3, "sha256": self.sha})
+        self.assertEqual(json.loads(result.stdout), self.check())
+
+    def test_control_symlink_is_rejected_before_writing(self):
+        outside = Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        (self.active / "control").symlink_to(outside, target_is_directory=True)
+        config = self.active / "config.toml"
+        config.write_text("max_steps=50\n")
+        with self.assertRaises(OSError):
+            resume.write_config(str(config), str(self.active / "control"), 3)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.check()
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_ancestor_symlink_is_rejected_before_writing(self):
+        alias = Path(self.temporary.name) / "alias"
+        alias.symlink_to(Path(self.temporary.name), target_is_directory=True)
+        config = self.active / "config.toml"
+        config.write_text("max_steps=50\n")
+        with self.assertRaises(OSError):
+            resume.write_config(str(config), str(alias / "alpha/run_alpha/control"), 3)
+        self.assertFalse((self.active / "control").exists())
+
+    def test_safe_runtime_control_is_regular_readable_and_exact(self):
+        config = self.active / "config.toml"
+        config.write_text("max_steps=50\n")
+        generated = Path(resume.write_config(str(config), str(self.active / "control"), 3))
+        self.assertEqual(generated.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(tomllib.loads(generated.read_text())["ckpt"], {"resume_step": 3, "skip_progress": True})
 
 
 if __name__ == "__main__":
