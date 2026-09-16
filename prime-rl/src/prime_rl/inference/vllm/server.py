@@ -167,12 +167,18 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
     async with lora_load_lock:
         handler = models(raw_request)
         remote_adapter = lora_request.lora_path.startswith(("http://", "https://"))
+        request_data = await raw_request.json()
+        require_delta = request_data.get("require_delta", False)
+        if not isinstance(require_delta, bool):
+            return JSONResponse(content={"error": "require_delta must be a boolean"}, status_code=400)
         if remote_adapter:
             _begin_lora_stage()
         try:
             if remote_adapter:
                 source_url = lora_request.lora_path
-                await engine_client(raw_request).collective_rpc("stage_lora_adapter", args=(source_url,))
+                await engine_client(raw_request).collective_rpc(
+                    "stage_lora_adapter", args=(source_url, require_delta)
+                )
                 lora_request.lora_path = adapter_cache_path(source_url).as_posix()
             lora_request.load_inplace = True
             if remote_adapter:
@@ -198,9 +204,14 @@ async def stage_lora_adapter(raw_request: Request):
     source_url = data.get("lora_path")
     if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
         return JSONResponse({"error": "lora_path must be an HTTP URL"}, status_code=400)
+    require_delta = data.get("require_delta", False)
+    if not isinstance(require_delta, bool):
+        return JSONResponse({"error": "require_delta must be a boolean"}, status_code=400)
     _begin_lora_stage()
     try:
-        destination = await asyncio.to_thread(stage_lora_adapter_files, source_url)
+        destination = await asyncio.to_thread(
+            stage_lora_adapter_files, source_url, require_delta=require_delta
+        )
         return {"status": "ok", "path": destination.as_posix()}
     finally:
         _end_lora_stage()

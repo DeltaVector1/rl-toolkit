@@ -24,7 +24,10 @@ from prime_rl.utils.client import (
 from prime_rl.utils.logger import format_time, get_logger
 from prime_rl.utils.pathing import get_broadcast_dir, get_step_path, wait_for_path
 from prime_rl.utils.utils import get_latest_ckpt_step
-from prime_rl.utils.checkpoint_delta import build_xor_delta_checkpoint
+from prime_rl.utils.checkpoint_delta import (
+    build_xor_delta_adapter,
+    build_xor_delta_checkpoint,
+)
 
 
 def inference_weight_path(config: OrchestratorConfig, weights_path, lora_name: str | None):
@@ -160,6 +163,29 @@ class WeightWatcher:
                             get_logger().info(
                                 f"Built lossless checkpoint delta for policy v{next_step}: {delta_path}"
                             )
+                elif self.lora_name is not None and next_step > 1 and isinstance(weights_path, str):
+                    previous_path = get_step_path(broadcast_dir, next_step - 1)
+                    previous_url = inference_weight_path(self.config, previous_path, self.lora_name)
+                    if not isinstance(previous_url, str):
+                        raise RuntimeError(
+                            f"cannot build adapter delta for policy v{next_step}: "
+                            "previous adapter URL is unavailable"
+                        )
+                    delta_path = await asyncio.to_thread(
+                        build_xor_delta_adapter,
+                        previous_path,
+                        local_weights_path,
+                        base_url=previous_url,
+                        target_url=weights_path,
+                    )
+                    if delta_path is None:
+                        raise RuntimeError(
+                            f"cannot build adapter delta for policy v{next_step}; "
+                            "consecutive adapters are not compatible"
+                        )
+                    get_logger().info(
+                        f"Built lossless adapter delta for policy v{next_step}: {delta_path}"
+                    )
             self.last_wait_for_ckpt_time = time.perf_counter() - t0
 
             # Remote LoRA files cross the high-loss China link. Stage them on
@@ -169,7 +195,11 @@ class WeightWatcher:
             if isinstance(weights_path, str):
                 stage_started = time.perf_counter()
                 if self.lora_name is not None:
-                    await stage_lora_adapter(self.inference.admin_clients, weights_path)
+                    await stage_lora_adapter(
+                        self.inference.admin_clients,
+                        weights_path,
+                        require_delta=next_step > 1,
+                    )
                 else:
                     await stage_full_checkpoint(self.inference.admin_clients, weights_path)
                 self.last_stage_weights_time = time.perf_counter() - stage_started
@@ -205,7 +235,12 @@ class WeightWatcher:
             get_logger().debug(f"Updating weights to step {next_step}")
             t1 = time.perf_counter()
             lora_name = f"{self.lora_name}-slot{next_step % 2}" if self.lora_name is not None else None
-            await self.inference.update_weights(weights_path, lora_name=lora_name, step=next_step)
+            await self.inference.update_weights(
+                weights_path,
+                lora_name=lora_name,
+                step=next_step,
+                require_delta=self.lora_name is not None and next_step > 1,
+            )
             self.last_update_weights_time = time.perf_counter() - t1
             self.update_count += 1
             get_logger().debug(f"Updated weights to step {next_step} in {format_time(self.last_update_weights_time)}")
@@ -259,7 +294,12 @@ class WeightWatcher:
                 f"{len(self.inference.admin_clients)} inference endpoint(s); restoring it"
             )
             t0 = time.perf_counter()
-            await load_lora_adapter(missing, self.policy.model_name, weights_path)
+            await load_lora_adapter(
+                missing,
+                self.policy.model_name,
+                weights_path,
+                require_delta=self.ckpt_step > 1,
+            )
             visible = await asyncio.gather(
                 *(model_is_visible(client, self.policy.model_name) for client in self.inference.admin_clients)
             )

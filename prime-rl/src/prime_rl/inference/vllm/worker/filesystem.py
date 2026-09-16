@@ -400,7 +400,30 @@ def download(
     shutil.rmtree(parts_dir)
 
 
-def stage_lora_adapter_files(source_url: str) -> Path:
+def _adapter_delta_manifest(source_url: str) -> tuple[dict[str, object] | None, bool]:
+    """Read the optional transport delta and report whether it exists."""
+    try:
+        value = json.loads(_read_source_text(f"{source_url.rstrip('/')}/{DELTA_MANIFEST}"))
+    except HTTPError as exc:
+        if exc.code == 404:
+            return None, False
+        raise
+    if not isinstance(value, dict):
+        raise OSError("adapter delta manifest is not an object")
+    return value, True
+
+
+def _read_adapter_checksum(path: Path) -> str:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise OSError(f"cannot read adapter checksum: {path}") from exc
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise OSError(f"invalid adapter checksum: {path}")
+    return value
+
+
+def stage_lora_adapter_files(source_url: str, *, require_delta: bool = False) -> Path:
     """Download one remote adapter into the host-shared cache.
 
     The API server can call this before it pauses generation. Worker-side
@@ -417,6 +440,7 @@ def stage_lora_adapter_files(source_url: str) -> Path:
         started = time.monotonic()
         try:
             manifest = _source_manifest(source_url)
+            delta_manifest, delta_present = _adapter_delta_manifest(source_url)
             files = manifest["files"]
             assert isinstance(files, dict)
 
@@ -426,7 +450,20 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                         local_manifest = json.load(source)
                 except (FileNotFoundError, OSError, ValueError):
                     local_manifest = None
-                if local_manifest == manifest:
+                transport_path = destination / "transport.json"
+                try:
+                    with transport_path.open("r", encoding="utf-8") as source:
+                        transport = json.load(source)
+                except (FileNotFoundError, OSError, ValueError):
+                    transport = None
+                if local_manifest == manifest and (
+                    not require_delta
+                    or (
+                        isinstance(transport, dict)
+                        and transport.get("mode") == "delta"
+                        and transport.get("source_url") == source_url
+                    )
+                ):
                     _write_stage_status(
                         destination.parent,
                         {
@@ -441,6 +478,8 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                     _cleanup_retired_adapters(destination.parent, destination.name)
                     return destination
 
+            if require_delta and not delta_present:
+                raise OSError("adapter delta manifest is missing; refusing full adapter fallback")
             total_bytes = sum(int(item["size"]) for item in files.values())
             progress_lock = threading.Lock()
             progress_bytes = 0
@@ -481,7 +520,8 @@ def stage_lora_adapter_files(source_url: str) -> Path:
                 },
             )
             temporary = destination.with_name(f"{destination.name}.partial")
-            temporary.mkdir(exist_ok=True)
+            shutil.rmtree(temporary, ignore_errors=True)
+            temporary.mkdir()
             _write_json(temporary / "manifest.json", manifest)
             for filename in _ADAPTER_FILES:
                 item = files[filename]

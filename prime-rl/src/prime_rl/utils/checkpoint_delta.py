@@ -12,6 +12,8 @@ import numpy as np
 
 DELTA_MANIFEST = "xor-delta-v1.json"
 IO_CHUNK = 16 * 1024 * 1024
+ADAPTER_FILE = "adapter_model.safetensors"
+ADAPTER_CONFIG_FILE = "adapter_config.json"
 
 
 def sha256_file(path: Path) -> str:
@@ -114,6 +116,93 @@ def build_xor_delta_checkpoint(
     return manifest_path
 
 
+def build_xor_delta_adapter(
+    base_dir: Path,
+    target_dir: Path,
+    *,
+    base_url: str,
+    target_url: str,
+) -> Path | None:
+    """Build a compressed, byte-exact delta for two consecutive LoRA adapters.
+
+    The adapter file is intentionally kept in its normal safetensors form at
+    the destination. Only the transport artifact is compressed. The manifest
+    records both file checksums so the receiver cannot apply a delta to the
+    wrong policy.
+    """
+    base_path = base_dir / ADAPTER_FILE
+    target_path = target_dir / ADAPTER_FILE
+    base_config = base_dir / ADAPTER_CONFIG_FILE
+    target_config = target_dir / ADAPTER_CONFIG_FILE
+    if not all(path.is_file() for path in (base_path, target_path, base_config, target_config)):
+        return None
+    if base_config.read_bytes() != target_config.read_bytes():
+        return None
+    if base_path.stat().st_size != target_path.stat().st_size:
+        return None
+
+    manifest_path = target_dir / DELTA_MANIFEST
+    if manifest_path.is_file():
+        try:
+            with manifest_path.open("r", encoding="utf-8") as source:
+                existing = json.load(source)
+            if (
+                existing.get("kind") == "lora-adapter"
+                and existing.get("base_url") == base_url
+                and existing.get("target_url") == target_url
+            ):
+                return manifest_path
+        except (OSError, ValueError):
+            pass
+
+    delta_name = f"{ADAPTER_FILE}.xor.zlib"
+    delta_path = target_dir / delta_name
+    temporary = target_dir / f"{delta_name}.partial"
+    compressor = zlib.compressobj(level=1)
+    base_digest = hashlib.sha256()
+    target_digest = hashlib.sha256()
+    with (
+        base_path.open("rb") as base,
+        target_path.open("rb") as target,
+        temporary.open("wb") as output,
+    ):
+        while target_chunk := target.read(IO_CHUNK):
+            base_chunk = base.read(len(target_chunk))
+            if len(base_chunk) != len(target_chunk):
+                raise OSError(f"base adapter ended early: {base_path.name}")
+            base_digest.update(base_chunk)
+            target_digest.update(target_chunk)
+            output.write(compressor.compress(_xor_bytes(base_chunk, target_chunk)))
+        if base.read(1):
+            raise OSError(f"base adapter is longer than target: {target_path.name}")
+        output.write(compressor.flush())
+    temporary.replace(delta_path)
+
+    manifest = {
+        "version": 1,
+        "kind": "lora-adapter",
+        "codec": "xor-zlib",
+        "base_url": base_url,
+        "target_url": target_url,
+        "config_sha256": sha256_file(target_config),
+        "files": [
+            {
+                "filename": ADAPTER_FILE,
+                "delta": delta_name,
+                "size": target_path.stat().st_size,
+                "sha256": target_digest.hexdigest(),
+                "base_sha256": base_digest.hexdigest(),
+                "delta_size": delta_path.stat().st_size,
+                "delta_sha256": sha256_file(delta_path),
+            }
+        ],
+    }
+    temporary_manifest = target_dir / f"{DELTA_MANIFEST}.partial"
+    temporary_manifest.write_text(json.dumps(manifest, separators=(",", ":")), encoding="utf-8")
+    temporary_manifest.replace(manifest_path)
+    return manifest_path
+
+
 def apply_xor_delta_file(
     base_path: Path,
     delta_path: Path,
@@ -121,10 +210,12 @@ def apply_xor_delta_file(
     *,
     expected_size: int,
     expected_sha256: str,
+    expected_base_sha256: str | None = None,
 ) -> None:
     """Reconstruct one target file without materializing an uncompressed delta."""
     temporary = target_path.with_name(f"{target_path.name}.assembling")
     decompressor = zlib.decompressobj()
+    base_digest = hashlib.sha256()
     digest = hashlib.sha256()
     written = 0
 
@@ -134,6 +225,7 @@ def apply_xor_delta_file(
             base_chunk = base.read(len(delta_chunk))
             if len(base_chunk) != len(delta_chunk):
                 raise OSError(f"delta is longer than base file: {base_path.name}")
+            base_digest.update(base_chunk)
             target_chunk = _xor_bytes(base_chunk, delta_chunk)
             target.write(target_chunk)
             digest.update(target_chunk)
@@ -166,4 +258,6 @@ def apply_xor_delta_file(
         raise OSError(f"reconstructed size mismatch for {target_path.name}: {written} != {expected_size}")
     if digest.hexdigest() != expected_sha256:
         raise OSError(f"reconstructed checksum mismatch for {target_path.name}")
+    if expected_base_sha256 is not None and base_digest.hexdigest() != expected_base_sha256:
+        raise OSError(f"base checksum mismatch for {base_path.name}")
     temporary.replace(target_path)
