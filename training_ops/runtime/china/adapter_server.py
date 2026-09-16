@@ -3,11 +3,15 @@ from collections import OrderedDict
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
+import select
 import socket
 import shutil
 import stat
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -33,6 +37,8 @@ transfer_write_bytes = 256 * 1024
 connection_timeout_seconds = 120
 adapter_metadata_max_bytes = 2 * 1024 * 1024
 max_transport_chunks = 65_536
+source_upgrade_limit_seconds = 600.0
+source_deadline_header = "X-Adapter-Deadline-Seconds"
 
 
 class UpgradeError(RuntimeError):
@@ -82,10 +88,13 @@ def _json_object(path: Path, description: str) -> dict[str, object]:
         raise UpgradeError(f"{description} is missing")
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        with os.fdopen(fd, "r", encoding="utf-8") as source:
+        with os.fdopen(fd, "rb") as source:
             if os.fstat(fd).st_size > adapter_metadata_max_bytes:
                 raise UpgradeError(f"{description} exceeds the metadata size limit")
-            value = json.load(source)
+            payload = source.read(adapter_metadata_max_bytes + 1)
+            if len(payload) > adapter_metadata_max_bytes:
+                raise UpgradeError(f"{description} exceeds the metadata size limit")
+            value = json.loads(payload)
     except (OSError, ValueError) as exc:
         raise UpgradeError(f"{description} is not valid JSON") from exc
     if not isinstance(value, dict):
@@ -354,6 +363,8 @@ def _identity_from_published_directory(
     cache: bool,
     weight_fd: int | None = None,
     verify_weights: bool = True,
+    deadline: float | None = None,
+    connection: socket.socket | None = None,
 ) -> dict[str, object]:
     if directory.is_symlink() or not directory.is_dir():
         raise UpgradeError(f"adapter step {step} directory is missing")
@@ -400,6 +411,8 @@ def _identity_from_published_directory(
         path = directory / name
         if path.is_symlink() or not path.is_file() or path.stat().st_size != record["size"]:
             raise UpgradeError(f"{description} file is incomplete: {name}")
+    if records[adapter_config_name]["size"] > adapter_metadata_max_bytes:
+        raise UpgradeError(f"{description} configuration exceeds the metadata size limit")
 
     digest_path = directory / adapter_digest_name
     if digest_path.is_symlink() or not digest_path.is_file():
@@ -407,7 +420,7 @@ def _identity_from_published_directory(
     try:
         fd = os.open(digest_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(fd, "r", encoding="ascii") as source:
-            sidecar_digest = source.read().strip()
+            sidecar_digest = source.read(66).strip()
     except (OSError, UnicodeError) as exc:
         raise UpgradeError(f"{description} weight checksum cannot be read") from exc
     if sidecar_digest != records[adapter_weights_name]["sha256"]:
@@ -448,7 +461,9 @@ def _identity_from_published_directory(
         else:
             is_owner = False
     if not is_owner:
-        validation_run.done.wait()
+        while not validation_run.done.wait(0.02):
+            _check_upgrade_deadline(deadline, connection)
+        _check_upgrade_deadline(deadline, connection)
         if validation_run.error is not None:
             raise validation_run.error
         if validation_run.result is None:
@@ -464,12 +479,15 @@ def _identity_from_published_directory(
         if cached is not None:
             validated_identity = cached.copy()
         else:
-            if predictive_chunk_records:
+            # Range requests verify their own open chunk below. Do not hash
+            # every other chunk on each cold source lane.
+            if predictive_chunk_records and verify_weights:
                 _validate_predictive_chunks(
                     directory,
                     manifest_entry,
                 )
             actual_config_digest = _sha256(directory / adapter_config_name)
+            _check_upgrade_deadline(deadline, connection)
             if actual_config_digest != records[adapter_config_name]["sha256"]:
                 raise UpgradeError(f"{description} configuration checksum differs")
             if verify_weights:
@@ -614,6 +632,7 @@ def _replace_from_dirs(
     expected_identity: tuple[int, int, int, int, int] | None = None,
     expected_digest: str | None = None,
     directory_validator=None,
+    before_publish=None,
 ) -> None:
     directory_flag = getattr(os, "O_DIRECTORY", 0)
     flags = os.O_RDONLY | directory_flag | getattr(os, "O_NOFOLLOW", 0)
@@ -646,6 +665,7 @@ def _replace_from_dirs(
                 destination.name,
                 expected_identity,
                 expected_digest,
+                before_publish,
             )
         else:
             raise OSError("adapter publication source is not regular")
@@ -761,6 +781,7 @@ def _replace_regular_from_dirs(
     destination_name: str,
     expected_identity: tuple[int, int, int, int, int] | None,
     expected_digest: str | None,
+    before_publish=None,
 ) -> None:
     source_fd = destination_fd = backup_fd = None
     temp_name = f".{destination_name}.publish-{os.getpid()}-{time.time_ns()}"
@@ -839,6 +860,8 @@ def _replace_regular_from_dirs(
             raise OSError("adapter publication source changed")
         if actual_digest != baseline_digest:
             raise OSError("adapter publication source checksum differs")
+        if before_publish is not None:
+            before_publish()
         os.replace(temp_name, destination_name, src_dir_fd=destination_dir, dst_dir_fd=destination_dir)
         destination_replaced = True
         destination_stat = os.stat(destination_name, dir_fd=destination_dir, follow_symlinks=False)
@@ -870,7 +893,7 @@ def _replace_regular_from_dirs(
             os.unlink(backup_name, dir_fd=destination_dir)
         temp_name = ""
         backup_name = ""
-    except OSError:
+    except (OSError, UpgradeError):
         if temp_name:
             try:
                 os.unlink(temp_name, dir_fd=destination_dir)
@@ -1054,6 +1077,10 @@ def _install_predictive_manifest(
     build: Path,
     manifest: dict[str, object],
     step: int,
+    *,
+    deadline: float | None = None,
+    connection: socket.socket | None = None,
+    publish: bool = True,
 ) -> None:
     if (
         manifest.get("version") != 2
@@ -1070,6 +1097,7 @@ def _install_predictive_manifest(
     validated_identities: dict[str, tuple[int, int, int, int, int]] = {}
     validated_digests: dict[str, str] = {}
     for item in manifest["chunks"]:
+        _check_upgrade_deadline(deadline, connection)
         if not isinstance(item, dict) or not isinstance(item.get("file"), str):
             raise UpgradeError("predictive manifest contains an invalid chunk")
         name = item["file"]
@@ -1117,6 +1145,7 @@ def _install_predictive_manifest(
     validated_digests[adapter_digest_name] = _sha256(build_digest)
     validated_digests[adapter_manifest_name] = _sha256(build_manifest)
     for artifact in build.iterdir():
+        _check_upgrade_deadline(deadline, connection)
         if artifact.is_symlink() or not artifact.is_file():
             raise UpgradeError("predictive build contains a non-regular artifact")
         _fsync_file(artifact)
@@ -1133,6 +1162,7 @@ def _install_predictive_manifest(
             if old_chunk.is_file():
                 stale_chunks.append(old_chunk)
     for name in chunk_names:
+        _check_upgrade_deadline(deadline, connection)
         _replace_from_dirs(
             build / name,
             target / name,
@@ -1146,11 +1176,15 @@ def _install_predictive_manifest(
         validated_digests[adapter_digest_name],
     )
     _fsync_directory(target)
+    if not publish:
+        return
+    _check_upgrade_deadline(deadline, connection)
     _replace_from_dirs(
         build_manifest,
         target_manifest,
         validated_identities[adapter_manifest_name],
         validated_digests[adapter_manifest_name],
+        before_publish=lambda: _check_upgrade_deadline(deadline, connection),
     )
     _fsync_directory(target)
     for name in (adapter_config_name, adapter_weights_name):
@@ -1183,7 +1217,262 @@ def _has_newer_stable_step(active_run: Path, step: int) -> bool:
     return False
 
 
-def _upgrade_v1_step(active_run: Path, target: Path, step: int, source_base_url: str) -> None:
+def _client_is_gone(connection: socket.socket | None) -> bool:
+    if connection is None:
+        return False
+    try:
+        readable, _, _ = select.select([connection], [], [], 0)
+        if not readable:
+            return False
+        return connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+    except BlockingIOError:
+        return False
+    except OSError:
+        return True
+
+
+def _check_upgrade_deadline(
+    deadline: float | None,
+    connection: socket.socket | None = None,
+) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise UpgradeError("predictive adapter source preparation deadline expired")
+    if _client_is_gone(connection):
+        raise UpgradeError("predictive adapter source client expired")
+
+
+def _prepare_predictive_build(
+    active_run: Path,
+    target: Path,
+    step: int,
+    source_base_url: str,
+    pending: Path,
+    build: Path,
+    deadline: float,
+) -> dict[str, list[int]]:
+    _check_upgrade_deadline(deadline)
+    _scavenge_upgrade_leftovers(active_run)
+    _check_upgrade_deadline(deadline)
+    stable = target / stable_name
+    if stable.is_symlink() or not stable.is_file():
+        raise UpgradeError(f"adapter step {step} is not stable")
+    manifest = _json_object(target / adapter_manifest_name, f"adapter step {step} manifest")
+    if manifest.get("version") != 1 or manifest.get("kind") != "lora-adapter":
+        raise UpgradeError(f"adapter step {step} has an unsupported manifest")
+    if manifest.get("target_step") != step:
+        raise UpgradeError(f"adapter step {step} manifest has the wrong target")
+    target_identity = _identity_from_published_directory(target, step, cache=False)
+    base1, base1_identity = _find_base(active_run, step - 1)
+    base2, base2_identity = _find_base(active_run, step - 2)
+    identities = (target_identity, base1_identity, base2_identity)
+    if len({item["config_sha256"] for item in identities}) != 1:
+        raise UpgradeError(f"adapter step {step} predecessor configurations differ")
+    if len({item["weights_size"] for item in identities}) != 1:
+        raise UpgradeError(f"adapter step {step} predecessor sizes differ")
+    _check_upgrade_deadline(deadline)
+    _prepare_cache(
+        active_run,
+        [
+            (target, target_identity),
+            (base1, base1_identity),
+            (base2, base2_identity),
+        ],
+        pending,
+    )
+    build.mkdir(parents=True, mode=0o700)
+    os.chmod(build, 0o700)
+    for name in (adapter_config_name, adapter_weights_name):
+        _link_private_file(target / name, build / name)
+    _check_upgrade_deadline(deadline)
+    from prime_rl.utils.adapter_delta import publish_adapter_manifest
+
+    publish_adapter_manifest(
+        build,
+        pending / f"step_{step - 1}",
+        base2_dir=pending / f"step_{step - 2}",
+        target_url=_predictive_step_url(source_base_url, step),
+        base_url=_predictive_step_url(source_base_url, step - 1),
+        base2_url=_predictive_step_url(source_base_url, step - 2),
+        target_step=step,
+        base_step=step - 1,
+        base2_step=step - 2,
+    )
+    _check_upgrade_deadline(deadline)
+    manifest = _json_object(build / adapter_manifest_name, "predictive adapter build manifest")
+    for artifact in build.iterdir():
+        if artifact.is_symlink() or not artifact.is_file():
+            raise UpgradeError("predictive build contains a non-regular artifact")
+        os.chmod(artifact, 0o600)
+    _promote_cache(active_run, pending, step)
+    _install_predictive_manifest(target, build, manifest, step, deadline=deadline, publish=False)
+    _identity_from_published_directory(target, step, cache=False)
+    _check_upgrade_deadline(deadline)
+    return {
+        name: list(_stat_identity(target / name))
+        for name in (adapter_config_name, adapter_weights_name, adapter_manifest_name, stable_name)
+    }
+
+
+def _stop_and_reap_worker(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired as exc:
+        raise UpgradeError("killed source worker was not reaped within one second") from exc
+
+
+def _upgrade_worker_main(request_fd: int, result_fd: int) -> int:
+    """Build in a fresh interpreter so the threaded server is safe."""
+    ok = False
+    message = ""
+    identities = {}
+    try:
+        with os.fdopen(request_fd, "rb") as source:
+            payload = source.read(16 * 1024 + 1)
+        if len(payload) > 16 * 1024:
+            raise UpgradeError("predictive adapter source worker request is too large")
+        request = json.loads(payload)
+        if not isinstance(request, dict):
+            raise UpgradeError("predictive adapter source worker request is invalid")
+        deadline = request.get("deadline")
+        step = request.get("step")
+        if not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+            raise UpgradeError("predictive adapter source worker deadline is invalid")
+        if type(step) is not int:
+            raise UpgradeError("predictive adapter source worker step is invalid")
+        if request.get("cleanup_only"):
+            _remove_leftover(Path(request["pending"]))
+            _remove_leftover(Path(request["build"]))
+            if request.get("published"):
+                _prune_cache(Path(request["active_run"]), step)
+                target = Path(request["target"])
+                manifest = _json_object(target / adapter_manifest_name, "published adapter manifest")
+                current = {item["file"] for item in manifest["chunks"]}
+                for name in (adapter_config_name, adapter_weights_name):
+                    for chunk in target.glob(f"{name}.transport-*"):
+                        if chunk.name not in current:
+                            _remove_leftover(chunk)
+        else:
+            identities = _prepare_predictive_build(
+                Path(request["active_run"]),
+                Path(request["target"]),
+                step,
+                request["source_base_url"],
+                Path(request["pending"]),
+                Path(request["build"]),
+                deadline,
+            )
+        ok = True
+    except BaseException as exc:
+        message = str(exc)[:512]
+    try:
+        with os.fdopen(result_fd, "wb") as destination:
+            destination.write(json.dumps({"ok": ok, "error": message, "identities": identities}).encode("utf-8"))
+    except OSError:
+        return 1
+    return 0 if ok else 1
+
+
+def _run_upgrade_worker(
+    active_run: Path,
+    target: Path,
+    step: int,
+    source_base_url: str,
+    pending: Path,
+    build: Path,
+    deadline: float,
+    connection: socket.socket | None,
+    *,
+    cleanup_only: bool = False,
+    published: bool = False,
+) -> dict[str, list[int]]:
+    _check_upgrade_deadline(deadline, connection)
+    request_read, request_write = os.pipe()
+    result_read, result_write = os.pipe()
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--predictive-build-worker",
+                str(request_read),
+                str(result_write),
+            ],
+            close_fds=True,
+            pass_fds=(request_read, result_write),
+        )
+    except BaseException:
+        for descriptor in (request_read, request_write, result_read, result_write):
+            os.close(descriptor)
+        raise
+    os.close(request_read)
+    os.close(result_write)
+    request = {
+        "active_run": str(active_run),
+        "target": str(target),
+        "step": step,
+        "source_base_url": source_base_url,
+        "pending": str(pending),
+        "build": str(build),
+        "deadline": deadline,
+        "cleanup_only": cleanup_only,
+        "published": published,
+    }
+    try:
+        with os.fdopen(request_write, "wb") as destination:
+            payload = json.dumps(request).encode("utf-8")
+            if len(payload) > 4096:
+                raise UpgradeError("predictive adapter source worker request is too large")
+            destination.write(payload)
+        while True:
+            status = process.poll()
+            if status is not None:
+                break
+            _check_upgrade_deadline(deadline, connection)
+            time.sleep(min(0.02, max(0.001, deadline - time.monotonic())))
+        _check_upgrade_deadline(deadline, connection)
+        with os.fdopen(result_read, "rb") as source:
+            result_read = -1
+            payload = source.read(8193)
+    except BaseException as exc:
+        try:
+            _stop_and_reap_worker(process)
+        except UpgradeError as reap_error:
+            exc.add_note(str(reap_error))
+        raise
+    finally:
+        if result_read >= 0:
+            os.close(result_read)
+    if len(payload) > 8192:
+        raise UpgradeError("predictive adapter source worker result is too large")
+    try:
+        result = json.loads(payload)
+    except ValueError as exc:
+        raise UpgradeError("predictive adapter source worker returned no result") from exc
+    if not isinstance(result, dict) or result.get("ok") is not True or status != 0:
+        message = result.get("error") if isinstance(result, dict) else None
+        raise UpgradeError(
+            message if isinstance(message, str) and message else "predictive adapter source worker failed"
+        )
+    return result.get("identities", {})
+
+
+def _upgrade_v1_step(
+    active_run: Path,
+    target: Path,
+    step: int,
+    source_base_url: str,
+    *,
+    deadline: float | None = None,
+    connection: socket.socket | None = None,
+) -> None:
+    if deadline is None:
+        deadline = time.monotonic() + source_upgrade_limit_seconds
     lock_path = active_run / lock_name
     if lock_path.is_symlink():
         raise UpgradeError("predictive upgrade lock is a symlink")
@@ -1199,9 +1488,14 @@ def _upgrade_v1_step(active_run: Path, target: Path, step: int, source_base_url:
     except OSError as exc:
         raise UpgradeError("cannot open predictive upgrade lock") from exc
     with lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        while True:
+            _check_upgrade_deadline(deadline, connection)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(min(0.05, max(0.001, deadline - time.monotonic())))
         try:
-            _scavenge_upgrade_leftovers(active_run)
             stable = target / stable_name
             if stable.is_symlink() or not stable.is_file():
                 raise UpgradeError(f"adapter step {step} is not stable")
@@ -1209,61 +1503,61 @@ def _upgrade_v1_step(active_run: Path, target: Path, step: int, source_base_url:
             manifest = _json_object(manifest_path, f"adapter step {step} manifest")
             if manifest.get("version") == 2:
                 return
-            if manifest.get("version") != 1 or manifest.get("kind") != "lora-adapter":
-                raise UpgradeError(f"adapter step {step} has an unsupported manifest")
-            if manifest.get("target_step") != step:
-                raise UpgradeError(f"adapter step {step} manifest has the wrong target")
-            target_identity = _identity_from_published_directory(target, step, cache=False)
-            base1, base1_identity = _find_base(active_run, step - 1)
-            base2, base2_identity = _find_base(active_run, step - 2)
-            identities = (target_identity, base1_identity, base2_identity)
-            if len({item["config_sha256"] for item in identities}) != 1:
-                raise UpgradeError(f"adapter step {step} predecessor configurations differ")
-            if len({item["weights_size"] for item in identities}) != 1:
-                raise UpgradeError(f"adapter step {step} predecessor sizes differ")
-
             cache_root = active_run / cache_name
             pending = cache_root / f".pending-{os.getpid()}-{time.time_ns()}"
             build = active_run / f".predictive-build-{os.getpid()}-{time.time_ns()}"
+            published = False
             try:
-                _prepare_cache(
+                identities = _run_upgrade_worker(
                     active_run,
-                    [
-                        (target, target_identity),
-                        (base1, base1_identity),
-                        (base2, base2_identity),
-                    ],
+                    target,
+                    step,
+                    source_base_url,
                     pending,
-                )
-                build.mkdir(parents=True, mode=0o700)
-                os.chmod(build, 0o700)
-                for name in (adapter_config_name, adapter_weights_name):
-                    _link_private_file(target / name, build / name)
-                from prime_rl.utils.adapter_delta import publish_adapter_manifest
-
-                manifest = publish_adapter_manifest(
                     build,
-                    pending / f"step_{step - 1}",
-                    base2_dir=pending / f"step_{step - 2}",
-                    target_url=_predictive_step_url(source_base_url, step),
-                    base_url=_predictive_step_url(source_base_url, step - 1),
-                    base2_url=_predictive_step_url(source_base_url, step - 2),
-                    target_step=step,
-                    base_step=step - 1,
-                    base2_step=step - 2,
+                    deadline,
+                    connection,
                 )
-                for artifact in build.iterdir():
-                    if artifact.is_symlink() or not artifact.is_file():
-                        raise UpgradeError("predictive build contains a non-regular artifact")
-                    os.chmod(artifact, 0o600)
-                _promote_cache(active_run, pending, step)
-                _install_predictive_manifest(target, build, manifest, step)
-                _prune_cache(active_run, step)
+                _check_upgrade_deadline(deadline, connection)
+                build_manifest = build / adapter_manifest_name
+                _json_object(build_manifest, "predictive adapter build manifest")
+
+                def check_publication(*, linked=False):
+                    _check_upgrade_deadline(deadline, connection)
+                    names = (adapter_config_name, adapter_weights_name, adapter_manifest_name, stable_name)
+                    if not isinstance(identities, dict) or set(identities) != set(names):
+                        raise UpgradeError("predictive adapter source identity result is invalid")
+                    for name in names:
+                        observed = list(_stat_identity(target / name))
+                        expected = identities[name]
+                        # Linking the old manifest as a rollback file changes
+                        # only its ctime before the final rename.
+                        if linked and name == adapter_manifest_name:
+                            observed, expected = observed[:4], expected[:4]
+                        if observed != expected:
+                            raise UpgradeError("predictive adapter target changed before publication")
+
+                check_publication()
+                _replace_from_dirs(
+                    build_manifest,
+                    target / adapter_manifest_name,
+                    _stat_identity(build_manifest),
+                    _sha256(build_manifest),
+                    before_publish=partial(check_publication, linked=True),
+                )
+                published = True
+                _fsync_directory(target)
             finally:
-                if build.exists():
-                    shutil.rmtree(build)
-                if pending.exists():
-                    shutil.rmtree(pending)
+                try:
+                    _run_upgrade_worker(
+                        active_run, target, step, source_base_url, pending, build,
+                        deadline, connection, cleanup_only=True, published=published,
+                    )
+                except UpgradeError:
+                    # The deadline wins over cleanup. A later build scavenges
+                    # these private, uniquely named directories in its worker.
+                    pass
+            _check_upgrade_deadline(deadline, connection)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
@@ -1287,6 +1581,20 @@ def _safe_request_path(handler: SimpleHTTPRequestHandler) -> tuple[Path, tuple[s
     ):
         raise UpgradeError("private adapter state is not served")
     return path, pieces
+
+
+def _request_upgrade_deadline(value: str | None) -> float:
+    if value is None:
+        seconds = source_upgrade_limit_seconds
+    else:
+        try:
+            seconds = float(value)
+        except ValueError as exc:
+            raise UpgradeError("predictive adapter source deadline is invalid") from exc
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise UpgradeError("predictive adapter source deadline is invalid")
+        seconds = min(seconds, source_upgrade_limit_seconds)
+    return time.monotonic() + seconds
 
 
 def _byte_range(value: str | None, size: int) -> tuple[int, int, int]:
@@ -1348,6 +1656,7 @@ class RangeHandler(SimpleHTTPRequestHandler):
             self.close_connection = True
 
     def _maybe_upgrade(self):
+        self.source_deadline = _request_upgrade_deadline(self.headers.get(source_deadline_header))
         path, pieces = _safe_request_path(self)
         if self.upgrade_path is None:
             return path
@@ -1367,8 +1676,18 @@ class RangeHandler(SimpleHTTPRequestHandler):
         active_run = Path(self.directory).resolve().joinpath(*self.upgrade_path)
         if _has_newer_stable_step(active_run, step):
             return path
+        if self.source_base_url is None:
+            raise UpgradeError("predictive adapter source URL is unavailable")
         target = active_run / pieces[prefix_length]
-        _upgrade_v1_step(active_run, target, step, self.source_base_url)
+        deadline = self.source_deadline
+        _upgrade_v1_step(
+            active_run,
+            target,
+            step,
+            self.source_base_url,
+            deadline=deadline,
+            connection=self.connection,
+        )
         return path
 
     def _predictive_chunk_identity(
@@ -1398,6 +1717,12 @@ class RangeHandler(SimpleHTTPRequestHandler):
                             *pieces[: prefix_length + 1]
                         )
             chunk_identity = None
+            if step_path is not None and pieces and ".transport-" in pieces[-1]:
+                if ".transport-predictive-" not in pieces[-1]:
+                    manifest = _json_object(step_path / adapter_manifest_name, "adapter manifest")
+                    if manifest.get("version") == 2:
+                        self.send_error(404)
+                        return None
             if pieces and pieces[-1].startswith(
                 f"{adapter_weights_name}.transport-predictive-"
             ):
@@ -1433,6 +1758,8 @@ class RangeHandler(SimpleHTTPRequestHandler):
                     cache=False,
                     weight_fd=weight_fd,
                     verify_weights=weight_fd is not None,
+                    **({"deadline": self.source_deadline, "connection": self.connection}
+                       if hasattr(self, "source_deadline") and path.name == adapter_manifest_name else {}),
                 )
             if chunk_identity is not None:
                 _verify_transport_fd(source.fileno(), *chunk_identity)
@@ -1442,6 +1769,11 @@ class RangeHandler(SimpleHTTPRequestHandler):
                     source = None
                 return super().send_head()
             size = os.fstat(source.fileno()).st_size
+            if path.name == adapter_manifest_name:
+                if size > adapter_metadata_max_bytes:
+                    raise UpgradeError("adapter manifest exceeds the metadata size limit")
+                _check_upgrade_deadline(self.source_deadline, self.connection)
+                self.connection.settimeout(max(0.001, self.source_deadline - time.monotonic()))
             try:
                 status, start, end = _byte_range(self.headers.get("Range"), size)
             except ValueError as exc:
@@ -1502,6 +1834,8 @@ class AdapterServer(ThreadingHTTPServer):
 
 
 def main() -> None:
+    if len(sys.argv) == 4 and sys.argv[1] == "--predictive-build-worker":
+        raise SystemExit(_upgrade_worker_main(int(sys.argv[2]), int(sys.argv[3])))
     parser = argparse.ArgumentParser()
     parser.add_argument("--directory", required=True)
     parser.add_argument("--port", type=int, default=8100)

@@ -60,6 +60,11 @@ def load_watcher_delta_method(urlopen):
     ]
     namespace = {
         "json": json,
+        "math": math,
+        "time": time,
+        "asyncio": asyncio,
+        "adapter_manifest_max_bytes": 2 * 1024 * 1024,
+        "_read_remote_adapter_manifest": fake_remote_reader(urlopen),
         "urlopen": urlopen,
         "_delta_stage_timeout_s": lambda: 30,
         "adapter_stage_limit_seconds": lambda step: {
@@ -74,6 +79,14 @@ def load_watcher_delta_method(urlopen):
     return namespace["_adapter_delta_base"]
 
 
+def fake_remote_reader(urlopen):
+    async def read(source_url, deadline):
+        location = source_url.rstrip("/") + "/adapter_manifest.json"
+        with urlopen(location, round(deadline - time.monotonic(), 2)) as source:
+            return json.load(source), location
+    return read
+
+
 def load_manifest_reader(urlopen):
     path = ROOT / "src/prime_rl/orchestrator/watcher.py"
     source = path.read_text(encoding="utf-8")
@@ -82,12 +95,16 @@ def load_manifest_reader(urlopen):
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.FunctionDef) and node.name == "_read_adapter_manifest"
     )
-    namespace = {"json": json, "urlopen": urlopen}
+    namespace = {
+        "json": json, "math": math, "time": time, "asyncio": asyncio,
+        "adapter_manifest_max_bytes": 2 * 1024 * 1024,
+        "_read_remote_adapter_manifest": fake_remote_reader(urlopen),
+    }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["_read_adapter_manifest"]
 
 
-def load_manifest_prewarm_method():
+def load_manifest_prewarm_method(reader):
     path = ROOT / "src/prime_rl/orchestrator/watcher.py"
     source = path.read_text(encoding="utf-8")
     function = next(
@@ -95,7 +112,11 @@ def load_manifest_prewarm_method():
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "_prewarm_adapter_manifest"
     )
-    namespace = {"asyncio": asyncio}
+    namespace = {
+        "asyncio": asyncio, "time": time,
+        "adapter_stage_limit_seconds": lambda _step: 600.0,
+        "_read_remote_adapter_manifest": reader,
+    }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["_prewarm_adapter_manifest"]
 
@@ -1191,20 +1212,20 @@ class AdapterTransportStateTest(unittest.TestCase):
             )
 
     def test_manifest_prewarm_does_not_block_the_event_loop(self):
-        prewarm = load_manifest_prewarm_method()
-        started = threading.Event()
-        release = threading.Event()
+        started = asyncio.Event()
+        release = asyncio.Event()
 
-        def blocking_helper(*_args):
+        async def read(*_args):
             started.set()
-            release.wait(2)
-            return "manifest-location"
+            await release.wait()
+            return {}, "manifest-location"
 
-        watcher = SimpleNamespace(_adapter_delta_base=blocking_helper)
+        prewarm = load_manifest_prewarm_method(read)
+        watcher = SimpleNamespace(_adapter_delta_base=lambda *_args: "manifest-location")
 
         async def exercise():
             task = asyncio.create_task(prewarm(watcher, 2, Path("step_2"), "http://source/step_2"))
-            await asyncio.to_thread(started.wait, 1)
+            await asyncio.wait_for(started.wait(), 1)
             tick = asyncio.Event()
             asyncio.get_running_loop().call_later(0.01, tick.set)
             await asyncio.wait_for(tick.wait(), 0.5)

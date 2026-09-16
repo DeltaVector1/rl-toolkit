@@ -394,6 +394,8 @@ class AdapterUpdateTest(unittest.TestCase):
             target.mkdir(parents=True)
             handler = adapter_server.RangeHandler.__new__(adapter_server.RangeHandler)
             handler.directory = temporary
+            handler.headers = {}
+            handler.connection = mock.sentinel.connection
             handler.upgrade_path = ("glm-perf-3", "run_glm-perf-3", "broadcasts")
             handler.source_base_url = (
                 "http://127.0.0.1:18100/glm-perf-3/run_glm-perf-3/broadcasts"
@@ -408,6 +410,8 @@ class AdapterUpdateTest(unittest.TestCase):
                 target,
                 2,
                 "http://127.0.0.1:18100/glm-perf-3/run_glm-perf-3/broadcasts",
+                deadline=mock.ANY,
+                connection=mock.sentinel.connection,
             )
             self.assertEqual(
                 adapter_server._predictive_step_url(handler.source_base_url, 2),

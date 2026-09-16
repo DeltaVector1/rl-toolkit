@@ -607,7 +607,17 @@ class AdapterServerTest(unittest.TestCase):
                         timeout=5,
                     )
                 self.assertEqual(raised.exception.code, 404)
-                self.assertEqual(calls.count("adapter_config.json"), 3)
+                stale_delta = step / "adapter_model.safetensors.transport-delta-stale.bin"
+                stale_delta.write_bytes(chunk)
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(
+                        f"http://127.0.0.1:{server.server_port}/active/step_0/{stale_delta.name}",
+                        timeout=5,
+                    )
+                self.assertEqual(raised.exception.code, 404)
+                # A bad requested chunk is now rejected after the cheap
+                # config check, without scanning every other wire chunk.
+                self.assertEqual(calls.count("adapter_config.json"), 4)
             finally:
                 server.shutdown()
                 thread.join(timeout=5)

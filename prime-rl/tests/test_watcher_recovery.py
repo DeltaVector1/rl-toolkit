@@ -53,6 +53,34 @@ def load_watcher_start(logger):
 
 
 class WatcherRecoveryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_policy_retries_share_one_stage_deadline(self):
+        start = load_watcher_start(_Logger())
+        stopped = asyncio.Event()
+        deadlines = []
+
+        async def retry_twice(_name, operation, *, attempts):
+            self.assertEqual(attempts, 2)
+            await operation()
+            await asyncio.sleep(0.02)
+            await operation()
+            stopped.set()
+
+        async def apply(_step, deadline):
+            deadlines.append(deadline)
+
+        start.__globals__["_run_with_retries"] = retry_twice
+        watcher = types.SimpleNamespace(
+            task=None, stopped=stopped, bootstrap_staged=True, poll_interval=0.0,
+            compute_next_ckpt_step=lambda: 1, ckpt_step=0, lora_name="policy-lora",
+            apply_policy_update=apply,
+        )
+        before = time.monotonic()
+        await start(watcher)
+        self.assertEqual(len(deadlines), 2)
+        self.assertEqual(deadlines[0], deadlines[1])
+        self.assertGreaterEqual(deadlines[0], before + 1.0)
+        self.assertLess(deadlines[0], before + 1.05)
+
     async def test_endpoint_repair_waits_for_health_then_reconciles(self):
         logger = _Logger()
         start = load_watcher_start(logger)

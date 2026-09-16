@@ -6,13 +6,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import quote
-from urllib.request import urlopen
 
 import httpx
 from modelexpress import p2p_pb2
@@ -39,6 +39,8 @@ from prime_rl.utils.checkpoint_delta import build_xor_delta_checkpoint
 
 v1_adapter_transport = "chunked-shuffled-xor-zstd"
 v2_adapter_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
+adapter_manifest_max_bytes = 2 * 1024 * 1024
+adapter_deadline_header = "X-Adapter-Deadline-Seconds"
 
 
 def _receiver_id(client) -> str:
@@ -414,18 +416,73 @@ def _read_adapter_manifest(
     manifest_path = path / "adapter_manifest.json"
     if source_url is None or (manifest_path.is_file() and not prefer_remote):
         try:
-            with manifest_path.open("r", encoding="utf-8") as source:
-                manifest = json.load(source)
+            with manifest_path.open("rb") as source:
+                payload = source.read(adapter_manifest_max_bytes + 1)
+            if len(payload) > adapter_manifest_max_bytes:
+                raise RuntimeError("published adapter manifest exceeds the size limit")
+            manifest = json.loads(payload)
         except (FileNotFoundError, OSError, ValueError) as exc:
             raise RuntimeError("published adapter manifest is unavailable") from exc
         location = manifest_path.as_posix()
     else:
-        try:
-            with urlopen(f"{source_url.rstrip('/')}/adapter_manifest.json", timeout=timeout) as source:
-                manifest = json.load(source)
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("published adapter manifest is unavailable from the adapter source") from exc
-        location = f"{source_url.rstrip('/')}/adapter_manifest.json"
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise TimeoutError("published adapter manifest deadline expired")
+        return asyncio.run(
+            _read_remote_adapter_manifest(
+                source_url, time.monotonic() + min(float(timeout), 600.0)
+            )
+        )
+    if not isinstance(manifest, dict):
+        raise RuntimeError("published adapter manifest is not an object")
+    return manifest, location
+
+
+async def _read_remote_adapter_manifest(
+    source_url: str,
+    deadline: float,
+) -> tuple[dict[str, object], str]:
+    """Read the source manifest within one cancellable absolute deadline."""
+    remaining = min(deadline - time.monotonic(), 600.0)
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise TimeoutError("published adapter manifest deadline expired")
+    location = f"{source_url.rstrip('/')}/adapter_manifest.json"
+    headers = {adapter_deadline_header: f"{remaining:.6f}"}
+    try:
+        async with asyncio.timeout(remaining):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(remaining)) as client:
+                async with client.stream("GET", location, headers=headers) as response:
+                    response.raise_for_status()
+                    declared_size = response.headers.get("Content-Length")
+                    if declared_size is not None:
+                        try:
+                            parsed_size = int(declared_size)
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                "published adapter manifest has an invalid content length"
+                            ) from exc
+                        if parsed_size < 0 or parsed_size > adapter_manifest_max_bytes:
+                            raise RuntimeError(
+                                "published adapter manifest exceeds the size limit"
+                            )
+                    payload = bytearray()
+                    async for chunk in response.aiter_raw():
+                        payload.extend(chunk)
+                        if len(payload) > adapter_manifest_max_bytes:
+                            raise RuntimeError(
+                                "published adapter manifest exceeds the size limit"
+                            )
+    except (TimeoutError, httpx.TimeoutException) as exc:
+        raise TimeoutError("published adapter manifest deadline expired") from exc
+    except (httpx.HTTPError, OSError) as exc:
+        raise RuntimeError(
+            "published adapter manifest is unavailable from the adapter source"
+        ) from exc
+    try:
+        manifest = json.loads(payload)
+    except ValueError as exc:
+        raise RuntimeError(
+            "published adapter manifest is unavailable from the adapter source"
+        ) from exc
     if not isinstance(manifest, dict):
         raise RuntimeError("published adapter manifest is not an object")
     return manifest, location
@@ -460,6 +517,7 @@ class WeightWatcher:
         self.last_update_weights_time: float = 0.0
         self.last_stage_weights_time: float = 0.0
         self.last_adapter_delta_build_time: float = -1.0
+        self.last_adapter_source_prepare_time: float = 0.0
         self.last_adapter_wire_stage_time: float = 0.0
         self.last_adapter_reconstruct_time: float = -1.0
         self.last_adapter_load_time: float = 0.0
@@ -500,7 +558,7 @@ class WeightWatcher:
                         update_deadline = None
                         update_attempts = 1
                         if self.lora_name is not None and next_step > 0:
-                            update_deadline = time.monotonic() + 2 * adapter_stage_limit_seconds(
+                            update_deadline = time.monotonic() + adapter_stage_limit_seconds(
                                 next_step
                             )
                             update_attempts = 2
@@ -610,6 +668,7 @@ class WeightWatcher:
         local_weights_path,
         target_url: str | None = None,
         deadline: float | None = None,
+        prepared_manifest: tuple[dict[str, object], str] | None = None,
     ) -> str:
         """Return the verified adjacent base URL and published delta manifest."""
         if self.lora_name is None or next_step <= 0:
@@ -662,17 +721,20 @@ class WeightWatcher:
                 raise TimeoutError(
                     f"cannot apply adapter policy v{next_step}: staging deadline expired"
                 )
-        try:
-            manifest, manifest_location = _read_adapter_manifest(
-                local_weights_path,
-                target_url if isinstance(target_url, str) else None,
-                manifest_timeout,
-                prefer_remote=True,
-            )
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"cannot apply adapter policy v{next_step}: {exc}"
-            ) from exc
+        if prepared_manifest is None:
+            try:
+                manifest, manifest_location = _read_adapter_manifest(
+                    local_weights_path,
+                    target_url if isinstance(target_url, str) else None,
+                    manifest_timeout,
+                    prefer_remote=True,
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"cannot apply adapter policy v{next_step}: {exc}"
+                ) from exc
+        else:
+            manifest, manifest_location = prepared_manifest
         if manifest.get("version") != 1:
             try:
                 validate_adapter_manifest(
@@ -710,12 +772,20 @@ class WeightWatcher:
         target_url: str,
         deadline: float | None = None,
     ) -> str:
-        return await asyncio.to_thread(
-            self._adapter_delta_base,
+        if deadline is None:
+            deadline = time.monotonic() + adapter_stage_limit_seconds(next_step)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"cannot apply adapter policy v{next_step}: staging deadline expired"
+            )
+        manifest = await _read_remote_adapter_manifest(target_url, deadline)
+        return self._adapter_delta_base(
             next_step,
             local_weights_path,
             target_url,
             deadline,
+            manifest,
         )
 
     async def apply_policy_update(
@@ -728,7 +798,7 @@ class WeightWatcher:
                 # Another caller raced us — bail without re-applying
                 return
 
-            t0 = time.perf_counter()
+            checkpoint_wait_started = time.perf_counter()
             weights_path = None
             local_weights_path = None
             require_delta = False
@@ -744,6 +814,7 @@ class WeightWatcher:
                         "Training is progressing normally."
                     )
                     await wait_for_path(stable_marker)
+                self.last_wait_for_ckpt_time = time.perf_counter() - checkpoint_wait_started
                 local_weights_path = weights_path
                 weights_path = inference_weight_path(self.config, weights_path, self.lora_name)
                 if self.lora_name is None and next_step > 1 and isinstance(weights_path, str):
@@ -771,12 +842,18 @@ class WeightWatcher:
                         raise TimeoutError(
                             f"cannot apply adapter policy v{next_step}: update time limit expired"
                         )
-                    manifest_path = await self._prewarm_adapter_manifest(
-                        next_step,
-                        local_weights_path,
-                        weights_path,
-                        delta_deadline,
-                    )
+                    source_prepare_started = time.perf_counter()
+                    try:
+                        manifest_path = await self._prewarm_adapter_manifest(
+                            next_step,
+                            local_weights_path,
+                            weights_path,
+                            delta_deadline,
+                        )
+                    finally:
+                        self.last_adapter_source_prepare_time = (
+                            time.perf_counter() - source_prepare_started
+                        )
                     require_delta = True
                     build_time = (
                         format_time(self.last_adapter_delta_build_time)
@@ -787,7 +864,8 @@ class WeightWatcher:
                         f"Using lossless adapter delta for policy v{next_step}: {manifest_path} "
                         f"(build {build_time})"
                     )
-            self.last_wait_for_ckpt_time = time.perf_counter() - t0
+            if self.model_express is not None:
+                self.last_wait_for_ckpt_time = time.perf_counter() - checkpoint_wait_started
 
             # Remote LoRA files cross the high-loss China link. Stage them on
             # both inference hosts before stopping old-policy generation. This
@@ -1066,6 +1144,7 @@ class WeightWatcher:
             "watcher/last_update_weights_time": self.last_update_weights_time,
             "watcher/last_stage_weights_time": self.last_stage_weights_time,
             "watcher/last_adapter_delta_build_time": self.last_adapter_delta_build_time,
+            "watcher/last_adapter_source_prepare_time": self.last_adapter_source_prepare_time,
             "watcher/last_adapter_wire_stage_time": self.last_adapter_wire_stage_time,
             "watcher/last_adapter_reconstruct_time": self.last_adapter_reconstruct_time,
             "watcher/last_adapter_load_time": self.last_adapter_load_time,
