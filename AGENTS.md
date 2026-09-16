@@ -14,22 +14,27 @@ conclusions. Keep reports short.
 - Use one writer per branch and one operator per live test. Preserve
   existing changed and untracked files.
 
-## Start and report
+## Scope and completion
 
-- Read `configs/nodes.toml` for hosts, paths, ports, containers, and topology.
-  Read `TRAINING_EXPECTATIONS.md` before a training test or run.
-- Use the `training-ops` skill. Do not write another SSH helper.
-- Use `uv run training-ops status` for a read-only status check.
 - First report `pwd`, repository root, `HEAD`, and `git status`; stop on an
   unexplained mismatch. Announced commits from the assigned writer are
-  expected during local review. Before a start, check all required source
-  files, recursive imports, mounts, patches, and remote file modes together.
-- Use `training_ops.watch()` in the foreground with an interval of 600 seconds
-  or less. After ten minutes without completion, report the measured state and
-  first blocker.
-- Report trainer compute, rollout collection, waiting, judging, adapter
-  preparation, transfer, loading, and full-weight transfer separately. Do not
-  add overlapping times. Keep estimates separate from measurements.
+  expected during local review.
+- Finish the authorized task and its checks. Fix faults within that scope;
+  ask when permission or a required choice is missing. Read-only tasks permit
+  no edits or live changes.
+- Check the affected behavior. Broaden or repeat tests only for a change,
+  failure, or unresolved risk. Local tests with disposable fixtures and the
+  repository network guard need no further approval.
+- After ten minutes without completion, report the measured state and first
+  blocker. At handoff, report changed files, commit, checks, and remaining work.
+
+## Context
+
+- Use the `training-ops` skill for run status, monitoring, deployment, starts,
+  stops, and repairs. Do not write another SSH helper.
+- Read `configs/nodes.toml` when you need hosts, paths, ports, containers, or
+  topology. Read `TRAINING_EXPECTATIONS.md` before a live training test or run.
+- Read other files only when the task needs them.
 
 ## Safety and permissions
 
@@ -40,13 +45,9 @@ conclusions. Keep reports short.
 - Use native FP8 weights. Do not use QLoRA or INT4 model weights, cached
   rollout batches, or a full rollout batch to debug trainer execution. Do not
   change a measurement limit to make a run pass.
-- Warn before copying the 755,632,050,320-byte GLM model (about 704 GiB).
-  Keep full-model copy time separate from training, adapter, and rollout time.
-- Repair only a fault reported by `training_ops.status()`. Needed repairs and
-  restarts for current neutral GLM speed tests are approved; ask the owner for
-  all other stops, restarts, run names, or setting changes.
-- If `training_ops.reward()` says `inside the noise`, report that the measured
-  change is too small to show improvement or decline.
+- Follow the skill's task-specific approval and measurement rules for live
+  work. Do not silently replace a requested method, setting, or metric;
+  report the code and metric source.
 
 ## Repository
 
@@ -55,6 +56,4 @@ conclusions. Keep reports short.
 - Put training-ops scripts under `training_ops/runtime/`.
   Remove temporary files when their task ends and do not add extra docs unless
   requested. Preserve files used by other active tasks.
-- Use simple English and names. Do not add new all-caps identifiers. Do not
-  silently replace a requested method, setting, or metric; report the code and
-  metric source.
+- Use simple English and names. Do not add new all-caps identifiers.
