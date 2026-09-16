@@ -1684,6 +1684,15 @@ class RangeHandler(SimpleHTTPRequestHandler):
         if self.source_base_url is None:
             raise UpgradeError("predictive adapter source URL is unavailable")
         target = active_run / pieces[prefix_length]
+        # A published v2 manifest needs no upgrade lock or full manifest parse.
+        # send_head still checks the publication and the requested open file.
+        try:
+            if _manifest_cache_entry(target, step).chunk_records:
+                return path
+        except UpgradeError:
+            # An upgrade can change the directory while this check runs.
+            # Use the locked path; send_head still rejects invalid metadata.
+            pass
         deadline = self.source_deadline
         _upgrade_v1_step(
             active_run,
