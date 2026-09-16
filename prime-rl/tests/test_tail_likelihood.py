@@ -2,11 +2,13 @@ import ast
 import asyncio
 import hashlib
 import math
+import sys
 import tomllib
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import ClassVar
+from unittest import mock
 
 import pydantic
 import torch
@@ -135,16 +137,41 @@ class TailLikelihoodTest(unittest.TestCase):
         self.assertIsNot(inherited.algo, config)
         self.assertIs(overridden.algo, explicit)
 
-    def test_registry_selects_native_algorithm_and_keeps_grpo(self):
-        namespace = {name: Algorithm for name in (
-            "EchoAlgorithm", "MaxRLAlgorithm", "OPDAlgorithm", "OPSDAlgorithm", "RAEAlgorithm", "SFTDistillAlgorithm",
-        )}
-        namespace.update(Algorithm=Algorithm, connect_frozen_pool=None,
-                         GRPOAlgorithm=grpo["GRPOAlgorithm"], TailRLAlgorithm=tail["TailRLAlgorithm"],
-                         stamp_advantages=None, stamp_loss_routing=None, Rollout=Rollout)
-        registry = load_source(root / "src/prime_rl/orchestrator/algo/__init__.py", **namespace)
-        for name, expected in (("grpo", grpo["GRPOAlgorithm"]), ("tail_likelihood", tail["TailRLAlgorithm"])):
-            self.assertIsInstance(registry["build_algorithm"](algo_config.validate_python({"type": name}), None), expected)
+    def test_registry_imports_with_baked_modules_and_no_rae(self):
+        prefix = "prime_rl.orchestrator.algo"
+        modules = {}
+        for name in ("prime_rl", "prime_rl.orchestrator", prefix):
+            modules[name] = ModuleType(name)
+            modules[name].__path__ = []
+        exports = {
+            "base": {"Algorithm": Algorithm, "connect_frozen_pool": None},
+            "echo": {"EchoAlgorithm": Algorithm},
+            "grpo": {"GRPOAlgorithm": grpo["GRPOAlgorithm"]},
+            "max_rl": {"MaxRLAlgorithm": Algorithm},
+            "opd": {"OPDAlgorithm": Algorithm},
+            "opsd": {"OPSDAlgorithm": Algorithm},
+            "routing": {"stamp_advantages": None, "stamp_loss_routing": None},
+            "sft": {"SFTDistillAlgorithm": Algorithm},
+            "tail_likelihood": {},
+        }
+        for name, attributes in exports.items():
+            module = modules[f"{prefix}.{name}"] = ModuleType(f"{prefix}.{name}")
+            module.__dict__.update(attributes)
+        modules["prime_rl.orchestrator.types"] = ModuleType("prime_rl.orchestrator.types")
+        modules["prime_rl.orchestrator.types"].Rollout = Rollout
+        modules[f"{prefix}.rae"] = None  # The deployed image has no RAE module.
+        with mock.patch.dict(sys.modules, modules):
+            for name, filename in ((f"{prefix}.tail_likelihood", "tail_likelihood.py"), (prefix, "__init__.py")):
+                path = root / "src/prime_rl/orchestrator/algo" / filename
+                # Execute all imports; load_source() would hide image incompatibility.
+                exec(compile(path.read_text(), str(path), "exec"), modules[name].__dict__)
+            registry = modules[prefix]
+            self.assertEqual(set(registry.ALGORITHM_CLASSES),
+                             {"grpo", "echo", "max_rl", "opd", "opsd", "sft", "tail_likelihood"})
+            self.assertNotIn("RAEAlgorithm", registry.__all__)
+            for name, expected in (("grpo", grpo["GRPOAlgorithm"]),
+                                   ("tail_likelihood", modules[f"{prefix}.tail_likelihood"].TailRLAlgorithm)):
+                self.assertIsInstance(registry.build_algorithm(algo_config.validate_python({"type": name}), None), expected)
 
     def test_disabled_grpo_is_byte_identical_and_numerically_unchanged(self):
         path = root / "src/prime_rl/orchestrator/algo/grpo.py"
