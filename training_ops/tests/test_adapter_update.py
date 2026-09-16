@@ -54,6 +54,31 @@ def _load_function(path: Path, name: str):
 
 
 class AdapterUpdateTest(unittest.TestCase):
+    def setUp(self):
+        # Operational tests must explicitly mock the boundary they exercise.
+        # In particular, deploy() uses _run_process(), not just _ssh().
+        process_patcher = mock.patch.object(
+            training_ops, "_run_process", side_effect=AssertionError("real process execution is forbidden in unit tests")
+        )
+        ssh_patcher = mock.patch.object(
+            training_ops, "_ssh", side_effect=AssertionError("real SSH is forbidden in unit tests")
+        )
+        deploy_patcher = mock.patch.object(
+            training_ops, "deploy", side_effect=AssertionError("real deployment is forbidden in unit tests")
+        )
+        self.process_guard = process_patcher.start()
+        self.ssh_guard = ssh_patcher.start()
+        self.deploy_guard = deploy_patcher.start()
+        for patcher in (process_patcher, ssh_patcher, deploy_patcher):
+            self.addCleanup(patcher.stop)
+
+    def test_status_reports_direct_route_fault(self):
+        state = training_ops.Status(direct_route="failed")
+        self.assertTrue(any("direct adapter source route" in message for message in training_ops._warnings(state)))
+        state.direct_route = "ready"
+        self.assertFalse(any("direct adapter source route" in message for message in training_ops._warnings(state)))
+        self.process_guard.assert_not_called()
+
     def test_adapter_stage_policy_matches_all_layers(self):
         repository = Path(__file__).resolve().parents[2]
         receiver_limit = _load_function(
@@ -169,7 +194,7 @@ class AdapterUpdateTest(unittest.TestCase):
             / "start_inference.sh"
         )
         launcher = launcher_path.read_text(encoding="utf-8")
-        start = launcher.index("<<'PY'\n") + len("<<'PY'\n")
+        start = launcher.index("<<'PY'\n", launcher.index("runtime_output=$(python3")) + len("<<'PY'\n")
         end = launcher.index("\nPY\n)", start)
         reader = launcher[start:end]
         nodes_path = Path(training_ops.repo_root) / "configs/nodes.toml"
@@ -220,7 +245,7 @@ class AdapterUpdateTest(unittest.TestCase):
         )
         self.assertNotIn("configs/general-agent/inference.toml", launcher)
         self.assertIn('@ "$inference_config"', launcher)
-        self.assertIn("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-16}", launcher)
+        self.assertIn('tomllib.load(stream)["adapter_transport"]["download_streams"]', launcher)
         self.assertIn('-e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams"', launcher)
         self.assertIn("-e PRIME_LORA_LANE_TIMEOUT_S=90", launcher)
         self.assertIn("-e PRIME_LORA_CHUNK_TIMEOUT_S=90", launcher)
@@ -244,11 +269,11 @@ class AdapterUpdateTest(unittest.TestCase):
             / "h200"
             / "start_inference.sh"
         ).read_text(encoding="utf-8")
-        start = launcher.index("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-16}")
+        start = launcher.index("download_streams=$(python3")
         end = launcher.index("runtime_output=$(python3", start)
-        validation = launcher[start:end]
+        validation = f"deployment={training_ops.repo_root}\n" + launcher[start:end]
 
-        for value in ("32", "48", "96"):
+        for value in ("64",):
             result = subprocess.run(
                 ["bash", "-c", f"PRIME_LORA_DOWNLOAD_STREAMS={value}\n{validation}"],
                 capture_output=True,
@@ -1071,10 +1096,17 @@ class AdapterUpdateTest(unittest.TestCase):
 
         with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "_ssh", side_effect=ssh
-        ):
+        ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy:
             result = training_ops._repair_engine("h200a")
 
         self.assertEqual(result, "issued")
+        self.assertEqual(deploy.call_args_list, [
+            mock.call("configs/nodes.toml", nodes=["h200a"]),
+            mock.call("training_ops/runtime/h200/start_inference.sh", nodes=["h200a"]),
+            mock.call("configs/general-agent/inference.toml", nodes=["h200a"]),
+        ])
+        self.process_guard.assert_not_called()
+        self.deploy_guard.assert_not_called()
         self.assertTrue(any("glm52-decensor-h200" in call for call in calls))
         self.assertTrue(any("start_inference.sh" in call for call in calls))
         self.assertTrue(any("ENGINE_CONTAINER=glm52-decensor-h200" in call for call in calls))

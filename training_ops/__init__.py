@@ -1007,6 +1007,7 @@ def _head_script() -> str:
         .replace("__ORCH__", orchestrator_container)
         .replace("__ADAPTER__", str(adapter_port))
         .replace("__ADAPTER_CONTAINER__", adapter_container)
+        + f"\nif python3 {runtime_root}/china/direct_adapter_route.py status {remote_repo}/configs/nodes.toml >/dev/null 2>&1; then echo direct_route ready; else echo direct_route failed; fi\n"
     )
 
 
@@ -1199,6 +1200,7 @@ class Status:
     judge: str = "000"
     secondary_judge: str = "unused"
     adapter: str = "000"
+    direct_route: str = "unknown"
     zmq_tunnel: bool = False
     nodes: list[NodeState] = field(default_factory=list)
     engines: list[EngineState] = field(default_factory=list)
@@ -1236,7 +1238,7 @@ class Status:
                 f"orchestrator "
                 f"{'failed' if self.orch_failed else 'up' if self.orch_up else 'finished' if self.trainer_finished else 'down'} | "
                 f"scoring judge {self.judge} | "
-                f"follow-up judge {self.secondary_judge} | adapter {self.adapter}"
+                f"follow-up judge {self.secondary_judge} | adapter {self.adapter} | direct route {self.direct_route}"
             )
         L.append(
             f"run steps {self.trainer_steps} | rollout failures in 5m {self.fails_5m} | "
@@ -2250,6 +2252,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
         "SECONDARY_JUDGE", "000" if secondary_judge_used else "unused"
     )
     s.adapter = h.get("ADAPTER", "000")
+    s.direct_route = h.get("direct_route", "unknown")
     s.zmq_tunnel = h.get("ZMQ_TUNNEL", "0") == "1"
 
     for host, (rc, out) in nodes_out.items():
@@ -2333,6 +2336,8 @@ def _warnings(s: Status) -> list[str]:
         detail = f" on {', '.join(failed_nodes)}" if failed_nodes else ""
         w.append(f"trainer cluster is not complete{detail}")
     trainer_only = s.mode == "trainer-only"
+    if not trainer_only and s.direct_route != "ready":
+        w.append("direct adapter source route is not ready; use adapter-tunnels repair")
     if not trainer_only and s.orch_failed:
         w.append("orchestrator process failed")
     elif not trainer_only and not s.orch_up and not s.trainer_finished:
@@ -4777,6 +4782,12 @@ def _repair_adapter_tunnels(config_dir: str | None = None, *, reset: bool = Fals
     for path in (orchestrator_config, "training_ops/runtime/h200/start_orchestrator.sh"):
         if not deploy(path, nodes=[orchestrator_host]):
             raise RuntimeError(f"adapter tunnel deployment failed: {path}")
+    for path, destinations in (
+        ("configs/nodes.toml", [trainer_head, orchestrator_host]),
+        ("training_ops/runtime/china/direct_adapter_route.py", [trainer_head]),
+    ):
+        if not deploy(path, nodes=destinations):
+            raise RuntimeError(f"direct adapter route deployment failed: {path}")
     tunnel_mode = "--restart-tunnels --tunnels-only" if reset else "--tunnels-only"
     command = (
         f"RUN={shlex.quote(run)} RUN_NAME={shlex.quote(run_name)} "
@@ -4961,6 +4972,9 @@ def _repair_engine(host: str, config_dir: str | None = None) -> str:
     engine_container = glm_inference_container
     engine_model = glm_model
     start_script = f"{runtime_root}/h200/start_inference.sh"
+    for path in ("configs/nodes.toml", "training_ops/runtime/h200/start_inference.sh", _selected_inference_config(selected)):
+        if not deploy(path, nodes=[host]):
+            raise RuntimeError(f"inference configuration deployment failed on {host}: {path}")
     startup_grace = 600
     print(
         f"{host}: removing and restarting {engine_container}. The model load needs 5 to 10 minutes."

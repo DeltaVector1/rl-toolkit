@@ -8,7 +8,17 @@ test -f "$inference_config" || {
   echo "inference config is missing: $inference_config" >&2
   exit 2
 }
-download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-16}
+download_streams=$(python3 - "$deployment/configs/nodes.toml" <<'PY'
+import sys
+import tomllib
+with open(sys.argv[1], "rb") as stream:
+    print(tomllib.load(stream)["adapter_transport"]["download_streams"])
+PY
+) || exit 2
+if [ -n "${PRIME_LORA_DOWNLOAD_STREAMS+x}" ] && [ "$PRIME_LORA_DOWNLOAD_STREAMS" != "$download_streams" ]; then
+  echo "PRIME_LORA_DOWNLOAD_STREAMS differs from nodes.toml" >&2
+  exit 2
+fi
 case "$download_streams" in
   ''|*[!0-9]*)
     echo "PRIME_LORA_DOWNLOAD_STREAMS must be an integer" >&2
