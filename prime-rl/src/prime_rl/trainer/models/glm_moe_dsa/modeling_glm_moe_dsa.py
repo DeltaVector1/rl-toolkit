@@ -126,7 +126,6 @@ class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
 
         if layer_idx >= config.first_k_dense_replace:
             self.mlp = MoE(moe_args, dim=config.hidden_size, hidden_dim=config.moe_intermediate_size)
-            self.mlp.router.parity_trace_layer = layer_idx
         else:
             self.mlp = MLP(mlp_config)
 

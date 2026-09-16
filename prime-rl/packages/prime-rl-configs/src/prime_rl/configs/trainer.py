@@ -821,9 +821,6 @@ class TrainerConfig(BaseConfig):
     max_concurrent_runs: int = Field(1, ge=1)
     """Maximum number of concurrent runs to allow. If 1, only one run may run at a time."""
 
-    enable_token_export: bool = False
-    """Opt-in per-token JSONL export for rollout debugging. When enabled, writes token ids and aligned trainer metrics after each forward pass."""
-
     env_vars: EnvVars = {}
     """Extra environment variables for the trainer process(es). Merged on top of the launcher defaults."""
 
