@@ -1392,6 +1392,8 @@ class AdapterTransportStateTest(unittest.TestCase):
                     (partial / "READY").unlink()
                     output = partial / "adapter_model.safetensors"
                     output.write_bytes(b"x" * output.stat().st_size)
+                    for proof in (partial / "transport-chunks").rglob("*.done"):
+                        proof.unlink()
                     statuses = []
                     old_status = filesystem._write_stage_status
                     old_download = filesystem._PersistentAdapterLanePool.download
@@ -1430,6 +1432,10 @@ class AdapterTransportStateTest(unittest.TestCase):
             for status in statuses:
                 self.assertGreaterEqual(status["bytes_done"], 0)
                 self.assertLessEqual(status["bytes_done"], status["bytes_total"])
+            self.assertEqual(
+                max(value["bytes_done"] for value in statuses if value["status"] == "staging"),
+                statuses[-1]["bytes_total"],
+            )
             self.assertEqual((resumed / "adapter_model.safetensors").read_bytes(), model)
 
     def test_full_stage_rejects_corrupt_wire_chunk(self):
@@ -2716,7 +2722,7 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
         runtime = REPOSITORY / "training_ops/runtime/h200"
         glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
-        self.assertIn("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-112}", glm_source)
+        self.assertIn("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-16}", glm_source)
         self.assertIn('-e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams"', glm_source)
         self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
         source_generator = glm_source.split(

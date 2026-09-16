@@ -1107,7 +1107,14 @@ async def stage_lora_adapter(
         return staged, time.perf_counter() - group_started
 
     groups = [ordered_hosts, *peer_groups]
-    grouped_results = [await _stage_group(group) for group in groups]
+    group_tasks = [asyncio.create_task(_stage_group(group)) for group in groups]
+    try:
+        # Wait for origins first without delaying peer startup. A peer failure
+        # must not discard origin progress; an origin failure cancels peers.
+        grouped_results = [await task for task in group_tasks]
+    except BaseException:
+        await _cancel_and_reap(group_tasks)
+        raise
     results = [result for staged, _seconds in grouped_results for result in staged]
     group_seconds = [seconds for _staged, seconds in grouped_results]
     origin_stage_seconds = group_seconds[0] if group_seconds else 0.0
@@ -1136,18 +1143,18 @@ async def stage_lora_adapter(
     adapter_identity = identities[0]
     assert isinstance(adapter_identity, dict)
     return {
-        "wire_stage_seconds": sum(legacy_wire_values) if None not in legacy_wire_values else None,
-        "transfer_wall_seconds": sum(transfer_values) if None not in transfer_values else None,
+        "wire_stage_seconds": max(legacy_wire_values) if None not in legacy_wire_values else None,
+        "transfer_wall_seconds": max(transfer_values) if None not in transfer_values else None,
         "origin_transfer_wall_seconds": transfer_values[0],
         "peer_transfer_wall_seconds": (
-            sum(transfer_values[1:]) if None not in transfer_values[1:] else None
+            max(transfer_values[1:], default=0.0) if None not in transfer_values[1:] else None
         ),
         "origin_stage_seconds": origin_stage_seconds,
         "peer_stage_seconds": peer_stage_seconds,
-        "reconstruction_wall_seconds": sum(reconstruct_values) if None not in reconstruct_values else None,
-        "reconstruct_seconds": sum(reconstruct_values) if None not in reconstruct_values else None,
+        "reconstruction_wall_seconds": max(reconstruct_values) if None not in reconstruct_values else None,
+        "reconstruct_seconds": max(reconstruct_values) if None not in reconstruct_values else None,
         "reconstruction_worker_seconds": max(worker_values) if worker_values else None,
-        "final_verification_wall_seconds": sum(verification_values) if None not in verification_values else None,
+        "final_verification_wall_seconds": max(verification_values) if None not in verification_values else None,
         "total_stage_wall_seconds": time.perf_counter() - started,
         "cache_hit": bool(results) and all(bool(result["cache_hit"]) for result in results),
         "bytes_done": sum(int(result["bytes_done"]) for result in results),

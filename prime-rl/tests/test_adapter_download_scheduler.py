@@ -1,5 +1,6 @@
 import errno
 import hashlib
+import http.client
 import http.server
 import inspect
 import importlib.util
@@ -13,6 +14,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -62,6 +64,161 @@ def load_filesystem_module():
 
 
 class DownloadSchedulerTest(unittest.TestCase):
+    def test_lane_fallbacks_rotate_from_each_primary(self):
+        filesystem = load_filesystem_module()
+        urls = [f"http://lane{index}" for index in range(5)]
+        pool = filesystem._PersistentAdapterLanePool(urls, width=3)
+        for lane in range(3):
+            self.assertEqual(pool.urls_for_lane(lane, "chunk"), [
+                f"{url}/chunk" for url in urls[lane:] + urls[:lane]
+            ])
+
+    def test_retained_prefix_progress_is_counted_once_and_rolled_back(self):
+        payload = b"resume-body"
+        for retained in (payload[:3], b"bad", payload, b"x" * len(payload), payload + b"extra"):
+            with self.subTest(retained=retained), tempfile.TemporaryDirectory() as temporary:
+                filesystem = load_filesystem_module()
+                filesystem.lane_rotation_delay_seconds = 0
+                root = Path(temporary)
+                destination = root / "chunk"
+                destination.write_bytes(retained)
+                changes, starts = [], []
+
+                def read_range(_connection, _source, **kwargs):
+                    start = kwargs["start"]
+                    starts.append(start)
+                    if retained == payload[:3] and len(starts) == 1:
+                        kwargs["consume"](payload[start:start + 2])
+                        raise filesystem._PersistentTransportError("connection lost")
+                    kwargs["consume"](payload[start:])
+
+                pool = filesystem._PersistentAdapterLanePool(1)
+                parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with mock.patch.object(filesystem._PersistentAdapterConnection, "read_range", read_range):
+                        pool.download(
+                            ["http://lane0/chunk", "http://lane1/chunk"], 0,
+                            destination, parent_fd, expected_size=len(payload),
+                            expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            progress=lambda _lane, amount: changes.append(amount),
+                            per_request_timeout_seconds=1,
+                        )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertEqual(sum(changes), len(payload))
+                self.assertTrue(all(0 <= sum(changes[:index]) <= len(payload)
+                                    for index in range(1, len(changes) + 1)))
+                if retained == payload[:3]:
+                    self.assertEqual(starts, [3, 5])
+                    self.assertEqual(changes, [3, 2, len(payload) - 5])
+                if retained == b"bad":
+                    self.assertEqual(starts, [3, 0])
+                    self.assertIn(-len(payload), changes)
+                if retained == payload:
+                    self.assertEqual(starts, [])
+
+    def test_persistent_attempt_deadline_is_bounded_by_chunk_and_stage(self):
+        for remaining in (None, 0.5):
+            with self.subTest(remaining=remaining), tempfile.TemporaryDirectory() as temporary:
+                filesystem = load_filesystem_module()
+                root = Path(temporary)
+                started = time.monotonic()
+                deadline = None if remaining is None else started + remaining
+                calls = []
+
+                def read_range(_connection, _source, **kwargs):
+                    calls.append(kwargs)
+                    kwargs["consume"](b"x")
+
+                pool = filesystem._PersistentAdapterLanePool(1)
+                parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with mock.patch.object(filesystem, "_configured_chunk_timeout", return_value=1), mock.patch.object(
+                        filesystem._PersistentAdapterConnection, "read_range", read_range
+                    ):
+                        pool.download(
+                            ["http://lane/chunk"], 0, root / "chunk", parent_fd,
+                            expected_size=1, expected_sha256=hashlib.sha256(b"x").hexdigest(),
+                            per_request_timeout_seconds=5, deadline=deadline,
+                        )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertEqual(calls[0]["stage_deadline"], deadline)
+                if deadline is not None:
+                    self.assertEqual(calls[0]["attempt_deadline"], deadline)
+                else:
+                    self.assertGreaterEqual(calls[0]["attempt_deadline"], started + 1)
+                    self.assertLessEqual(calls[0]["attempt_deadline"], time.monotonic() + 1)
+
+    @staticmethod
+    def _metadata_response(body, *, declared=None, chunked=False):
+        class Socket:
+            def makefile(self, *_args):
+                if chunked:
+                    header = b"Transfer-Encoding: chunked\r\n"
+                    wire_body = b"d\r\n" + body
+                else:
+                    size = len(body) if declared is None else declared
+                    header = f"Content-Length: {size}\r\n".encode()
+                    wire_body = body
+                return io.BytesIO(b"HTTP/1.1 200 OK\r\n" + header + b"\r\n" + wire_body)
+
+        response = http.client.HTTPResponse(Socket())
+        response.begin()
+        return response
+
+    def test_short_metadata_retries_the_next_lane(self):
+        filesystem = load_filesystem_module()
+        payload = b'{"version":2}'
+        urls = ["http://lane0/metadata", "http://lane1/metadata"]
+        for chunked in (False, True):
+            with self.subTest(chunked=chunked):
+                responses = [self._metadata_response(payload[:5], declared=len(payload), chunked=chunked),
+                             self._metadata_response(payload)]
+                with mock.patch.object(filesystem, "_metadata_source_urls", return_value=urls), mock.patch.object(
+                    filesystem.urllib.request, "urlopen", side_effect=responses
+                ) as request:
+                    self.assertEqual(filesystem._read_source_bytes(urls[0], max_bytes=1024), payload)
+                self.assertEqual([call.args[0] for call in request.call_args_list], urls)
+
+    def test_metadata_network_failures_preserve_partial_but_complete_errors_do_not(self):
+        for failure in ("short", "chunked", "reset", "json", "manifest"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                filesystem = load_filesystem_module()
+                source = "http://source/run/step_1"
+                calls = []
+
+                def request(url, timeout):
+                    calls.append(url)
+                    if failure == "reset":
+                        raise ConnectionResetError("connection reset by peer")
+                    body = b'{"version":9}' if failure == "manifest" else b'{"ver'
+                    return self._metadata_response(
+                        body, declared=13 if failure == "short" else len(body),
+                        chunked=failure == "chunked",
+                    )
+
+                with mock.patch.dict(os.environ, {"PRIME_LORA_CACHE_DIR": temporary}), mock.patch.object(
+                    filesystem, "_metadata_source_urls", return_value=["http://lane0/meta", "http://lane1/meta"]
+                ), mock.patch.object(filesystem.urllib.request, "urlopen", side_effect=request):
+                    destination = filesystem.adapter_cache_path(source)
+                    partial = destination.with_name(destination.name + ".partial")
+                    partial.mkdir()
+                    sentinel = partial / "retained-chunk"
+                    sentinel.write_bytes(b"retained")
+                    network_failure = failure in {"short", "chunked", "reset"}
+                    exception = filesystem._PersistentTransportError if network_failure else (ValueError, OSError)
+                    with self.assertRaises(exception):
+                        filesystem.stage_lora_adapter_files(source, require_delta=True)
+                    self.assertEqual(len(calls), 2 if network_failure else 1)
+                    if network_failure:
+                        self.assertEqual(sentinel.read_bytes(), b"retained")
+                    else:
+                        self.assertFalse(partial.exists())
+
     def _persistent_server(self, filesystem, payload, action=None):
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -463,7 +620,7 @@ class DownloadSchedulerTest(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
-    def test_persistent_chunk_allows_continuous_trickle(self):
+    def test_persistent_chunk_rotates_and_resumes_continuous_trickle(self):
         filesystem = load_filesystem_module()
         payload = b"trickle-body"
 
@@ -523,8 +680,12 @@ class DownloadSchedulerTest(unittest.TestCase):
                     os.close(parent_fd)
                 elapsed = time.monotonic() - started
                 self.assertEqual((chunks / "trickle").read_bytes(), payload)
-                self.assertEqual(handler.requests, 1)
-                self.assertGreaterEqual(elapsed, 0.55)
+                self.assertEqual(handler.requests, 2)
+                self.assertEqual(handler.paths, ["/slow", "/fast"])
+                resumed = int(handler.ranges[1].split("=")[1].split("-")[0])
+                self.assertGreater(resumed, 0)
+                self.assertLess(resumed, len(payload))
+                self.assertGreaterEqual(elapsed, 0.2)
                 self.assertLess(elapsed, 1.2)
         finally:
             filesystem.lane_rotation_delay_seconds = old_delay

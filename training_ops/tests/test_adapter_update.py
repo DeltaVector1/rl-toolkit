@@ -220,7 +220,7 @@ class AdapterUpdateTest(unittest.TestCase):
         )
         self.assertNotIn("configs/general-agent/inference.toml", launcher)
         self.assertIn('@ "$inference_config"', launcher)
-        self.assertIn("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-112}", launcher)
+        self.assertIn("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-16}", launcher)
         self.assertIn('-e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams"', launcher)
         self.assertIn("-e PRIME_LORA_LANE_TIMEOUT_S=90", launcher)
         self.assertIn("-e PRIME_LORA_CHUNK_TIMEOUT_S=90", launcher)
@@ -244,7 +244,7 @@ class AdapterUpdateTest(unittest.TestCase):
             / "h200"
             / "start_inference.sh"
         ).read_text(encoding="utf-8")
-        start = launcher.index("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-112}")
+        start = launcher.index("download_streams=${PRIME_LORA_DOWNLOAD_STREAMS-16}")
         end = launcher.index("runtime_output=$(python3", start)
         validation = launcher[start:end]
 

@@ -1012,7 +1012,10 @@ def _read_source_bytes(
                     read_size = 16 * 1024 * 1024
                     if max_bytes is not None:
                         read_size = min(read_size, max_bytes - total + 1)
-                    chunk = response.read(read_size)
+                    try:
+                        chunk = response.read(read_size)
+                    except http.client.IncompleteRead as exc:
+                        raise _PersistentTransportError("adapter metadata body ended early") from exc
                     if not chunk:
                         break
                     chunks.append(chunk)
@@ -1022,6 +1025,8 @@ def _read_source_bytes(
                             f"source exceeds the {max_bytes}-byte read limit: {source_url}"
                         )
                 _check_deadline(deadline, cancel_event)
+                if content_length is not None and total != content_length_value:
+                    raise _PersistentTransportError("adapter metadata body ended early")
                 return b"".join(chunks)
         except HTTPError as exc:
             if not _is_retryable_metadata_error(exc):
@@ -1030,7 +1035,8 @@ def _read_source_bytes(
         except OSError as exc:
             if not _is_retryable_metadata_error(exc):
                 raise
-            last_error = exc
+            last_error = _PersistentTransportError("adapter metadata request failed")
+            last_error.__cause__ = exc
     assert last_error is not None
     raise last_error
 
@@ -1190,7 +1196,7 @@ def _is_retryable_metadata_error(exception: BaseException) -> bool:
         return _retryable_adapter_http_status(exception.code)
     if isinstance(exception, _AdapterMetadataError):
         return False
-    if isinstance(exception, (TimeoutError, ConnectionError, socket.timeout)):
+    if isinstance(exception, (_PersistentTransportError, TimeoutError, ConnectionError, socket.timeout)):
         return True
     if isinstance(exception, URLError):
         reason = exception.reason
@@ -3606,6 +3612,7 @@ class _PersistentAdapterConnection:
         expected_sha256: str | None,
         timeout: float,
         stage_deadline: float | None = None,
+        attempt_deadline: float | None = None,
         cancel_event: threading.Event | None = None,
         consume,
     ) -> None:
@@ -3613,12 +3620,14 @@ class _PersistentAdapterConnection:
             raise OSError("adapter persistent read timeout must be positive")
         def remaining_timeout() -> float:
             _check_cancelled(cancel_event)
-            if stage_deadline is None:
-                return timeout
-            remaining = stage_deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("adapter persistent request exceeded its stage time limit")
-            return min(timeout, remaining)
+            remaining = timeout
+            now = time.monotonic()
+            for bound, label in ((stage_deadline, "stage"), (attempt_deadline, "attempt")):
+                if bound is not None:
+                    if now >= bound:
+                        raise TimeoutError(f"adapter persistent request exceeded its {label} time limit")
+                    remaining = min(remaining, bound - now)
+            return remaining
 
         try:
             connection, parsed = self._open(source_url, remaining_timeout())
@@ -3782,14 +3791,9 @@ class _PersistentAdapterLanePool:
             raise OSError("persistent adapter lane URLs are unavailable")
         primary = self._primary_urls[lane % self.slot_count]
         assert isinstance(primary, str)
-        return [
-            f"{primary.rstrip('/')}/{name}",
-            *(
-                f"{source.rstrip('/')}/{name}"
-                for source in self._source_urls
-                if source != primary
-            ),
-        ]
+        start = self._source_urls.index(primary)
+        sources = self._source_urls[start:] + self._source_urls[:start]
+        return [f"{source.rstrip('/')}/{name}" for source in sources]
 
     def close(self) -> None:
         for _lock, connection in self._lanes:
@@ -3847,6 +3851,8 @@ class _PersistentAdapterLanePool:
                         cancel_event,
                         parent_fd=parent_fd,
                     ) == expected_sha256:
+                        if progress is not None and present != reported_bytes:
+                            progress(lane, present - reported_bytes)
                         return
                     os.unlink(destination.name, dir_fd=parent_fd)
                     if progress is not None and reported_bytes:
@@ -3854,6 +3860,10 @@ class _PersistentAdapterLanePool:
                     reported_bytes = 0
                     present = 0
 
+                if present != reported_bytes:
+                    if progress is not None:
+                        progress(lane, present - reported_bytes)
+                    reported_bytes = present
                 while source_cursor < len(source_urls):
                     source_url = source_urls[source_cursor]
                     source_cursor += 1
@@ -3880,6 +3890,12 @@ class _PersistentAdapterLanePool:
                         ),
                         _ADAPTER_LANE_TIMEOUT_S,
                     )
+                attempt_timeout = _configured_chunk_timeout()
+                if per_request_timeout_seconds is not None:
+                    attempt_timeout = min(attempt_timeout, per_request_timeout_seconds)
+                attempt_deadline = time.monotonic() + attempt_timeout
+                if deadline is not None:
+                    attempt_deadline = min(attempt_deadline, deadline)
                 try:
                     with os.fdopen(
                         _open_nofollow(
@@ -3911,6 +3927,7 @@ class _PersistentAdapterLanePool:
                             expected_sha256=expected_sha256,
                             timeout=timeout,
                             stage_deadline=deadline,
+                            attempt_deadline=attempt_deadline,
                             cancel_event=cancel_event,
                             consume=consume,
                         )
@@ -4512,6 +4529,7 @@ def _stage_chunked_linear_adapter(
     total_wire_bytes = sum(int(item["wire_size"]) for item in chunks) + config_size
     progress_lock = threading.Lock()
     progress_bytes = 0
+    credited_wire_names: set[str] = set()
     for item in chunks:
         if not isinstance(item, dict) or not isinstance(item.get("file"), str):
             continue
@@ -4519,35 +4537,9 @@ def _stage_chunked_linear_adapter(
         _reject_symlink_path(chunk_path, "adapter transport chunk")
         if _path_regular_size(chunk_path, "adapter transport chunk") != int(item["wire_size"]):
             continue
-        done_path = _proof_path(chunk_path, _COMPLETED_SUFFIX)
-        wire_ready_path = _proof_path(chunk_path, _WIRE_READY_SUFFIX)
-        done_valid, done_proof = _proof_identity_matches(done_path, item, completed=True)
-        done_valid = done_valid and _output_proof_matches(
-            output_path, item, done_proof, deadline, cancel_event
-        )
-        if done_valid:
-            try:
-                done_valid = (
-                    _path_regular_size(chunk_path, "adapter transport chunk")
-                    == int(item["wire_size"])
-                    and _sha256(chunk_path, deadline, cancel_event)
-                    == str(item["wire_sha256"])
-                )
-            except (FileNotFoundError, OSError):
-                done_valid = False
-        wire_ready_valid, _ = _proof_identity_matches(wire_ready_path, item, completed=False)
-        if wire_ready_valid:
-            try:
-                wire_ready_valid = (
-                    _path_regular_size(chunk_path, "adapter transport chunk")
-                    == int(item["wire_size"])
-                    and _sha256(chunk_path, deadline, cancel_event)
-                    == str(item["wire_sha256"])
-                )
-            except (FileNotFoundError, OSError):
-                wire_ready_valid = False
-        if done_valid or wire_ready_valid:
+        if _sha256(chunk_path, deadline, cancel_event) == str(item["wire_sha256"]):
             progress_bytes += int(item["wire_size"])
+            credited_wire_names.add(str(item["file"]))
     reconstruct_lock = threading.Lock()
     reconstruct_worker_seconds = 0.0
     reconstruction_started = None
@@ -4634,30 +4626,7 @@ def _stage_chunked_linear_adapter(
         _reject_symlink_path(chunk_path, "adapter transport chunk")
         _reject_symlink_path(incoming_path, "adapter chunk incoming file")
         wire_size = int(item["wire_size"])
-        reusable = False
-        for proof_path, completed in (
-            (_proof_path(chunk_path, _COMPLETED_SUFFIX), True),
-            (_proof_path(chunk_path, _WIRE_READY_SUFFIX), False),
-        ):
-            proof_valid, proof = _proof_identity_matches(
-                proof_path, item, completed=completed
-            )
-            if not proof_valid:
-                continue
-            try:
-                reusable = (
-                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
-                    and _sha256(chunk_path, deadline, cancel_event)
-                    == str(item["wire_sha256"])
-                )
-                if reusable and completed:
-                    reusable = _output_proof_matches(
-                        output_path, item, proof, deadline, cancel_event
-                    )
-            except (FileNotFoundError, OSError):
-                reusable = False
-            if reusable:
-                break
+        reusable = str(item["file"]) in credited_wire_names
         if not reusable:
             # The old final wire file remains until incoming is atomically
             # renamed over it, so reserve the incoming allocation as peak use.
@@ -4793,6 +4762,9 @@ def _stage_chunked_linear_adapter(
 
         if not wire_ready_valid:
             chunk_lane = assigned_lane
+            if name in credited_wire_names:
+                report(chunk_lane, -wire_size)
+                credited_wire_names.remove(name)
 
             def lane_report(_lane: int, amount: int) -> None:
                 report(chunk_lane, amount)
@@ -5509,6 +5481,8 @@ def _stage_chunked_xor_adapter(
             with timing_lock:
                 if transfer_finished is None or transfer_finished_at > transfer_finished:
                     transfer_finished = transfer_finished_at
+        else:
+            report(chunk_lane, wire_size)
 
         _check_deadline(deadline, cancel_event)
         encoded = _read_bytes_nofollow(chunk_path)

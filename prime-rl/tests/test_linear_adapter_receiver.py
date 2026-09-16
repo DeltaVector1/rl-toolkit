@@ -160,7 +160,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             )
         self.assertEqual(closed, ["response", "connection"])
 
-    def test_persistent_read_allows_slow_continuous_progress(self):
+    def test_persistent_read_allows_progress_within_attempt_bound(self):
         filesystem = load_filesystem()
         closed = []
 
@@ -213,6 +213,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 total=4,
                 expected_sha256=None,
                 timeout=0.01,
+                attempt_deadline=time.monotonic() + 0.1,
                 consume=received.append,
             )
         finally:
@@ -744,17 +745,35 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 destination.rename(partial)
                 (partial / "READY").unlink()
                 (partial / "adapter_model.safetensors").write_bytes(b"damaged!")
-                resumed = filesystem._stage_chunked_linear_adapter(
-                    source_url,
-                    transport,
-                    source_manifest,
-                    deadline=None,
-                    status_metadata={
-                        "policy_step": 3,
-                        "stage_timeout_seconds": 300.0,
-                        "acceptance_target_seconds": 300.0,
-                    },
+                (partial / "transport-chunks" / "chunk-0.done").unlink()
+                statuses = []
+                old_status = filesystem._write_stage_status
+
+                def record_status(cache_root, value, **kwargs):
+                    statuses.append(dict(value))
+                    return old_status(cache_root, value, **kwargs)
+
+                filesystem._write_stage_status = record_status
+                try:
+                    resumed = filesystem._stage_chunked_linear_adapter(
+                        source_url,
+                        transport,
+                        source_manifest,
+                        deadline=None,
+                        status_metadata={
+                            "policy_step": 3,
+                            "stage_timeout_seconds": 300.0,
+                            "acceptance_target_seconds": 300.0,
+                        },
+                    )
+                finally:
+                    filesystem._write_stage_status = old_status
+                self.assertEqual(statuses[0]["bytes_done"], len(wire))
+                self.assertEqual(
+                    max(value["bytes_done"] for value in statuses if value["status"] == "staging"),
+                    len(wire) + len(config),
                 )
+                self.assertTrue(all(0 <= value["bytes_done"] <= value["bytes_total"] for value in statuses))
                 self.assertEqual((resumed / "adapter_model.safetensors").read_bytes(), target)
                 self.assertEqual(chunk_download_calls, 1)
                 self.assertEqual(decode_calls, 3)
