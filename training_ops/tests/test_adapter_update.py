@@ -37,7 +37,15 @@ def _load_function(path: Path, name: str):
     node.returns = None
     for arg in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs):
         arg.annotation = None
-    namespace = {}
+    shared_path = training_ops.repo_root / "prime-rl/src/prime_rl/utils/checkpoint_delta.py"
+    shared_constant = next(
+        assignment.value
+        for assignment in ast.parse(shared_path.read_text(encoding="utf-8")).body
+        if isinstance(assignment, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "adapter_stage_timeout_seconds"
+                for target in assignment.targets)
+    )
+    namespace = {"adapter_stage_timeout_seconds": ast.literal_eval(shared_constant)}
     exec(
         compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), str(path), "exec"),
         namespace,
@@ -61,7 +69,7 @@ class AdapterUpdateTest(unittest.TestCase):
             ("receiver", receiver_limit, OSError),
             ("client", client_limit, RuntimeError),
         )
-        for step, expected in ((1, 960), (2, 960), (3, 960), (4, 960), (99, 960)):
+        for step, expected in ((1, 600), (2, 600), (3, 600), (4, 600), (99, 600)):
             with self.subTest(step=step):
                 self.assertEqual(
                     [int(limit(step)) for _, limit, _ in layers],
@@ -604,7 +612,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 6,
-            "stage_timeout_seconds": 960,
+            "stage_timeout_seconds": 600,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 298.297,
             "error": "TimeoutError: adapter persistent request exceeded its stage time limit",
@@ -614,7 +622,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 6,
-            "stage_timeout_seconds": 960,
+            "stage_timeout_seconds": 600,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 299.102,
             "error": "_PersistentTransportError: adapter persistent download retries exhausted",
@@ -635,7 +643,7 @@ class AdapterUpdateTest(unittest.TestCase):
             evidence,
         )
 
-    def test_step_one_terminal_status_uses_960_limit_and_reports_target_overrun(self):
+    def test_step_one_terminal_status_uses_600_limit_and_reports_target_overrun(self):
         config = training_ops._adapter_update_config("glm-perf-3")
         broadcast = training_ops.AdapterBroadcast(
             path="/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3/broadcasts/step_1",
@@ -648,9 +656,9 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 1,
-            "stage_timeout_seconds": 960,
+            "stage_timeout_seconds": 600,
             "acceptance_target_seconds": 300,
-            "elapsed_seconds": 960.0,
+            "elapsed_seconds": 600.0,
             "error": "_PersistentTransportError: adapter persistent request failed",
         }
         with mock.patch.object(
@@ -663,7 +671,7 @@ class AdapterUpdateTest(unittest.TestCase):
             return_value={"h200a": (0, json.dumps(failed)), "h200b": (0, json.dumps(failed))},
         ):
             evidence = training_ops._adapter_stage_status_evidence("glm-perf-3", config, "")
-        self.assertIn("operational limit 960s", evidence)
+        self.assertIn("operational limit 600s", evidence)
         self.assertIn("300s acceptance target exceeded on h200a, h200b", evidence)
 
     def test_terminal_stage_status_refuses_stale_unknown_and_success(self):
@@ -682,7 +690,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 6,
-            "stage_timeout_seconds": 960,
+            "stage_timeout_seconds": 600,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 262.336,
         }
@@ -691,7 +699,7 @@ class AdapterUpdateTest(unittest.TestCase):
             "source_url": source,
             "path": cache,
             "policy_step": 6,
-            "stage_timeout_seconds": 960,
+            "stage_timeout_seconds": 600,
             "acceptance_target_seconds": 300,
             "elapsed_seconds": 298.297,
             "error": "_PersistentTransportError: adapter persistent request failed",
@@ -715,6 +723,16 @@ class AdapterUpdateTest(unittest.TestCase):
         check(
             {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(unknown))},
             "not terminal",
+        )
+        wrong_limit = dict(failed, stage_timeout_seconds=960)
+        check(
+            {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(wrong_limit))},
+            "wrong operational limit",
+        )
+        overdue = dict(failed, elapsed_seconds=600.1)
+        check(
+            {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(overdue))},
+            "duration on h200b is invalid",
         )
         check(
             {"h200a": (0, json.dumps(ready)), "h200b": (0, json.dumps(ready))},

@@ -81,7 +81,7 @@ deployment_scp_timeout_seconds = 300
 deployment_bundle_scp_timeout_seconds = 60
 large_file_transfer_timeout_seconds = 7200
 adapter_update_engine_startup_timeout_seconds = 900
-adapter_delta_stage_timeout_seconds = 300
+adapter_delta_stage_timeout_seconds = 600
 adapter_stage_acceptance_target_seconds = 300
 trainer_seconds_max = 600
 rollout_seconds_max = 720
@@ -96,7 +96,7 @@ _dependency_remote_archive_pattern = re.compile(
 def _adapter_stage_limit_seconds(policy_step: int) -> int:
     if type(policy_step) is not int or policy_step <= 0:
         raise Refused("adapter policy step must be a positive integer")
-    return 960
+    return adapter_delta_stage_timeout_seconds
 
 if set(inference_hosts) != set(inference_settings):
     raise RuntimeError("each inference host must have one [inference.<host>] entry")
