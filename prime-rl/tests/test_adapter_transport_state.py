@@ -2100,7 +2100,8 @@ class AdapterTransportStateTest(unittest.TestCase):
         self.assertIn('manifest.get("version") != 1', watcher_source)
         policy_update = watcher_source[watcher_source.index('f"Policy update'):]
         self.assertIn("attempts=update_attempts", policy_update)
-        self.assertIn("2 * adapter_stage_limit_seconds", watcher_source)
+        self.assertIn("update_deadline = time.monotonic() + adapter_stage_limit_seconds", watcher_source)
+        self.assertNotIn("2 * adapter_stage_limit_seconds", watcher_source)
         self.assertIn("delta_deadline = min(delta_deadline, update_deadline)", watcher_source)
         self.assertIn("for attempt in range(1, attempts + 1)", watcher_source)
         self.assertIn("failed on attempt {attempt}/{attempts}", watcher_source)

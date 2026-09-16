@@ -1305,12 +1305,16 @@ def _prepare_predictive_build(
         os.chmod(artifact, 0o600)
     _promote_cache(active_run, pending, step)
     _install_predictive_manifest(target, build, manifest, step, deadline=deadline, publish=False)
-    _identity_from_published_directory(target, step, cache=False)
-    _check_upgrade_deadline(deadline)
-    return {
+    target_stats = {
         name: list(_stat_identity(target / name))
         for name in (adapter_config_name, adapter_weights_name, adapter_manifest_name, stable_name)
     }
+    _identity_from_published_directory(target, step, cache=False)
+    for name, identity in target_stats.items():
+        if list(_stat_identity(target / name)) != identity:
+            raise UpgradeError("predictive adapter target changed during final validation")
+    _check_upgrade_deadline(deadline)
+    return target_stats
 
 
 def _stop_and_reap_worker(process: subprocess.Popen) -> None:
@@ -1536,6 +1540,7 @@ def _upgrade_v1_step(
                             observed, expected = observed[:4], expected[:4]
                         if observed != expected:
                             raise UpgradeError("predictive adapter target changed before publication")
+                    _check_upgrade_deadline(deadline, connection)
 
                 check_publication()
                 _replace_from_dirs(

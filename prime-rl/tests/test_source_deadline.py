@@ -106,6 +106,17 @@ class ManifestDeadlineTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SourceDeadlineTest(unittest.TestCase):
+    def predictive_steps(self, root):
+        for step in range(3):
+            target = root / f"step_{step}"
+            target.mkdir()
+            (target / "STABLE").touch()
+            (target / "adapter_config.json").write_text('{}')
+            (target / "adapter_model.safetensors").write_bytes(
+                valid_safetensor_bytes([16000 + step] * 64))
+            adapter_delta.publish_adapter_manifest(target, target_step=step)
+        return target
+
     def target(self, root):
         target = root / "step_2"
         target.mkdir()
@@ -193,14 +204,7 @@ class SourceDeadlineTest(unittest.TestCase):
     def test_real_exec_retry_keeps_cache_only_second_base_until_commit(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for step in range(3):
-                target = root / f"step_{step}"
-                target.mkdir()
-                (target / "STABLE").touch()
-                (target / "adapter_config.json").write_text('{}')
-                (target / "adapter_model.safetensors").write_bytes(
-                    valid_safetensor_bytes([16000 + step] * 64))
-                adapter_delta.publish_adapter_manifest(target, target_step=step)
+            target = self.predictive_steps(root)
             base2 = root / "step_0"
             private_base2 = root / adapter_server.cache_name / "step_0"
             private_base2.parent.mkdir()
@@ -225,6 +229,98 @@ class SourceDeadlineTest(unittest.TestCase):
             self.assertEqual(json.loads((target / "adapter_manifest.json").read_text())["version"], 2)
             self.assertFalse(list(root.glob(".predictive-build-*")))
             self.assertFalse(list((root / adapter_server.cache_name).glob(".pending-*")))
+
+    def test_mutation_after_final_checksum_keeps_old_manifest_and_retry_succeeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = self.predictive_steps(root)
+            manifest_path = target / adapter_server.adapter_manifest_name
+            weights_path = target / adapter_server.adapter_weights_name
+            old_manifest, old_weights = manifest_path.read_bytes(), weights_path.read_bytes()
+            real_popen = subprocess.Popen
+            processes = []
+
+            def launch(command, **kwargs):
+                script = """
+import runpy, sys
+from pathlib import Path
+namespace = runpy.run_path(sys.argv[1])
+globals_ = namespace['_upgrade_worker_main'].__globals__
+sha256 = globals_['_sha256']
+weights = Path(sys.argv[4])
+checks = 0
+def mutate_after_checksum(path):
+    global checks
+    digest = sha256(path)
+    if path == weights:
+        checks += 1
+        if checks == 2:
+            payload = weights.read_bytes()
+            weights.write_bytes(payload[:-1] + bytes([payload[-1] ^ 1]))
+    return digest
+globals_['_sha256'] = mutate_after_checksum
+sys.exit(namespace['_upgrade_worker_main'](int(sys.argv[2]), int(sys.argv[3])))
+"""
+                process = real_popen([sys.executable, "-c", script, command[1],
+                                      command[-2], command[-1], str(weights_path)], **kwargs)
+                processes.append(process)
+                return process
+
+            env = {"PYTHONPATH": str(Path(__file__).parents[1] / "src")}
+            with mock.patch.dict(os.environ, env):
+                with mock.patch.object(adapter_server.subprocess, "Popen", launch):
+                    with self.assertRaisesRegex(adapter_server.UpgradeError, "changed during final validation"):
+                        adapter_server._upgrade_v1_step(root, target, 2, "http://source")
+                self.assertNotEqual(weights_path.read_bytes(), old_weights)
+                self.assertEqual(manifest_path.read_bytes(), old_manifest)
+                self.assertTrue(all(process.poll() is not None for process in processes))
+                weights_path.write_bytes(old_weights)
+                adapter_server._upgrade_v1_step(root, target, 2, "http://source")
+            self.assertEqual(json.loads(manifest_path.read_text())["version"], 2)
+
+    def test_final_stat_expires_budget_before_commit_and_retry_succeeds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = self.predictive_steps(root)
+            manifest_path = target / adapter_server.adapter_manifest_name
+            old_manifest = manifest_path.read_bytes()
+            deadline = time.monotonic() + 600
+            monotonic = time.monotonic
+            stat_identity = adapter_server._stat_identity
+            replace = adapter_server._replace_from_dirs
+            final_check = False
+            expired = False
+
+            def delayed_stat(path):
+                nonlocal expired
+                result = stat_identity(path)
+                if final_check and path == target / adapter_server.stable_name:
+                    # Advance the clock at the last stat, after the callback's
+                    # initial deadline check, without a 600-second test sleep.
+                    expired = True
+                return result
+
+            def final_replace(source, destination, *args, **kwargs):
+                nonlocal final_check
+                if destination == manifest_path:
+                    final_check = True
+                try:
+                    return replace(source, destination, *args, **kwargs)
+                finally:
+                    final_check = False
+
+            env = {"PYTHONPATH": str(Path(__file__).parents[1] / "src")}
+            with mock.patch.dict(os.environ, env):
+                with mock.patch.object(adapter_server, "_stat_identity", delayed_stat), \
+                        mock.patch.object(adapter_server, "_replace_from_dirs", final_replace), \
+                        mock.patch.object(adapter_server.time, "monotonic",
+                                          lambda: deadline + 0.01 if expired else monotonic()):
+                    with self.assertRaisesRegex(adapter_server.UpgradeError, "deadline"):
+                        adapter_server._upgrade_v1_step(root, target, 2, "http://source", deadline=deadline)
+                self.assertTrue(expired)
+                self.assertEqual(manifest_path.read_bytes(), old_manifest)
+                adapter_server._upgrade_v1_step(root, target, 2, "http://source")
+            self.assertEqual(json.loads(manifest_path.read_text())["version"], 2)
 
     def test_slow_hash_and_scavenge_are_killed_in_exec_worker(self):
         real_popen = subprocess.Popen
