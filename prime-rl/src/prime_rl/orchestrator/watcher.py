@@ -30,6 +30,7 @@ from prime_rl.utils.client import (
     model_is_visible,
     stage_full_checkpoint,
     stage_lora_adapter,
+    remove_lora_adapter,
 )
 from prime_rl.utils.logger import format_time, get_logger
 from prime_rl.utils.pathing import get_broadcast_dir, get_step_path, wait_for_path
@@ -846,6 +847,23 @@ class WeightWatcher:
             manifest,
         )
 
+    async def _remove_initial_lora(self) -> None:
+        """Release only the bootstrap slot after the two rolling slots are in use."""
+        if self.lora_name is None or self.ckpt_step < 2:
+            return
+        current_slot = f"{self.lora_name}-slot{self.ckpt_step % 2}"
+        if (
+            self.policy.model_name != current_slot
+            or self.policy.version != self.ckpt_step
+            or self.verified_adapter_step != self.ckpt_step
+        ):
+            raise RuntimeError("cannot remove initial LoRA before the current policy is verified and switched")
+        clients = self.inference.admin_clients
+        await remove_lora_adapter(clients, self.lora_name)
+        if await common_loaded_lora_receipt(clients, self.lora_name) is not None:
+            raise RuntimeError("initial LoRA is still loaded after removal")
+        get_logger().info(f"Initial LoRA slot {self.lora_name} is absent after policy v{self.ckpt_step}")
+
     async def apply_policy_update(
         self,
         next_step: int,
@@ -855,6 +873,9 @@ class WeightWatcher:
             if next_step <= self.ckpt_step:
                 # Another caller raced us — bail without re-applying
                 return
+
+            if next_step >= 3:
+                await self._remove_initial_lora()
 
             checkpoint_wait_started = time.perf_counter()
             weights_path = None
@@ -1069,6 +1090,9 @@ class WeightWatcher:
             # rollout must not use the new policy until both inference hosts
             # report the adapter as visible.
             await self.inference.wait_for_ready(self.policy.model_name)
+
+            if next_step == 2:
+                await self._remove_initial_lora()
 
             for observer in self.observers:
                 try:

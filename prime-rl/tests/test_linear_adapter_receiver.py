@@ -8,6 +8,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -51,6 +52,29 @@ def load_filesystem():
 
 
 class LinearAdapterReceiverTest(unittest.TestCase):
+    def test_empty_receipts_allow_a_cache_directory_that_does_not_exist(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "not-created"
+            with mock.patch.dict(os.environ, {"PRIME_LORA_CACHE_DIR": str(cache)}):
+                filesystem.write_loaded_adapter_receipts({})
+            self.assertFalse(cache.exists())
+
+    def test_receipt_write_fails_closed_without_process_identity(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+        ):
+            receipts = {"initial": {"source_url": "http://source/step_0"},
+                        "slot0": {"source_url": "http://source/step_2"}}
+            filesystem.write_loaded_adapter_receipts(receipts)
+            path = Path(temporary) / filesystem._ADAPTER_LOADED_RECEIPTS
+            old_bytes = path.read_bytes()
+            with mock.patch.object(filesystem, "_process_start_time", return_value=None):
+                with self.assertRaisesRegex(OSError, "start-time identity"):
+                    filesystem.write_loaded_adapter_receipts({"slot0": receipts["slot0"]})
+            self.assertEqual(path.read_bytes(), old_bytes)
+
     def test_publish_sync_order_is_staging_then_parent(self):
         source = (ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py").read_text(
             encoding="utf-8"

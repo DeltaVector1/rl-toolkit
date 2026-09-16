@@ -164,6 +164,9 @@ def _load_adapter_load_function():
         "_validate_loaded_receipt",
         "_is_retryable_lora_error",
         "load_lora_adapter",
+        "common_loaded_lora_receipt",
+        "unload_lora_adapter",
+        "remove_lora_adapter",
     }
     nodes = [
         node
@@ -185,6 +188,7 @@ def _load_adapter_load_function():
         "_cancel_and_reap": cancel_and_reap,
         "get_logger": lambda: SimpleNamespace(debug=lambda *_args: None, warning=lambda *_args: None),
         "httpx": httpx,
+        "urlsplit": __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit,
         "re": re,
         "retry": lambda **_kwargs: lambda function: function,
         "retry_if_exception": lambda *_args, **_kwargs: None,
@@ -251,6 +255,62 @@ def _load_admin_post_function():
 
 
 class StageLoraAdapterTest(unittest.TestCase):
+    def test_remove_adapter_uses_verified_route_and_reaps_other_endpoints_on_failure(self):
+        remove = _load_adapter_load_function().__globals__["remove_lora_adapter"]
+        calls, stopped = [], []
+
+        async def exercise():
+            other_started = asyncio.Event()
+
+            async def post(client, path, **kwargs):
+                calls.append((client, path, kwargs))
+                if client == "one":
+                    await other_started.wait()
+                    raise RuntimeError("engine removal failed")
+                other_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.append(client)
+
+            remove.__globals__["_admin_post_response"] = post
+            with self.assertRaisesRegex(RuntimeError, "engine removal failed"):
+                await remove(["one", "two"], "policy")
+            self.assertFalse([task for task in asyncio.all_tasks()
+                              if task is not asyncio.current_task() and not task.done()])
+
+        asyncio.run(exercise())
+        self.assertEqual(stopped, ["two"])
+        for _client, path, kwargs in calls:
+            self.assertEqual(path, "/remove_lora_adapter")
+            self.assertEqual(kwargs["json"], {"lora_name": "policy"})
+            self.assertEqual((kwargs["timeout_s"], kwargs["total_timeout_s"], kwargs["max_attempts"]), (30.0, 30.0, 1))
+
+    def test_common_loaded_receipt_requires_consistent_endpoint_state(self):
+        common = _load_adapter_load_function().__globals__["common_loaded_lora_receipt"]
+        receipt = {**_adapter_identity(), "lora_name": "initial", "server_instance": "one"}
+
+        class Client:
+            def __init__(self, payload, status=200):
+                self.payload, self.status = payload, status
+
+            async def get(self, path, **_kwargs):
+                self_path = "http://host" + path
+                return httpx.Response(self.status, json=self.payload, request=httpx.Request("GET", self_path))
+
+        absent = {"loaded_receipts": {}}
+        present = {"loaded_receipts": {"initial": receipt}}
+        self.assertIsNone(asyncio.run(common([Client(absent), Client(absent)], "initial")))
+        other = {"loaded_receipts": {"initial": {**receipt, "server_instance": "two"}}}
+        self.assertEqual(asyncio.run(common([Client(present), Client(other)], "initial")),
+                         {key: value for key, value in receipt.items() if key != "server_instance"})
+        for second in (absent, {}, {"loaded_receipts": []}, {"loaded_receipts": {"initial": None}},
+                       {"loaded_receipts": {"initial": {**receipt, "target_sha256": "f" * 64}}}):
+            with self.subTest(second=second), self.assertRaises(RuntimeError):
+                asyncio.run(common([Client(present), Client(second)], "initial"))
+        with self.assertRaises(httpx.HTTPStatusError):
+            asyncio.run(common([Client(present), Client(absent, 500)], "initial"))
+
     def test_health_rejects_http_500(self):
         _maybe_check_has_model, check_health = _load_health_functions()
 

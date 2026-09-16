@@ -926,25 +926,71 @@ async def stage_lora_adapter(raw_request: Request):
     return await asyncio.shield(task)
 
 
+@router.post("/remove_lora_adapter")
+async def remove_lora_adapter(raw_request: Request):
+    """Remove one exact engine adapter before releasing its cache receipt."""
+    data = await raw_request.json()
+    name = data.get("lora_name") if isinstance(data, dict) else None
+    if not isinstance(name, str) or not name:
+        raise RuntimeError("adapter removal requires an exact LoRA name")
+    handler = models(raw_request)
+    async with asyncio.timeout(30.0), lora_load_lock, handler.lora_resolver_lock[name]:
+        loaded = getattr(handler, "lora_requests", None)
+        if not isinstance(loaded, dict):
+            raise RuntimeError("loaded LoRA registry is unavailable")
+        stored = loaded.get(name)
+        if stored is None:
+            if name in _loaded_lora_receipts:
+                raise RuntimeError("adapter serving record is missing; engine removal is unverified")
+            return {"status": "ok"}
+        adapter_id = getattr(stored, "lora_int_id", None)
+        if getattr(stored, "lora_name", None) != name or type(adapter_id) is not int or adapter_id <= 0:
+            raise RuntimeError("adapter removal has an invalid name or engine ID")
+        if any(other_name != name and getattr(other, "lora_int_id", None) == adapter_id
+               for other_name, other in loaded.items()):
+            raise RuntimeError("adapter engine ID is shared by another LoRA name")
+        engine = engine_client(raw_request)
+        before = await engine.list_loras()
+        if not isinstance(before, set) or any(type(value) is not int or value <= 0 for value in before):
+            raise RuntimeError("engine adapter ID list is invalid")
+        if adapter_id in before and await engine.remove_lora(adapter_id) is not True:
+            raise RuntimeError("engine did not confirm adapter removal")
+        after = await engine.list_loras()
+        if after != before - {adapter_id}:
+            raise RuntimeError("engine adapter removal did not preserve the other adapter IDs")
+        if loaded.get(name) is not stored:
+            raise RuntimeError("adapter serving record changed during engine removal")
+        remaining = {key: value for key, value in _loaded_lora_receipts.items() if key != name}
+        # Persist first so a failed write leaves the exact name/ID available
+        # for a retry, even if the engine has already removed that ID.
+        write_loaded_adapter_receipts(remaining)
+        del loaded[name]
+        _loaded_lora_receipts.pop(name, None)
+        return {"status": "ok", "lora_name": name, "lora_int_id": adapter_id}
+
+
 @router.get("/staging_status")
 async def staging_status(raw_request: Request):
     state = _combined_lora_stage_status(_lora_stage_status(), adapter_stage_status())
     handler = models(raw_request)
     loaded = getattr(handler, "lora_requests", None)
+    if not isinstance(loaded, dict):
+        raise RuntimeError("loaded LoRA registry is unavailable")
+    # No await in this reconciliation: API loads cannot interleave with it.
     receipts = {}
-    if isinstance(loaded, dict):
-        for name, receipt in list(_loaded_lora_receipts.items()):
-            source_url = receipt.get("source_url")
-            stored = loaded.get(name)
-            expected_path = (
-                adapter_cache_path(source_url).as_posix()
-                if isinstance(source_url, str)
-                else None
-            )
-            if stored is None or str(getattr(stored, "lora_path", "")) != expected_path:
-                _loaded_lora_receipts.pop(name, None)
-                continue
-            receipts[name] = dict(receipt)
+    for name, receipt in _loaded_lora_receipts.items():
+        source_url = receipt.get("source_url")
+        stored = loaded.get(name)
+        expected_path = (
+            adapter_cache_path(source_url).as_posix()
+            if isinstance(source_url, str)
+            else None
+        )
+        if stored is None or str(getattr(stored, "lora_path", "")) != expected_path:
+            raise RuntimeError("adapter serving record is missing or changed; engine removal is unverified")
+        receipts[name] = dict(receipt)
+    # A missing serving record is not proof of engine removal. Only the
+    # verified removal route may release that adapter's cache receipt.
     state["loaded_receipts"] = receipts
     return state
 

@@ -2042,7 +2042,7 @@ def write_loaded_adapter_receipts(receipts: dict[str, dict[str, object]]) -> Non
         return
     start_time = _process_start_time(os.getpid())
     if start_time is None:
-        return
+        raise OSError("cannot persist loaded adapter receipts without process start-time identity")
     _ensure_directory(cache_root, "adapter cache directory")
     _write_json(
         path,

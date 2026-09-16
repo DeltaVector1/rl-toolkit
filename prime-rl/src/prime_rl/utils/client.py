@@ -115,9 +115,11 @@ async def common_loaded_lora_receipt(
         response.raise_for_status()
         payload = response.json()
         receipts = payload.get("loaded_receipts") if isinstance(payload, dict) else None
-        receipt = receipts.get(lora_name) if isinstance(receipts, dict) else None
-        if receipt is None:
+        if not isinstance(receipts, dict):
+            raise RuntimeError("staging status has no valid loaded adapter receipt map")
+        if lora_name not in receipts:
             return None
+        receipt = receipts[lora_name]
         source_url = receipt.get("source_url") if isinstance(receipt, dict) else None
         parsed = urlsplit(source_url) if isinstance(source_url, str) else None
         if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -1524,6 +1526,19 @@ async def load_lora_adapter(
         await _cancel_and_reap(tasks)
         raise
     return [result for result in results if result is not None]
+
+
+async def remove_lora_adapter(admin_clients: list[AsyncClient], lora_name: str) -> None:
+    """Remove an exact adapter from engine state, serving metadata, and receipts."""
+    tasks = [asyncio.create_task(_admin_post_response(
+        client, "/remove_lora_adapter", json={"lora_name": lora_name},
+        timeout_s=30.0, total_timeout_s=30.0, max_attempts=1,
+    )) for client in admin_clients]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        await _cancel_and_reap(tasks)
+        raise
 
 
 async def unload_lora_adapter(admin_clients: list[AsyncClient], lora_name: str) -> None:

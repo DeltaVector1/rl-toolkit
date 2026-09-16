@@ -1,5 +1,6 @@
 import ast
 import asyncio
+from collections import defaultdict
 import contextlib
 import hashlib
 import io
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from urllib.error import HTTPError
 from pathlib import Path
 from types import SimpleNamespace
@@ -121,6 +123,8 @@ def load_resume_slot_finder(common_receipt):
 
 
 def load_server_load_endpoints(destination, handler, reader_lock=None):
+    if not hasattr(handler, "lora_resolver_lock"):
+        handler.lora_resolver_lock = defaultdict(asyncio.Lock)
     source = SERVER_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
     names = {
@@ -131,6 +135,7 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
         "_target_has_routed_experts",
         "_validate_adapter_target_compatibility",
         "load_lora_adapter",
+        "remove_lora_adapter",
         "staging_status",
     }
     nodes = [
@@ -224,6 +229,7 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
         "hashlib": hashlib,
         "json": json,
         "models": lambda _request: handler,
+        "engine_client": lambda _request: handler.engine_client,
         "re": re,
         "router": FakeRouter(),
         "stage_lora_adapter_files": lambda *_args, **_kwargs: destination,
@@ -437,6 +443,160 @@ def run_startup_validator(
 
 
 class ResumeRecoveryTest(unittest.TestCase):
+    def test_engine_removal_failures_keep_metadata_and_receipts(self):
+        for failure in ("invalid id", "aliased id", "list failure", "remove failure", "not removed", "other ID lost"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                stored = SimpleNamespace(lora_name="policy", lora_int_id=17)
+                loaded = {"policy": stored, "policy-slot0": SimpleNamespace(lora_int_id=31),
+                          "policy-slot1": SimpleNamespace(lora_int_id=23)}
+                before = {17, 23, 31}
+                engine = SimpleNamespace(list_loras=mock.AsyncMock(side_effect=[before, {23, 31}]),
+                                         remove_lora=mock.AsyncMock(return_value=True))
+                handler = SimpleNamespace(lora_requests=loaded, engine_client=engine)
+                _, _, namespace, _, _ = load_server_load_endpoints(Path(temporary), handler)
+                receipts = {name: {"source_url": f"http://source/{name}"} for name in loaded}
+                namespace["_loaded_lora_receipts"].update(receipts)
+                writer = namespace["write_loaded_adapter_receipts"] = mock.Mock()
+                if failure == "invalid id":
+                    stored.lora_int_id = True
+                elif failure == "aliased id":
+                    loaded["policy-slot0"].lora_int_id = 17
+                elif failure == "list failure":
+                    engine.list_loras.side_effect = RuntimeError("engine list failed")
+                elif failure == "remove failure":
+                    engine.remove_lora.return_value = False
+                elif failure == "not removed":
+                    engine.list_loras.side_effect = [before, before]
+                else:
+                    engine.list_loras.side_effect = [before, {31}]
+
+                async def request_data():
+                    return {"lora_name": "policy"}
+
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(namespace["remove_lora_adapter"](SimpleNamespace(json=request_data)))
+                self.assertIs(loaded["policy"], stored)
+                self.assertEqual(namespace["_loaded_lora_receipts"], receipts)
+                writer.assert_not_called()
+
+    def test_engine_removal_is_serialized_and_keeps_other_adapter_ids(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ids, removed, probes = {17, 23, 31}, [], []
+
+            async def list_loras():
+                probes.append(set(ids))
+                return set(ids)
+
+            async def remove_lora(adapter_id):
+                await asyncio.sleep(0)
+                ids.remove(adapter_id)
+                removed.append(adapter_id)
+                return True
+
+            async def request_data():
+                return {"lora_name": "policy"}
+
+            loaded = {name: SimpleNamespace(lora_name=name, lora_int_id=value)
+                      for name, value in (("policy", 17), ("policy-slot1", 23), ("policy-slot0", 31))}
+            handler = SimpleNamespace(lora_requests=loaded,
+                engine_client=SimpleNamespace(list_loras=list_loras, remove_lora=remove_lora))
+            _, _, namespace, _, _ = load_server_load_endpoints(Path(temporary), handler)
+            namespace["_loaded_lora_receipts"].update({name: {} for name in loaded})
+            writer = namespace["write_loaded_adapter_receipts"] = mock.Mock()
+            remove = namespace["remove_lora_adapter"]
+
+            async def exercise():
+                async with handler.lora_resolver_lock["policy"]:
+                    first = asyncio.create_task(remove(SimpleNamespace(json=request_data)))
+                    await asyncio.sleep(0)
+                    self.assertEqual(probes, [], "removal must wait for the built-in per-name lock")
+                return await asyncio.gather(first, remove(SimpleNamespace(json=request_data)))
+
+            results = asyncio.run(exercise())
+            self.assertEqual([result["status"] for result in results], ["ok", "ok"])
+            self.assertEqual(removed, [17])
+            self.assertEqual(ids, {23, 31})
+            self.assertEqual(set(loaded), {"policy-slot0", "policy-slot1"})
+            writer.assert_called_once_with({"policy-slot0": {}, "policy-slot1": {}})
+
+    def test_status_persists_retirement_and_keeps_loaded_and_manifest_bases(self):
+        from test_linear_adapter_receiver import load_filesystem
+
+        status_node = next(node for node in ast.parse(SERVER_PATH.read_text()).body
+                           if isinstance(node, ast.AsyncFunctionDef) and node.name == "staging_status")
+        self.assertFalse(any(isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith))
+                             for node in ast.walk(status_node)))
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            initial_source = Path(temporary) / "initial.safetensors"
+            initial_source.write_bytes(b"source evidence")
+            with mock.patch.dict(os.environ, {"PRIME_LORA_CACHE_DIR": str(cache)}):
+                urls = {step: f"http://source/run/broadcasts/step_{step}" for step in range(4)}
+                paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+                names = {0: "policy", 1: "policy-slot1", 2: "policy-slot0"}
+                for step in range(3):
+                    write_cached_adapter(paths[step], urls[step], transport={"source_url": urls[step]})
+                handler = SimpleNamespace(lora_requests={
+                    names[step]: SimpleNamespace(lora_path=str(paths[step]), lora_name=names[step],
+                                                lora_int_id=(17, 23, 31)[step]) for step in range(3)
+                })
+                ids = {17, 23, 31}
+                removals = []
+
+                async def list_loras():
+                    return set(ids)
+
+                async def remove_lora(adapter_id):
+                    removals.append(adapter_id)
+                    ids.remove(adapter_id)
+                    return True
+
+                async def request_data():
+                    return {"lora_name": "policy"}
+
+                handler.engine_client = SimpleNamespace(list_loras=list_loras, remove_lora=remove_lora)
+                request = SimpleNamespace(json=request_data)
+                _, status, namespace, _, _ = load_server_load_endpoints(paths[2], handler)
+                receipts = {names[step]: {"source_url": urls[step]} for step in range(3)}
+                namespace["_loaded_lora_receipts"].update(receipts)
+                namespace["adapter_cache_path"] = filesystem.adapter_cache_path
+                namespace["write_loaded_adapter_receipts"] = filesystem.write_loaded_adapter_receipts
+                filesystem.write_loaded_adapter_receipts(receipts)
+                receipt_file = cache / filesystem._ADAPTER_LOADED_RECEIPTS
+                old_bytes = receipt_file.read_bytes()
+                stored = handler.lora_requests.pop("policy")
+                # Metadata-only unload must not release a possibly engine-mapped file.
+                with self.assertRaisesRegex(RuntimeError, "engine removal is unverified"):
+                    asyncio.run(status(request))
+                self.assertEqual(receipt_file.read_bytes(), old_bytes)
+                handler.lora_requests["policy"] = stored
+                with mock.patch.object(filesystem, "_process_start_time", return_value=None):
+                    with self.assertRaisesRegex(OSError, "start-time identity"):
+                        asyncio.run(namespace["remove_lora_adapter"](request))
+                self.assertEqual(receipt_file.read_bytes(), old_bytes)
+                self.assertEqual(namespace["_loaded_lora_receipts"], receipts)
+                self.assertIs(handler.lora_requests["policy"], stored)
+                self.assertEqual(ids, {23, 31})
+                self.assertEqual(asyncio.run(namespace["remove_lora_adapter"](request))["status"], "ok")
+                self.assertEqual(removals, [17])  # Retry finishes persistence without another engine removal.
+                with mock.patch.dict(namespace, {"write_loaded_adapter_receipts": mock.Mock(
+                    side_effect=AssertionError("status must not write receipts"))}):
+                    result = asyncio.run(status(request))
+                expected = {name: receipt for name, receipt in receipts.items() if name != "policy"}
+                self.assertEqual(result["loaded_receipts"], expected)
+                self.assertEqual(json.loads(receipt_file.read_text())["receipts"], expected)
+                self.assertEqual(set(filesystem._loaded_adapter_source_urls(cache)), {urls[1], urls[2]})
+                filesystem._cleanup_adapter_space_before_stage(cache, paths[3],
+                    {"mode": "delta", "base_url": urls[2], "base2_url": urls[1]})
+                self.assertFalse(paths[0].exists())
+                self.assertTrue(paths[1].exists())
+                self.assertTrue(paths[2].exists())
+                self.assertEqual(initial_source.read_bytes(), b"source evidence")
+                handler.lora_requests = None
+                with self.assertRaisesRegex(RuntimeError, "registry is unavailable"):
+                    asyncio.run(status(object()))
+
     def test_token_batch_budget_refills_a_drained_pipeline(self):
         _, budget = load_rollout_budget_functions()
         self.assertEqual(
@@ -556,6 +716,11 @@ class ResumeRecoveryTest(unittest.TestCase):
             self.assertEqual(namespace["_loaded_lora_receipts"]["adapter-slot1"], success["loaded_receipt"])
             self.assertEqual(asyncio.run(status(Request()))["loaded_receipts"]["adapter-slot1"], success["loaded_receipt"])
 
+            with mock.patch.dict(namespace, {"write_loaded_adapter_receipts": mock.Mock(
+                side_effect=OSError("cannot persist loaded receipts"))}):
+                with self.assertRaisesRegex(OSError, "cannot persist"):
+                    asyncio.run(load(LoadRequest(), Request()))
+
             delta_success = asyncio.run(load(LoadRequest(), UnprefetchedDeltaRequest()))
             self.assertEqual(delta_success["status"], "ok")
             self.assertEqual(len(stage_calls), 1)
@@ -563,7 +728,7 @@ class ResumeRecoveryTest(unittest.TestCase):
             self.assertEqual(stage_calls[0][1]["stage_timeout_seconds"], 960.0)
 
             async def status_during_staging():
-                stage_started = threading.Event()
+                stage_started = asyncio.Event()
 
                 def slow_stage(*_args, **_kwargs):
                     stage_started.set()
@@ -577,8 +742,7 @@ class ResumeRecoveryTest(unittest.TestCase):
                         return {"require_delta": False, "prefetched": False}
 
                 task = asyncio.create_task(load(LoadRequest(), UnprefetchedRequest()))
-                if not await asyncio.to_thread(stage_started.wait, 1.0):
-                    raise AssertionError("staging did not start")
+                await asyncio.wait_for(stage_started.wait(), 1.0)
                 state = await status(Request())
                 await task
                 return state
@@ -607,8 +771,11 @@ class ResumeRecoveryTest(unittest.TestCase):
             remote = asyncio.run(load(LoadRequest(), Request()))
             self.assertEqual(remote["status"], "ok")
             handler.lora_requests.pop("adapter-slot1")
-            self.assertNotIn("adapter-slot1", asyncio.run(status(Request()))["loaded_receipts"])
-            self.assertNotIn("adapter-slot1", namespace["_loaded_lora_receipts"])
+            with self.assertRaisesRegex(RuntimeError, "engine removal is unverified"):
+                asyncio.run(status(Request()))
+            self.assertIn("adapter-slot1", namespace["_loaded_lora_receipts"])
+            # This fixture has proved metadata-only removal is unsafe; clear its stale test receipt.
+            namespace["_loaded_lora_receipts"].pop("adapter-slot1")
 
             handler.response = object()
             handler.path_override = "/wrong/path"
