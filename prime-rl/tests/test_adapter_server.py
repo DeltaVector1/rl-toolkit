@@ -87,6 +87,114 @@ class AdapterServerTest(unittest.TestCase):
         adapter_server._identity_cache.clear()
         adapter_server._identity_validation_runs.clear()
         adapter_server._manifest_cache.clear()
+        adapter_server._transport_digest_cache.clear()
+
+    def test_transport_digest_cache_keeps_a_complete_predictive_manifest(self):
+        self.assertGreaterEqual(
+            adapter_server._MAX_TRANSPORT_DIGEST_CACHE_ENTRIES,
+            adapter_server.max_transport_chunks,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            chunks = []
+            payload = b"verified transport chunk"
+            digest = hashlib.sha256(payload).hexdigest()
+            for index in range(1834):
+                name = f"{adapter_server.adapter_weights_name}.transport-predictive-{index:05d}.bin"
+                (root / name).write_bytes(payload)
+                chunks.append({"file": name, "wire_size": len(payload), "wire_sha256": digest})
+            with mock.patch.object(
+                adapter_server, "_transport_digest_cache", adapter_server.OrderedDict()
+            ), mock.patch.object(
+                adapter_server, "_sha256_fd", wraps=adapter_server._sha256_fd
+            ) as hash_file:
+                adapter_server._validate_predictive_chunks(root, chunks)
+                self.assertEqual(hash_file.call_count, len(chunks))
+                for _ in range(2):
+                    for item in chunks:
+                        fd = os.open(root / item["file"], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                        try:
+                            adapter_server._verify_transport_fd(fd, item["wire_size"], item["wire_sha256"])
+                        finally:
+                            os.close(fd)
+                self.assertEqual(hash_file.call_count, len(chunks))
+                self.assertEqual(len(adapter_server._transport_digest_cache), len(chunks))
+
+    def test_transport_digest_cache_remains_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            adapter_server, "_transport_digest_cache", adapter_server.OrderedDict()
+        ), mock.patch.object(adapter_server, "_MAX_TRANSPORT_DIGEST_CACHE_ENTRIES", 3):
+            root = Path(temporary)
+            for index in range(4):
+                path = root / str(index)
+                path.write_bytes(b"chunk")
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    adapter_server._verify_transport_fd(fd, 5, hashlib.sha256(b"chunk").hexdigest())
+                finally:
+                    os.close(fd)
+                self.assertLessEqual(len(adapter_server._transport_digest_cache), 3)
+            self.assertEqual(len(adapter_server._transport_digest_cache), 3)
+
+    def test_transport_digest_cache_rejects_changed_file_or_manifest_digest(self):
+        for mutation in ("rewrite", "replacement", "size", "digest"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+                adapter_server, "_transport_digest_cache", adapter_server.OrderedDict()
+            ):
+                path = Path(temporary) / "chunk"
+                path.write_bytes(b"chunk")
+                digest = hashlib.sha256(b"chunk").hexdigest()
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    adapter_server._verify_transport_fd(fd, 5, digest)
+                finally:
+                    os.close(fd)
+                before = path.stat()
+                # Let filesystems with a coarse update clock advance ctime.
+                time.sleep(0.01)
+                if mutation == "rewrite":
+                    path.write_bytes(b"wrong")
+                    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    self.assertNotEqual(path.stat().st_ctime_ns, before.st_ctime_ns)
+                elif mutation == "replacement":
+                    incoming = path.with_name("incoming")
+                    incoming.write_bytes(b"wrong")
+                    os.utime(incoming, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    os.replace(incoming, path)
+                    self.assertNotEqual(path.stat().st_ino, before.st_ino)
+                elif mutation == "size":
+                    path.write_bytes(b"shorter?")
+                else:
+                    digest = hashlib.sha256(b"wrong").hexdigest()
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    with self.assertRaises(adapter_server.UpgradeError):
+                        adapter_server._verify_transport_fd(fd, 5, digest)
+                finally:
+                    os.close(fd)
+
+    def test_transport_digest_cache_does_not_keep_a_hash_raced_by_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            adapter_server, "_transport_digest_cache", adapter_server.OrderedDict()
+        ):
+            path = Path(temporary) / "chunk"
+            path.write_bytes(b"chunk")
+            original_hash = adapter_server._sha256_fd
+
+            def hash_then_mutate(fd, name):
+                result = original_hash(fd, name)
+                time.sleep(0.01)
+                path.write_bytes(b"wrong")
+                return result
+
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                with mock.patch.object(adapter_server, "_sha256_fd", hash_then_mutate):
+                    with self.assertRaisesRegex(adapter_server.UpgradeError, "changed during validation"):
+                        adapter_server._verify_transport_fd(fd, 5, hashlib.sha256(b"chunk").hexdigest())
+            finally:
+                os.close(fd)
+            self.assertFalse(adapter_server._transport_digest_cache)
 
     @contextmanager
     def _predictive_http_server(self, root):

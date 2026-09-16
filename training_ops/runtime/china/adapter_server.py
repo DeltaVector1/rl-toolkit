@@ -63,7 +63,8 @@ class _ValidationRun:
 _identity_validation_runs: dict[tuple[object, ...], _ValidationRun] = {}
 _transport_digest_cache: OrderedDict[tuple[str, tuple[int, int, int, int, int]], None] = OrderedDict()
 _transport_digest_lock = Lock()
-_MAX_TRANSPORT_DIGEST_CACHE_ENTRIES = 128
+# Keep one complete manifest's verified file identities for ranges and retries.
+_MAX_TRANSPORT_DIGEST_CACHE_ENTRIES = max_transport_chunks
 
 
 @dataclass(frozen=True)
