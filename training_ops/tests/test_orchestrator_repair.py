@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import training_ops
+import training_ops.tests  # Install the local-only test guard before any test runs.
 
 
 def _load_function(path, name, namespace=None):
@@ -52,19 +53,21 @@ class OrchestratorRepairTest(unittest.TestCase):
             training_ops,
             "_config_for_run",
             side_effect=AssertionError("explicit engine repair must not scan runs"),
-        ):
+        ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy:
             result = training_ops.repair(f"engine:{host}:configs/general-agent")
 
         self.assertEqual(result, "issued")
         self.assertEqual(len(ssh_calls), 3)
+        self.assertEqual(deploy.call_args_list, [mock.call("configs/nodes.toml", nodes=[host]), mock.call("training_ops/runtime/h200/start_inference.sh", nodes=[host]), mock.call("configs/general-agent/inference.toml", nodes=[host])])
         expected_config = f"{training_ops.remote_repo}/configs/general-agent/inference.toml"
         self.assertTrue(all(expected_config in script for _, script, _ in ssh_calls))
 
     def test_engine_repair_rejects_missing_explicit_config_before_ssh(self):
-        with mock.patch.object(training_ops, "_ssh") as ssh:
+        with mock.patch.object(training_ops, "_ssh") as ssh, mock.patch.object(training_ops, "deploy") as deploy:
             with self.assertRaisesRegex(training_ops.Refused, "no trainer.toml"):
                 training_ops.repair("engine:h200a:configs/missing")
         ssh.assert_not_called()
+        deploy.assert_not_called()
 
     def test_engine_repair_without_config_keeps_current_run_selection(self):
         host = training_ops.inference_hosts[0]
@@ -79,12 +82,13 @@ class OrchestratorRepairTest(unittest.TestCase):
             training_ops, "current_run", return_value="legacy-run"
         ), mock.patch.object(
             training_ops, "_config_for_run", return_value=selected
-        ) as config_for_run:
+        ) as config_for_run, mock.patch.object(training_ops, "deploy", return_value=True) as deploy:
             result = training_ops.repair(f"engine:{host}")
 
         self.assertEqual(result, "issued")
         config_for_run.assert_called_once_with("legacy-run")
         self.assertEqual(len(ssh_calls), 3)
+        self.assertEqual(deploy.call_args_list, [mock.call("configs/nodes.toml", nodes=[host]), mock.call("training_ops/runtime/h200/start_inference.sh", nodes=[host]), mock.call("configs/general-agent/inference.toml", nodes=[host])])
 
     def test_adapter_tunnels_uses_explicit_config_dir_and_tunnels_only(self):
         ssh_calls = []
@@ -104,6 +108,8 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertEqual(deploy.call_args_list, [
             mock.call("configs/general-agent/orchestrator.toml", nodes=[training_ops.orchestrator_host]),
             mock.call("training_ops/runtime/h200/start_orchestrator.sh", nodes=[training_ops.orchestrator_host]),
+            mock.call("configs/nodes.toml", nodes=[training_ops.trainer_head, training_ops.orchestrator_host]),
+            mock.call("training_ops/runtime/china/direct_adapter_route.py", nodes=[training_ops.trainer_head, training_ops.orchestrator_host]),
         ])
         self.assertEqual(len(ssh_calls), 1)
         host, script, timeout = ssh_calls[0]
@@ -747,14 +753,15 @@ class SourcePortProbeTest(unittest.TestCase):
             function = source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
             self.assertNotIn("china_source_ports_ready", function)
             self.assertNotIn("china_tunnel_connection", function)
-        phase = "china_lane_size=2\n" + source.split("china_lane_size=2\n", 1)[1]
+        phase = "repair_stage=direct-source\n" + source.split("repair_stage=direct-source\n", 1)[1]
         phase = phase.split('if [ "$secondary_enabled" = 1 ]; then', 1)[0]
         for probe_status in (0, 1):
             fixtures = f'''
 lora_source_ports=(18100 18101)
 adapter_port=8000
 tunnels_only=1
-china_tunnel_connection() {{ echo china; }}
+restart_tunnels=0
+direct_route_control() {{ echo china; }}
 china_source_ports_ready() {{ echo source; return {probe_status}; }}
 peer_tunnel() {{ echo peer; }}
 repair_fail() {{ exit 1; }}
@@ -778,6 +785,8 @@ repair_fail() {{ exit 1; }}
         result = subprocess.run(
             ["bash", "-c", "china_source_ports_ready() {" + section + "\n" + r'''
 repair_timeout() { echo 'unexpected repair timeout call' >&2; echo 5; }
+direct_route_control() { return 0; }
+direct_route_listeners_ready() { return 0; }
 ps() { echo 'bash source # china-tunnel-lora-0'; }
 timeout() { printf '%s\n' "$*" >&2; cat >/dev/null; echo 2; }
 lora_source_ports=(18100 18101)
@@ -900,7 +909,7 @@ class TunnelRepairBoundsTest(unittest.TestCase):
 
     def shell(self, functions, body):
         return subprocess.run(
-            ["bash", "-uc", "\n".join(self.function(name) for name in functions) + body],
+            ["bash", "--noprofile", "--norc", "-uc", "\n".join(self.function(name) for name in functions) + body],
             text=True, capture_output=True, timeout=3,
         )
 

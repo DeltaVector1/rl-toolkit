@@ -11,6 +11,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import training_ops
+import training_ops.tests  # Install the local-only test guard before any test runs.
 
 
 class DependencyBundleTest(unittest.TestCase):

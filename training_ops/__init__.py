@@ -4784,7 +4784,7 @@ def _repair_adapter_tunnels(config_dir: str | None = None, *, reset: bool = Fals
             raise RuntimeError(f"adapter tunnel deployment failed: {path}")
     for path, destinations in (
         ("configs/nodes.toml", [trainer_head, orchestrator_host]),
-        ("training_ops/runtime/china/direct_adapter_route.py", [trainer_head]),
+        ("training_ops/runtime/china/direct_adapter_route.py", [trainer_head, orchestrator_host]),
     ):
         if not deploy(path, nodes=destinations):
             raise RuntimeError(f"direct adapter route deployment failed: {path}")
@@ -6026,6 +6026,7 @@ def _start_dependency_inventory(
         inference_hosts,
     )
     add("training_ops/runtime/china/resume_state.py", [orchestrator_host])
+    add("training_ops/runtime/china/direct_adapter_route.py", [orchestrator_host])
 
     configured_hosts = list(dict.fromkeys([*trainer_hosts, *inference_hosts]))
     add("configs/nodes.toml", configured_hosts)

@@ -2369,7 +2369,7 @@ peer_repair_missing_remote_lanes() {
 china_source_ports_ready() {
   local probe_seconds=40 verified_ports
   direct_route_control status || return 1
-  direct_route_listeners_ready || return 1
+  direct_route_listeners_ready capture || return 1
   if ! verified_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
       python3 - "${lora_source_ports[0]}" "${lora_source_ports[-1]}" <<'PY'
 import asyncio
@@ -3907,7 +3907,7 @@ adapter_relay_start() {
 
 direct_route_control() {
   local action=$1 probe_seconds
-  case "$action" in start|restart|status) ;; *) return 2 ;; esac
+  case "$action" in start|restart|status|snapshot) ;; *) return 2 ;; esac
   probe_seconds=$(repair_timeout 200) || return 1
   timeout --signal=TERM --kill-after=2s "$probe_seconds" \
     ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=10 \
@@ -3916,29 +3916,18 @@ direct_route_control() {
 }
 
 direct_route_listeners_ready() {
-  local listeners
-  listeners=$(sudo ss -H -ltnp) || return 1
-  python3 -c '
-import re, sys
-first, last = map(int, sys.argv[1:])
-owners = {}
-for line in sys.stdin:
-    fields = line.split()
-    if len(fields) < 5 or not fields[3].startswith("127.0.0.1:"):
-        continue
-    port = int(fields[3].rsplit(":", 1)[1])
-    if not first <= port <= last:
-        continue
-    matches = re.findall(r"\(\"sshd(?:-session)?\",pid=(\d+),fd=\d+\)", line)
-    if len(matches) != 1 or port in owners:
-        raise SystemExit("direct route listener ownership differs")
-    owners[port] = matches[0]
-if set(owners) != set(range(first, last + 1)):
-    raise SystemExit("direct route listeners are incomplete")
-groups = [owners[port] for port in range(first, last + 1, 2)]
-if len(set(groups)) != len(groups) or any(owners[port] != owners[port + 1] for port in range(first, last + 1, 2)):
-    raise SystemExit("direct route requires one SSH owner per two listeners")
-' "${lora_source_ports[0]}" "${lora_source_ports[-1]}" <<<"$listeners"
+  local mode=${1:-stable} snapshot identity
+  snapshot=$(direct_route_control snapshot) || return 1
+  identity=$(sudo python3 "$deployment/training_ops/runtime/china/direct_adapter_route.py" \
+    verify "$nodes_file" <<<"$snapshot") || return 1
+  if [ "$mode" = capture ]; then
+    direct_route_snapshot=$identity
+  else
+    [ -n "${direct_route_snapshot:-}" ] && [ "$identity" = "$direct_route_snapshot" ] || {
+      echo "direct route session/listener identities changed during readiness" >&2
+      return 1
+    }
+  fi
 }
 
 china_legacy_cleanup_required=0
