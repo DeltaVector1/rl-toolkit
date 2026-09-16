@@ -4075,6 +4075,8 @@ sudo docker run -d --name "$ORCH_CT" \
   -v "$deployment/prime-rl/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \
   -v "$deployment/prime-rl/deps/verifiers/verifiers/v1/harnesses/null/harness.py":/app/deps/verifiers/verifiers/v1/harnesses/null/harness.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/grpo.py":/app/src/prime_rl/orchestrator/algo/grpo.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/__init__.py":/app/src/prime_rl/orchestrator/algo/__init__.py:ro \
+  -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/tail_likelihood.py":/app/src/prime_rl/orchestrator/algo/tail_likelihood.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/orchestrator/dispatcher.py":/app/src/prime_rl/orchestrator/dispatcher.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/orchestrator/train_sink.py":/app/src/prime_rl/orchestrator/train_sink.py:ro \
@@ -4083,6 +4085,7 @@ sudo docker run -d --name "$ORCH_CT" \
   -v "$deployment/prime-rl/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
   -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/shared.py":/app/packages/prime-rl-configs/src/prime_rl/configs/shared.py:ro \
   -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py":/app/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py:ro \
+  -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py":/app/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
   --entrypoint /app/.venv/bin/orchestrator "$image" \

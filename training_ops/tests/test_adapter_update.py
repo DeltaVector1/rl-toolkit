@@ -418,7 +418,7 @@ class AdapterUpdateTest(unittest.TestCase):
                 f'prime_rl/configs/{module}":/app/packages/prime-rl-configs/src/'
                 f'prime_rl/configs/{module}:ro \\'
             )
-            for module in ("shared.py", "trainer.py", "orchestrator.py")
+            for module in ("shared.py", "trainer.py", "orchestrator.py", "algorithm.py")
         ]
         self.assertEqual(mounts, expected)
 
