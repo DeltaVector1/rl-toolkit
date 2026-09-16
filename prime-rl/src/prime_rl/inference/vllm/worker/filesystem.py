@@ -745,6 +745,61 @@ def _check_deadline(
         raise TimeoutError("adapter delta staging exceeded its time limit")
 
 
+@contextmanager
+def _adapter_socket_deadline(sock, deadline, cancel_event):
+    """Interrupt buffered HTTP reads and finish the guard before socket reuse."""
+    _check_deadline(deadline, cancel_event)
+    if sock is None or (deadline is None and cancel_event is None):
+        yield
+        _check_deadline(deadline, cancel_event)
+        return
+    stopped = threading.Event()
+    guard_lock = threading.Lock()
+    failure = None
+
+    def guard():
+        nonlocal failure
+        while not stopped.is_set():
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            wait_seconds = remaining
+            if cancel_event is not None:
+                wait_seconds = 0.02 if remaining is None else min(0.02, remaining)
+            if stopped.wait(wait_seconds):
+                return
+            with guard_lock:
+                if stopped.is_set():
+                    return
+                try:
+                    _check_deadline(deadline, cancel_event)
+                except TimeoutError as exc:
+                    failure = exc
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    return
+
+    thread = threading.Thread(target=guard, name="adapter-socket-deadline", daemon=True)
+    thread.start()
+    read_error = None
+    try:
+        yield
+    except BaseException as exc:
+        read_error = exc
+        raise
+    finally:
+        # Serialize completion with abort. A guard that lost this race cannot
+        # touch the socket, and a guard that won must finish before reuse.
+        with guard_lock:
+            stopped.set()
+        thread.join()
+        if failure is not None and not isinstance(
+            read_error, (_PersistentLocalError, _PersistentProtocolError, _AdapterMetadataError)
+        ):
+            raise failure
+    _check_deadline(deadline, cancel_event)
+
+
 def _acquire_stage_lock(
     lock,
     deadline: float | None,
@@ -977,14 +1032,14 @@ def _read_source_bytes(
     last_error: OSError | None = None
     for candidate in _metadata_source_urls(source_url):
         _check_deadline(deadline, cancel_event)
+        timeout = _request_timeout(deadline, cancel_event, maximum=_configured_chunk_timeout())
+        request_deadline = time.monotonic() + timeout
+        if deadline is not None:
+            request_deadline = min(request_deadline, deadline)
         try:
             with urllib.request.urlopen(
                 candidate,
-                timeout=_request_timeout(
-                    deadline,
-                    cancel_event,
-                    maximum=_configured_chunk_timeout(),
-                ),
+                timeout=timeout,
             ) as response:
                 headers = getattr(response, "headers", {})
                 content_length = (
@@ -1007,23 +1062,26 @@ def _read_source_bytes(
                         )
                 chunks = []
                 total = 0
-                while True:
-                    _check_deadline(deadline, cancel_event)
-                    read_size = 16 * 1024 * 1024
-                    if max_bytes is not None:
-                        read_size = min(read_size, max_bytes - total + 1)
-                    try:
-                        chunk = response.read(read_size)
-                    except http.client.IncompleteRead as exc:
-                        raise _PersistentTransportError("adapter metadata body ended early") from exc
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if max_bytes is not None and total > max_bytes:
-                        raise _AdapterMetadataError(
-                            f"source exceeds the {max_bytes}-byte read limit: {source_url}"
-                        )
+                read_available = getattr(response, "read1", None) or response.read
+                response_socket = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+                with _adapter_socket_deadline(response_socket, request_deadline, cancel_event):
+                    while True:
+                        _check_deadline(request_deadline, cancel_event)
+                        read_size = 16 * 1024 * 1024
+                        if max_bytes is not None:
+                            read_size = min(read_size, max_bytes - total + 1)
+                        try:
+                            chunk = read_available(read_size)
+                        except http.client.IncompleteRead as exc:
+                            raise _PersistentTransportError("adapter metadata body ended early") from exc
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if max_bytes is not None and total > max_bytes:
+                            raise _AdapterMetadataError(
+                                f"source exceeds the {max_bytes}-byte read limit: {source_url}"
+                            )
                 _check_deadline(deadline, cancel_event)
                 if content_length is not None and total != content_length_value:
                     raise _PersistentTransportError("adapter metadata body ended early")
@@ -3640,6 +3698,10 @@ class _PersistentAdapterConnection:
         if parsed.query:
             request_path += f"?{parsed.query}"
         response = None
+        read_deadline = min(
+            (value for value in (stage_deadline, attempt_deadline) if value is not None),
+            default=None,
+        )
         try:
             connection.request(
                 "GET",
@@ -3651,8 +3713,10 @@ class _PersistentAdapterConnection:
             )
             if connection.sock is not None:
                 connection.sock.settimeout(remaining_timeout())
-            response = connection.getresponse()
-            remaining_timeout()
+            request_socket = connection.sock
+            with _adapter_socket_deadline(request_socket, read_deadline, cancel_event):
+                response = connection.getresponse()
+                remaining_timeout()
         except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
             if response is not None:
                 try:
@@ -3721,35 +3785,36 @@ class _PersistentAdapterConnection:
                 ) from exc
         remaining = expected_length
         try:
-            while remaining:
-                if connection.sock is not None:
+            with _adapter_socket_deadline(request_socket, read_deadline, cancel_event):
+                while remaining:
+                    if connection.sock is not None:
+                        try:
+                            connection.sock.settimeout(remaining_timeout())
+                        except (OSError, TimeoutError) as exc:
+                            raise _PersistentTransportError(
+                                "adapter response read timeout setup failed"
+                            ) from exc
                     try:
-                        connection.sock.settimeout(remaining_timeout())
-                    except (OSError, TimeoutError) as exc:
-                        raise _PersistentTransportError(
-                            "adapter response read timeout setup failed"
+                        chunk = read_available(min(1024 * 1024, remaining))
+                    except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
+                        raise _PersistentTransportError("adapter response ended during read") from exc
+                    remaining_timeout()
+                    if not chunk:
+                        raise _PersistentTransportError("adapter response body ended early")
+                    if len(chunk) > remaining:
+                        raise _PersistentProtocolError("adapter response body is too long")
+                    try:
+                        consume(chunk)
+                    except OSError as exc:
+                        if isinstance(exc, (TimeoutError, socket.timeout)):
+                            raise
+                        raise _PersistentLocalError(
+                            f"adapter local destination write failed: {exc}"
                         ) from exc
-                try:
-                    chunk = read_available(min(1024 * 1024, remaining))
-                except (OSError, TimeoutError, http.client.HTTPException, EOFError) as exc:
-                    raise _PersistentTransportError("adapter response ended during read") from exc
-                remaining_timeout()
-                if not chunk:
-                    raise _PersistentTransportError("adapter response body ended early")
-                if len(chunk) > remaining:
-                    raise _PersistentProtocolError("adapter response body is too long")
-                try:
-                    consume(chunk)
-                except OSError as exc:
-                    if isinstance(exc, (TimeoutError, socket.timeout)):
+                    except BaseException:
                         raise
-                    raise _PersistentLocalError(
-                        f"adapter local destination write failed: {exc}"
-                    ) from exc
-                except BaseException:
-                    raise
-                remaining -= len(chunk)
-                remaining_timeout()
+                    remaining -= len(chunk)
+                    remaining_timeout()
             self._last_completed_at = time.monotonic()
         except BaseException:
             close_response()

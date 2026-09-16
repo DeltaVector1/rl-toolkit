@@ -64,6 +64,239 @@ def load_filesystem_module():
 
 
 class DownloadSchedulerTest(unittest.TestCase):
+    def assert_no_socket_guards(self):
+        self.assertFalse([thread for thread in threading.enumerate()
+                          if thread.name == "adapter-socket-deadline"])
+
+    def test_header_trickle_deadline_rotates_and_resumes_retained_prefix(self):
+        filesystem = load_filesystem_module()
+        filesystem.lane_rotation_delay_seconds = 0.001
+        payload = b"header-resume-body"
+        slow_finished = threading.Event()
+
+        def slow_header(request, number):
+            if number != 1:
+                return False
+            try:
+                request.connection.sendall(b"HTTP/1.1 206 Partial Content\r\nX-Slow: ")
+                for _ in range(30):
+                    request.connection.sendall(b"x")
+                    time.sleep(0.02)
+            except OSError:
+                pass
+            finally:
+                request.close_connection = True
+                slow_finished.set()
+            return True
+
+        server, thread, handler = self._persistent_server(filesystem, payload, slow_header)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                destination = root / "chunk"
+                destination.write_bytes(payload[:3])
+                parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                pool = filesystem._PersistentAdapterLanePool(1)
+                started = time.monotonic()
+                try:
+                    pool.download(
+                        [f"http://127.0.0.1:{server.server_address[1]}/{lane}" for lane in ("slow", "fast")],
+                        0, destination, parent_fd, expected_size=len(payload),
+                        expected_sha256=hashlib.sha256(payload).hexdigest(),
+                        per_request_timeout_seconds=0.06, deadline=started + 0.12,
+                    )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                elapsed = time.monotonic() - started
+                self.assertGreaterEqual(elapsed, 0.05)
+                self.assertLess(elapsed, 0.18)
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertEqual(handler.paths, ["/slow", "/fast"])
+                self.assertEqual(handler.ranges, [f"bytes=3-{len(payload) - 1}"] * 2)
+                self.assert_no_socket_guards()
+                print(f"header trickle: {elapsed:.3f}s, 2 lanes, retained prefix 3 bytes")
+        finally:
+            completed = slow_finished.wait(1)
+            server.shutdown()
+            thread.join(1)
+            server.server_close()
+            self.assertTrue(completed)
+
+    def test_metadata_trickle_retries_incrementally_and_bounds_stage(self):
+        payload = b"metadata-body" * 4
+        for chunked, stage_only in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(chunked=chunked, stage_only=stage_only):
+                filesystem = load_filesystem_module()
+                slow_finished = threading.Event()
+
+                def slow_body(request, number):
+                    if number != 1:
+                        return False
+                    request.send_response(200)
+                    if chunked:
+                        request.send_header("Transfer-Encoding", "chunked")
+                        body = b"0" * 30 + f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n"
+                    else:
+                        request.send_header("Content-Length", str(len(payload)))
+                        body = payload
+                    request.end_headers()
+                    try:
+                        for value in body:
+                            request.wfile.write(bytes((value,)))
+                            request.wfile.flush()
+                            time.sleep(0.02)
+                    except OSError:
+                        pass
+                    finally:
+                        request.close_connection = True
+                        slow_finished.set()
+                    return True
+
+                server, thread, handler = self._persistent_server(filesystem, payload, slow_body)
+                try:
+                    urls = [f"http://127.0.0.1:{server.server_address[1]}/{lane}" for lane in ("slow", "fast")]
+                    started = time.monotonic()
+                    with mock.patch.object(filesystem, "_metadata_source_urls", return_value=urls), mock.patch.object(
+                        filesystem, "_configured_chunk_timeout", return_value=1 if stage_only else 0.06
+                    ):
+                        if stage_only:
+                            with self.assertRaises((TimeoutError, filesystem._PersistentTransportError)):
+                                filesystem._read_source_bytes(urls[0], deadline=started + 0.12, max_bytes=1024)
+                        else:
+                            self.assertEqual(filesystem._read_source_bytes(
+                                urls[0], deadline=started + 0.3, max_bytes=1024,
+                            ), payload)
+                    elapsed = time.monotonic() - started
+                    self.assertLess(elapsed, 0.2 if stage_only else 0.18)
+                    self.assertEqual(handler.paths, ["/slow"] if stage_only else ["/slow", "/fast"])
+                    self.assertEqual(handler.ranges, [None] * len(handler.paths))
+                    self.assert_no_socket_guards()
+                    print(f"metadata trickle: {elapsed:.3f}s, chunked={chunked}, stage_only={stage_only}")
+                finally:
+                    completed = slow_finished.wait(1)
+                    server.shutdown()
+                    thread.join(1)
+                    server.server_close()
+                    self.assertTrue(completed)
+
+    def test_cancellation_interrupts_header_and_metadata_reads(self):
+        for metadata in (False, True):
+            with self.subTest(metadata=metadata):
+                filesystem = load_filesystem_module()
+                cancel = threading.Event()
+                entered = threading.Event()
+                finished = threading.Event()
+
+                def blocked(request, _number):
+                    try:
+                        if metadata:
+                            request.connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nx")
+                        else:
+                            request.connection.sendall(b"HTTP/1.1 206 Partial Content\r\nX-Slow: ")
+                        entered.set()
+                        finished.wait(1)
+                    finally:
+                        request.close_connection = True
+                    return True
+
+                server, thread, handler = self._persistent_server(filesystem, b"hello", blocked)
+                def cancel_after_entry():
+                    if entered.wait(1):
+                        cancel.set()
+                cancelling = threading.Thread(target=cancel_after_entry)
+                cancelling.start()
+                connection = filesystem._PersistentAdapterConnection()
+                try:
+                    url = f"http://127.0.0.1:{server.server_address[1]}/blocked"
+                    started = time.monotonic()
+                    with self.assertRaises((TimeoutError, filesystem._PersistentTransportError)):
+                        if metadata:
+                            filesystem._read_source_bytes(url, deadline=started + 5, cancel_event=cancel)
+                        else:
+                            connection.read_range(url, start=0, end=4, total=5, expected_sha256=None,
+                                                  timeout=5, stage_deadline=started + 5,
+                                                  cancel_event=cancel, consume=lambda _chunk: None)
+                    elapsed = time.monotonic() - started
+                    self.assertLess(elapsed, 0.15)
+                    self.assertEqual(handler.requests, 1)
+                    self.assert_no_socket_guards()
+                    print(f"request cancellation: {elapsed:.3f}s, metadata={metadata}")
+                finally:
+                    finished.set()
+                    connection.close()
+                    cancelling.join(1)
+                    server.shutdown()
+                    thread.join(1)
+                    server.server_close()
+
+    def test_finished_deadline_guard_cannot_close_reused_connection(self):
+        filesystem = load_filesystem_module()
+        payload = b"reuse"
+        server, thread, handler = self._persistent_server(filesystem, payload)
+        connection = filesystem._PersistentAdapterConnection()
+        try:
+            received = []
+            for index in range(2):
+                connection.read_range(
+                    f"http://127.0.0.1:{server.server_address[1]}/chunk", start=0, end=4,
+                    total=5, expected_sha256=hashlib.sha256(payload).hexdigest(), timeout=1,
+                    attempt_deadline=time.monotonic() + 0.06, consume=received.append,
+                )
+                self.assert_no_socket_guards()
+                if index == 0:
+                    time.sleep(0.08)
+            self.assertEqual(b"".join(received), payload * 2)
+            self.assertEqual(handler.connections, 1)
+        finally:
+            connection.close()
+            server.shutdown()
+            thread.join(1)
+            server.server_close()
+
+    def test_socket_guard_joins_an_abort_that_won_the_completion_race(self):
+        filesystem = load_filesystem_module()
+        for local_error in (None, filesystem._PersistentLocalError("disk failed"),
+                            filesystem._PersistentProtocolError("checksum differs"),
+                            filesystem._AdapterMetadataError("invalid manifest")):
+            with self.subTest(local_error=local_error):
+                abort_started = threading.Event()
+                release_abort = threading.Event()
+                returned = threading.Event()
+                errors = []
+
+                class Socket:
+                    def shutdown(self, _how):
+                        abort_started.set()
+                        release_abort.wait(1)
+
+                def operation():
+                    try:
+                        with filesystem._adapter_socket_deadline(Socket(), time.monotonic() + 0.02, None):
+                            abort_started.wait(1)
+                            if local_error is not None:
+                                raise local_error
+                    except BaseException as exc:
+                        errors.append(exc)
+                    finally:
+                        returned.set()
+
+                caller = threading.Thread(target=operation)
+                caller.start()
+                try:
+                    self.assertTrue(abort_started.wait(1))
+                    self.assertFalse(returned.wait(0.02))
+                finally:
+                    release_abort.set()
+                    caller.join(1)
+                self.assertTrue(returned.is_set())
+                self.assertEqual(len(errors), 1)
+                if local_error is None:
+                    self.assertIsInstance(errors[0], TimeoutError)
+                else:
+                    self.assertIs(errors[0], local_error)
+                self.assert_no_socket_guards()
+
     def test_lane_fallbacks_rotate_from_each_primary(self):
         filesystem = load_filesystem_module()
         urls = [f"http://lane{index}" for index in range(5)]
