@@ -1105,17 +1105,7 @@ async def stage_lora_adapter(
         return staged, time.perf_counter() - group_started
 
     groups = [ordered_hosts, *peer_groups]
-    if require_delta and len(groups) > 1:
-        group_tasks = [asyncio.create_task(_stage_group(group)) for group in groups]
-        completed_groups = await asyncio.gather(*group_tasks, return_exceptions=True)
-        failures = [
-            result for result in completed_groups if isinstance(result, BaseException)
-        ]
-        if failures:
-            raise failures[0]
-        grouped_results = completed_groups
-    else:
-        grouped_results = [await _stage_group(group) for group in groups]
+    grouped_results = [await _stage_group(group) for group in groups]
     results = [result for staged, _seconds in grouped_results for result in staged]
     group_seconds = [seconds for _staged, seconds in grouped_results]
     origin_stage_seconds = group_seconds[0] if group_seconds else 0.0
