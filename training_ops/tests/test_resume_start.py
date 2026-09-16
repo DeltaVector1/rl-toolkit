@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest import mock
 
 import training_ops
+import training_ops.tests  # Install the local-only test guard before any test runs.
 
 
 class ResumeStartTest(unittest.TestCase):

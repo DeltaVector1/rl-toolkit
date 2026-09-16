@@ -14,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import training_ops
+import training_ops.tests  # Install the local-only test guard before any test runs.
 
 adapter_server_path = (
     Path(__file__).resolve().parents[1] / "runtime" / "china" / "adapter_server.py"
@@ -1270,7 +1271,7 @@ class AdapterUpdateTest(unittest.TestCase):
             training_ops, "_ssh", return_value=(0, "")
         ), mock.patch.object(
             training_ops, "_restart_adapter_engine_script"
-        ) as restart_script:
+        ) as restart_script, mock.patch.object(training_ops, "_ssh_address", side_effect=lambda host: training_ops.hosts["trainer_lan"][host]):
             result = training_ops._repair_adapter_update()
 
         self.assertIn("reloaded exact GLM inference containers", result)

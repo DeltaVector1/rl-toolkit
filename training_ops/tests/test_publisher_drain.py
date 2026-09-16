@@ -9,6 +9,9 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import training_ops.tests
+
 spec = importlib.util.spec_from_file_location("publisher_drain", Path(__file__).parents[1] / "runtime/h200/drain_rollout_publisher.py")
 publisher = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(publisher)

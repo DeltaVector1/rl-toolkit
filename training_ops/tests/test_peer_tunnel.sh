@@ -1813,7 +1813,7 @@ export PEER_TEST_LOG="$duplicate_log" PEER_DUPLICATE_MARKER=china-tunnel-lora-0 
   PEER_DUPLICATE_COMMAND="$duplicate_command"
 export TUNNEL_OWNER_PPID=10000 TUNNEL_SS_OUTPUT="$tmp/duplicate-ss" PEER_STALE_LISTENERS_ACTIVE=1
 set +e
-PATH="$tmp/bin:$PATH" china_tunnel_supervisors_ready
+PATH="$tmp/bin:$PATH" china_tunnel_legacy_supervisors_ready
 duplicate_ready_status=$?
 set -e
 test "$duplicate_ready_status" -ne 0
@@ -1827,7 +1827,7 @@ printf '%s\n' "$china_supervisor_command" "$extra_marker_command" >"$extra_marke
 lora_source_ports=(18100 18101)
 export PEER_TEST_LOG="$extra_marker_log"
 set +e
-PATH="$tmp/bin:$PATH" china_tunnel_supervisors_ready
+PATH="$tmp/bin:$PATH" china_tunnel_legacy_supervisors_ready
 extra_marker_status=$?
 set -e
 test "$extra_marker_status" -ne 0
