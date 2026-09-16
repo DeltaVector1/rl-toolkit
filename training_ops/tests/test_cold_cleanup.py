@@ -235,6 +235,76 @@ class ColdCleanupTest(unittest.TestCase):
                 training_ops.run_root = old_root
                 training_ops.runtime_root = old_runtime
 
+    def test_cleanup_scans_only_requested_publisher_dirs_after_pid_file_loss(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            old_root = training_ops.run_root
+            old_runtime = training_ops.runtime_root
+            processes = []
+            try:
+                root = Path(temporary)
+                training_ops.run_root = str(root / "runs")
+                training_ops.runtime_root = str(
+                    Path(__file__).resolve().parents[1] / "runtime"
+                )
+                sync_script = Path(training_ops.runtime_root) / "china" / "sync_microbatches.sh"
+
+                def start_publisher(run_dir):
+                    run_dir = Path(run_dir)
+                    (run_dir / "rollouts").mkdir(parents=True)
+                    process = subprocess.Popen(
+                        ["bash", str(sync_script)],
+                        env={
+                            **os.environ,
+                            "run_dir": str(run_dir),
+                            "nodes": "10.92.20.76",
+                            "interval": "60",
+                        },
+                    )
+                    processes.append(process)
+                    pid_file = run_dir / ".microbatch-sync.pid"
+                    for _ in range(50):
+                        if pid_file.exists():
+                            break
+                        time.sleep(0.02)
+                    self.assertTrue(pid_file.exists())
+                    return process, pid_file
+
+                requested = Path(training_ops.run_root) / "alpha"
+                requested_process, requested_pid_file = start_publisher(requested)
+                requested_pid_file.unlink()
+                foreign_parent_process, _ = start_publisher(
+                    Path(training_ops.run_root) / "beta"
+                )
+                foreign_service_process, foreign_service_pid_file = start_publisher(
+                    Path(training_ops.run_root) / "gamma" / "run_gamma"
+                )
+                # Keep a valid foreign PID file in place. The cleanup must not
+                # follow the old cross-run PID-file glob.
+                foreign_service_pid_file.write_text(
+                    str(foreign_service_process.pid), encoding="ascii"
+                )
+
+                def fake_ssh(host, script, timeout=0):
+                    result = subprocess.run(
+                        ["bash", "-c", script], capture_output=True, text=True
+                    )
+                    return result.returncode, result.stdout + result.stderr
+
+                with mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh):
+                    training_ops._cold_start_cleanup("alpha", ["n76"])
+
+                requested_process.wait(timeout=3)
+                self.assertIsNotNone(requested_process.returncode)
+                self.assertIsNone(foreign_parent_process.poll())
+                self.assertIsNone(foreign_service_process.poll())
+            finally:
+                for process in processes:
+                    if process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=3)
+                training_ops.run_root = old_root
+                training_ops.runtime_root = old_runtime
+
     def test_cleanup_does_not_kill_an_unrelated_process_with_a_stale_pid(self):
         with tempfile.TemporaryDirectory() as temporary:
             old_root = training_ops.run_root
@@ -274,7 +344,7 @@ class ColdCleanupTest(unittest.TestCase):
                 training_ops.runtime_root = str(
                     Path(__file__).resolve().parents[1] / "runtime"
                 )
-                stale_dir = Path(training_ops.run_root) / "stale" / "run_stale"
+                stale_dir = Path(training_ops.run_root) / "alpha" / "run_alpha"
                 (stale_dir / "rollouts").mkdir(parents=True)
                 process = subprocess.Popen(
                     [

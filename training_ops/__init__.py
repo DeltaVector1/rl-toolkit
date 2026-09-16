@@ -6222,9 +6222,9 @@ stop_sync_processes() {{
   }}
 
   # The PID file is an optimisation only. A process can outlive an unlink or
-  # lose the file during a failed startup, so inspect every configured publisher
-  # directory and every /proc entry. The matcher above is exact; this is not a
-  # name-based kill.
+  # lose the file during a failed startup, so inspect the two requested
+  # publisher directories and every /proc entry. The matcher above is exact;
+  # this is not a name-based kill.
   scan_run_dir() {{
     local expected_run_dir=$1 proc_dir pid
     [ -d "$expected_run_dir" ] || return 0
@@ -6238,24 +6238,6 @@ stop_sync_processes() {{
   }}
   scan_run_dir "$run_parent"
   scan_run_dir "$run_dir"
-  for service_dir in "$runs_path"/*/run_*; do
-    [ "$service_dir" = "$run_dir" ] && continue
-    case "$service_dir" in
-      "$runs_path"/*/run_*) scan_run_dir "$service_dir" ;;
-    esac
-  done
-  for pid_file in "$run_parent/.microbatch-sync.pid" "$runs_path"/*/run_*/.microbatch-sync.pid; do
-    [ -f "$pid_file" ] || continue
-    stale_run_dir=${{pid_file%/.microbatch-sync.pid}}
-    case "$stale_run_dir" in
-      "$runs_path"/*/run_*) ;;
-      *) continue ;;
-    esac
-    # Do not follow a symlink while deriving a process identity.
-    [ -L "$stale_run_dir" ] && continue
-    pid=$(cat "$pid_file" 2>/dev/null || true)
-    sync_process_matches "$pid" "$stale_run_dir" && stop_one_sync_process "$pid" "$stale_run_dir"
-  done
   return 0
 }}
 
