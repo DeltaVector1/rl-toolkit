@@ -6597,6 +6597,23 @@ def start(
     nodes = [_check_host(h) for h in (nodes or trainer_hosts)]
     if trainer_head in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [trainer_head] + [n for n in nodes if n != trainer_head]
+    if mode == "restart" and resume_adapter is not None:
+        control_file = f"{service_run_dir}/control/orch.toml"
+        missing_control = [
+            host
+            for host, (code, _output) in _fan(
+                nodes,
+                lambda host: _ssh(
+                    host,
+                    f"test -f {shlex.quote(control_file)} && test -s {shlex.quote(control_file)}",
+                ),
+            ).items()
+            if code
+        ]
+        if missing_control:
+            raise Refused(
+                f"adapter restart requires a non-empty control file {control_file} on {missing_control}"
+            )
     required_files = _start_dependency_inventory(selected, nodes)
     _deploy_dependencies(required_files)
     name = f"run_{run}"
@@ -6854,16 +6871,37 @@ exit 1
     if mode == "cold":
         _cold_start_cleanup(run, nodes)
         _cold_adapter_cache_cleanup(initial_adapter_identity)
-    launch_adapter()
     if mode == "cold":
+        launch_adapter()
         launch_orch()
         wait_for_orchestrator_control()
         launch_trainer()
     elif resume_adapter is not None:
-        launch_orch()
-        wait_for_orchestrator_control()
-        launch_trainer()
+        try:
+            launch_adapter()
+            launch_trainer()
+            # The next trainer step needs a fresh batch from the orchestrator.
+            launch_orch()
+        except Exception as error:
+            cleanup_commands = [
+                (
+                    orchestrator_host,
+                    "pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null || true; "
+                    f"sudo docker rm -f {orchestrator_container} {adapter_relay_container}",
+                ),
+                *((host, f"sudo docker rm -f {trainer_container}") for host in nodes),
+                (trainer_head, f"sudo docker rm -f {adapter_container}"),
+            ]
+            for host, command in cleanup_commands:
+                try:
+                    code, output = _ssh(host, command, timeout=60)
+                    if code:
+                        error.add_note(f"restart cleanup failed on {host}: {output.strip()}")
+                except Exception as cleanup_error:
+                    error.add_note(f"restart cleanup failed on {host}: {cleanup_error}")
+            raise
     else:
+        launch_adapter()
         mark_restart_start()
         launch_trainer()
         wait_for_fresh_broadcast()
