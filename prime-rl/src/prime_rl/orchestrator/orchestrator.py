@@ -383,21 +383,54 @@ async def _verify_startup_adapter_delta(
 async def _find_loaded_resume_policy(
     admin_clients,
     lora_name: str,
-    final_sync_version: int,
-) -> tuple[str | None, dict[str, object] | None]:
-    """Find the current rotating slot, preferring the incoming policy slot."""
-    if final_sync_version <= 0:
+    saved_source_urls: dict[int, str],
+    forward_seed_step: int | None = None,
+    stale_source_urls: set[str] | None = None,
+) -> tuple[int | None, str | None, dict[str, object] | None]:
+    """Find the newest loaded slot that maps exactly to a saved policy."""
+    source_steps: dict[str, int] = {}
+    for step, source_url in saved_source_urls.items():
+        if (
+            type(step) is not int
+            or step < 0
+            or not isinstance(source_url, str)
+            or source_url in source_steps
+        ):
+            raise RuntimeError("saved policy source map is invalid or ambiguous")
+        source_steps[source_url] = step
+
+    newest_saved_step = max(saved_source_urls, default=0)
+    if newest_saved_step <= 0:
         slots = (lora_name,)
     else:
         slots = (
-            f"{lora_name}-slot{final_sync_version % 2}",
-            f"{lora_name}-slot{(final_sync_version - 1) % 2}",
+            f"{lora_name}-slot{newest_saved_step % 2}",
+            f"{lora_name}-slot{(newest_saved_step - 1) % 2}",
         )
+    loaded = []
+    stale_source_urls = stale_source_urls or set()
     for slot in slots:
         receipt = await common_loaded_lora_receipt(admin_clients, slot)
-        if receipt is not None:
-            return slot, receipt
-    return None, None
+        if receipt is None:
+            continue
+        if not isinstance(receipt, dict):
+            raise RuntimeError("loaded policy receipt is invalid")
+        receipt_source_url = receipt.get("source_url")
+        step = source_steps.get(receipt_source_url)
+        if step is None:
+            if receipt_source_url in stale_source_urls:
+                continue
+            raise RuntimeError("loaded policy receipt does not map to a saved policy")
+        expected_slot = lora_name if step == 0 else f"{lora_name}-slot{step % 2}"
+        if slot != expected_slot:
+            raise RuntimeError(
+                "loaded policy receipt does not map to its exact saved policy slot"
+            )
+        loaded.append((step, slot, receipt))
+    selected = max(loaded, key=lambda item: item[0]) if loaded else None
+    if forward_seed_step is not None and selected is not None and selected[0] < forward_seed_step:
+        raise RuntimeError("loaded policy receipt is older than the forward resume seed")
+    return selected if selected is not None else (None, None, None)
 
 
 def _select_pruned_resume_tail(
@@ -818,10 +851,50 @@ class Orchestrator:
                     raise RuntimeError(
                         f"cannot resume policy v{final_sync_version}: saved adapter chain is incomplete"
                     )
-                loaded_slot, loaded_receipt = await _find_loaded_resume_policy(
+                retained_tail = (
+                    tuple(range(final_sync_version - 2, final_sync_version + 1))
+                    if final_sync_version >= 4
+                    else ()
+                )
+                forward_seed_step = (
+                    retained_tail[0] - 1 if sync_versions == retained_tail else None
+                )
+                source_steps = (
+                    (forward_seed_step, *sync_versions)
+                    if forward_seed_step is not None
+                    else sync_versions
+                )
+                saved_source_urls = {
+                    step: inference_weight_path(
+                        config,
+                        get_step_path(broadcast_dir, step),
+                        self.lora_name,
+                    )
+                    for step in source_steps
+                }
+                if not all(isinstance(url, str) for url in saved_source_urls.values()):
+                    raise RuntimeError("saved adapter policy has no source URL")
+                stale_source_urls = set()
+                if forward_seed_step is not None:
+                    stale_source_urls = {
+                        source_url
+                        for step in range(1, forward_seed_step)
+                        if step % 2 != forward_seed_step % 2
+                        and isinstance(
+                            source_url := inference_weight_path(
+                                config,
+                                get_step_path(broadcast_dir, step),
+                                self.lora_name,
+                            ),
+                            str,
+                        )
+                    }
+                loaded_step, loaded_slot, loaded_receipt = await _find_loaded_resume_policy(
                     self.policy_inference.admin_clients,
                     self.lora_name,
-                    final_sync_version,
+                    saved_source_urls,
+                    forward_seed_step,
+                    stale_source_urls,
                 )
                 if loaded_receipt is None:
                     sync_versions = _select_pruned_resume_tail(
@@ -833,39 +906,16 @@ class Orchestrator:
                     )
                     using_pruned_resume_tail = sync_versions[0] > 0
                 else:
-                    loaded_source_url = loaded_receipt.get("source_url")
-                    if not isinstance(loaded_source_url, str):
-                        raise RuntimeError(
-                            "cannot resume adapter transfer: loaded policy source URL is invalid"
-                        )
-                    matching_steps = tuple(
-                        step
-                        for step in sync_versions
-                        if inference_weight_path(
-                            config,
-                            get_step_path(broadcast_dir, step),
-                            self.lora_name,
-                        )
-                        == loaded_source_url
+                    assert loaded_step is not None and loaded_slot is not None
+                    loaded_source_url = saved_source_urls[loaded_step]
+                    leading_step = (
+                        retained_tail[0] if loaded_step == forward_seed_step else None
                     )
-                    if len(matching_steps) != 1:
-                        raise RuntimeError(
-                            "cannot resume adapter transfer: the common loaded policy is not "
-                            "one saved policy in this run"
-                        )
-                    loaded_step = matching_steps[0]
-                    expected_loaded_slot = (
-                        self.lora_name
-                        if loaded_step == 0
-                        else f"{self.lora_name}-slot{loaded_step % 2}"
-                    )
-                    if loaded_slot != expected_loaded_slot:
-                        raise RuntimeError(
-                            "cannot resume adapter transfer: loaded policy slot does not match its policy step"
-                        )
+                    manifest_step = loaded_step if leading_step is None else leading_step
+                    manifest_url = saved_source_urls[manifest_step]
                     try:
                         with urlopen(
-                            f"{loaded_source_url.rstrip('/')}/adapter_manifest.json",
+                            f"{manifest_url.rstrip('/')}/adapter_manifest.json",
                             timeout=30,
                         ) as source:
                             loaded_manifest = json.load(source)
@@ -873,12 +923,12 @@ class Orchestrator:
                             raise RuntimeError("saved policy manifest is invalid")
                         loaded_base_url = inference_weight_path(
                             config,
-                            get_step_path(broadcast_dir, loaded_step - 1),
+                            get_step_path(broadcast_dir, manifest_step - 1),
                             self.lora_name,
                         )
                         loaded_base2_url = inference_weight_path(
                             config,
-                            get_step_path(broadcast_dir, loaded_step - 2),
+                            get_step_path(broadcast_dir, manifest_step - 2),
                             self.lora_name,
                         )
                         if not all(
@@ -886,10 +936,14 @@ class Orchestrator:
                             for url in (loaded_base_url, loaded_base2_url)
                         ):
                             raise RuntimeError("saved policy predecessor URL is invalid")
+                        if loaded_source_url != (
+                            manifest_url if leading_step is None else loaded_base_url
+                        ):
+                            raise RuntimeError("loaded policy source URL differs from saved chain")
                         validate_adapter_manifest(
                             loaded_manifest,
-                            target_step=loaded_step,
-                            target_url=loaded_source_url,
+                            target_step=manifest_step,
+                            target_url=manifest_url,
                             base_url=loaded_base_url,
                             base2_url=loaded_base2_url,
                         )
@@ -898,17 +952,33 @@ class Orchestrator:
                                 "saved policy manifest is not a version-two delta"
                             )
                         loaded_files = _adapter_file_records(loaded_manifest)
-                    except (OSError, ValueError, RuntimeError) as exc:
+                    except (KeyError, OSError, ValueError, RuntimeError) as exc:
                         raise RuntimeError(
-                            f"cannot resume adapter transfer: saved policy v{loaded_step} is invalid"
+                            f"cannot resume adapter transfer: saved policy v{manifest_step} is invalid"
                         ) from exc
                     loaded_weights = loaded_files["adapter_model.safetensors"]
                     loaded_config = loaded_files["adapter_config.json"]
                     expected_identity = {
-                        "target_sha256": loaded_weights["sha256"],
-                        "target_size": loaded_weights["size"],
-                        "config_sha256": loaded_config["sha256"],
-                        "config_size": loaded_config["size"],
+                        "target_sha256": (
+                            loaded_weights["sha256"]
+                            if leading_step is None
+                            else loaded_manifest["base_sha256"]
+                        ),
+                        "target_size": (
+                            loaded_weights["size"]
+                            if leading_step is None
+                            else loaded_manifest["base_size"]
+                        ),
+                        "config_sha256": (
+                            loaded_config["sha256"]
+                            if leading_step is None
+                            else loaded_manifest["base_config_sha256"]
+                        ),
+                        "config_size": (
+                            loaded_config["size"]
+                            if leading_step is None
+                            else loaded_manifest["base_config_size"]
+                        ),
                     }
                     if any(
                         loaded_receipt.get(name) != value
@@ -917,18 +987,16 @@ class Orchestrator:
                         raise RuntimeError(
                             "cannot resume adapter transfer: loaded and saved policy identities differ"
                         )
+                    loaded_identity = {
+                        "source_url": loaded_source_url,
+                        **expected_identity,
+                    }
                     if final_sync_version >= 4:
-                        retained_tail = tuple(
-                            range(final_sync_version - 2, final_sync_version + 1)
-                        )
-                        if loaded_step not in retained_tail:
+                        if loaded_step not in (*retained_tail, retained_tail[0] - 1):
                             raise RuntimeError(
                                 "cannot resume adapter transfer: loaded policy is outside the retained adapter tail"
                             )
-                        resume_seed_identities[loaded_step] = {
-                            "source_url": loaded_source_url,
-                            **expected_identity,
-                        }
+                        resume_seed_identities[loaded_step] = loaded_identity
                         missing_predecessors = {
                             step
                             for step in retained_tail[:2]
@@ -938,7 +1006,9 @@ class Orchestrator:
                             raise RuntimeError(
                                 "cannot resume adapter transfer: retained adapter predecessor is missing"
                             )
-                        if loaded_step == retained_tail[0]:
+                        if loaded_step == retained_tail[0] - 1:
+                            sync_versions = retained_tail
+                        elif loaded_step == retained_tail[0]:
                             sync_versions = (retained_tail[1], final_sync_version)
                         elif loaded_step == retained_tail[1]:
                             sync_versions = (retained_tail[0], final_sync_version)
@@ -994,6 +1064,17 @@ class Orchestrator:
                     if not (
                         using_pruned_resume_tail and sync_version < final_sync_version
                     ):
+                        if (
+                            using_pruned_resume_tail
+                            and sync_version == final_sync_version
+                            and any(
+                                step not in staged_adapter_identities
+                                for step in (sync_version - 2, sync_version - 1)
+                            )
+                        ):
+                            raise RuntimeError(
+                                f"cannot resume LoRA policy v{sync_version}: retained adapter predecessor is missing"
+                            )
                         await _verify_startup_adapter_delta(
                             config,
                             self.lora_name,
@@ -1067,7 +1148,7 @@ class Orchestrator:
                         using_pruned_resume_tail
                         and sync_version < final_sync_version
                         and stage_result.get("cache_hit") is not True
-                        and sync_version - 1 not in resume_seed_identities
+                        and sync_version - 1 not in staged_adapter_identities
                     ):
                         raise RuntimeError(
                             f"cannot resume LoRA policy v{sync_version}: retained adapter cache is not ready"

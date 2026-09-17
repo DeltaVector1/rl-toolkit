@@ -121,7 +121,13 @@ def load_resume_slot_finder(common_receipt):
     return namespace["_find_loaded_resume_policy"]
 
 
-def load_resume_staging(seed_identities, sync_versions, stage_results):
+def load_resume_staging(
+    seed_identities,
+    sync_versions,
+    stage_results,
+    *,
+    final_sync_version=4,
+):
     """Run the startup staging loop and its real final identity validator."""
     source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -159,10 +165,12 @@ def load_resume_staging(seed_identities, sync_versions, stage_results):
     async def stage(_clients, _path, **kwargs):
         return stage_results[kwargs["policy_step"]]
 
+    manifests = retained_manifest_chain(final_sync_version - 2)
+
     async def read_manifest(url, _deadline):
-        if url != "http://source/step_4":
+        if url != f"http://source/step_{final_sync_version}":
             raise AssertionError("resume must use verified predecessor identities")
-        return retained_manifest_chain(2)[4], url
+        return manifests[final_sync_version], url
 
     stage_mock = mock.AsyncMock(side_effect=stage)
     namespace = {
@@ -170,7 +178,7 @@ def load_resume_staging(seed_identities, sync_versions, stage_results):
         "self": state,
         "config": config,
         "sync_versions": sync_versions,
-        "final_sync_version": 4,
+        "final_sync_version": final_sync_version,
         "using_pruned_resume_tail": True,
         "resume_seed_identities": seed_identities,
         "staged_adapter_identities": dict(seed_identities),
@@ -462,6 +470,28 @@ def retained_manifest_chain(first_step=32):
             base2_config_sha256=previous_previous_config_sha256,
         )
     return manifests
+
+
+def forward_seed_identity(manifest, receipt, validate):
+    validate(
+        manifest,
+        target_step=23,
+        target_url="http://source/step_23",
+        base_url="http://source/step_22",
+        base2_url="http://source/step_21",
+    )
+    if manifest.get("version") != 2:
+        raise RuntimeError("leading manifest is not version two")
+    identity = {
+        "source_url": "http://source/step_22",
+        "target_sha256": manifest["base_sha256"],
+        "target_size": manifest["base_size"],
+        "config_sha256": manifest["base_config_sha256"],
+        "config_size": manifest["base_config_size"],
+    }
+    if any(receipt.get(name) != value for name, value in identity.items()):
+        raise RuntimeError("loaded identity differs")
+    return identity
 
 
 class JsonResponse(io.BytesIO):
@@ -1329,9 +1359,16 @@ class ResumeRecoveryTest(unittest.TestCase):
             ),
         )
         self.assertIn("resume_seed_identities", setup)
+        self.assertIn("if sync_versions == retained_tail else None", setup)
+        self.assertIn("(forward_seed_step, *sync_versions)", setup)
+        self.assertIn('loaded_manifest["base_sha256"]', setup)
+        self.assertIn('loaded_manifest["base_config_sha256"]', setup)
+        self.assertIn("loaded_step == retained_tail[0] - 1", setup)
+        self.assertIn("sync_versions = retained_tail", setup)
         self.assertIn("sync_versions = (retained_tail[1], final_sync_version)", setup)
         self.assertIn("sync_versions = (retained_tail[0], final_sync_version)", setup)
         self.assertIn("using_pruned_resume_tail and sync_version < final_sync_version", setup)
+        self.assertIn("sync_version - 1 not in staged_adapter_identities", setup)
 
     def test_loaded_v2_resume_accepts_fresh_v3_and_loads_only_v4(self):
         results = {
@@ -1349,6 +1386,160 @@ class ResumeRecoveryTest(unittest.TestCase):
             expected_adapter_identity=results[4]["adapter_identity"],
         )
         self.assertEqual(state.policy.version, 4)
+
+    def test_tail_only_setup_uses_v22_to_stage_v23_through_v25(self):
+        manifest = retained_manifest_chain(23)[23]
+        fetches = []
+
+        def fetch(url, timeout):
+            fetches.append((url, timeout))
+            if url != "http://source/step_23/adapter_manifest.json":
+                raise AssertionError("setup must not fetch the missing v22 manifest")
+            return JsonResponse(json.dumps(manifest).encode("utf-8"))
+
+        def validate(value, *, target_step, target_url, base_url, base2_url):
+            if (
+                value.get("version") != 2
+                or target_step != 23
+                or target_url != "http://source/step_23"
+                or base_url != "http://source/step_22"
+                or base2_url != "http://source/step_21"
+            ):
+                raise RuntimeError("invalid leading manifest")
+
+        receipts = {
+            "adapter-slot1": startup_identity(19, "9", "x"),
+            "adapter-slot0": startup_identity(22, "1", "z"),
+        }
+        probes = []
+
+        async def common(_clients, slot):
+            probes.append(slot)
+            return receipts[slot]
+
+        stable_sources = {step: f"http://source/step_{step}" for step in (23, 24, 25)}
+        eligible_sources = {22: "http://source/step_22", **stable_sources}
+        finder = load_resume_slot_finder(common)
+        loaded_step, loaded_slot, loaded_receipt = asyncio.run(
+            finder(
+                [],
+                "adapter",
+                eligible_sources,
+                22,
+                {"http://source/step_19", "http://source/step_21"},
+            )
+        )
+        self.assertEqual((loaded_step, loaded_slot), (22, "adapter-slot0"))
+        self.assertEqual(probes, ["adapter-slot1", "adapter-slot0"])
+        with fetch("http://source/step_23/adapter_manifest.json", 30) as source:
+            identity = forward_seed_identity(json.load(source), loaded_receipt, validate)
+        self.assertEqual(identity, startup_identity(22, "1", "z"))
+        self.assertEqual(fetches, [("http://source/step_23/adapter_manifest.json", 30)])
+
+        results = {
+            23: {"cache_hit": False, "adapter_identity": startup_identity(23, "2", "a")},
+            24: {"cache_hit": False, "adapter_identity": startup_identity(24, "3", "b")},
+            25: {"cache_hit": False, "adapter_identity": startup_identity(25, "4", "c")},
+        }
+        run, inference, stage, state = load_resume_staging(
+            {22: identity},
+            (23, 24, 25),
+            results,
+            final_sync_version=25,
+        )
+
+        asyncio.run(run())
+
+        self.assertEqual(
+            [call.kwargs["policy_step"] for call in stage.await_args_list],
+            [23, 24, 25],
+        )
+        inference.update_weights.assert_awaited_once_with(
+            "http://source/step_25",
+            lora_name="adapter-slot1",
+            step=25,
+            require_delta=True,
+            prefetched=True,
+            expected_adapter_identity=results[25]["adapter_identity"],
+        )
+        self.assertEqual(state.policy.version, 25)
+
+    def test_forward_seed_rejects_bad_identity_or_leading_v23_manifest_before_stage(self):
+        good_manifest = retained_manifest_chain(23)[23]
+
+        def validate(value, *, target_step, target_url, base_url, base2_url):
+            if (
+                target_step != 23
+                or target_url != "http://source/step_23"
+                or base_url != "http://source/step_22"
+                or base2_url != "http://source/step_21"
+                or value.get("base_url") != base_url
+                or value.get("base2_url") != base2_url
+            ):
+                raise RuntimeError("invalid leading manifest")
+
+        cases = (
+            (dict(good_manifest), startup_identity(22, "f", "z")),
+            (dict(good_manifest, version=1), startup_identity(22, "1", "z")),
+            (
+                dict(good_manifest, base_url="http://source/step_20"),
+                startup_identity(22, "1", "z"),
+            ),
+        )
+        for manifest, receipt in cases:
+            with self.subTest(manifest=manifest, receipt=receipt):
+                stage = mock.AsyncMock()
+
+                async def setup_then_stage():
+                    seed = forward_seed_identity(manifest, receipt, validate)
+                    await stage(seed)
+
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(setup_then_stage())
+                stage.assert_not_awaited()
+
+    def test_forward_resume_rejects_skipped_or_mismatched_predecessor(self):
+        results = {
+            23: {"cache_hit": False, "adapter_identity": startup_identity(23, "2", "a")},
+            24: {"cache_hit": False, "adapter_identity": startup_identity(24, "3", "b")},
+            25: {"cache_hit": False, "adapter_identity": startup_identity(25, "4", "c")},
+        }
+        run, inference, stage, _state = load_resume_staging(
+            {22: startup_identity(22, "1", "z")},
+            (23, 25),
+            results,
+            final_sync_version=25,
+        )
+        with self.assertRaisesRegex(RuntimeError, "predecessor is missing"):
+            asyncio.run(run())
+        self.assertEqual(
+            [call.kwargs["policy_step"] for call in stage.await_args_list], [23]
+        )
+        inference.update_weights.assert_not_awaited()
+
+        for bad_step in (23, 24):
+            with self.subTest(bad_step=bad_step):
+                bad_results = {step: dict(result) for step, result in results.items()}
+                bad_results[bad_step] = {
+                    **bad_results[bad_step],
+                    "adapter_identity": {
+                        **bad_results[bad_step]["adapter_identity"],
+                        "target_sha256": "f" * 64,
+                    },
+                }
+                run, inference, stage, _state = load_resume_staging(
+                    {22: startup_identity(22, "1", "z")},
+                    (23, 24, 25),
+                    bad_results,
+                    final_sync_version=25,
+                )
+                with self.assertRaisesRegex(RuntimeError, "identity differs"):
+                    asyncio.run(run())
+                self.assertEqual(
+                    [call.kwargs["policy_step"] for call in stage.await_args_list],
+                    [23, 24],
+                )
+                inference.update_weights.assert_not_awaited()
 
     def test_pruned_resume_rejects_fresh_cold_or_backward_predecessor(self):
         for seed in ({}, {3: startup_identity(3, "3", "b")}, {4: startup_identity(4, "4", "c")}):
@@ -1527,46 +1718,80 @@ class ResumeRecoveryTest(unittest.TestCase):
                 None,
             )
 
-    def test_loaded_resume_finds_saved_rotating_slot(self):
-        receipt = {
-            "source_url": "http://source/step_33",
-            "target_size": 8,
-            "target_sha256": "a" * 64,
-            "config_size": 2,
-            "config_sha256": "b" * 64,
+    def test_loaded_resume_selects_newest_exact_saved_rotating_slot(self):
+        receipts = {
+            "glm52-decensor-r32-node-local-slot1": startup_identity(19, "9", "x"),
+            "glm52-decensor-r32-node-local-slot0": startup_identity(22, "2", "a"),
         }
         calls = []
 
         async def common(_clients, slot):
             calls.append(slot)
-            return receipt if slot.endswith("slot1") else None
+            return receipts[slot]
 
         finder = load_resume_slot_finder(common)
         self.assertEqual(
-            asyncio.run(finder([], "glm52-decensor-r32-node-local", 34)),
-            ("glm52-decensor-r32-node-local-slot1", receipt),
+            asyncio.run(
+                finder(
+                    [],
+                    "glm52-decensor-r32-node-local",
+                    {step: f"http://source/step_{step}" for step in range(22, 26)},
+                    22,
+                    {"http://source/step_19", "http://source/step_21"},
+                )
+            ),
+            (22, "glm52-decensor-r32-node-local-slot0", receipts["glm52-decensor-r32-node-local-slot0"]),
         )
         self.assertEqual(
             calls,
             [
-                "glm52-decensor-r32-node-local-slot0",
                 "glm52-decensor-r32-node-local-slot1",
+                "glm52-decensor-r32-node-local-slot0",
             ],
         )
 
-    def test_loaded_resume_rejects_mixed_or_missing_slot_receipts(self):
+    def test_loaded_resume_rejects_invalid_ambiguous_or_mixed_slot_receipts(self):
         async def mixed(_clients, _slot):
             raise RuntimeError("loaded policy receipt is missing on one endpoint")
 
         finder = load_resume_slot_finder(mixed)
         with self.assertRaisesRegex(RuntimeError, "missing"):
-            asyncio.run(finder([], "adapter", 34))
+            asyncio.run(finder([], "adapter", {34: "http://source/step_34"}))
+
+        for receipt, saved in (
+            (startup_identity(30, "a", "b"), {34: "http://source/step_34"}),
+            (
+                startup_identity(33, "a", "b"),
+                {33: "http://source/step_33", 34: "http://source/step_34"},
+            ),
+        ):
+            async def invalid(_clients, slot, receipt=receipt):
+                return receipt if slot.endswith("slot0") else None
+
+            finder = load_resume_slot_finder(invalid)
+            with self.subTest(receipt=receipt, saved=saved), self.assertRaisesRegex(
+                RuntimeError, "does not map"
+            ):
+                asyncio.run(finder([], "adapter", saved))
+
+        finder = load_resume_slot_finder(lambda *_args: None)
+        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+            asyncio.run(
+                finder(
+                    [],
+                    "adapter",
+                    {33: "http://source/same", 34: "http://source/same"},
+                )
+            )
 
         async def missing(_clients, _slot):
             return None
 
         finder = load_resume_slot_finder(missing)
-        self.assertEqual(asyncio.run(finder([], "adapter", 34)), (None, None))
+        self.assertEqual(
+            asyncio.run(finder([], "adapter", {34: "http://source/step_34"})),
+            (None, None, None),
+        )
 
     def test_pruned_resume_rejects_noncontiguous_saved_tail(self):
         def fetch(_url, timeout):
