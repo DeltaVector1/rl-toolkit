@@ -92,6 +92,7 @@ from prime_rl.utils.client import (
     common_loaded_lora_receipt,
     init_nccl_broadcast,
     init_nixl_broadcast,
+    remove_lora_adapter,
     stage_lora_adapter,
 )
 from prime_rl.utils.config import to_toml_dict
@@ -431,6 +432,100 @@ async def _find_loaded_resume_policy(
     if forward_seed_step is not None and selected is not None and selected[0] < forward_seed_step:
         raise RuntimeError("loaded policy receipt is older than the forward resume seed")
     return selected if selected is not None else (None, None, None)
+
+
+async def _prepare_final_resume_adapter_slot(
+    admin_clients,
+    lora_name: str,
+    target_step: int,
+    serving_slot: str | None,
+    stale_source_urls: set[str],
+) -> str | None:
+    """Remove one verified stale adapter before the final replacement stage."""
+    if type(target_step) is not int or target_step <= 0:
+        raise RuntimeError("final resume policy step is invalid")
+    if not isinstance(lora_name, str) or not lora_name:
+        raise RuntimeError("final resume LoRA name is invalid")
+    if not isinstance(stale_source_urls, set) or any(
+        not isinstance(url, str) for url in stale_source_urls
+    ):
+        raise RuntimeError("final resume stale adapter source map is invalid")
+    target_slot = f"{lora_name}-slot{target_step % 2}"
+    if not admin_clients:
+        raise RuntimeError("cannot prepare final resume adapter without an inference endpoint")
+
+    async def read_status(admin_client):
+        response = await admin_client.get("/staging_status", timeout=10.0)
+        response.raise_for_status()
+        state = response.json()
+        if not isinstance(state, dict):
+            raise RuntimeError("final resume staging status is invalid")
+        if state.get("status") not in {"idle", "ready"}:
+            raise RuntimeError("cannot unload final resume adapter while endpoint is not idle")
+        for field in ("active_requests", "inflight_requests", "requests_in_flight"):
+            active = state.get(field)
+            if active is not None and (type(active) is not int or active != 0):
+                raise RuntimeError("cannot unload final resume adapter while requests are active")
+        receipts = state.get("loaded_receipts")
+        if not isinstance(receipts, dict):
+            raise RuntimeError("final resume staging status has no loaded adapter receipts")
+        receipt = receipts.get(target_slot)
+        if receipt is None:
+            return None
+        if not isinstance(receipt, dict) or receipt.get("lora_name") != target_slot:
+            raise RuntimeError("final resume loaded adapter receipt has the wrong LoRA name or slot")
+        source_url = receipt.get("source_url")
+        if not isinstance(source_url, str) or source_url not in stale_source_urls:
+            raise RuntimeError("final resume loaded adapter receipt is not the exact stale adapter")
+        match = re.search(r"/step_(\d+)$", source_url.rstrip("/"))
+        if match is None or int(match.group(1)) % 2 != target_step % 2:
+            raise RuntimeError("final resume stale adapter receipt has the wrong slot parity")
+        return receipt
+
+    statuses = await asyncio.gather(*(read_status(client) for client in admin_clients))
+    present = [receipt for receipt in statuses if receipt is not None]
+    if not present:
+        return None
+    if target_slot == serving_slot:
+        raise RuntimeError("final resume target slot is the current serving slot")
+    if serving_slot is None:
+        raise RuntimeError("final resume current serving slot is unknown")
+    expected = dict(present[0])
+    expected.pop("server_instance", None)
+    for receipt in present[1:]:
+        actual = dict(receipt)
+        actual.pop("server_instance", None)
+        if actual != expected:
+            raise RuntimeError("final resume loaded adapter receipts differ across endpoints")
+    await remove_lora_adapter(admin_clients, target_slot)
+    remaining = await asyncio.gather(*(read_status(client) for client in admin_clients))
+    if any(receipt is not None for receipt in remaining):
+        raise RuntimeError("final resume adapter receipt remains after removal")
+    return expected["source_url"]
+
+
+def _stale_resume_source_urls(
+    config: OrchestratorConfig,
+    broadcast_dir,
+    lora_name: str,
+    final_sync_version: int,
+) -> set[str]:
+    """Return older source URLs that occupy the final rotating slot."""
+    if final_sync_version < 4:
+        return set()
+    stale_source_urls = set()
+    for step in range(1, final_sync_version - 2):
+        if step % 2 != final_sync_version % 2:
+            continue
+        source_url = inference_weight_path(
+            config,
+            get_step_path(broadcast_dir, step),
+            lora_name,
+        )
+        if not isinstance(source_url, str) or source_url in stale_source_urls:
+            raise RuntimeError("final resume stale adapter source history is invalid")
+        stale_source_urls.add(source_url)
+    return stale_source_urls
 
 
 def _select_pruned_resume_tail(
@@ -835,6 +930,7 @@ class Orchestrator:
             loaded_slot = None
             using_pruned_resume_tail = False
             resume_seed_identities: dict[int, dict[str, object]] = {}
+            stale_source_urls: set[str] = set()
             if (
                 self.lora_name is not None
                 and config.weight_broadcast.type == "filesystem"
@@ -859,6 +955,12 @@ class Orchestrator:
                 forward_seed_step = (
                     retained_tail[0] - 1 if sync_versions == retained_tail else None
                 )
+                stale_source_urls = _stale_resume_source_urls(
+                    config,
+                    broadcast_dir,
+                    self.lora_name,
+                    final_sync_version,
+                )
                 source_steps = (
                     (forward_seed_step, *sync_versions)
                     if forward_seed_step is not None
@@ -874,21 +976,6 @@ class Orchestrator:
                 }
                 if not all(isinstance(url, str) for url in saved_source_urls.values()):
                     raise RuntimeError("saved adapter policy has no source URL")
-                stale_source_urls = set()
-                if forward_seed_step is not None:
-                    stale_source_urls = {
-                        source_url
-                        for step in range(1, forward_seed_step)
-                        if step % 2 != forward_seed_step % 2
-                        and isinstance(
-                            source_url := inference_weight_path(
-                                config,
-                                get_step_path(broadcast_dir, step),
-                                self.lora_name,
-                            ),
-                            str,
-                        )
-                    }
                 loaded_step, loaded_slot, loaded_receipt = await _find_loaded_resume_policy(
                     self.policy_inference.admin_clients,
                     self.lora_name,
@@ -1086,6 +1173,19 @@ class Orchestrator:
                             previous_previous_identity=staged_adapter_identities.get(sync_version - 2),
                         )
                     weights_path = source_weights_path
+                if (
+                    self.lora_name is not None
+                    and sync_version == final_sync_version
+                    and using_pruned_resume_tail
+                    and stale_source_urls
+                ):
+                    await _prepare_final_resume_adapter_slot(
+                        self.policy_inference.admin_clients,
+                        self.lora_name,
+                        sync_version,
+                        loaded_slot,
+                        stale_source_urls,
+                    )
                 if self.model_express is not None:
                     await asyncio.to_thread(
                         self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY

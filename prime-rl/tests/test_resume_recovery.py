@@ -121,12 +121,55 @@ def load_resume_slot_finder(common_receipt):
     return namespace["_find_loaded_resume_policy"]
 
 
+def load_final_resume_slot_preparer(remove):
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_prepare_final_resume_adapter_slot"
+    )
+    namespace = {
+        "asyncio": asyncio,
+        "re": re,
+        "remove_lora_adapter": remove,
+    }
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"),
+        namespace,
+    )
+    return namespace["_prepare_final_resume_adapter_slot"]
+
+
+def load_stale_resume_source_selector(inference_path):
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_stale_resume_source_urls"
+    )
+    namespace = {
+        "OrchestratorConfig": object,
+        "get_step_path": lambda output, step: output / f"step_{step}",
+        "inference_weight_path": inference_path,
+    }
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"),
+        namespace,
+    )
+    return namespace["_stale_resume_source_urls"]
+
+
 def load_resume_staging(
     seed_identities,
     sync_versions,
     stage_results,
     *,
     final_sync_version=4,
+    final_slot_cleanup=None,
+    stale_source_urls=None,
+    serving_slot="adapter-slot0",
 ):
     """Run the startup staging loop and its real final identity validator."""
     source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
@@ -193,6 +236,9 @@ def load_resume_staging(
         "adapter_stage_limit_seconds": lambda _step: 600.0,
         "get_logger": lambda: mock.Mock(),
         "stage_lora_adapter": stage_mock,
+        "_prepare_final_resume_adapter_slot": final_slot_cleanup or mock.AsyncMock(),
+        "stale_source_urls": stale_source_urls or set(),
+        "loaded_slot": serving_slot,
         "_read_remote_adapter_manifest": read_manifest,
         "validate_adapter_manifest": lambda *_args, **_kwargs: None,
         "_write_receivers_ready": mock.Mock(),
@@ -1387,7 +1433,7 @@ class ResumeRecoveryTest(unittest.TestCase):
         )
         self.assertEqual(state.policy.version, 4)
 
-    def test_tail_only_setup_uses_v22_to_stage_v23_through_v25(self):
+    def test_full_saved_history_uses_v22_to_stage_v23_through_v25(self):
         manifest = retained_manifest_chain(23)[23]
         fetches = []
 
@@ -1417,16 +1463,26 @@ class ResumeRecoveryTest(unittest.TestCase):
             probes.append(slot)
             return receipts[slot]
 
-        stable_sources = {step: f"http://source/step_{step}" for step in (23, 24, 25)}
-        eligible_sources = {22: "http://source/step_22", **stable_sources}
+        with tempfile.TemporaryDirectory() as temporary:
+            broadcast_dir = Path(temporary)
+            for step in range(26):
+                step_path = broadcast_dir / f"step_{step}"
+                step_path.mkdir()
+                (step_path / "STABLE").write_text("stable", encoding="ascii")
+            eligible_sources = {
+                step: f"http://source/step_{step}" for step in range(26)
+            }
+        stale_sources = load_stale_resume_source_selector(
+            lambda _config, path, _lora_name: f"http://source/{path.name}"
+        )(SimpleNamespace(), broadcast_dir, "adapter", 25)
         finder = load_resume_slot_finder(common)
         loaded_step, loaded_slot, loaded_receipt = asyncio.run(
             finder(
                 [],
                 "adapter",
                 eligible_sources,
-                22,
-                {"http://source/step_19", "http://source/step_21"},
+                None,
+                stale_sources,
             )
         )
         self.assertEqual((loaded_step, loaded_slot), (22, "adapter-slot0"))
@@ -1441,11 +1497,14 @@ class ResumeRecoveryTest(unittest.TestCase):
             24: {"cache_hit": False, "adapter_identity": startup_identity(24, "3", "b")},
             25: {"cache_hit": False, "adapter_identity": startup_identity(25, "4", "c")},
         }
+        final_slot_cleanup = mock.AsyncMock()
         run, inference, stage, state = load_resume_staging(
             {22: identity},
             (23, 24, 25),
             results,
             final_sync_version=25,
+            final_slot_cleanup=final_slot_cleanup,
+            stale_source_urls=stale_sources,
         )
 
         asyncio.run(run())
@@ -1463,6 +1522,325 @@ class ResumeRecoveryTest(unittest.TestCase):
             expected_adapter_identity=results[25]["adapter_identity"],
         )
         self.assertEqual(state.policy.version, 25)
+        final_slot_cleanup.assert_awaited_once_with(
+            [],
+            "adapter",
+            25,
+            "adapter-slot0",
+            stale_sources,
+        )
+
+    def test_stale_resume_sources_follow_target_parity_and_tail_boundary(self):
+        selector = load_stale_resume_source_selector(
+            lambda _config, path, _lora_name: f"http://source/{path.name}"
+        )
+        config = SimpleNamespace()
+        broadcast_dir = Path("/unused/broadcast")
+        self.assertEqual(
+            selector(config, broadcast_dir, "adapter", 25),
+            {f"http://source/step_{step}" for step in range(1, 23, 2)},
+        )
+        self.assertEqual(
+            selector(config, broadcast_dir, "adapter", 24),
+            {f"http://source/step_{step}" for step in range(2, 22, 2)},
+        )
+        self.assertEqual(selector(config, broadcast_dir, "adapter", 3), set())
+        full_history = selector(config, broadcast_dir, "adapter", 25)
+        pruned_history = selector(config, broadcast_dir, "adapter", 25)
+        self.assertEqual(full_history, pruned_history)
+        self.assertNotIn("http://source/step_22", full_history)
+        self.assertNotIn("http://source/step_23", full_history)
+        self.assertNotIn("http://source/step_25", full_history)
+
+    def test_final_resume_slot_removes_exact_stale_receipt_before_stage(self):
+        stale_url = "http://source/step_19"
+        receipt = {
+            "lora_name": "adapter-slot1",
+            "source_url": stale_url,
+            "target_size": 8,
+            "target_sha256": "9" * 64,
+            "server_instance": "host-a",
+        }
+
+        class Response:
+            def __init__(self, state):
+                self.state = state
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.state
+
+        class Client:
+            def __init__(self, instance):
+                self.state = {
+                    "status": "ready",
+                    "loaded_receipts": {
+                        "adapter-slot1": {**receipt, "server_instance": instance}
+                    },
+                }
+
+            async def get(self, _path, timeout):
+                self.timeout = timeout
+                return Response(self.state)
+
+        clients = [Client("host-a"), Client("host-b")]
+
+        async def remove(clients, slot):
+            for client in clients:
+                client.state["loaded_receipts"].pop(slot, None)
+
+        removed = mock.AsyncMock(side_effect=remove)
+        prepare = load_final_resume_slot_preparer(removed)
+
+        result = asyncio.run(
+            prepare(
+                clients,
+                "adapter",
+                25,
+                "adapter-slot0",
+                {stale_url, "http://source/step_21"},
+            )
+        )
+
+        self.assertEqual(result, stale_url)
+        removed.assert_awaited_once_with(clients, "adapter-slot1")
+        self.assertEqual([client.timeout for client in clients], [10.0, 10.0])
+        self.assertEqual(
+            [client.state["loaded_receipts"] for client in clients], [{}, {}]
+        )
+
+    def test_final_resume_slot_rejects_wrong_target_slot_or_receipt(self):
+        cases = (
+            {
+                "lora_name": "adapter-slot0",
+                "source_url": "http://source/step_19",
+            },
+            {
+                "lora_name": "adapter-slot1",
+                "source_url": "http://source/step_18",
+            },
+            {
+                "lora_name": "adapter-slot1",
+                "source_url": "http://source/step_20",
+            },
+        )
+        for bad_receipt in cases:
+            with self.subTest(receipt=bad_receipt):
+                class Response:
+                    def raise_for_status(self):
+                        return None
+
+                    def json(self):
+                        return {
+                            "status": "ready",
+                            "loaded_receipts": {"adapter-slot1": bad_receipt},
+                        }
+
+                class Client:
+                    async def get(self, _path, timeout):
+                        return Response()
+
+                removed = mock.AsyncMock()
+                prepare = load_final_resume_slot_preparer(removed)
+                with self.assertRaisesRegex(RuntimeError, "wrong|exact stale"):
+                    asyncio.run(
+                        prepare(
+                            [Client()],
+                            "adapter",
+                            25,
+                            "adapter-slot0",
+                            {"http://source/step_19"},
+                        )
+                    )
+                removed.assert_not_awaited()
+
+    def test_final_resume_slot_rejects_current_serving_slot_or_active_requests(self):
+        removed = mock.AsyncMock()
+        prepare = load_final_resume_slot_preparer(removed)
+
+        class CurrentResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "status": "ready",
+                    "loaded_receipts": {
+                        "adapter-slot0": {
+                            "lora_name": "adapter-slot0",
+                            "source_url": "http://source/step_18",
+                        }
+                    },
+                }
+
+        class CurrentClient:
+            async def get(self, _path, timeout):
+                return CurrentResponse()
+
+        with self.assertRaisesRegex(RuntimeError, "current serving"):
+            asyncio.run(
+                prepare(
+                    [CurrentClient()],
+                    "adapter",
+                    24,
+                    "adapter-slot0",
+                    {"http://source/step_18"},
+                )
+            )
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "status": "ready",
+                    "active_requests": 1,
+                    "loaded_receipts": {
+                        "adapter-slot1": {
+                            "lora_name": "adapter-slot1",
+                            "source_url": "http://source/step_19",
+                        }
+                    },
+                }
+
+        class Client:
+            async def get(self, _path, timeout):
+                return Response()
+
+        with self.assertRaisesRegex(RuntimeError, "requests are active"):
+            asyncio.run(
+                prepare(
+                    [Client()],
+                    "adapter",
+                    25,
+                    "adapter-slot0",
+                    {"http://source/step_19"},
+                )
+            )
+        removed.assert_not_awaited()
+
+    def test_final_resume_slot_aborts_when_unload_fails(self):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "status": "ready",
+                    "loaded_receipts": {
+                        "adapter-slot1": {
+                            "lora_name": "adapter-slot1",
+                            "source_url": "http://source/step_19",
+                        }
+                    },
+                }
+
+        class Client:
+            async def get(self, _path, timeout):
+                return Response()
+
+        removed = mock.AsyncMock(side_effect=RuntimeError("unload failed"))
+        prepare = load_final_resume_slot_preparer(removed)
+        with self.assertRaisesRegex(RuntimeError, "unload failed"):
+            asyncio.run(
+                prepare(
+                    [Client()],
+                    "adapter",
+                    25,
+                    "adapter-slot0",
+                    {"http://source/step_19"},
+                )
+            )
+        removed.assert_awaited_once()
+
+    def test_final_resume_slot_restart_after_partial_removal_is_idempotent(self):
+        stale_url = "http://source/step_19"
+        receipt = {"lora_name": "adapter-slot1", "source_url": stale_url}
+
+        class Response:
+            def __init__(self, state):
+                self.state = state
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self.state
+
+        class Client:
+            def __init__(self):
+                self.state = {
+                    "status": "ready",
+                    "loaded_receipts": {"adapter-slot1": dict(receipt)},
+                }
+
+            async def get(self, _path, timeout):
+                return Response(self.state)
+
+        clients = [Client(), Client()]
+        removals = []
+
+        async def partial_remove(_clients, slot):
+            removals.append(slot)
+            clients[0].state["loaded_receipts"].pop(slot, None)
+
+        prepare = load_final_resume_slot_preparer(partial_remove)
+        with self.assertRaisesRegex(RuntimeError, "remains after removal"):
+            asyncio.run(
+                prepare(clients, "adapter", 25, "adapter-slot0", {stale_url})
+            )
+        self.assertEqual(removals, ["adapter-slot1"])
+        self.assertEqual(clients[0].state["loaded_receipts"], {})
+        self.assertIn("adapter-slot1", clients[1].state["loaded_receipts"])
+
+        async def remove(_clients, slot):
+            removals.append(slot)
+            for client in clients:
+                client.state["loaded_receipts"].pop(slot, None)
+
+        prepare = load_final_resume_slot_preparer(remove)
+        self.assertEqual(
+            asyncio.run(prepare(clients, "adapter", 25, "adapter-slot0", {stale_url})),
+            stale_url,
+        )
+        self.assertEqual(removals, ["adapter-slot1", "adapter-slot1"])
+        self.assertIsNone(
+            asyncio.run(prepare(clients, "adapter", 25, "adapter-slot0", {stale_url}))
+        )
+        self.assertEqual(removals, ["adapter-slot1", "adapter-slot1"])
+
+    def test_final_resume_slot_rejects_successful_unload_that_leaves_receipt(self):
+        stale_url = "http://source/step_19"
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "status": "ready",
+                    "loaded_receipts": {
+                        "adapter-slot1": {
+                            "lora_name": "adapter-slot1",
+                            "source_url": stale_url,
+                        }
+                    },
+                }
+
+        class Client:
+            async def get(self, _path, timeout):
+                return Response()
+
+        removed = mock.AsyncMock()
+        prepare = load_final_resume_slot_preparer(removed)
+        with self.assertRaisesRegex(RuntimeError, "remains after removal"):
+            asyncio.run(
+                prepare([Client()], "adapter", 25, "adapter-slot0", {stale_url})
+            )
+        removed.assert_awaited_once_with(mock.ANY, "adapter-slot1")
 
     def test_forward_seed_rejects_bad_identity_or_leading_v23_manifest_before_stage(self):
         good_manifest = retained_manifest_chain(23)[23]
