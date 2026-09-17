@@ -1329,7 +1329,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     self.assertLessEqual(sum(path.is_dir() for path in paths.values()), 4)
                 loaded = [target - 1, target]
 
-    def test_pre_stage_cleanup_rejects_reused_pid_identity_after_restart(self):
+    def test_pre_stage_cleanup_rejects_missing_or_corrupt_receipts(self):
         filesystem = load_filesystem()
         old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
         try:
@@ -1361,7 +1361,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 )
 
                 receipt_path = Path(temporary) / filesystem._ADAPTER_LOADED_RECEIPTS
-                for ownership in ("stale", "corrupt", "missing"):
+                for ownership in ("corrupt", "missing"):
                     with self.subTest(ownership=ownership):
                         if ownership == "corrupt":
                             receipt_path.write_text("not json")
@@ -1382,6 +1382,148 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)
             else:
                 os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_pre_stage_cleanup_uses_transport_bases_after_receipt_owner_exits(self):
+        filesystem = load_filesystem()
+        for owner in ("reused", "dead", "unreadable", "malformed"):
+            with self.subTest(owner=owner), tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+                os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+            ):
+                cache = Path(temporary)
+                urls = {step: f"http://source/run/step_{step}" for step in (19, 22, 23, 24, 25, 26)}
+                paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+                for step in (19, 22, 23, 24, 26):
+                    paths[step].mkdir()
+                    (paths[step] / "READY").touch()
+                    (paths[step] / "transport.json").write_text(json.dumps({"source_url": urls[step]}))
+                unknown = filesystem.adapter_cache_path("unknown")
+                unknown.mkdir()
+                (unknown / "READY").touch()
+                partial = paths[25].with_name(f"{paths[25].name}.partial")
+                partial.mkdir()
+                receipt = {"pid": os.getpid(), "start_time": 1, "receipts": {
+                    "slot0": {"source_url": urls[19]}, "slot1": {"source_url": urls[22]},
+                }}
+                if owner == "malformed":
+                    receipt["receipts"]["slot1"] = {}
+                receipt_path = cache / filesystem._ADAPTER_LOADED_RECEIPTS
+                receipt_path.write_text(json.dumps(receipt))
+                transport = {"base_url": urls[24], "base2_url": urls[23]}
+                with mock.patch.object(
+                    filesystem, "_process_start_time", return_value=2 if owner == "reused" else None
+                ), mock.patch.object(
+                    filesystem.os, "kill", side_effect=ProcessLookupError() if owner in ("dead", "malformed") else None
+                ):
+                    with filesystem.adapter_reader_lock(paths[19]):
+                        filesystem._cleanup_adapter_space_before_stage(
+                            cache, paths[25], transport, source_url=urls[25]
+                        )
+                        self.assertTrue(paths[19].is_dir())
+                    filesystem._cleanup_adapter_space_before_stage(
+                        cache, paths[25], transport, source_url=urls[25]
+                    )
+                for step in (19, 22):
+                    self.assertEqual(paths[step].exists(), owner in ("reused", "unreadable", "malformed"))
+                for step in (23, 24, 26):
+                    self.assertTrue(paths[step].is_dir())
+                self.assertTrue(unknown.is_dir())
+                self.assertTrue(partial.is_dir())
+                self.assertEqual(json.loads(receipt_path.read_text()), receipt)
+
+    def test_pre_stage_cleanup_rejects_malformed_dead_owner_sources(self):
+        filesystem = load_filesystem()
+        invalid_receipts = [
+            {}, [], {"slot": None}, {"slot": {}},
+            *({"slot": {"source_url": value}} for value in (
+                "not a URL", "ftp://source/step_19", "http:///step_19",
+                "http://[invalid/step_19", "", None, 19, "http://source/\ud800",
+            )),
+            {"slot0": {"source_url": "http://source/step_19"}, "slot1": {"source_url": "bad"}},
+        ]
+        for receipts in invalid_receipts:
+            with self.subTest(receipts=receipts), tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+                os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+            ):
+                cache = Path(temporary)
+                urls = {step: f"http://source/run/step_{step}" for step in (19, 23, 24, 25)}
+                paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+                for step in (19, 23, 24):
+                    paths[step].mkdir()
+                    (paths[step] / "READY").touch()
+                    (paths[step] / "transport.json").write_text(json.dumps({"source_url": urls[step]}))
+                (cache / filesystem._ADAPTER_LOADED_RECEIPTS).write_text(json.dumps({
+                    "pid": os.getpid(), "start_time": 1, "receipts": receipts,
+                }))
+                with mock.patch.object(
+                    filesystem, "_process_start_time", return_value=None
+                ), mock.patch.object(filesystem.os, "kill", side_effect=ProcessLookupError()):
+                    self.assertEqual(filesystem._loaded_adapter_receipt_state(cache), ("unknown", []))
+                    filesystem._cleanup_adapter_space_before_stage(
+                        cache, paths[25], {"base_url": urls[24], "base2_url": urls[23]}, source_url=urls[25]
+                    )
+                for step in (19, 23, 24):
+                    self.assertTrue(paths[step].is_dir())
+
+    def test_stale_receipt_stage_frees_space_before_target_allocation(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+        ):
+            cache = Path(temporary)
+            urls = {step: f"http://source/run/step_{step}" for step in (19, 22, 23, 24, 25)}
+            paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+            cache_bytes = 4096
+            for step in (19, 22, 23, 24):
+                paths[step].mkdir()
+                (paths[step] / "READY").touch()
+                (paths[step] / "transport.json").write_text(json.dumps({"source_url": urls[step]}))
+            (cache / filesystem._ADAPTER_LOADED_RECEIPTS).write_text(json.dumps({
+                "pid": os.getpid(), "start_time": 1,
+                "receipts": {"slot0": {"source_url": urls[19]}, "slot1": {"source_url": urls[22]}},
+            }))
+            transport = {
+                "mode": "delta", "transport": filesystem._ADAPTER_LINEAR_TRANSPORT,
+                "source_manifest": {"target_step": 25},
+                "base_url": urls[24], "base2_url": urls[23],
+                "target_size": cache_bytes, "target_sha256": "a" * 64,
+                "config_size": 0, "config_sha256": "b" * 64,
+            }
+            manifest = {"files": {
+                filesystem._ADAPTER_FILES[0]: {"size": 0, "sha256": "b" * 64},
+                filesystem._ADAPTER_FILES[1]: {"size": cache_bytes, "sha256": "a" * 64},
+            }}
+
+            def disk_usage(_path):
+                return types.SimpleNamespace(free=(4 - sum(path.is_dir() for path in paths.values())) * cache_bytes)
+
+            def stage(source_url, _transport, _manifest, **_kwargs):
+                self.assertEqual(source_url, urls[25])
+                self.assertFalse(paths[19].exists())
+                self.assertFalse(paths[22].exists())
+                self.assertTrue(paths[23].is_dir())
+                self.assertTrue(paths[24].is_dir())
+                self.assertEqual(disk_usage(cache).free, 2 * cache_bytes)
+                filesystem._preflight_adapter_space(
+                    cache, [(paths[25] / filesystem._ADAPTER_FILES[1], cache_bytes)]
+                )
+                paths[25].mkdir()
+                filesystem._preallocate(paths[25] / filesystem._ADAPTER_FILES[1], cache_bytes)
+                (paths[25] / "READY").touch()
+                return paths[25]
+
+            self.assertEqual(disk_usage(cache).free, 0)
+            with mock.patch.object(
+                filesystem, "_process_start_time", return_value=None
+            ), mock.patch.object(
+                filesystem.os, "kill", side_effect=ProcessLookupError()
+            ), mock.patch.object(
+                filesystem, "_read_delta_manifest_with_visibility_wait", return_value=transport
+            ), mock.patch.object(filesystem, "_source_manifest", return_value=manifest), mock.patch.object(
+                filesystem, "_stage_chunked_linear_adapter", side_effect=stage
+            ) as stage_call, mock.patch.object(filesystem.shutil, "disk_usage", side_effect=disk_usage):
+                self.assertEqual(filesystem.stage_lora_adapter_files(urls[25], require_delta=True), paths[25])
+                stage_call.assert_called_once()
+            self.assertEqual((paths[25] / filesystem._ADAPTER_FILES[1]).stat().st_size, cache_bytes)
 
     def test_delta_cleanup_rejects_a_symlinked_candidate(self):
         filesystem = load_filesystem()

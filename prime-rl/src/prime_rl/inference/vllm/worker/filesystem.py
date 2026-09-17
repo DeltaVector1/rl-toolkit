@@ -3035,7 +3035,8 @@ def _cleanup_obsolete_adapter_partials(
         )
 
 
-def _loaded_adapter_source_urls(cache_root: Path) -> list[str]:
+def _loaded_adapter_receipt_state(cache_root: Path) -> tuple[str, list[str]]:
+    """Distinguish a dead owner from a missing or untrusted receipt."""
     try:
         cache_fd = _open_directory_nofollow(
             cache_root,
@@ -3054,7 +3055,7 @@ def _loaded_adapter_source_urls(cache_root: Path) -> list[str]:
         finally:
             os.close(cache_fd)
     except (FileNotFoundError, OSError, ValueError):
-        return []
+        return "unknown", []
     pid = value.get("pid") if isinstance(value, dict) else None
     start_time = value.get("start_time") if isinstance(value, dict) else None
     if (
@@ -3062,21 +3063,45 @@ def _loaded_adapter_source_urls(cache_root: Path) -> list[str]:
         or pid <= 0
         or type(start_time) is not int
         or start_time <= 0
-        or _process_start_time(pid) != start_time
     ):
-        return []
-    try:
-        os.kill(pid, 0)
-    except (OSError, OverflowError):
-        return []
+        return "unknown", []
     receipts = value.get("receipts") if isinstance(value, dict) else None
     if not isinstance(receipts, dict):
-        return []
-    return [
+        return "unknown", []
+    urls = [
         receipt["source_url"]
         for receipt in receipts.values()
         if isinstance(receipt, dict) and isinstance(receipt.get("source_url"), str)
     ]
+    current_start_time = _process_start_time(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass
+    except (OSError, OverflowError):
+        return "unknown", []
+    else:
+        if current_start_time != start_time:
+            return "unknown", []
+        return "live", urls
+    # Stale data is not a lease. Only a complete receipt permits the caller
+    # to use the validated transport's bases as cleanup anchors.
+    if not urls or len(urls) != len(receipts):
+        return "unknown", []
+    for source_url in urls:
+        try:
+            parsed = urlsplit(source_url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                return "unknown", []
+            if adapter_cache_path(source_url).parent != cache_root:
+                return "unknown", []
+        except (OSError, ValueError):
+            return "unknown", []
+    return "stale", []
+
+
+def _loaded_adapter_source_urls(cache_root: Path) -> list[str]:
+    return _loaded_adapter_receipt_state(cache_root)[1]
 
 
 def _cleanup_adapter_space_before_stage(
@@ -3093,14 +3118,16 @@ def _cleanup_adapter_space_before_stage(
     if deadline is not None:
         cleanup_deadline = min(cleanup_deadline, deadline)
     preserve_names = {destination.name}
-    loaded_urls = _loaded_adapter_source_urls(cache_root)
-    if not loaded_urls:
+    receipt_state, loaded_urls = _loaded_adapter_receipt_state(cache_root)
+    if receipt_state == "unknown" or (receipt_state == "live" and not loaded_urls):
         return
     active_urls = list(loaded_urls)
     for key in ("base_url", "base2_url"):
         predecessor_url = transport.get(key)
         if isinstance(predecessor_url, str):
             preserve_names.add(adapter_cache_path(predecessor_url).name)
+            if receipt_state == "stale":
+                active_urls.append(predecessor_url)
 
     active: Path | None = None
     for active_url in active_urls:
