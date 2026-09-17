@@ -73,9 +73,16 @@ class AdapterCacheScanTest(unittest.TestCase):
         ):
             cache = Path(temporary)
             metadata = self.add_metadata(cache)
-            active, old, leased = (cache / (letter * 64) for letter in "abc")
-            for path in (active, old, leased):
-                self.add_ready(filesystem, path, "http://source/adapter")
+            urls = [f"http://source/step_{step}" for step in (3, 1, 2)]
+            active, old, leased = (filesystem.adapter_cache_path(url) for url in urls)
+            for path, url in zip((active, old, leased), urls):
+                self.add_ready(filesystem, path, url)
+            unknown = [cache / (letter * 64) for letter in "def"]
+            for path in unknown:
+                self.add_ready(filesystem, path, "http://unknown/step_0")
+            (unknown[0] / "transport.json").unlink()
+            (unknown[0] / "manifest.json").unlink()
+            (unknown[1] / "transport.json").write_text("not json")
             retired = active.with_name(active.name + ".retired-1")
             self.add_ready(filesystem, retired, "http://source/adapter")
             partial = old.with_name(old.name + ".partial")
@@ -94,6 +101,8 @@ class AdapterCacheScanTest(unittest.TestCase):
             self.assertFalse(old.exists())
             self.assertFalse(retired.exists())
             self.assertFalse(partial.exists())
+            for path in unknown:
+                self.assertTrue(path.is_dir())
             self.assert_metadata_unchanged(metadata)
 
     def test_full_reuse_ignores_persistent_reader_metadata_and_checks_digest(self):
@@ -148,8 +157,13 @@ class AdapterCacheScanTest(unittest.TestCase):
                         elif kind == "partial":
                             name += ".partial"
                         candidate = cache / name
+                        if kind == "previous":
+                            source_url = f"http://source/step_{index}"
+                            candidate = cache / hashlib.sha256(source_url.encode()).hexdigest()
                         candidate.mkdir()
                         (candidate / "READY").write_text("ready\n")
+                        if kind == "previous":
+                            (candidate / "transport.json").write_text(json.dumps({"source_url": source_url}))
                     scan = self.scans(filesystem, cache, destination)[kind]
                     if count > limit:
                         with self.assertRaisesRegex(OSError, "too many .*candidates") as raised:

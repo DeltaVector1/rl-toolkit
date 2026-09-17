@@ -1223,53 +1223,111 @@ class LinearAdapterReceiverTest(unittest.TestCase):
 
     def test_pre_stage_cleanup_preserves_loaded_policy_over_staged_status(self):
         filesystem = load_filesystem()
-        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
-        try:
-            with tempfile.TemporaryDirectory() as temporary:
-                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
-                loaded_url = "http://source/run/broadcasts/step_0"
-                base2_url = "http://source/run/broadcasts/step_1"
-                base_url = "http://source/run/broadcasts/step_2"
-                target_url = "http://source/run/broadcasts/step_3"
-                obsolete_url = "http://old/adapter"
-                paths = {
-                    url: filesystem.adapter_cache_path(url)
-                    for url in (loaded_url, base2_url, base_url, target_url, obsolete_url)
-                }
-                for url in (loaded_url, base2_url, base_url, obsolete_url):
-                    path = paths[url]
-                    path.mkdir(parents=True)
-                    (path / "READY").write_text("ready\n", encoding="ascii")
-                    (path / "transport.json").write_text(
-                        json.dumps({"source_url": url}), encoding="utf-8"
-                    )
-                target_partial = paths[target_url].with_name(
-                    f"{paths[target_url].name}.partial"
-                )
+        for loaded_steps in ((19, 22), (22, 19)):
+            with self.subTest(loaded_steps=loaded_steps), tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+                os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+            ):
+                cache = Path(temporary)
+                urls = {step: f"http://source/run/broadcasts/step_{step}" for step in range(19, 26)}
+                paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+                for step, path in paths.items():
+                    if step != 23:
+                        path.mkdir()
+                        (path / "READY").write_text("ready\n")
+                        (path / "transport.json").write_text(json.dumps({"source_url": urls[step]}))
+                target_partial = paths[23].with_name(f"{paths[23].name}.partial")
                 target_partial.mkdir()
                 filesystem.write_loaded_adapter_receipts(
-                    {"adapter-slot1": {"source_url": loaded_url}}
+                    {f"adapter-slot{index}": {"source_url": urls[step]}
+                     for index, step in enumerate(loaded_steps)}
                 )
-                (Path(temporary) / ".adapter-stage-status.json").write_text(
-                    json.dumps({"status": "staging", "source_url": base_url}),
-                    encoding="utf-8",
+                (cache / ".adapter-stage-status.json").write_text(
+                    json.dumps({"status": "staging", "source_url": urls[19]})
                 )
-
+                transport = {"mode": "delta", "base_url": urls[22], "base2_url": urls[21]}
+                with filesystem.adapter_reader_lock(paths[20]):
+                    lock_path = filesystem._adapter_reader_lock(paths[20])
+                    lock_inode = lock_path.stat().st_ino
+                    filesystem._cleanup_adapter_space_before_stage(
+                        cache, paths[23], transport, source_url=urls[23]
+                    )
+                    self.assertTrue(paths[20].is_dir())
+                    self.assertEqual(lock_path.stat().st_ino, lock_inode)
                 filesystem._cleanup_adapter_space_before_stage(
-                    Path(temporary),
-                    paths[target_url],
-                    {"mode": "delta", "base_url": base_url, "base2_url": base2_url},
+                    cache, paths[23], transport, source_url=urls[23]
                 )
-
-                for url in (loaded_url, base2_url, base_url):
-                    self.assertTrue(paths[url].is_dir())
+                for step in (19, 21, 22, 24, 25):
+                    self.assertTrue(paths[step].is_dir())
                 self.assertTrue(target_partial.is_dir())
-                self.assertFalse(paths[obsolete_url].exists())
-        finally:
-            if old_cache is None:
-                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
-            else:
-                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+                self.assertFalse(paths[20].exists())
+                self.assertEqual(lock_path.stat().st_ino, lock_inode)
+
+    def test_pre_stage_cleanup_prunes_before_repeated_low_space_stages(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+        ):
+            cache = Path(temporary)
+            urls = {step: f"http://source/run/step_{step}" for step in range(19, 31)}
+            paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+            cache_bytes = 4096
+            capacity = 4 * cache_bytes
+
+            def publish(step, transport):
+                paths[step].mkdir()
+                (paths[step] / "READY").write_text("ready\n")
+                (paths[step] / "transport.json").write_text(json.dumps({
+                    **transport, "source_url": urls[step],
+                }))
+
+            for step in range(19, 23):
+                publish(step, {})
+            for index in range(300):
+                (cache / f".{index:064x}.readers.lock").touch()
+            loaded = [19, 22]
+
+            def disk_usage(_path):
+                used = sum(path.is_dir() for path in paths.values()) * cache_bytes
+                return types.SimpleNamespace(free=capacity - used)
+
+            for target in range(23, 31):
+                filesystem.write_loaded_adapter_receipts({
+                    f"slot{index}": {"source_url": urls[step]}
+                    for index, step in enumerate(loaded)
+                })
+                transport = {
+                    "mode": "delta", "transport": filesystem._ADAPTER_LINEAR_TRANSPORT,
+                    "source_manifest": {"target_step": target},
+                    "base_url": urls[target - 1], "base2_url": urls[target - 2],
+                    "target_size": cache_bytes, "target_sha256": "a" * 64,
+                    "config_size": 0, "config_sha256": "b" * 64,
+                }
+                manifest = {"files": {
+                    filesystem._ADAPTER_FILES[0]: {"size": 0, "sha256": "b" * 64},
+                    filesystem._ADAPTER_FILES[1]: {"size": cache_bytes, "sha256": "a" * 64},
+                }}
+
+                def stage(source_url, validated_transport, _manifest, **_kwargs):
+                    self.assertEqual(source_url, urls[target])
+                    filesystem._preflight_adapter_space(
+                        cache, [(paths[target] / filesystem._ADAPTER_FILES[1], cache_bytes)]
+                    )
+                    for step in {*loaded, target - 1, target - 2}:
+                        self.assertTrue(paths[step].is_dir())
+                    publish(target, validated_transport)
+                    filesystem._cleanup_adapter_caches(cache, paths[target])
+                    return paths[target]
+
+                with self.subTest(target=target), mock.patch.object(
+                    filesystem, "_read_delta_manifest_with_visibility_wait", return_value=transport
+                ), mock.patch.object(filesystem, "_source_manifest", return_value=manifest), mock.patch.object(
+                    filesystem, "_stage_chunked_linear_adapter", side_effect=stage
+                ), mock.patch.object(filesystem.shutil, "disk_usage", side_effect=disk_usage):
+                    self.assertEqual(
+                        filesystem.stage_lora_adapter_files(urls[target], require_delta=True), paths[target]
+                    )
+                    self.assertLessEqual(sum(path.is_dir() for path in paths.values()), 4)
+                loaded = [target - 1, target]
 
     def test_pre_stage_cleanup_rejects_reused_pid_identity_after_restart(self):
         filesystem = load_filesystem()
@@ -1302,16 +1360,23 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-                filesystem._cleanup_adapter_space_before_stage(
-                    Path(temporary),
-                    paths["target"],
-                    {"mode": "delta", "base_url": urls["base"], "base2_url": urls["base2"]},
-                )
-
-                for name in ("loaded", "base2", "base"):
-                    self.assertTrue(paths[name].exists())
-                self.assertTrue(paths["target"].with_name(f"{paths['target'].name}.partial").exists())
-                self.assertTrue((Path(temporary) / filesystem._ADAPTER_LOADED_RECEIPTS).is_file())
+                receipt_path = Path(temporary) / filesystem._ADAPTER_LOADED_RECEIPTS
+                for ownership in ("stale", "corrupt", "missing"):
+                    with self.subTest(ownership=ownership):
+                        if ownership == "corrupt":
+                            receipt_path.write_text("not json")
+                        elif ownership == "missing":
+                            receipt_path.unlink()
+                        filesystem._cleanup_adapter_space_before_stage(
+                            Path(temporary),
+                            paths["target"],
+                            {"mode": "delta", "base_url": urls["base"], "base2_url": urls["base2"]},
+                            source_url=urls["target"],
+                        )
+                        for name in ("loaded", "base2", "base"):
+                            self.assertTrue(paths[name].exists())
+                        self.assertTrue(paths["target"].with_name(f"{paths['target'].name}.partial").exists())
+                        self.assertEqual(receipt_path.exists(), ownership != "missing")
         finally:
             if old_cache is None:
                 os.environ.pop("PRIME_LORA_CACHE_DIR", None)

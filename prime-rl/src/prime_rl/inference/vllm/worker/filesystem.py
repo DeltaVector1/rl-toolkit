@@ -2813,6 +2813,7 @@ def _cleanup_previous_adapter_caches(
     *,
     preserve_names: set[str] | None = None,
     preserve_active_bases: bool = True,
+    future_source_url: str | None = None,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> None:
@@ -2830,8 +2831,22 @@ def _cleanup_previous_adapter_caches(
         active_name = active.name
         ready_candidates: list[str] = []
         candidate_steps: dict[str, tuple[str, int]] = {}
+        unknown_names: set[str] = set()
 
-        def cached_step(directory_fd: int) -> tuple[str, int] | None:
+        def source_step(source_url: str) -> tuple[str, int] | None:
+            parsed = urlsplit(source_url)
+            match = re.fullmatch(r"step_(\d+)", Path(parsed.path.rstrip("/")).name)
+            if match is None:
+                return None
+            run_url = urlunsplit(parsed._replace(
+                path=str(Path(parsed.path.rstrip("/")).parent),
+                query="",
+                fragment="",
+            ))
+            return run_url, int(match.group(1))
+
+        def cached_source_url(directory_fd: int, cache_name: str) -> str | None:
+            source_url = None
             for metadata_name in ("transport.json", "manifest.json"):
                 try:
                     metadata = json.loads(
@@ -2842,24 +2857,23 @@ def _cleanup_previous_adapter_caches(
                             max_bytes=_ADAPTER_METADATA_MAX_BYTES,
                         )
                     )
-                except (FileNotFoundError, OSError, ValueError):
+                except FileNotFoundError:
                     continue
-                source_url = metadata.get("source_url") if isinstance(metadata, dict) else None
-                if not isinstance(source_url, str):
-                    continue
-                parsed = urlsplit(source_url)
-                match = re.fullmatch(
-                    r"step_(\d+)",
-                    Path(parsed.path.rstrip("/")).name,
-                )
-                if match is not None:
-                    run_url = urlunsplit(parsed._replace(
-                        path=str(Path(parsed.path.rstrip("/")).parent),
-                        query="",
-                        fragment="",
-                    ))
-                    return run_url, int(match.group(1))
-            return None
+                except (OSError, ValueError):
+                    return None
+                value = metadata.get("source_url") if isinstance(metadata, dict) else None
+                if not isinstance(value, str) or adapter_cache_path(value).name != cache_name:
+                    return None
+                try:
+                    parsed = urlsplit(value)
+                    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                        return None
+                except ValueError:
+                    return None
+                if source_url is not None and value != source_url:
+                    return None
+                source_url = value
+            return source_url
 
         entry_count = 0
         with os.scandir(cache_fd) as entries:
@@ -2897,13 +2911,17 @@ def _cleanup_previous_adapter_caches(
                 else:
                     os.close(ready_fd)
                 ready_candidates.append(name)
-                step = cached_step(candidate_fd)
+                candidate_url = cached_source_url(candidate_fd, name)
+                if candidate_url is None:
+                    unknown_names.add(name)
+                    continue
+                step = source_step(candidate_url)
                 if step is not None:
                     candidate_steps[name] = step
             finally:
                 os.close(candidate_fd)
 
-        keep = {active_name, *(preserve_names or set())}
+        keep = {active_name, *unknown_names, *(preserve_names or set())}
         keep.update(adapter_cache_path(url).name for url in _loaded_adapter_source_urls(cache_root))
         active_step = None
         try:
@@ -2921,7 +2939,9 @@ def _cleanup_previous_adapter_caches(
                         max_bytes=_ADAPTER_METADATA_MAX_BYTES,
                     )
                 )
-                active_step = cached_step(active_fd)
+                active_url = cached_source_url(active_fd, active_name)
+                if active_url is not None:
+                    active_step = source_step(active_url)
             finally:
                 os.close(active_fd)
         except (FileNotFoundError, OSError, ValueError):
@@ -2934,6 +2954,9 @@ def _cleanup_previous_adapter_caches(
                     if predecessor_name in ready_candidates:
                         keep.add(predecessor_name)
 
+        # Loaded slots are a keep-set, not the boundary for future caches.
+        if future_source_url is not None:
+            active_step = source_step(future_source_url)
         if active_step is not None:
             keep.update(
                 name
@@ -3061,6 +3084,7 @@ def _cleanup_adapter_space_before_stage(
     destination: Path,
     transport: dict[str, object],
     *,
+    source_url: str | None = None,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> None:
@@ -3111,6 +3135,7 @@ def _cleanup_adapter_space_before_stage(
         active,
         preserve_names=preserve_names,
         preserve_active_bases=False,
+        future_source_url=source_url,
         deadline=cleanup_deadline,
         cancel_event=cancel_event,
     )
@@ -6652,6 +6677,7 @@ def stage_lora_adapter_files(
                     destination.parent,
                     destination,
                     transport,
+                    source_url=source_url,
                     deadline=operation_deadline,
                     cancel_event=cancel_event,
                 )
