@@ -451,10 +451,6 @@ async def _prepare_final_resume_adapter_slot(
     ):
         raise RuntimeError("final resume stale adapter source map is invalid")
     target_slot = f"{lora_name}-slot{target_step % 2}"
-    if target_slot == serving_slot:
-        raise RuntimeError("final resume target slot is the current serving slot")
-    if serving_slot is None:
-        raise RuntimeError("final resume current serving slot is unknown")
     if not admin_clients:
         raise RuntimeError("cannot prepare final resume adapter without an inference endpoint")
 
@@ -490,6 +486,10 @@ async def _prepare_final_resume_adapter_slot(
     present = [receipt for receipt in statuses if receipt is not None]
     if not present:
         return None
+    if target_slot == serving_slot:
+        raise RuntimeError("final resume target slot is the current serving slot")
+    if serving_slot is None:
+        raise RuntimeError("final resume current serving slot is unknown")
     expected = dict(present[0])
     expected.pop("server_instance", None)
     for receipt in present[1:]:
@@ -502,6 +502,30 @@ async def _prepare_final_resume_adapter_slot(
     if any(receipt is not None for receipt in remaining):
         raise RuntimeError("final resume adapter receipt remains after removal")
     return expected["source_url"]
+
+
+def _stale_resume_source_urls(
+    config: OrchestratorConfig,
+    broadcast_dir,
+    lora_name: str,
+    final_sync_version: int,
+) -> set[str]:
+    """Return older source URLs that occupy the final rotating slot."""
+    if final_sync_version < 4:
+        return set()
+    stale_source_urls = set()
+    for step in range(1, final_sync_version - 2):
+        if step % 2 != final_sync_version % 2:
+            continue
+        source_url = inference_weight_path(
+            config,
+            get_step_path(broadcast_dir, step),
+            lora_name,
+        )
+        if not isinstance(source_url, str) or source_url in stale_source_urls:
+            raise RuntimeError("final resume stale adapter source history is invalid")
+        stale_source_urls.add(source_url)
+    return stale_source_urls
 
 
 def _select_pruned_resume_tail(
@@ -931,6 +955,12 @@ class Orchestrator:
                 forward_seed_step = (
                     retained_tail[0] - 1 if sync_versions == retained_tail else None
                 )
+                stale_source_urls = _stale_resume_source_urls(
+                    config,
+                    broadcast_dir,
+                    self.lora_name,
+                    final_sync_version,
+                )
                 source_steps = (
                     (forward_seed_step, *sync_versions)
                     if forward_seed_step is not None
@@ -946,20 +976,6 @@ class Orchestrator:
                 }
                 if not all(isinstance(url, str) for url in saved_source_urls.values()):
                     raise RuntimeError("saved adapter policy has no source URL")
-                if forward_seed_step is not None:
-                    stale_source_urls = {
-                        source_url
-                        for step in range(1, forward_seed_step)
-                        if step % 2 != forward_seed_step % 2
-                        and isinstance(
-                            source_url := inference_weight_path(
-                                config,
-                                get_step_path(broadcast_dir, step),
-                                self.lora_name,
-                            ),
-                            str,
-                        )
-                    }
                 loaded_step, loaded_slot, loaded_receipt = await _find_loaded_resume_policy(
                     self.policy_inference.admin_clients,
                     self.lora_name,
