@@ -259,6 +259,7 @@ def load_server_load_endpoints(destination, handler, reader_lock=None):
     names = {
         "_adapter_requires_routed_experts",
         "_is_finite_number",
+        "_normalize_engine_lora_ids",
         "_read_verified_adapter_identity",
         "_set_moe_lora_mode",
         "_target_has_routed_experts",
@@ -629,6 +630,103 @@ class ResumeRecoveryTest(unittest.TestCase):
                 self.assertIs(loaded["policy"], stored)
                 self.assertEqual(namespace["_loaded_lora_receipts"], receipts)
                 writer.assert_not_called()
+
+    def test_engine_removal_normalizes_list_and_tuple_ids(self):
+        for before, after in (
+            ([17, 23, 31], [23, 31]),
+            ((17, 23, 31), (23, 31)),
+        ):
+            with self.subTest(shape=type(before).__name__), tempfile.TemporaryDirectory() as temporary:
+                stored = SimpleNamespace(lora_name="policy", lora_int_id=17)
+                loaded = {
+                    "policy": stored,
+                    "policy-slot0": SimpleNamespace(lora_int_id=31),
+                }
+                engine = SimpleNamespace(
+                    list_loras=mock.AsyncMock(side_effect=[before, after]),
+                    remove_lora=mock.AsyncMock(return_value=True),
+                )
+                handler = SimpleNamespace(lora_requests=loaded, engine_client=engine)
+                _, _, namespace, _, _ = load_server_load_endpoints(Path(temporary), handler)
+                receipts = {name: {"source_url": f"http://source/{name}"} for name in loaded}
+                namespace["_loaded_lora_receipts"].update(receipts)
+                writer = namespace["write_loaded_adapter_receipts"] = mock.Mock()
+
+                async def request_data():
+                    return {"lora_name": "policy"}
+
+                result = asyncio.run(namespace["remove_lora_adapter"](
+                    SimpleNamespace(json=request_data)
+                ))
+                self.assertEqual(result["status"], "ok")
+                engine.remove_lora.assert_awaited_once_with(17)
+                self.assertEqual(set(loaded), {"policy-slot0"})
+                writer.assert_called_once_with({"policy-slot0": receipts["policy-slot0"]})
+
+    def test_engine_removal_rejects_invalid_id_shapes_before_remove(self):
+        class CustomInt(int):
+            pass
+
+        invalid_values = (
+            [17, 17],
+            (17, 17),
+            [True, 17],
+            [0, 17],
+            [-1, 17],
+            [CustomInt(17)],
+            "17",
+            {"17": True},
+        )
+        for invalid in invalid_values:
+            with self.subTest(value=repr(invalid)), tempfile.TemporaryDirectory() as temporary:
+                stored = SimpleNamespace(lora_name="policy", lora_int_id=17)
+                loaded = {"policy": stored}
+                engine = SimpleNamespace(
+                    list_loras=mock.AsyncMock(return_value=invalid),
+                    remove_lora=mock.AsyncMock(return_value=True),
+                )
+                handler = SimpleNamespace(lora_requests=loaded, engine_client=engine)
+                _, _, namespace, _, _ = load_server_load_endpoints(Path(temporary), handler)
+                receipts = {"policy": {"source_url": "http://source/policy"}}
+                namespace["_loaded_lora_receipts"].update(receipts)
+                writer = namespace["write_loaded_adapter_receipts"] = mock.Mock()
+
+                async def request_data():
+                    return {"lora_name": "policy"}
+
+                with self.assertRaisesRegex(RuntimeError, "engine adapter ID list is invalid"):
+                    asyncio.run(namespace["remove_lora_adapter"](
+                        SimpleNamespace(json=request_data)
+                    ))
+                engine.remove_lora.assert_not_awaited()
+                self.assertEqual(loaded["policy"], stored)
+                self.assertEqual(namespace["_loaded_lora_receipts"], receipts)
+                writer.assert_not_called()
+
+    def test_engine_removal_accepts_already_absent_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            stored = SimpleNamespace(lora_name="policy", lora_int_id=17)
+            loaded = {"policy": stored, "policy-slot0": SimpleNamespace(lora_int_id=31)}
+            engine = SimpleNamespace(
+                list_loras=mock.AsyncMock(side_effect=[[31], (31,)]),
+                remove_lora=mock.AsyncMock(return_value=True),
+            )
+            handler = SimpleNamespace(lora_requests=loaded, engine_client=engine)
+            _, _, namespace, _, _ = load_server_load_endpoints(Path(temporary), handler)
+            receipts = {name: {"source_url": f"http://source/{name}"} for name in loaded}
+            namespace["_loaded_lora_receipts"].update(receipts)
+            writer = namespace["write_loaded_adapter_receipts"] = mock.Mock()
+
+            async def request_data():
+                return {"lora_name": "policy"}
+
+            result = asyncio.run(namespace["remove_lora_adapter"](
+                SimpleNamespace(json=request_data)
+            ))
+            self.assertEqual(result["status"], "ok")
+            engine.remove_lora.assert_not_awaited()
+            self.assertEqual(set(loaded), {"policy-slot0"})
+            writer.assert_called_once_with({"policy-slot0": receipts["policy-slot0"]})
 
     def test_engine_removal_is_serialized_and_keeps_other_adapter_ids(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -926,6 +926,17 @@ async def stage_lora_adapter(raw_request: Request):
     return await asyncio.shield(task)
 
 
+def _normalize_engine_lora_ids(value: object) -> set[int]:
+    if type(value) not in (set, list, tuple):
+        raise RuntimeError("engine adapter ID list is invalid")
+    normalized: set[int] = set()
+    for adapter_id in value:
+        if type(adapter_id) is not int or adapter_id <= 0 or adapter_id in normalized:
+            raise RuntimeError("engine adapter ID list is invalid")
+        normalized.add(adapter_id)
+    return normalized
+
+
 @router.post("/remove_lora_adapter")
 async def remove_lora_adapter(raw_request: Request):
     """Remove one exact engine adapter before releasing its cache receipt."""
@@ -950,12 +961,10 @@ async def remove_lora_adapter(raw_request: Request):
                for other_name, other in loaded.items()):
             raise RuntimeError("adapter engine ID is shared by another LoRA name")
         engine = engine_client(raw_request)
-        before = await engine.list_loras()
-        if not isinstance(before, set) or any(type(value) is not int or value <= 0 for value in before):
-            raise RuntimeError("engine adapter ID list is invalid")
+        before = _normalize_engine_lora_ids(await engine.list_loras())
         if adapter_id in before and await engine.remove_lora(adapter_id) is not True:
             raise RuntimeError("engine did not confirm adapter removal")
-        after = await engine.list_loras()
+        after = _normalize_engine_lora_ids(await engine.list_loras())
         if after != before - {adapter_id}:
             raise RuntimeError("engine adapter removal did not preserve the other adapter IDs")
         if loaded.get(name) is not stored:
