@@ -2633,9 +2633,12 @@ def _cleanup_retired_adapters(
             for entry in entries:
                 _check_deadline(deadline, cancel_event)
                 entry_count += 1
-                if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                if entry_count > _ADAPTER_DIRECTORY_ENTRY_LIMIT:
                     raise OSError("adapter cache has too many cleanup entries")
-                names.append(entry.name)
+                if entry.name.startswith(prefix):
+                    names.append(entry.name)
+                    if len(names) > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                        raise OSError("too many retired adapter cleanup candidates")
         for name in names:
             _check_deadline(deadline, cancel_event)
             if not name.startswith(prefix):
@@ -2762,7 +2765,7 @@ def reconcile_retired_adapter(
                 for entry in entries:
                     _check_deadline(deadline, cancel_event)
                     entry_count += 1
-                    if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                    if entry_count > _ADAPTER_DIRECTORY_ENTRY_LIMIT:
                         raise OSError("adapter cache has too many recovery entries")
                     if entry.name.startswith(prefix):
                         names.append(entry.name)
@@ -2864,7 +2867,7 @@ def _cleanup_previous_adapter_caches(
             for entry in entries:
                 _check_deadline(deadline, cancel_event)
                 entry_count += 1
-                if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                if entry_count > _ADAPTER_DIRECTORY_ENTRY_LIMIT:
                     raise OSError("adapter cache has too many cleanup entries")
                 names.append(entry.name)
         for name in names:
@@ -2988,12 +2991,14 @@ def _cleanup_obsolete_adapter_partials(
             for entry in entries:
                 _check_deadline(deadline, cancel_event)
                 entry_count += 1
-                if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                if entry_count > _ADAPTER_DIRECTORY_ENTRY_LIMIT:
                     raise OSError("adapter cache has too many cleanup entries")
                 if entry.name.endswith(".partial") and re.fullmatch(
                     r"[0-9a-f]{64}", entry.name[: -len(".partial")]
                 ):
                     names.append(entry.name)
+                    if len(names) > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                        raise OSError("too many partial adapter cleanup candidates")
     finally:
         os.close(cache_fd)
     for name in names:
@@ -3409,7 +3414,7 @@ def _reuse_full_adapter_cache(
             for entry in entries:
                 _check_deadline(deadline, cancel_event)
                 entry_count += 1
-                if entry_count > _ADAPTER_CLEANUP_ENTRY_LIMIT:
+                if entry_count > _ADAPTER_DIRECTORY_ENTRY_LIMIT:
                     raise OSError("adapter cache has too many reuse entries")
                 names.append(entry.name)
         for name in sorted(names):
