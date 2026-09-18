@@ -102,6 +102,107 @@ class ResumeStateTest(unittest.TestCase):
             resume.partial_rollout(str(self.active), 3, quarantine=True)
         self.assertTrue(target.exists())
 
+    def test_quarantine_refuses_child_symlink_swap_at_rename(self):
+        trace = self.partial()
+        original_iter = Path.iterdir
+        def entries(path):
+            return iter([]) if path == Path("/proc") else original_iter(path)
+        original_rename = resume.move_no_replace
+        swapped = False
+        def rename(*args, **kwargs):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                trace.unlink()
+                trace.symlink_to(self.weight)
+            return original_rename(*args, **kwargs)
+        with mock.patch.object(Path, "iterdir", entries), mock.patch.object(resume, "move_no_replace", side_effect=rename):
+            with self.assertRaises((OSError, ValueError)):
+                resume.partial_rollout(str(self.active), 3, quarantine=True)
+        self.assertTrue(trace.is_symlink())
+        self.assertEqual(self.weight.read_bytes(), b"adapter-three")
+
+    def test_quarantine_never_overwrites_destination_created_at_rename(self):
+        self.partial()
+        original_iter = Path.iterdir
+        def entries(path):
+            return iter([]) if path == Path("/proc") else original_iter(path)
+        original_rename = resume.move_no_replace
+        created = []
+        def rename(source, destination, **kwargs):
+            resume.os.mkdir(destination, dir_fd=kwargs["dst_dir_fd"])
+            created.append(resume.os.stat(destination, dir_fd=kwargs["dst_dir_fd"]))
+            try:
+                return original_rename(source, destination, **kwargs)
+            finally:
+                self.assertEqual(resume.os.stat(destination, dir_fd=kwargs["dst_dir_fd"]).st_ino, created[0].st_ino)
+        with mock.patch.object(Path, "iterdir", entries), mock.patch.object(resume, "move_no_replace", side_effect=rename):
+            with self.assertRaises(FileExistsError):
+                resume.partial_rollout(str(self.active), 3, quarantine=True)
+        self.assertTrue((self.active / "rollouts/step_4/train/all/traces.jsonl").is_file())
+
+    def test_quarantine_private_directory_collision_preserves_both_paths(self):
+        trace = self.partial()
+        destination = self.active / "rollouts/quarantined-step_4-collision"
+        destination.mkdir()
+        inode = destination.stat().st_ino
+        original_iter = Path.iterdir
+        def entries(path):
+            return iter([]) if path == Path("/proc") else original_iter(path)
+        with mock.patch.object(Path, "iterdir", entries), mock.patch.object(resume.secrets, "token_hex", return_value="collision"):
+            with self.assertRaises(FileExistsError):
+                resume.partial_rollout(str(self.active), 3, quarantine=True)
+        self.assertEqual(destination.stat().st_ino, inode)
+        self.assertEqual(list(destination.iterdir()), [])
+        self.assertEqual(trace.read_text(), "partial trace")
+
+    def test_quarantine_rollback_never_replaces_a_new_active_step(self):
+        trace = self.partial()
+        target = self.active / "rollouts/step_4"
+        original_iter = Path.iterdir
+        def entries(path):
+            return iter([]) if path == Path("/proc") else original_iter(path)
+        original_rename = resume.move_no_replace
+        calls = 0
+        replacement_inode = None
+        def rename(*args, **kwargs):
+            nonlocal calls, replacement_inode
+            calls += 1
+            if calls == 1:
+                trace.unlink()
+                trace.symlink_to(self.weight)
+                result = original_rename(*args, **kwargs)
+                target.mkdir()
+                replacement_inode = target.stat().st_ino
+                return result
+            return original_rename(*args, **kwargs)
+        with mock.patch.object(Path, "iterdir", entries), mock.patch.object(resume, "move_no_replace", side_effect=rename):
+            with self.assertRaisesRegex(ValueError, "rollback refused; preserved"):
+                resume.partial_rollout(str(self.active), 3, quarantine=True)
+        self.assertEqual(target.stat().st_ino, replacement_inode)
+        self.assertEqual(list(target.iterdir()), [])
+        preserved = list((self.active / "rollouts").glob("quarantined-step_4-*/step_4/train/all/traces.jsonl"))
+        self.assertEqual(len(preserved), 1)
+        self.assertTrue(preserved[0].is_symlink())
+
+    def test_quarantine_refuses_rollback_for_substituted_step_inode(self):
+        self.partial()
+        target = self.active / "rollouts/step_4"
+        original_iter = Path.iterdir
+        def entries(path):
+            return iter([]) if path == Path("/proc") else original_iter(path)
+        original_rename = resume.move_no_replace
+        def rename(*args, **kwargs):
+            target.rename(target.with_name("saved-original"))
+            target.mkdir()
+            return original_rename(*args, **kwargs)
+        with mock.patch.object(Path, "iterdir", entries), mock.patch.object(resume, "move_no_replace", side_effect=rename) as move:
+            with self.assertRaisesRegex(ValueError, "identity changed; preserved"):
+                resume.partial_rollout(str(self.active), 3, quarantine=True)
+        self.assertEqual(move.call_count, 1)
+        self.assertFalse(target.exists())
+        self.assertEqual((target.with_name("saved-original") / "train/all/traces.jsonl").read_text(), "partial trace")
+
     def test_partial_refuses_active_publisher_lock(self):
         self.partial()
         with (self.active / ".batch-sync.lock").open() as stream:

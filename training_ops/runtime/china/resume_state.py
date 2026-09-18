@@ -2,6 +2,7 @@
 
 import hashlib
 import fcntl
+import ctypes
 import json
 import os
 import re
@@ -214,6 +215,105 @@ def completed_batch(service_dir: str, step: int, expected: str) -> dict:
     return {"step": step, "records": count, "batch_sha256": expected}
 
 
+def move_no_replace(source: str, destination: str, *, src_dir_fd: int, dst_dir_fd: int) -> None:
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        rename = library.renameat2
+    except AttributeError as error:
+        raise ValueError("atomic no-replace rename is unavailable") from error
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(src_dir_fd, os.fsencode(source), dst_dir_fd, os.fsencode(destination), 1):
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), destination)
+
+
+def open_directory(path: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def partial_tree(descriptor: int, prefix: str = ".") -> dict:
+    """Read every allowed entry relative to pinned, no-follow directories."""
+    allowed = {"train": True, "train/all": True, "train/all/traces.jsonl": False}
+    result = {prefix: os.fstat(descriptor)}
+    for name in os.listdir(descriptor):
+        relative = name if prefix == "." else f"{prefix}/{name}"
+        if relative not in allowed:
+            raise ValueError("quarantined rollout has an unexpected entry")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        if allowed[relative]:
+            flags |= os.O_DIRECTORY
+        child = os.open(name, flags, dir_fd=descriptor)
+        try:
+            info = os.fstat(child)
+            if allowed[relative]:
+                result.update(partial_tree(child, relative))
+            elif not stat.S_ISREG(info.st_mode):
+                raise ValueError("quarantined trace is not regular")
+            else:
+                result[relative] = info
+        finally:
+            os.close(child)
+    return result
+
+
+def quarantine_partial(root: Path, target: Path, observed: dict) -> str:
+    directory = open_directory(root)
+    private = None
+    destination = root / f"quarantined-step_{target.name[5:]}-{secrets.token_hex(16)}"
+    child_name = target.name
+    location = destination / child_name
+    try:
+        if os.stat(target.name, dir_fd=directory, follow_symlinks=False) != observed["."]:
+            raise ValueError("partial rollout changed before quarantine")
+        # mkdir is exclusive. A collision never grants use of an old directory.
+        os.mkdir(destination.name, mode=0o700, dir_fd=directory)
+        private = os.open(destination.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        info = os.fstat(private)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise ValueError("quarantine directory is not private")
+        move_no_replace(target.name, child_name, src_dir_fd=directory, dst_dir_fd=private)
+        try:
+            moved = os.open(child_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=private)
+            try:
+                current = partial_tree(moved)
+            finally:
+                os.close(moved)
+            def identity(value):
+                return value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns
+            if {name: identity(value) for name, value in current.items()} != {name: identity(value) for name, value in observed.items()}:
+                raise ValueError("partial rollout changed during quarantine")
+            linked = os.stat(destination.name, dir_fd=directory, follow_symlinks=False)
+            if (linked.st_dev, linked.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError("private quarantine directory moved")
+        except (OSError, ValueError) as error:
+            # Never replace a new active step or return a substituted inode.
+            moved_info = os.stat(child_name, dir_fd=private, follow_symlinks=False)
+            original = observed["."]
+            if (moved_info.st_dev, moved_info.st_ino) != (original.st_dev, original.st_ino):
+                raise ValueError(f"quarantine identity changed; preserved at {location}") from error
+            try:
+                move_no_replace(child_name, target.name, src_dir_fd=private, dst_dir_fd=directory)
+            except OSError as rollback_error:
+                raise ValueError(f"quarantine rollback refused; preserved at {location}: {rollback_error}") from error
+            raise ValueError(f"quarantine validation failed; restored {target}: {error}") from error
+        return str(location)
+    finally:
+        if private is not None:
+            os.close(private)
+        os.close(directory)
+
+
 def partial_rollout(service_dir: str, step: int, *, quarantine=False) -> dict:
     if type(step) is not int or step < 0:
         raise ValueError("invalid partial rollout step")
@@ -265,17 +365,7 @@ def partial_rollout(service_dir: str, step: int, *, quarantine=False) -> dict:
             raise ValueError("partial rollout changed during validation")
         result = {"partial": True}
         if quarantine:
-            destination = root / f"quarantined-step_{step + 1}-{secrets.token_hex(16)}"
-            directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
-                if os.stat(target.name, dir_fd=directory, follow_symlinks=False) != observed["."]:
-                    raise ValueError("partial rollout changed before quarantine")
-                if destination.exists() or destination.is_symlink():
-                    raise ValueError("quarantine destination already exists")
-                os.rename(target.name, destination.name, src_dir_fd=directory, dst_dir_fd=directory)
-            finally:
-                os.close(directory)
-            result["quarantined"] = str(destination)
+            result["quarantined"] = quarantine_partial(root, target, observed)
         return result
     finally:
         os.close(descriptor)
