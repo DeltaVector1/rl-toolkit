@@ -530,20 +530,42 @@ class AcceptanceProbeTest(unittest.TestCase):
                 value,
             )
 
-    def test_rollout_timing_uses_only_upper_bound(self):
+    def test_rollout_timing_uses_completed_batch_cycle(self):
         for seconds in (300.0, 720.0):
             report = self.acceptance(
                 [{"step": 1, "time/forward_backward": 300.0}],
-                [{"step": 1, "train/agg/all/timing/generation/max": seconds}],
+                [
+                    {
+                        "step": 1,
+                        "time/step": seconds,
+                        "train/agg/all/timing/generation/max": 900.0,
+                    }
+                ],
             )
             self.assertFalse(
-                any("generation time exceeds" in alarm for alarm in report.alarms)
+                any("batch cycle exceeds" in alarm for alarm in report.alarms)
             )
+        report = self.acceptance(
+            [{"step": 1, "time/forward_backward": 300.0}],
+            [
+                {
+                    "step": 1,
+                    "time/step": 721.0,
+                    "train/agg/all/timing/generation/max": 1.0,
+                }
+            ],
+        )
+        self.assertTrue(any("batch cycle exceeds" in alarm for alarm in report.alarms))
+        self.assertIn("metric time/step", report.report())
+
+    def test_rollout_generation_max_does_not_replace_batch_cycle_measurement(self):
         report = self.acceptance(
             [{"step": 1, "time/forward_backward": 300.0}],
             [{"step": 1, "train/agg/all/timing/generation/max": 721.0}],
         )
-        self.assertTrue(any("generation time exceeds" in alarm for alarm in report.alarms))
+        self.assertTrue(
+            any("batch cycle is missing or invalid" in alarm for alarm in report.alarms)
+        )
 
     def test_current_fp8_config_does_not_require_removed_dequant_flags(self):
         report = training_ops._acceptance_from_text(
@@ -635,10 +657,27 @@ dequantize_checkpoint_moe = true
         }]
         logs = "Rollout failed after three attempts: rollout is unscored; its complete group will be replaced"
         self.assertEqual(training_ops._failure_evidence([], [], logs), {})
-        self.assertEqual(
-            training_ops._failure_evidence([], rows, logs),
-            {"environment": 1, "transport/rollout": 1},
+        self.assertEqual(training_ops._failure_evidence([], rows, logs), {})
+
+    def test_replaced_group_does_not_hide_transport_or_repeated_group_failure(self):
+        replacement = (
+            "rollout is unscored; its complete group will be replaced\n"
+            "Rollout failed in group 4: ReadTimeout"
         )
+        rows = [{"step": 1, "train/agg/all/has_error/mean": 1.0}]
+        self.assertIn("transport", training_ops._failure_evidence([], rows, replacement))
+
+        repeated = (
+            "rollout is unscored; its complete group will be replaced\n"
+            "Finished group | consecutive errored groups=8/8"
+        )
+        self.assertIn("transport", training_ops._failure_evidence([], rows, repeated))
+
+    def test_judge_outage_remains_failure_evidence(self):
+        failures = training_ops._failure_evidence(
+            [], [], "scoring judge returned 503"
+        )
+        self.assertIn("judge", failures)
 
 
 if __name__ == "__main__":

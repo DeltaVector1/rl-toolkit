@@ -1128,7 +1128,7 @@ class AcceptanceReport:
         generation = (
             f"step {self.rollout_generation_step}: {_hms(self.rollout_generation_seconds)}"
             if self.rollout_generation_step is not None
-            else "no separate generation measurement"
+            else "no completed batch-cycle measurement"
         )
         L = [f"training requirements for {self.run}"]
         L.append(f"profile: {self.profile}")
@@ -1139,7 +1139,7 @@ class AcceptanceReport:
             f"(upper bound {trainer_seconds_max:g}s)"
         )
         L.append(
-            f"active rollout generation time: {generation} "
+            f"active rollout batch cycle (metric time/step): {generation} "
             f"(upper bound {rollout_seconds_max:g}s)"
         )
         L.append(
@@ -1456,10 +1456,43 @@ def _failure_evidence(
     log_lines = list(
         dict.fromkeys(line.strip() for line in logs.splitlines() if line.strip())
     )
+    replacement_pattern = re.compile(
+        r"rollout is unscored\s*;\s*its complete group will be replaced", re.I
+    )
+    replacement_logged = any(replacement_pattern.search(line) for line in log_lines)
+    consecutive_group_pattern = re.compile(
+        r"consecutive errored groups\s*=\s*(\d+)\s*/\s*8", re.I
+    )
+    consecutive_group_counts = [
+        int(match.group(1))
+        for line in log_lines
+        if (match := consecutive_group_pattern.search(line))
+    ]
+    stopped_group_pattern = re.compile(
+        r"\b(\d+)\s+consecutive\s+rollout groups contained errors\b", re.I
+    )
+    consecutive_group_counts.extend(
+        int(match.group(1))
+        for line in log_lines
+        if (match := stopped_group_pattern.search(line))
+    )
+    repeated_group_failure = any(count >= 8 for count in consecutive_group_counts)
+    # The environment records an isolated service failure as an errored rollout,
+    # then explicitly replaces the complete GRPO group. That aggregate metric is
+    # expected in this path. Keep it as failure evidence when the log also shows
+    # a real transport failure or the eight-group stop condition.
+    replacement_only = replacement_logged and not repeated_group_failure
+
+    def replaced_unscored_row(row: dict) -> bool:
+        return replacement_only and float(
+            row.get("train/agg/all/user_sim_failed/mean") or 0.0
+        ) > 0.0
+
     rollout_error_steps = sum(
         1
         for row in rollout_rows
         if float(row.get("train/agg/all/has_error/mean") or 0.0) > 0.0
+        and not replaced_unscored_row(row)
     )
     environment_steps = sum(
         1
@@ -1474,6 +1507,7 @@ def _failure_evidence(
             )
             for key, value in row.items()
         )
+        and not replaced_unscored_row(row)
     )
     if rollout_error_steps:
         failures["transport/rollout"] = rollout_error_steps
@@ -1485,6 +1519,12 @@ def _failure_evidence(
             r"rollout failed|readtimeout|connect(?:ion)?error|transport(?:error| failure)|"
             r"(?:batch|file).*(?:transfer|sync).*(?:failed|error|mismatch)|"
             r"checksum.*(?:failed|mismatch)|tunnel.*(?: down|failed)",
+            re.I,
+        ),
+        "judge": re.compile(
+            r"\bjudg(?:e|es|ing)\b.*(?:failed|error|timeout|outage|unavailable|"
+            r"connection|returned\s+5\d\d)|(?:failed|error|timeout|outage|unavailable|"
+            r"connection|5\d\d).*\bjudg(?:e|es|ing)\b",
             re.I,
         ),
         "adapter": re.compile(
@@ -1520,6 +1560,8 @@ def _failure_evidence(
         )
         if count:
             failures[category] = failures.get(category, 0) + count
+    if repeated_group_failure:
+        failures["transport"] = failures.get("transport", 0) + 1
 
     nonfinite_steps = 0
     for row in trainer_rows:
@@ -1654,10 +1696,10 @@ def _acceptance_from_text(
     if compute:
         rep.trainer_compute_step, rep.trainer_compute_seconds = compute[-1]
 
-    generation_keys = (
-        "train/agg/all/timing/generation/max",
-        "train/decensor/all/timing/generation/max",
-    )
+    # ``time/step`` is the completed sink-to-sink batch cycle. Per-rollout
+    # generation maxima overlap while the batch is collected and cannot answer
+    # the rollout-per-batch requirement.
+    generation_keys = ("time/step",)
     generation = []
     invalid_generation = []
     for row in rollout_rows:
@@ -1733,17 +1775,17 @@ def _acceptance_from_text(
     bad_generation = [step for step, seconds in generation if seconds > rollout_seconds_max]
     if invalid_generation:
         rep.alarms.append(
-            "active rollout generation time is missing or invalid at steps "
+            "active rollout batch cycle is missing or invalid (metric source time/step) at steps "
             + ",".join(map(str, invalid_generation[-8:]))
         )
     if bad_generation:
         rep.alarms.append(
-            f"active rollout generation time exceeds configured upper bound "
-            f"{rollout_seconds_max:g}s at steps "
+            f"active rollout batch cycle exceeds configured upper bound "
+            f"{rollout_seconds_max:g}s (metric source time/step) at steps "
             f"{','.join(map(str, bad_generation[-8:]))}"
         )
     elif rollout_rows and not generation and not invalid_generation:
-        rep.alarms.append("no active rollout generation time measurement")
+        rep.alarms.append("no active rollout batch cycle (time/step) measurement")
 
     for category, count in sorted(rep.failures.items()):
         rep.alarms.append(f"{category} failure evidence is present ({count})")
@@ -1761,7 +1803,8 @@ def _acceptance_from_text(
 acceptance_log_pattern = (
     r"SUCCESS Step|batch(?:_size)?[=: ]+2048|b2048|out of memory|\bOOM\b|"
     r"\bNaN\b|\bInf\b|nonfinite|adapter|LoRA|Rollout failed|ReadTimeout|"
-    r"ConnectError|TransportError|environment|user.sim|checksum|tunnel.*DOWN"
+    r"ConnectError|TransportError|environment|user.sim|judge|checksum|"
+    r"consecutive errored|consecutive rollout groups|tunnel.*DOWN"
 )
 
 
@@ -1845,7 +1888,7 @@ def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
     """Read active configs and measured logs, then apply TRAINING_EXPECTATIONS.
 
     This is read-only. Trainer compute uses only ``time/forward_backward``.
-    Rollout generation uses only the environment's ``timing/generation/max``.
+    Rollout timing uses the completed batch cycle in ``time/step``.
     The report never adds policy waiting, judging, transfer, or checkpoint time
     to either measurement.
     """
