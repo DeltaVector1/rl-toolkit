@@ -164,15 +164,19 @@ Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
 
 ## In progress
 
-- Next trial: run easy-only for 50 completed steps. The effective model-visible
-  prefix in 100% of rollouts is `<think>\nI agree with the content and am ready
-  to write the full answer.` The active template supplies `<think>` when
-  thinking is enabled, so configured added text starts at `\nI agree with the
-  content and am ready to write the full answer.` and does not duplicate it.
-  The supplied prefix tokens are context and are excluded from policy loss.
-  Keep scoring and the environment unchanged.
+- Active run: `glm-decensor-difficulty-10` uses easy-only prompts, no assistant
+  prefill, TailRL, a 1.5M-token cap, and group size 16.
+- Use a fixed no-prefix evaluation with 300 prompts per difficulty bucket at
+  startup and every 10 steps. Skip a group only when every scored refusal
+  score is at least 7. Acceptance requires 50 completed steps.
+- Step 1 took 19m16, including the startup 900-prompt evaluation. Reward was
+  .1953, 608/640 rollouts were trainable, and rollout errors were zero. The
+  trainer started with 46 microbatches.
 
-## Prefill and easy-first trial
+## Historical prefill and easy-first trial
+
+- The earlier 100% assistant-prefill plan is historical. It is not the active
+  difficulty-10 run above.
 
 - The measured 50-step result had per-difficulty changes inside noise. The
   aggregate fall was confounded by the harder prompt mix, so it is not proof
