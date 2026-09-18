@@ -583,6 +583,8 @@ class AcceptanceProbeTest(unittest.TestCase):
         self.assertEqual(report.rollout_generation_startup_steps, [1])
         self.assertTrue(any("batch cycle exceeds" in alarm for alarm in report.alarms))
         self.assertIn("startup evaluation overhead excluded", report.report())
+        self.assertIn("time/step is sink-to-sink batch elapsed time", report.report())
+        self.assertIn("can include waiting", report.report())
 
     def test_current_fp8_config_does_not_require_removed_dequant_flags(self):
         report = training_ops._acceptance_from_text(
@@ -685,6 +687,45 @@ dequantize_checkpoint_moe = true
         )
         self.assertEqual(training_ops._failure_evidence([], rows, logs), {})
 
+    def test_replacement_does_not_suppress_a_later_error_row(self):
+        rows = [
+            {"step": 2, "train/agg/all/has_error/mean": 0.0025},
+            {
+                "step": 3,
+                "train/agg/all/has_error/mean": 0.0025,
+                "train/agg/all/metrics/decensor_user_sim_failed/mean": 1.0,
+            },
+        ]
+        logs = (
+            "Rollout failed in group abc — TaskError: rollout is unscored\n"
+            "Finished group | rollouts=16 (errored=1) | dropped complete group; "
+            "consecutive errored groups=1/8"
+        )
+        self.assertEqual(
+            training_ops._failure_evidence([], rows, logs),
+            {"environment": 1, "transport/rollout": 2},
+        )
+
+    def test_unscored_text_does_not_hide_other_failure_categories(self):
+        replacement = (
+            "Rollout failed in group abc — TaskError: rollout is unscored\n"
+            "Finished group | rollouts=16 (errored=1) | dropped complete group; "
+            "consecutive errored groups=1/8\n"
+        )
+        rows = [{"step": 2, "train/agg/all/has_error/mean": 0.0025}]
+        for line, category in (
+            ("judge failed: rollout is unscored", "judge"),
+            ("adapter load failed: rollout is unscored", "adapter"),
+            ("OOM while scoring: rollout is unscored", "stability"),
+        ):
+            failures = training_ops._failure_evidence([], rows, replacement + line)
+            self.assertIn(category, failures, line)
+
+        failures = training_ops._failure_evidence(
+            [], rows, replacement + "Rollout failed: ReadTimeout; rollout is unscored"
+        )
+        self.assertIn("transport", failures)
+
     def test_replaced_group_does_not_hide_transport_or_repeated_group_failure(self):
         replacement = (
             "rollout is unscored; its complete group will be replaced\n"
@@ -704,6 +745,9 @@ dequantize_checkpoint_moe = true
             [], [], "scoring judge returned 503"
         )
         self.assertIn("judge", failures)
+        self.assertEqual(
+            training_ops._failure_evidence([], [], "judge connection healthy"), {}
+        )
 
 
 if __name__ == "__main__":

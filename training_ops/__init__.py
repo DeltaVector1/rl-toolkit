@@ -1149,8 +1149,12 @@ class AcceptanceReport:
                 + ",".join(map(str, self.rollout_generation_startup_steps))
             )
         L.append(
-            "excluded from both times: policy/check waiting, judging/scoring, batch transfer, "
+            "trainer timing excludes policy/check waiting, judging/scoring, batch transfer, "
             "adapter transfer, and checkpoint save"
+        )
+        L.append(
+            "time/step is sink-to-sink batch elapsed time and can include waiting, "
+            "judging/scoring, and other overlapped work"
         )
         stability = (
             f"stability: {self.completed_steps}/{final_validation_steps} completed steps | "
@@ -1513,9 +1517,17 @@ def _failure_evidence(
         )
 
     real_transport = any(real_transport_line(line) for line in log_lines)
-    # Ignore only an explicitly replaced unscored group, not transport errors.
-    replacement_only = (
+    error_rows = [
+        row
+        for row in rollout_rows
+        if float(row.get("train/agg/all/has_error/mean") or 0.0) > 0.0
+    ]
+    # Correlate one replacement event with one errored metric row only.
+    replacement_log_only = (
         replacement_logged and not repeated_group_failure and not real_transport
+    )
+    replacement_only = (
+        replacement_log_only and len(replacement_counts) == 1 and len(error_rows) == 1
     )
 
     def replaced_unscored_row(row: dict) -> bool:
@@ -1557,9 +1569,10 @@ def _failure_evidence(
             re.I,
         ),
         "judge": re.compile(
-            r"\bjudg(?:e|es|ing)\b.*(?:failed|error|timeout|outage|unavailable|"
-            r"connection|returned\s+5\d\d)|(?:failed|error|timeout|outage|unavailable|"
-            r"connection|5\d\d).*\bjudg(?:e|es|ing)\b",
+            r"\bjudg(?:e|es|ing)\b.*(?:failed|failure|error|timeout|outage|"
+            r"unavailable|refused|reset|down|returned\s+5\d\d)|"
+            r"(?:failed|failure|error|timeout|outage|unavailable|refused|reset|"
+            r"down|5\d\d).*\bjudg(?:e|es|ing)\b",
             re.I,
         ),
         "adapter": re.compile(
@@ -1582,7 +1595,9 @@ def _failure_evidence(
             for line in log_lines
             if pattern.search(line)
             and not (
-                (unscored_pattern.search(line) or replacement_pattern.search(line))
+                category == "transport"
+                and replacement_log_only
+                and (unscored_pattern.search(line) or replacement_pattern.search(line))
                 and not real_transport_line(line)
             )
             and not re.search(
@@ -1732,9 +1747,8 @@ def _acceptance_from_text(
     if compute:
         rep.trainer_compute_step, rep.trainer_compute_seconds = compute[-1]
 
-    # ``time/step`` is the completed sink-to-sink batch cycle. Per-rollout
-    # generation maxima overlap while the batch is collected and cannot answer
-    # the rollout-per-batch requirement.
+    # ``time/step`` is sink-to-sink batch elapsed time. Per-rollout generation
+    # maxima overlap while the batch is collected and cannot answer the limit.
     generation_keys = ("time/step",)
     generation = []
     invalid_generation = []
@@ -1940,9 +1954,8 @@ def acceptance(run: str = "", quiet: bool = False) -> AcceptanceReport:
     """Read active configs and measured logs, then apply TRAINING_EXPECTATIONS.
 
     This is read-only. Trainer compute uses only ``time/forward_backward``.
-    Rollout timing uses the completed batch cycle in ``time/step``.
-    The report never adds policy waiting, judging, transfer, or checkpoint time
-    to either measurement.
+    Rollout timing uses sink-to-sink elapsed time in ``time/step``; that metric
+    can include waiting and judging/scoring between completed batches.
     """
     run = run or current_run()
     if _trainer_mode() == "trainer-only":
