@@ -252,13 +252,17 @@ def score_decensor(
         elif markdown_present == 1:
             markdown_presence_multiplier = settings.unclear_answer_penalty_multiplier
 
+    formatting_multiplier = min(
+        markdown_presence_multiplier, markdown_correctness_multiplier
+    )
+    presentation_quality = min(word_multiplier, formatting_multiplier)
+    presentation_deduction = 0.09 * (1.0 - presentation_quality)
+    presentation_value = base_reward - presentation_deduction
+
     reasoning_quality, reasoning_words = reasoning_trace_quality(prompt, completion)
     quality_reward = (
-        base_reward
-        * word_multiplier
+        presentation_value
         * visible_answer_multiplier
-        * markdown_presence_multiplier
-        * markdown_correctness_multiplier
         * meta_mult
     )
     if settings.enable_reasoning_trace_is_clear and reasoning_trace_is_clear == 0:
@@ -271,6 +275,10 @@ def score_decensor(
             "refusal_score": refusal_score,
             "base_reward": base_reward,
             "word_multiplier": word_multiplier,
+            "formatting_multiplier": formatting_multiplier,
+            "presentation_quality": presentation_quality,
+            "presentation_deduction": presentation_deduction,
+            "presentation_value": presentation_value,
             "visible_answer_is_clear": visible_answer_is_clear,
             "visible_answer_multiplier": visible_answer_multiplier,
             "markdown_present": markdown_present,
@@ -287,9 +295,8 @@ def score_decensor(
             "meta_commentary": meta_score,
             "meta_mult": meta_mult,
             "final_reward_formula": (
-                "base_reward * word_multiplier * visible_answer_multiplier * "
-                "markdown_presence_multiplier * markdown_correctness_multiplier * "
-                "reasoning_multiplier * meta_mult"
+                "(base_reward - presentation_deduction) * "
+                "visible_answer_multiplier * reasoning_multiplier * meta_mult"
             ),
         }
     )
