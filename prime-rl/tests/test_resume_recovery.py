@@ -45,6 +45,40 @@ def load_rollout_budget_functions():
     return namespace["rollout_budget"], namespace["token_batch_rollout_budget"]
 
 
+def load_policy_update_boundary():
+    source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "wait_for_policy_update_boundary"
+    )
+    namespace = {
+        "asyncio": asyncio,
+        "POLICY_UPDATE_BATCH_WAIT_TIMEOUT_S": 1200,
+        "get_logger": lambda: mock.Mock(),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(ORCHESTRATOR_PATH), "exec"), namespace)
+    return namespace["wait_for_policy_update_boundary"]
+
+
+def boundary_state(*, batch_size, current, target, live=1):
+    return SimpleNamespace(
+        config=SimpleNamespace(batch_size=batch_size, max_off_policy_steps=4),
+        train_sink=SimpleNamespace(batch_progress=lambda: (current, target, "tokens")),
+        dispatcher=SimpleNamespace(
+            inflight_train_count=live,
+            pending_train_schedule_count=0,
+            queued_train_count=0,
+            mark_batch_boundary_complete=mock.Mock(),
+        ),
+        progress=SimpleNamespace(step=5),
+        policy=SimpleNamespace(version=0),
+        stopped=asyncio.Event(),
+        batch_completed=asyncio.Event(),
+    )
+
+
 def load_startup_validator(urlopen, validate_manifest, file_records):
     source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
     function = next(
@@ -539,6 +573,61 @@ def forward_seed_identity(manifest, receipt, validate):
     if any(receipt.get(name) != value for name, value in identity.items()):
         raise RuntimeError("loaded identity differs")
     return identity
+
+
+class PolicyUpdateBoundaryTest(unittest.TestCase):
+    def test_token_batch_partial_progress_defers_policy_update(self):
+        boundary = load_policy_update_boundary()
+        state = boundary_state(batch_size=None, current=100, target=1_500_000)
+
+        async def exercise():
+            task = asyncio.create_task(boundary(state, 1))
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            state.dispatcher.mark_batch_boundary_complete.assert_not_called()
+            state.batch_completed.set()
+            await task
+
+        asyncio.run(exercise())
+        state.dispatcher.mark_batch_boundary_complete.assert_called_once_with(1)
+
+    def test_zero_batch_progress_applies_policy_update(self):
+        boundary = load_policy_update_boundary()
+        state = boundary_state(batch_size=None, current=0, target=1_500_000)
+
+        asyncio.run(boundary(state, 1))
+
+        state.dispatcher.mark_batch_boundary_complete.assert_not_called()
+
+    def test_fixed_batch_boundary_behavior_is_unchanged(self):
+        boundary = load_policy_update_boundary()
+        state = boundary_state(batch_size=1024, current=100, target=1024)
+
+        async def exercise():
+            task = asyncio.create_task(boundary(state, 1))
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            state.batch_completed.set()
+            await task
+
+        asyncio.run(exercise())
+        state.dispatcher.mark_batch_boundary_complete.assert_called_once_with(1)
+
+    def test_policy_update_boundary_timeout_is_bounded(self):
+        boundary = load_policy_update_boundary()
+        state = boundary_state(batch_size=None, current=100, target=1_500_000)
+        observed = []
+
+        async def timeout(awaitable, timeout):
+            observed.append(timeout)
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        with mock.patch.object(asyncio, "wait_for", timeout):
+            asyncio.run(boundary(state, 1))
+
+        self.assertEqual(observed, [1200])
+        state.dispatcher.mark_batch_boundary_complete.assert_not_called()
 
 
 class JsonResponse(io.BytesIO):
