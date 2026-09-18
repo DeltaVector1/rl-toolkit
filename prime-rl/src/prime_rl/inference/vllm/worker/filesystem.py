@@ -6774,14 +6774,6 @@ def stage_lora_adapter_files(
                     or config_spec.get("size") != transport["config_size"]
                 ):
                     raise OSError("adapter transport target differs from source manifest")
-                _cleanup_adapter_space_before_stage(
-                    destination.parent,
-                    destination,
-                    transport,
-                    source_url=source_url,
-                    deadline=operation_deadline,
-                    cancel_event=cancel_event,
-                )
                 _reject_symlink_path(destination / "READY", "adapter ready marker")
                 if _path_regular_size(destination / "READY", "adapter ready marker") is not None:
                     try:
@@ -6865,6 +6857,16 @@ def stage_lora_adapter_files(
                             with _adapter_stage_publish_lock:
                                 committed_event.set()
                         return destination
+                # A verified cache hit needs no space and must not prune a
+                # later policy's saved partial during restart reconciliation.
+                _cleanup_adapter_space_before_stage(
+                    destination.parent,
+                    destination,
+                    transport,
+                    source_url=source_url,
+                    deadline=operation_deadline,
+                    cancel_event=cancel_event,
+                )
                 _check_deadline(operation_deadline, cancel_event)
                 if transport.get("transport") == _ADAPTER_LINEAR_TRANSPORT:
                     return _stage_chunked_linear_adapter(

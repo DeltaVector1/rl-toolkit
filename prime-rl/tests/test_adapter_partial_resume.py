@@ -116,6 +116,101 @@ def run_receiver(cache, fail=False):
             "proof": (partial / "transport-chunks/chunk-0.done").is_file()}
 
 
+def run_cache_check(cache, invalid=""):
+    """Check policy one in a fresh process with real live policy zero/one receipts."""
+    os.environ["PRIME_LORA_CACHE_DIR"] = cache
+    filesystem = load_filesystem()
+    transport, manifest, _, config, wire = fixture(filesystem)
+    source = transport["base_url"]
+    previous = transport["base2_url"]
+    destination = filesystem.adapter_cache_path(source)
+    future = filesystem.adapter_cache_path(manifest["source_url"])
+    partial = future.with_name(future.name + ".partial")
+    transport.update({
+        "version": 1, "transport": filesystem._ADAPTER_DELTA_TRANSPORT,
+        "target_sha256": transport["base_sha256"],
+        "base_url": previous, "base_sha256": transport["base2_sha256"],
+    })
+    for key in tuple(transport):
+        if key.startswith("base2_"):
+            del transport[key]
+    for url, model in ((previous, b"base-two"), (source, b"base-one")):
+        root = filesystem.adapter_cache_path(url)
+        root.mkdir(exist_ok=True)
+        files = {
+            name: {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            for name, data in (("adapter_model.safetensors", model), ("adapter_config.json", config))
+        }
+        (root / "adapter_model.safetensors").write_bytes(model)
+        (root / "adapter_config.json").write_bytes(config)
+        (root / "READY").write_text("ready\n")
+        (root / "manifest.json").write_text(json.dumps({"source_url": url, "files": files}))
+        (root / "transport.json").write_text(json.dumps({
+            "mode": transport["transport"], "source_url": url,
+            "target_sha256": files["adapter_model.safetensors"]["sha256"],
+            "base_url": previous, "base_sha256": transport["base_sha256"],
+        }))
+    manifest = {"version": 1, "source_url": source, "files": files}
+    transport["source_manifest"] = {
+        "version": 1, "kind": "lora-adapter", "mode": "delta",
+        "target_step": 1, "base_step": 0, "target_url": source,
+        "base_url": previous, "transport": transport["transport"],
+        "files": [{"name": name, **spec} for name, spec in files.items()],
+        "chunks": transport["chunks"],
+    }
+    chunks = destination / "transport-chunks"
+    chunks.mkdir(exist_ok=True)
+    (chunks / "chunk-0").write_bytes(wire)
+    filesystem._publish_relay_manifest(
+        destination, source, transport["source_manifest"], transport, files,
+    )
+    filesystem.write_loaded_adapter_receipts({
+        "slot0": {"source_url": previous}, "slot1": {"source_url": source},
+    })
+    assert filesystem._loaded_adapter_receipt_state(Path(cache)) == ("live", [previous, source])
+
+    def snapshot():
+        if not partial.exists():
+            return None
+        return {
+            "inode": partial.stat().st_ino,
+            "files": {
+                str(path.relative_to(partial)): [path.stat().st_ino, path.read_bytes().hex()]
+                for path in partial.rglob("*") if path.is_file()
+            },
+        }
+
+    before = snapshot()
+    assert before is not None
+    obsolete = filesystem.adapter_cache_path("http://other/step_0")
+    obsolete = obsolete.with_name(obsolete.name + ".partial")
+    if invalid:
+        obsolete.mkdir()
+        (obsolete / "transport-manifest.json").write_text("not json")
+        if invalid == "not-ready":
+            (destination / "READY").unlink()
+        elif invalid == "bad-model":
+            (destination / "adapter_model.safetensors").write_bytes(b"bad-data")
+        else:
+            raise ValueError(invalid)
+
+    def transfer(*_args, **_kwargs):
+        assert invalid, "a verified cache hit must not start a transfer"
+        assert not partial.exists() and not obsolete.exists(), "cleanup must precede transfer"
+        return destination
+
+    with mock.patch.multiple(
+        filesystem,
+        _read_delta_manifest_with_visibility_wait=lambda *_a, **_k: transport,
+        _source_manifest=lambda *_a, **_k: manifest,
+    ), mock.patch.object(filesystem, "_stage_chunked_xor_adapter", side_effect=transfer) as stage:
+        result = filesystem.stage_lora_adapter_files(source, require_delta=True, policy_step=1)
+    assert result == destination
+    return {"before": before, "after": snapshot(), "transfers": stage.call_count,
+            "cache_hit": filesystem.adapter_stage_status().get("cache_hit"),
+            "obsolete_exists": obsolete.exists()}
+
+
 class AdapterPartialResumeTest(unittest.TestCase):
     def child(self, cache, fail=False):
         result = subprocess.run(
@@ -124,6 +219,42 @@ class AdapterPartialResumeTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
+
+    def cache_check_child(self, cache, invalid=""):
+        result = subprocess.run(
+            [sys.executable, __file__, cache, "cache-check", invalid],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_fresh_process_cache_hit_keeps_future_legacy_and_canonical_partials(self):
+        for legacy in (True, False):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as cache:
+                self.assertTrue(self.child(cache, True)["proof"])
+                partial = next(Path(cache).glob("*.partial"))
+                if legacy:
+                    transport, *_ = fixture(load_filesystem())
+                    (partial / "transport-manifest.json").write_text(
+                        json.dumps(transport, sort_keys=True, separators=(",", ":"))
+                    )
+                checked = self.cache_check_child(cache)
+                self.assertEqual(checked["after"], checked["before"])
+                self.assertTrue(checked["cache_hit"])
+                self.assertEqual(checked["transfers"], 0)
+                resumed = self.child(cache)
+                self.assertTrue(resumed["ready"])
+                self.assertFalse(any("chunk-0" in name for name in resumed["downloads"]))
+                self.assertEqual(resumed["decoded"], 0)
+
+    def test_fresh_process_invalid_cache_still_cleans_partials_before_transfer(self):
+        for invalid in ("not-ready", "bad-model"):
+            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as cache:
+                self.assertTrue(self.child(cache, True)["proof"])
+                checked = self.cache_check_child(cache, invalid)
+                self.assertIsNone(checked["after"])
+                self.assertFalse(checked["obsolete_exists"])
+                self.assertEqual(checked["transfers"], 1)
 
     def test_fresh_process_terminal_failure_keeps_verified_chunks(self):
         with tempfile.TemporaryDirectory() as cache:
@@ -260,4 +391,7 @@ class AdapterPartialResumeTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    print(json.dumps(run_receiver(sys.argv[1], bool(int(sys.argv[2])))))
+    if sys.argv[2] == "cache-check":
+        print(json.dumps(run_cache_check(sys.argv[1], sys.argv[3])))
+    else:
+        print(json.dumps(run_receiver(sys.argv[1], bool(int(sys.argv[2])))))
