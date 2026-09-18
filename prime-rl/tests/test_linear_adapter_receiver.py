@@ -1228,7 +1228,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
             ):
                 cache = Path(temporary)
-                urls = {step: f"http://source/run/broadcasts/step_{step}" for step in range(19, 26)}
+                urls = {step: f"http://source/run/broadcasts/step_{step}" for step in range(19, 27)}
                 paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
                 for step, path in paths.items():
                     if step != 23:
@@ -1237,6 +1237,45 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                         (path / "transport.json").write_text(json.dumps({"source_url": urls[step]}))
                 target_partial = paths[23].with_name(f"{paths[23].name}.partial")
                 target_partial.mkdir()
+                def write_partial(step, identity_url=None):
+                    partial = paths[step].with_name(f"{paths[step].name}.partial")
+                    partial.mkdir()
+                    identity_url = identity_url or urls[step]
+                    identity = filesystem._adapter_resume_identity(
+                        identity_url,
+                        {
+                            "version": 1,
+                            "mode": "delta",
+                            "transport": filesystem._ADAPTER_DELTA_TRANSPORT,
+                            "base_url": urls[step - 1],
+                            "base_sha256": "a" * 64,
+                            "base_size": 1,
+                            "base_config_sha256": "b" * 64,
+                            "base_config_size": 1,
+                            "target_sha256": "c" * 64,
+                            "target_size": 1,
+                            "config_sha256": "d" * 64,
+                            "config_size": 1,
+                            "chunks": [],
+                        },
+                    )
+                    (partial / "transport-manifest.json").write_text(identity)
+                    return partial
+
+                future_partial = write_partial(24)
+                future_inode = future_partial.stat().st_ino
+                future_content = (future_partial / "transport-manifest.json").read_text()
+                wrong_source_partial = write_partial(
+                    25, "http://other/run/broadcasts/step_24"
+                )
+                wrong_identity_partial = write_partial(26)
+                wrong_identity = json.loads(
+                    (wrong_identity_partial / "transport-manifest.json").read_text()
+                )
+                wrong_identity["resume_identity_version"] = 2
+                (wrong_identity_partial / "transport-manifest.json").write_text(
+                    json.dumps(wrong_identity, sort_keys=True, separators=(",", ":"))
+                )
                 filesystem.write_loaded_adapter_receipts(
                     {f"adapter-slot{index}": {"source_url": urls[step]}
                      for index, step in enumerate(loaded_steps)}
@@ -1259,6 +1298,13 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 for step in (19, 21, 22, 24, 25):
                     self.assertTrue(paths[step].is_dir())
                 self.assertTrue(target_partial.is_dir())
+                self.assertTrue(future_partial.is_dir())
+                self.assertEqual(future_partial.stat().st_ino, future_inode)
+                self.assertEqual(
+                    (future_partial / "transport-manifest.json").read_text(), future_content
+                )
+                self.assertFalse(wrong_source_partial.exists())
+                self.assertFalse(wrong_identity_partial.exists())
                 self.assertFalse(paths[20].exists())
                 self.assertEqual(lock_path.stat().st_ino, lock_inode)
 

@@ -13,7 +13,8 @@ from test_linear_adapter_receiver import load_filesystem
 
 
 def fixture(filesystem, build_seconds=1):
-    digest = lambda data: hashlib.sha256(data).hexdigest()
+    def digest(data):
+        return hashlib.sha256(data).hexdigest()
     target, config, wire = b"target!!", b"{}\n", b"wire"
     value = {
         "version": 2, "kind": "lora-adapter", "mode": "delta",
@@ -196,7 +197,7 @@ def run_cache_check(cache, invalid=""):
 
     def transfer(*_args, **_kwargs):
         assert invalid, "a verified cache hit must not start a transfer"
-        assert not partial.exists() and not obsolete.exists(), "cleanup must precede transfer"
+        assert partial.exists() and not obsolete.exists(), "future partial must be preserved"
         return destination
 
     with mock.patch.multiple(
@@ -252,7 +253,7 @@ class AdapterPartialResumeTest(unittest.TestCase):
             with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as cache:
                 self.assertTrue(self.child(cache, True)["proof"])
                 checked = self.cache_check_child(cache, invalid)
-                self.assertIsNone(checked["after"])
+                self.assertEqual(checked["after"], checked["before"])
                 self.assertFalse(checked["obsolete_exists"])
                 self.assertEqual(checked["transfers"], 1)
 

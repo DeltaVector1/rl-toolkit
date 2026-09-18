@@ -2819,6 +2819,7 @@ def _cleanup_previous_adapter_caches(
     preserve_names: set[str] | None = None,
     preserve_active_bases: bool = True,
     future_source_url: str | None = None,
+    prune_full_transport_chunks: bool = False,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> None:
@@ -2844,9 +2845,7 @@ def _cleanup_previous_adapter_caches(
             if match is None:
                 return None
             run_url = urlunsplit(parsed._replace(
-                path=str(Path(parsed.path.rstrip("/")).parent),
-                query="",
-                fragment="",
+                path=str(Path(parsed.path.rstrip("/")).parent), query="", fragment=""
             ))
             return run_url, int(match.group(1))
 
@@ -2891,7 +2890,10 @@ def _cleanup_previous_adapter_caches(
                 names.append(entry.name)
         for name in names:
             _check_deadline(deadline, cancel_event)
-            if name == active_name or re.fullmatch(r"[0-9a-f]{64}", name) is None:
+            if (
+                (name == active_name and not prune_full_transport_chunks)
+                or re.fullmatch(r"[0-9a-f]{64}", name) is None
+            ):
                 continue
             if len(ready_candidates) >= _ADAPTER_CLEANUP_CANDIDATE_LIMIT:
                 raise OSError("too many cached adapter candidates")
@@ -2920,6 +2922,13 @@ def _cleanup_previous_adapter_caches(
                 if candidate_url is None:
                     unknown_names.add(name)
                     continue
+                if prune_full_transport_chunks:
+                    _cleanup_verified_full_adapter_transport_chunks(
+                        cache_root / name,
+                        candidate_url,
+                        deadline=deadline,
+                        cancel_event=cancel_event,
+                    )
                 step = source_step(candidate_url)
                 if step is not None:
                     candidate_steps[name] = step
@@ -2969,6 +2978,8 @@ def _cleanup_previous_adapter_caches(
                 if step[0] == active_step[0] and step[1] > active_step[1]
             )
 
+        if prune_full_transport_chunks:
+            return
         for name in ready_candidates:
             if name in keep:
                 continue
@@ -2999,10 +3010,59 @@ def _cleanup_obsolete_adapter_partials(
     cache_root: Path,
     preserve_names: set[str],
     *,
+    future_source_url: str | None = None,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> None:
     """Remove abandoned adapter partials while preserving resumable stages."""
+    def source_step(source_url: str) -> tuple[str, int] | None:
+        try:
+            parsed = urlsplit(source_url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                return None
+            return urlunsplit(parsed._replace(
+                path=str(Path(parsed.path.rstrip("/")).parent), query="", fragment=""
+            )), _adapter_step_from_source_url(source_url)
+        except (TypeError, ValueError, OSError):
+            return None
+
+    future_step = source_step(future_source_url) if isinstance(future_source_url, str) else None
+
+    def partial_source_step(cache_fd: int, partial_name: str) -> tuple[str, int] | None:
+        try:
+            directory_fd = _open_directory_entry_nofollow(
+                cache_fd,
+                partial_name,
+                "adapter partial directory",
+            )
+            try:
+                raw_identity = _read_text_nofollow(
+                    "transport-manifest.json",
+                    encoding="utf-8",
+                    dir_fd=directory_fd,
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
+            finally:
+                os.close(directory_fd)
+            value = json.loads(raw_identity)
+            if not isinstance(value, dict):
+                return None
+            source_url = value.get("source_url")
+            if (
+                not isinstance(source_url, str)
+                or value.get("resume_identity_version") != 1
+            ):
+                return None
+            identity = dict(value)
+            identity["source_manifest"] = value
+            if _adapter_resume_identity(source_url, identity) != raw_identity:
+                return None
+            if adapter_cache_path(source_url) != cache_root / partial_name[: -len(".partial")]:
+                return None
+            return source_step(source_url)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, AssertionError):
+            return None
+
     try:
         cache_fd = _open_directory_nofollow(
             cache_root,
@@ -3027,17 +3087,25 @@ def _cleanup_obsolete_adapter_partials(
                     names.append(entry.name)
                     if len(names) > _ADAPTER_CLEANUP_ENTRY_LIMIT:
                         raise OSError("too many partial adapter cleanup candidates")
+        for name in names:
+            _check_deadline(deadline, cancel_event)
+            if name[: -len(".partial")] in preserve_names:
+                continue
+            if future_step is not None:
+                candidate_step = partial_source_step(cache_fd, name)
+                if (
+                    candidate_step is not None
+                    and candidate_step[0] == future_step[0]
+                    and candidate_step[1] > future_step[1]
+                ):
+                    continue
+            _cleanup_delta_stage_artifacts(
+                cache_root / name[: -len(".partial")],
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
     finally:
         os.close(cache_fd)
-    for name in names:
-        _check_deadline(deadline, cancel_event)
-        if name[: -len(".partial")] in preserve_names:
-            continue
-        _cleanup_delta_stage_artifacts(
-            cache_root / name[: -len(".partial")],
-            deadline=deadline,
-            cancel_event=cancel_event,
-        )
 
 
 def _loaded_adapter_receipt_state(cache_root: Path) -> tuple[str, list[str]]:
@@ -3123,6 +3191,15 @@ def _cleanup_adapter_space_before_stage(
     if deadline is not None:
         cleanup_deadline = min(cleanup_deadline, deadline)
     preserve_names = {destination.name}
+    _cleanup_previous_adapter_caches(
+        cache_root,
+        destination,
+        preserve_names=preserve_names,
+        future_source_url=source_url,
+        prune_full_transport_chunks=True,
+        deadline=cleanup_deadline,
+        cancel_event=cancel_event,
+    )
     receipt_state, loaded_urls = _loaded_adapter_receipt_state(cache_root)
     if receipt_state == "unknown" or (receipt_state == "live" and not loaded_urls):
         return
@@ -3174,6 +3251,7 @@ def _cleanup_adapter_space_before_stage(
     _cleanup_obsolete_adapter_partials(
         cache_root,
         preserve_names,
+        future_source_url=source_url,
         deadline=cleanup_deadline,
         cancel_event=cancel_event,
     )
@@ -3277,10 +3355,69 @@ def _full_cache_matches_manifest(
         os.close(directory_fd)
 
 
+def _cleanup_verified_full_adapter_transport_chunks(
+    destination: Path,
+    source_url: str,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> bool:
+    """Remove full-transfer chunks only after the READY cache proof passes."""
+    lock_path = _adapter_reader_lock(destination)
+    with os.fdopen(
+        _open_nofollow(lock_path, os.O_RDWR | os.O_CREAT, label="adapter reader lock"),
+        "a+",
+    ) as reader_lock:
+        try:
+            fcntl.flock(reader_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        try:
+            if _verified_local_full_adapter_cache(
+                source_url,
+                destination,
+                require_full_transport=True,
+                deadline=deadline,
+                cancel_event=cancel_event,
+            ) is None:
+                return False
+            parent_fd = _open_directory_nofollow(
+                destination.parent,
+                create=False,
+                label="adapter cache directory",
+            )
+            try:
+                destination_fd = _open_directory_entry_nofollow(
+                    parent_fd,
+                    destination.name,
+                    "adapter destination",
+                )
+                try:
+                    try:
+                        _remove_directory_entry(
+                            destination_fd,
+                            "transport-chunks",
+                            "adapter transport chunk directory",
+                            deadline=deadline,
+                            cancel_event=cancel_event,
+                        )
+                    except FileNotFoundError:
+                        return True
+                finally:
+                    os.close(destination_fd)
+                _fsync_directory(destination)
+            finally:
+                os.close(parent_fd)
+            return True
+        finally:
+            fcntl.flock(reader_lock, fcntl.LOCK_UN)
+
+
 def _verified_local_full_adapter_cache(
     source_url: str,
     destination: Path,
     *,
+    require_full_transport: bool = False,
     deadline: float | None = None,
     cancel_event: threading.Event | None = None,
 ) -> dict[str, object] | None:
@@ -3408,6 +3545,8 @@ def _verified_local_full_adapter_cache(
                 )
             )
         except FileNotFoundError:
+            if require_full_transport:
+                return None
             transport = None
         if transport is not None and (
             not isinstance(transport, dict)
@@ -6714,6 +6853,12 @@ def stage_lora_adapter_files(
                             "updated_at": time.time(),
                             "elapsed_seconds": round(time.monotonic() - started, 3),
                         },
+                    )
+                    _cleanup_verified_full_adapter_transport_chunks(
+                        destination,
+                        source_url,
+                        deadline=operation_deadline,
+                        cancel_event=cancel_event,
                     )
                     _cleanup_adapter_caches(
                         destination.parent,

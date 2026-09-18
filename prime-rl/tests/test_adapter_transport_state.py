@@ -1773,7 +1773,39 @@ class AdapterTransportStateTest(unittest.TestCase):
                     model_spec["sha256"] + "\n",
                     encoding="ascii",
                 )
+                (destination / "transport.json").write_text(
+                    json.dumps(
+                        {
+                            "mode": "full",
+                            "transport": filesystem._ADAPTER_FULL_TRANSPORT,
+                            "source_url": source_url,
+                            "target_sha256": model_spec["sha256"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (destination / "transport-chunks").mkdir()
+                (destination / "transport-chunks" / "chunk-0").write_bytes(b"wire")
                 (destination / "READY").write_text("ready\n", encoding="ascii")
+                filesystem.write_loaded_adapter_receipts(
+                    {"adapter-slot": {"source_url": source_url}}
+                )
+                receipt_before = (
+                    destination.parent / filesystem._ADAPTER_LOADED_RECEIPTS
+                ).read_bytes()
+                protected_before = {
+                    name: (destination / name).read_bytes()
+                    for name in (
+                        "adapter_config.json",
+                        "adapter_model.safetensors",
+                        "adapter_manifest.json",
+                        "manifest.json",
+                        "relay_manifest.json",
+                        "transport.json",
+                        "READY",
+                        "adapter_model.safetensors.sha256",
+                    )
+                }
                 with mock.patch.object(
                     filesystem,
                     "_read_chunked_xor_manifest",
@@ -1792,6 +1824,73 @@ class AdapterTransportStateTest(unittest.TestCase):
                 self.assertEqual(status["path"], destination.as_posix())
                 self.assertEqual(status["target_sha256"], model_spec["sha256"])
                 self.assertTrue(status["cache_hit"])
+                self.assertFalse((destination / "transport-chunks").exists())
+                self.assertEqual(
+                    receipt_before,
+                    (destination.parent / filesystem._ADAPTER_LOADED_RECEIPTS).read_bytes(),
+                )
+                for name, content in protected_before.items():
+                    self.assertEqual((destination / name).read_bytes(), content)
+                (destination / "transport-chunks").mkdir()
+                (destination / "transport-chunks" / "chunk-0").write_bytes(b"wire")
+                filesystem._cleanup_adapter_space_before_stage(
+                    Path(temporary),
+                    filesystem.adapter_cache_path("http://source/run/broadcasts/step_1"),
+                    {
+                        "mode": "delta",
+                        "transport": filesystem._ADAPTER_DELTA_TRANSPORT,
+                        "base_url": source_url,
+                    },
+                    source_url="http://source/run/broadcasts/step_1",
+                )
+                self.assertFalse((destination / "transport-chunks").exists())
+                (destination / "transport-chunks").mkdir()
+                (destination / "transport-chunks" / "chunk-0").write_bytes(b"wire")
+                for transport_name in (
+                    filesystem._ADAPTER_DELTA_TRANSPORT,
+                    filesystem._ADAPTER_LINEAR_TRANSPORT,
+                ):
+                    (destination / "transport.json").write_text(
+                        json.dumps(
+                            {
+                                "mode": "delta",
+                                "transport": transport_name,
+                                "source_url": source_url,
+                                "target_sha256": model_spec["sha256"],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    self.assertFalse(
+                        filesystem._cleanup_verified_full_adapter_transport_chunks(
+                            destination,
+                            source_url,
+                        )
+                    )
+                    self.assertTrue((destination / "transport-chunks").exists())
+                (destination / "transport.json").write_bytes(protected_before["transport.json"])
+                (destination / "adapter_model.safetensors").write_bytes(b"corrupt")
+                self.assertFalse(
+                    filesystem._cleanup_verified_full_adapter_transport_chunks(
+                        destination,
+                        source_url,
+                    )
+                )
+                self.assertTrue((destination / "transport-chunks").exists())
+                (destination / "adapter_model.safetensors").write_bytes(
+                    protected_before["adapter_model.safetensors"]
+                )
+                with mock.patch.object(
+                    filesystem,
+                    "_read_chunked_xor_manifest",
+                    side_effect=AssertionError("restart must use local READY cache"),
+                ), mock.patch.object(
+                    filesystem,
+                    "_source_manifest",
+                    side_effect=AssertionError("restart must use local READY cache"),
+                ):
+                    self.assertEqual(filesystem.stage_lora_adapter_files(source_url), destination)
+                self.assertFalse((destination / "transport-chunks").exists())
             finally:
                 if old_cache is None:
                     os.environ.pop("PRIME_LORA_CACHE_DIR", None)
