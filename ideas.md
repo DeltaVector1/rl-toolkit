@@ -162,16 +162,24 @@ Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
   cap while preserving group 16, 32K/16K, rank-32 targets, reward logic, and
   the 600s limit.
 
-## In progress
+## Approved difficulty-10 experiment and measured stop
 
-- Active run: `glm-decensor-difficulty-10` uses easy-only prompts, no assistant
-  prefill, TailRL, a 1.5M-token cap, and group size 16.
-- Use a fixed no-prefix evaluation with 300 prompts per difficulty bucket at
-  startup and every 10 steps. Skip a group only when every scored refusal
-  score is at least 7. Acceptance requires 50 completed steps.
-- Step 1 took 19m16, including the startup 900-prompt evaluation. Reward was
-  .1953, 608/640 rollouts were trainable, and rollout errors were zero. The
-  trainer started with 46 microbatches.
+- `glm-decensor-difficulty-10` completed four trainer steps and was deliberately
+  stopped. In `token_batch_size` mode, it skipped the existing batch-boundary
+  deferral and repeatedly restarted the same 21 partial groups at policy v1/v2.
+- The accepted batch plateau was 1,212,901/1,500,000 tokens. Discarded groups
+  were 206 live plus 130 complete at v1, and 256 live plus 77 complete at v2.
+  Forward/backward for steps 1-4 was about 385-399s, with no OOM or nonfinite
+  values.
+- Step rewards were .1953/.2343/.1769/.2188. Four points are too few and too
+  noisy to show a trend.
+- Accepted repair: token batches now use the existing bounded 1200s
+  batch-boundary wait. There was no reward, algorithm, or limit change.
+- The new run keeps easy-only prompts, no prefill, TailRL, a 1.5M-token cap,
+  and group size 16. Use fixed no-prefix evaluation with 300 prompts per
+  difficulty bucket at startup and every 10 steps. Skip a group only when it
+  is fully scored and error-free and all refusal scores are at least 7.
+  Complete 50 steps and require the reward/no-prefix trend to be outside noise.
 
 ## Historical prefill and easy-first trial
 
