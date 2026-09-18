@@ -93,6 +93,24 @@ while True: time.sleep(0.1)
         publisher.drain(str(self.active), self.script, timeout=0.2)
         self.assertIsNone(unrelated.poll())
 
+    def test_streamed_helper_drains_exact_publisher_and_preserves_other_run(self):
+        pid = self.child()
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True, env={**os.environ, "SOURCE_RUN_DIR": str(self.active.parent / "run_other")})
+        self.addCleanup(lambda: (unrelated.terminate(), unrelated.wait(timeout=3)))
+        result = subprocess.run([sys.executable, "-", str(self.active), self.script], input=Path(spec.origin).read_text(), capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), f"publisher drained: {self.active}; groups=1; lock=free")
+        state = publisher.process(pid)
+        self.assertTrue(state is None or state[1] == "Z")
+        self.assertIsNone(unrelated.poll())
+
+    def test_streamed_helper_with_no_publisher_is_idempotent(self):
+        for _ in range(2):
+            result = subprocess.run([sys.executable, "-", str(self.active), self.script], input=Path(spec.origin).read_text(), capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), f"publisher drained: {self.active}; groups=0; lock=free")
+        self.assertEqual(list(self.active.iterdir()), [])
+
     def test_microbatch_orphan_finishes_before_resume_scan_in_both_run_paths(self):
         for parent in (False, True):
             with self.subTest(parent=parent):

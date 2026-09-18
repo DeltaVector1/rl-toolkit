@@ -5005,13 +5005,44 @@ def _repair_orchestrator() -> str:
 
     resume_step = _orchestrator_resume_step(run, latest=True)
     if resume_step is not None:
+        if was_running:
+            raise Refused("resume publisher drain requires a stopped or absent orchestrator")
         _, _, service_dir = _cold_run_paths(run)
+        drain_source = (repo_root / "training_ops/runtime/h200/drain_rollout_publisher.py").read_text()
+        sync_script = f"{runtime_root}/h200/sync_rollout_batches.sh"
+        drain_script = (
+            "set -euo pipefail\nstate=$(\n" + _orchestrator_state_script(orchestrator_container)
+            + f"\n)\n[ \"$state\" = {shlex.quote(observed_state[0])} ] || exit 62\n"
+            + f"sudo python3 - {shlex.quote(service_dir)} {shlex.quote(sync_script)} <<'PY'\n{drain_source}\nPY"
+        )
+        drain_code, drain_output = _ssh(orchestrator_host, drain_script, timeout=60)
+        if drain_code or not re.fullmatch(
+            rf"publisher drained: {re.escape(service_dir)}; groups=[0-9]+; lock=free",
+            drain_output.strip(),
+        ):
+            raise Refused(f"orchestrator publisher drain failed: {drain_output.strip() or f'exit {drain_code}'}")
+        final_state_code, final_state = _ssh(
+            orchestrator_host, _orchestrator_state_script(orchestrator_container), timeout=90,
+        )
+        if final_state_code or final_state.strip().splitlines() != observed_state:
+            raise Refused("orchestrator state changed during publisher drain")
+        final_checks = _fan(
+            inference_hosts,
+            lambda host: _ssh(
+                host, _orchestrator_resume_safety_script(_inference_config(host)["ports"]), timeout=120,
+            ),
+        )
+        final_failed = {host: output.strip() for host, (code, output) in final_checks.items() if code}
+        if final_failed:
+            raise Refused(f"inference health or idle state changed during publisher drain: {final_failed}")
+        # A draining child may finish an old publication after its lock closes.
+        # Recheck the stable policy and cached-batch guards after it has exited.
+        if _orchestrator_resume_step(run, latest=True) != resume_step:
+            raise Refused("trainer resume policy changed during publisher drain")
         partial = _resume_repair_state(orchestrator_host, "partial", service_dir, resume_step)
         if type(partial.get("partial")) is not bool:
             raise Refused("partial rollout evidence is invalid")
         if partial["partial"]:
-            if was_running:
-                raise Refused("partial rollout quarantine requires a stopped orchestrator")
             moved = _resume_repair_state(orchestrator_host, "quarantine", service_dir, resume_step)
             if not moved.get("quarantined"):
                 raise Refused("partial rollout quarantine was not confirmed")

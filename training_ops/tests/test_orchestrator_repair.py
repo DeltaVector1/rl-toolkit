@@ -550,6 +550,8 @@ class OrchestratorRepairTest(unittest.TestCase):
 
         def fake_ssh(_host, script, timeout=120):
             ssh_scripts.append(script)
+            if "Drain one run's publisher group" in script:
+                return 0, f"publisher drained: {training_ops.run_root}/glm-perf-3/run_glm-perf-3; groups=0; lock=free\n"
             if "--format '{{json .}}'" in script:
                 return 0, json.dumps({"name": f"/{training_ops.trainer_container}", "running": True, "environment": ["RUN=glm-perf-3"]})
             if "echo absent" in script:
@@ -678,6 +680,96 @@ class OrchestratorRepairTest(unittest.TestCase):
             with self.assertRaisesRegex(training_ops.Refused, "idle or waiting"):
                 training_ops._repair_orchestrator()
         deploy.assert_not_called()
+
+
+class OrchestratorPublisherDrainRepairTest(unittest.TestCase):
+    def repair(self, *, drain_code=0, drain_output=None, partial=True, guard_failure=None, running=False, state_changed=False, inference_changed=False):
+        run = "glm-perf-3"
+        service_dir = f"{training_ops.run_root}/{run}/run_{run}"
+        events = []
+        before = training_ops.Status(trainer_up=True, orch_failed=running, nodes=[training_ops.NodeState(host=training_ops.trainer_head, reachable=True, gpu_util=0)], batch="batch 4/1024; 0 inflight")
+        def ssh(host, script, timeout=120):
+            if "Drain one run's publisher group" in script:
+                events.append("drain")
+                self.assertEqual(host, training_ops.orchestrator_host)
+                self.assertEqual(timeout, 60)
+                source = (training_ops.repo_root / "training_ops/runtime/h200/drain_rollout_publisher.py").read_text()
+                self.assertIn(source, script)
+                self.assertIn(f"sudo python3 - {service_dir} {training_ops.runtime_root}/h200/sync_rollout_batches.sh", script)
+                self.assertLess(script.index('[ "$state" = stopped ]'), script.index("sudo python3 -"))
+                return drain_code, drain_output if drain_output is not None else f"publisher drained: {service_dir}; groups=0; lock=free\n"
+            if script == "recreate":
+                events.append("launch")
+                return 0, ""
+            events.append("state")
+            if state_changed and "drain" in events:
+                return 0, "running\n"
+            return 0, "running\n" if running else "stopped\n"
+        def idle(*args):
+            events.append("idle")
+            if inference_changed and "drain" in events:
+                return {training_ops.inference_hosts[0]: (1, "busy")}
+            return {}
+        def guard(*args, **kwargs):
+            events.append("guard")
+            if events.count("guard") == guard_failure:
+                raise training_ops.Refused("cached later batch")
+            return 3
+        def state(_host, action, directory, step):
+            events.append(action)
+            self.assertEqual((directory, step), (service_dir, 3))
+            return {"partial": partial} if action == "partial" else {"quarantined": f"{service_dir}/rollouts/saved/step_4"}
+        def recreate(*args, **kwargs):
+            events.append("recreate")
+            self.assertEqual(kwargs["resume_step"], 3)
+            return "recreate"
+        error = None
+        with mock.patch.object(training_ops, "current_run", return_value=run), mock.patch.object(training_ops, "status", return_value=before), mock.patch.object(training_ops, "_ssh", side_effect=ssh), mock.patch.object(training_ops, "_fan", side_effect=idle), mock.patch.object(training_ops, "_orchestrator_resume_step", side_effect=guard), mock.patch.object(training_ops, "_resume_repair_state", side_effect=state), mock.patch.object(training_ops, "deploy", side_effect=lambda *_args: events.append("deploy") or True), mock.patch.object(training_ops, "_recreate_orchestrator_script", side_effect=recreate):
+            try:
+                training_ops._repair_orchestrator()
+            except training_ops.Refused as caught:
+                error = caught
+        return events, error
+
+    def test_guards_drain_recheck_quarantine_and_launch_are_ordered(self):
+        events, error = self.repair()
+        self.assertIsNone(error)
+        self.assertEqual(events, ["state", "idle", "guard", "drain", "state", "idle", "guard", "partial", "quarantine", "deploy", "recreate", "launch"])
+
+    def test_absent_publisher_and_partial_are_idempotent(self):
+        events, error = self.repair(partial=False)
+        self.assertIsNone(error)
+        self.assertEqual(events, ["state", "idle", "guard", "drain", "state", "idle", "guard", "partial", "deploy", "recreate", "launch"])
+
+    def test_drain_failure_or_unverified_output_blocks_all_later_actions(self):
+        for code, output in ((19, "drain failed"), (0, ""), (0, "publisher drained: /other; groups=0; lock=free"), (0, "publisher drained: /other; groups=0; lock=held")):
+            with self.subTest(code=code, output=output):
+                events, error = self.repair(drain_code=code, drain_output=output)
+                self.assertIsNotNone(error)
+                self.assertEqual(events, ["state", "idle", "guard", "drain"])
+
+    def test_pre_drain_guard_failure_prevents_drain(self):
+        events, error = self.repair(guard_failure=1)
+        self.assertIsNotNone(error)
+        self.assertEqual(events, ["state", "idle", "guard"])
+
+    def test_publication_completed_during_drain_blocks_quarantine(self):
+        events, error = self.repair(guard_failure=2)
+        self.assertIsNotNone(error)
+        self.assertEqual(events, ["state", "idle", "guard", "drain", "state", "idle", "guard"])
+
+    def test_post_drain_container_or_inference_change_blocks_quarantine(self):
+        for options, tail in (({"state_changed": True}, ["state"]), ({"inference_changed": True}, ["state", "idle"])):
+            with self.subTest(options=options):
+                events, error = self.repair(**options)
+                self.assertIsNotNone(error)
+                self.assertEqual(events, ["state", "idle", "guard", "drain", *tail])
+
+    def test_running_orchestrator_prevents_drain(self):
+        events, error = self.repair(running=True)
+        self.assertIsNotNone(error)
+        self.assertNotIn("drain", events)
+        self.assertNotIn("deploy", events)
 
 
 class OrchestratorResumeStateTest(unittest.TestCase):
