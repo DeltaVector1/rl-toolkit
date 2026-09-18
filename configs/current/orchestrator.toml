@@ -1,21 +1,24 @@
-output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-9/run_glm-decensor-difficulty-9"
+output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-10/run_glm-decensor-difficulty-10"
 max_steps = 50
 skip_if_every_refusal_score_is_at_least = 7
 seq_len = 32768
-token_batch_size = 1500000
+batch_size = 1024
 group_size = 16
 max_inflight_rollouts = 256
 max_off_policy_steps = 4
 pool_size = 4
+
+[algo]
+type = "tail_likelihood"
 
 [log]
 level = "info"
 
 [swanlab]
 project = "glm-runs"
-name = "orchestrator-glm-decensor-difficulty-9"
+name = "orchestrator-glm-decensor-difficulty-10"
 group = "glm-runs"
-tags = ["decensor-diff-9", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
+tags = ["decensor-diff-10", "glm-5.2", "decensor", "tail_likelihood", "lora-r32", "50-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -57,6 +60,9 @@ pool = { type = "static", num_workers = 16 }
 env.taskset.id = "decensor-v1"
 env.taskset.num_examples = 2000
 env.taskset.difficulty = "easy"
+env.taskset.data_split = "train"
+env.taskset.holdout_seed = 73129
+env.taskset.holdout_fraction = 0.25
 env.agent.harness = { id = "null" }
 env.agent.max_output_tokens = 16384
 env.agent.timeout.rollout = 3600
@@ -76,85 +82,127 @@ model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
-[[train.env]]
-name = "decensor-medium"
-ratio = 1.0
+[eval]
+interval = 10
+skip_first_step = false
+group_size = 1
+
+[eval.sampling]
+temperature = 0.0
+max_completion_tokens = 16384
+
+[[eval.env]]
+name = "decensor-easy-eval"
 pool = { type = "static", num_workers = 16 }
 env.taskset.id = "decensor-v1"
-env.taskset.num_examples = 2000
+env.taskset.num_examples = 300
+env.taskset.difficulty = "easy"
+env.taskset.data_split = "heldout"
+env.taskset.holdout_seed = 73129
+env.taskset.holdout_fraction = 0.25
+env.taskset.max_turns = 1
+env.taskset.style_probability = 0.0
+env.taskset.markdown_probability = 0.0
+env.taskset.enable_length_prompts = false
+env.taskset.task.enable_word_count = false
+env.taskset.task.enable_markdown_judges = false
+env.agent.harness = { id = "null" }
+env.agent.max_output_tokens = 16384
+env.agent.timeout.rollout = 3600
+
+[eval.env.sampling]
+max_completion_tokens = 16384
+
+[eval.env.env.taskset.task.judge]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+max_concurrent_requests = 48
+
+[eval.env.env.taskset.task.user]
+base_url = "http://127.0.0.1:26407/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+max_concurrent_requests = 48
+
+[[eval.env]]
+name = "decensor-medium-eval"
+pool = { type = "static", num_workers = 16 }
+env.taskset.id = "decensor-v1"
+env.taskset.num_examples = 300
 env.taskset.difficulty = "medium"
+env.taskset.data_split = "heldout"
+env.taskset.holdout_seed = 73129
+env.taskset.holdout_fraction = 0.25
+env.taskset.max_turns = 1
+env.taskset.style_probability = 0.0
+env.taskset.markdown_probability = 0.0
+env.taskset.enable_length_prompts = false
+env.taskset.task.enable_word_count = false
+env.taskset.task.enable_markdown_judges = false
 env.agent.harness = { id = "null" }
 env.agent.max_output_tokens = 16384
 env.agent.timeout.rollout = 3600
 
-[train.env.sampling]
+[eval.env.sampling]
 max_completion_tokens = 16384
 
-[train.env.env.taskset.task.judge]
+[eval.env.env.taskset.task.judge]
 base_url = "http://202.214.223.66:26406/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
-[train.env.env.taskset.task.user]
+[eval.env.env.taskset.task.user]
 base_url = "http://127.0.0.1:26407/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
-[[train.env]]
-name = "decensor-hard"
-ratio = 1.0
+[[eval.env]]
+name = "decensor-hard-eval"
 pool = { type = "static", num_workers = 16 }
 env.taskset.id = "decensor-v1"
-env.taskset.num_examples = 2000
+env.taskset.num_examples = 300
 env.taskset.difficulty = "hard"
+env.taskset.data_split = "heldout"
+env.taskset.holdout_seed = 73129
+env.taskset.holdout_fraction = 0.25
+env.taskset.max_turns = 1
+env.taskset.style_probability = 0.0
+env.taskset.markdown_probability = 0.0
+env.taskset.enable_length_prompts = false
+env.taskset.task.enable_word_count = false
+env.taskset.task.enable_markdown_judges = false
 env.agent.harness = { id = "null" }
 env.agent.max_output_tokens = 16384
 env.agent.timeout.rollout = 3600
 
-[train.env.sampling]
+[eval.env.sampling]
 max_completion_tokens = 16384
 
-[train.env.env.taskset.task.judge]
+[eval.env.env.taskset.task.judge]
 base_url = "http://202.214.223.66:26406/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
-[train.env.env.taskset.task.user]
+[eval.env.env.taskset.task.user]
 base_url = "http://127.0.0.1:26407/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
-
-[[train.ratio_stages]]
-start_step = 1
-ratios = { "decensor-easy" = 5.4, "decensor-medium" = 2.8, "decensor-hard" = 1.8 }
-
-[[train.ratio_stages]]
-start_step = 11
-ratios = { "decensor-easy" = 3.3, "decensor-medium" = 3.4, "decensor-hard" = 3.3 }
-
-[[train.ratio_stages]]
-start_step = 26
-ratios = { "decensor-easy" = 1.4, "decensor-medium" = 3.0, "decensor-hard" = 5.6 }
-
-[[train.ratio_stages]]
-start_step = 41
-ratios = { "decensor-easy" = 0.6, "decensor-medium" = 1.2, "decensor-hard" = 8.2 }
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/glm-decensor-difficulty-9"
-source_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-9"
+source_url = "http://127.0.0.1:18100/glm-decensor-difficulty-10"
+source_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-10"
 
 [rollout_transport]
 type = "filesystem"
 
 [ckpt]
 interval = 5
-resume_step = -1
 skip_progress = true
 keep_last = 2
 keep_interval = 100
