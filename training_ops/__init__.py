@@ -1533,6 +1533,10 @@ def _failure_evidence(
     timestamp_pattern = re.compile(
         r"\b(?:time|timestamp|ts)\s*[=:]\s*(\d+(?:\.\d+)?)\b", re.I
     )
+    dated_timestamp_pattern = re.compile(
+        r"(?<!\d)(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+        r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)(?!\d)"
+    )
     clock_pattern = re.compile(r"(?<!\d)(\d{1,2}):(\d{2}):(\d{2})(?!\d)")
 
     # Match the replacement to its metric step, not to row count.
@@ -1548,6 +1552,19 @@ def _failure_evidence(
             cycle, (int, float)
         ) or cycle < 0:
             return False
+        dated_match = dated_timestamp_pattern.search(evidence)
+        if dated_match:
+            dated_text = dated_match.group(1)
+            if dated_text.endswith("Z"):
+                dated_text = dated_text[:-1] + "+00:00"
+            try:
+                parsed_time = _dt.datetime.fromisoformat(dated_text)
+            except ValueError:
+                return False
+            if parsed_time.tzinfo is None:
+                parsed_time = parsed_time.replace(tzinfo=_dt.timezone.utc)
+            event_time = parsed_time.timestamp()
+            return row_time - cycle - 1.0 <= event_time <= row_time + 1.0
         timestamp_match = timestamp_pattern.search(evidence)
         if timestamp_match:
             event_time = float(timestamp_match.group(1))
@@ -1564,6 +1581,11 @@ def _failure_evidence(
         elapsed = (event_clock - (row_clock - float(cycle))) % 86400.0
         return elapsed <= float(cycle) + 1.0
 
+    replacement_evidence_lines = {
+        line
+        for event in replacement_events
+        for line in event.splitlines()
+    }
     replacement_rows = [
         row
         for row in error_rows
@@ -1640,6 +1662,7 @@ def _failure_evidence(
             and not (
                 category == "transport"
                 and replacement_log_only
+                and line in replacement_evidence_lines
                 and (unscored_pattern.search(line) or replacement_pattern.search(line))
                 and not real_transport_line(line)
             )

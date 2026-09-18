@@ -734,6 +734,41 @@ dequantize_checkpoint_moe = true
             {"environment": 1, "transport/rollout": 1},
         )
 
+    def test_replacement_does_not_hide_unrelated_unscored_log(self):
+        rows = [{
+            "step": 2,
+            "time": 2000.0,
+            "time/step": 100.0,
+            "train/agg/all/has_error/mean": 0.0025,
+        }]
+        logs = (
+            "timestamp=1950 Rollout failed in group abc — TaskError: rollout is unscored\n"
+            "Finished group | rollouts=16 (errored=1) | dropped complete group; "
+            "consecutive errored groups=1/8\n"
+            "Rollout failed in group unrelated: rollout is unscored"
+        )
+        self.assertEqual(
+            training_ops._failure_evidence([], rows, logs),
+            {"transport": 1},
+        )
+
+    def test_dated_replacement_does_not_match_a_later_date(self):
+        rows = [{
+            "step": 2,
+            "time": 1789732850.0,
+            "time/step": 100.0,
+            "train/agg/all/has_error/mean": 0.0025,
+        }]
+        logs = (
+            "2026-09-17T12:00:00+00:00 Rollout failed in group abc — TaskError: rollout is unscored\n"
+            "2026-09-17T12:00:00+00:00 Finished group | rollouts=16 (errored=1) | "
+            "dropped complete group; consecutive errored groups=1/8"
+        )
+        self.assertEqual(
+            training_ops._failure_evidence([], rows, logs),
+            {"transport/rollout": 1},
+        )
+
     def test_unscored_text_does_not_hide_other_failure_categories(self):
         replacement = (
             "Rollout failed in group abc — TaskError: rollout is unscored\n"
