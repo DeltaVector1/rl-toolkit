@@ -365,6 +365,97 @@ while True: time.sleep(0.1)
                 publisher.drain(str(self.active), self.script, timeout=1)
             sleep.assert_not_called()
 
+    def test_late_orphan_pid_reuse_stops_all_later_signals(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group + 1, group + 2, group + 3)}
+        current = dict(records)
+        def sent(pid, sig):
+            record = current[group + 2]
+            current[group + 2] = (*record[:3], "reused", record[4])
+        with mock.patch.object(publisher, "process", side_effect=current.get), mock.patch.object(publisher, "snapshot", side_effect=lambda: dict(current)), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher.os, "kill", side_effect=sent) as individual_signal, mock.patch.object(publisher.os, "killpg") as group_signal:
+            self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
+            individual_signal.assert_called_once_with(group + 1, signal.SIGTERM)
+            group_signal.assert_not_called()
+
+    def test_late_group_replacement_stops_all_later_signals(self):
+        groups = (987650, 987660, 987670)
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for group in groups for pid in (group, group + 1)}
+        for replace_leader in (False, True):
+            current = dict(records)
+            def sent(group, sig):
+                for other in groups:
+                    if other != group:
+                        pid = other if replace_leader else other + 1
+                        record = current[pid]
+                        current[pid] = (*record[:3], "reused", record[4])
+            with self.subTest(leader=replace_leader), mock.patch.object(publisher, "process", side_effect=current.get), mock.patch.object(publisher, "snapshot", side_effect=lambda: dict(current)), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher.os, "killpg", side_effect=sent) as group_signal:
+                self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
+                self.assertEqual(group_signal.call_count, 1)
+
+    def test_all_linux_dead_states_are_not_live_or_pending(self):
+        group = 987650
+        for state in ("Z", "X", "x"):
+            record = (Path(f"/proc/{group}"), state, group, "start", group)
+            with self.subTest(state=state), mock.patch.object(publisher, "same_run", return_value=True):
+                self.assertIsNone(publisher.stable_identity(record))
+                self.assertEqual(publisher.live_members({group: record}, group), {})
+                self.assertFalse(publisher.pending_publishers({group: record}, self.active, "SOURCE_RUN_DIR", {group}))
+
+    def test_dead_states_are_excluded_from_initial_plans_and_barrier(self):
+        group = 987650
+        for state in ("Z", "X", "x"):
+            records = {group: (Path(f"/proc/{group}"), state, group, "start", group)}
+            with self.subTest(state=state), mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher, "same_run", return_value=True), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+                self.assertTrue(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
+                group_signal.assert_not_called()
+                individual_signal.assert_not_called()
+                def already_signalled(_records, _root, _script, _identity, stopped, _environment):
+                    stopped.add(group)
+                    return True
+                with mock.patch.object(publisher, "signal_publishers", side_effect=already_signalled), mock.patch.object(publisher.time, "monotonic", side_effect=[0, 1]):
+                    publisher.drain(str(self.active), self.script, timeout=1)
+
+    def test_dead_states_in_later_snapshot_or_probe_discard_plan(self):
+        group = 987650
+        records = {group: (Path(f"/proc/{group}"), "S", group, "start", group)}
+        for state in ("Z", "X", "x"):
+            dead = {group: (records[group][0], state, *records[group][2:])}
+            for during_probe in (False, True):
+                with self.subTest(state=state, probe=during_probe), mock.patch.object(publisher, "process", side_effect=(dead if during_probe else records).get), mock.patch.object(publisher, "snapshot", return_value=dead), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher.os, "killpg") as group_signal:
+                    self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
+                    group_signal.assert_not_called()
+
+    def test_late_orphan_ownership_mismatch_stops_all_later_signals(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group + 1, group + 2, group + 3)}
+        signalled = []
+        def owned(pid, *_args):
+            return not signalled or pid != group + 2
+        with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher, "matches", side_effect=owned), mock.patch.object(publisher.os, "kill", side_effect=lambda pid, _sig: signalled.append(pid)):
+            with self.assertRaisesRegex(ValueError, "exact ownership before signal"):
+                publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+        self.assertEqual(signalled, [group + 1])
+
+    def test_late_wrong_session_still_refuses_after_an_earlier_group_signal(self):
+        groups = (987650, 987660)
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for group in groups for pid in (group, group + 1)}
+        current = dict(records)
+        def sent(group, sig):
+            other = next(value for value in groups if value != group)
+            record = current[other + 1]
+            current[other + 1] = (*record[:4], other + 100)
+        with mock.patch.object(publisher, "process", side_effect=current.get), mock.patch.object(publisher, "snapshot", side_effect=lambda: dict(current)), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher.os, "killpg", side_effect=sent) as group_signal:
+            with self.assertRaisesRegex(ValueError, "unknown member"):
+                publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+            self.assertEqual(group_signal.call_count, 1)
+
+    def test_target_exit_at_signal_stops_later_groups(self):
+        groups = (987650, 987660)
+        records = {group: (Path(f"/proc/{group}"), "S", group, str(group), group) for group in groups}
+        with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher.os, "killpg", side_effect=ProcessLookupError) as group_signal:
+            self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
+            self.assertEqual(group_signal.call_count, 1)
+
     def test_launcher_drain_failure_exits_before_replacement_start(self):
         source = (Path(__file__).parents[1] / "runtime/h200/start_orchestrator.sh").read_text()
         block = source.split('  publisher_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"', 1)[1].split("  publisher_pid=$!", 1)[0]

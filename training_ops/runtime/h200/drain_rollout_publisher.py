@@ -43,19 +43,23 @@ def snapshot():
     return {int(path.name): process(int(path.name)) for path in Path("/proc").iterdir() if path.name.isdecimal()}
 
 
+def is_live(record):
+    return bool(record) and record[1] not in {"Z", "X", "x"}
+
+
 def live_members(records, group):
-    return {pid: record for pid, record in records.items() if record and record[1] != "Z" and record[2] == group}
+    return {pid: record for pid, record in records.items() if is_live(record) and record[2] == group}
 
 
 def stable_identity(record):
-    return (record[3], record[2], record[4]) if record and record[1] != "Z" else None
+    return (record[3], record[2], record[4]) if is_live(record) else None
 
 
 def same_member(pid, record, group):
     current = process(pid)
     if current is None and pid == group and (Path("/proc") / str(pid)).exists():
         raise ValueError(f"publisher group {group} has an unreadable leader")
-    if current is None or current[1] == "Z" or current[3] != record[3]:
+    if not is_live(current) or not is_live(record) or current[3] != record[3]:
         return False
     if current[4] != group:
         raise ValueError(f"publisher group {group} has an unknown member {pid}")
@@ -83,17 +87,17 @@ def pending_publishers(records, directory, environment, observed_groups):
     # later exec removes that environment or the original child exits first.
     observed_groups.update(
         record[2] for pid, record in records.items()
-        if pid != os.getpid() and record and record[1] != "Z"
+        if pid != os.getpid() and is_live(record)
         and same_run(pid, directory, environment)
     )
-    return any(record and record[1] != "Z" and record[2] in observed_groups for record in records.values())
+    return any(is_live(record) and record[2] in observed_groups for record in records.values())
 
 
 def signal_publishers(records, directory, script, lock_identity, stopped, environment="SOURCE_RUN_DIR"):
-    """Return False for a changed plan, before signalling any process."""
+    """Rescan changed plans; never signal a changed target or later targets."""
     candidates = {
         record[2] for pid, record in records.items()
-        if record and record[1] != "Z" and record[2] not in stopped
+        if is_live(record) and record[2] not in stopped
         and matches(pid, directory, script, lock_identity, environment)
     }
     plans = {}
@@ -106,7 +110,7 @@ def signal_publishers(records, directory, script, lock_identity, stopped, enviro
         leader = records.get(group)
         if leader is None and (Path("/proc") / str(group)).exists():
             raise ValueError(f"publisher group {group} has an unreadable leader")
-        isolated = leader is not None and leader[1] != "Z"
+        isolated = is_live(leader)
         if isolated and (leader[2] != group or leader[4] != group):
             raise ValueError(f"publisher group {group} has an unknown leader")
         if isolated and not same_member(group, leader, group):
@@ -125,7 +129,7 @@ def signal_publishers(records, directory, script, lock_identity, stopped, enviro
     for _ in range(2):
         current = snapshot()
         if any(
-            record and record[1] != "Z" and record[2] not in plans and record[2] not in stopped
+            is_live(record) and record[2] not in plans and record[2] not in stopped
             and matches(pid, directory, script, lock_identity, environment)
             for pid, record in current.items()
         ):
@@ -150,15 +154,31 @@ def signal_publishers(records, directory, script, lock_identity, stopped, enviro
     for group, members in plans.items():
         try:
             if group in members:
+                # Earlier signals may have changed this later group's members.
+                if not same_members(snapshot(), members, group):
+                    return False
+                for pid, record in members.items():
+                    if not same_member(pid, record, group):
+                        return False
+                if not matches(group, directory, script, lock_identity, environment):
+                    raise ValueError(f"publisher leader {group} changed exact ownership before signal")
+                if not same_members(snapshot(), members, group) or not same_member(group, members[group], group):
+                    return False
                 os.killpg(group, signal.SIGTERM)
             else:
                 # A missing leader never authorizes a group signal. Only the
                 # exact orphan PIDs in the fully rechecked plan may be signalled.
-                for pid in members:
+                for pid, record in members.items():
+                    if not same_member(pid, record, group):
+                        return False
+                    if not matches(pid, directory, script, lock_identity, environment):
+                        raise ValueError(f"orphan publisher {pid} changed exact ownership before signal")
+                    if not same_member(pid, record, group):
+                        return False
                     os.kill(pid, signal.SIGTERM)
             stopped.add(group)
         except ProcessLookupError:
-            pass
+            return False
     return True
 
 
@@ -203,7 +223,7 @@ def drain_directory(root, script, timeout, environment, lock_name):
                     raise TimeoutError(f"publisher membership did not settle: {root}")
                 time.sleep(0.1)
                 continue
-            alive = any(record and record[1] != "Z" and record[2] in groups for record in records.values())
+            alive = any(is_live(record) and record[2] in groups for record in records.values())
             unlocked = descriptor is None
             if descriptor is not None:
                 try:
