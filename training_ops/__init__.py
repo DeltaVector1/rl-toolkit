@@ -4458,7 +4458,29 @@ esac
 """
 
 
-def _orchestrator_resume_step(run: str) -> int | None:
+def _resume_repair_state(host: str, action: str, service_dir: str, step: int, digest: str = "") -> dict:
+    source = (repo_root / "training_ops/runtime/china/resume_state.py").read_text()
+    arguments = " ".join(shlex.quote(str(item)) for item in (action, service_dir, step, digest))
+    prefix = ""
+    if action == "quarantine":
+        prefix = (
+            "set -euo pipefail\nstate=$(\n" + _orchestrator_state_script(orchestrator_container)
+            + '\n)\n[[ "$state" = stopped || "$state" = absent ]] || exit 62\n'
+        )
+    interpreter = "sudo python3" if action in {"partial", "quarantine"} else "python3"
+    code, output = _ssh(host, prefix + f"{interpreter} - {arguments} <<'PY'\n{source}\nPY", timeout=600)
+    if code:
+        raise Refused(f"orchestrator repair {action} check failed on {host}: {output.strip()}")
+    try:
+        value = json.loads(output)
+        if not isinstance(value, dict):
+            raise ValueError("expected object")
+        return value
+    except (TypeError, ValueError) as error:
+        raise Refused(f"invalid orchestrator repair {action} evidence") from error
+
+
+def _orchestrator_resume_step(run: str, *, latest: bool = False) -> int | None:
     """Keep the exact active trainer's explicit adapter restart policy."""
     _, _, service_dir = _cold_run_paths(run)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", trainer_container):
@@ -4507,6 +4529,20 @@ def _orchestrator_resume_step(run: str) -> int | None:
             raise ValueError("resume adapter is not the exact run policy path")
     except (ValueError, KeyError, TypeError, AttributeError) as error:
         raise Refused(f"invalid active trainer resume state: {error}") from error
+    if latest:
+        candidate = _resume_repair_state(trainer_head, "latest", service_dir, step)
+        chosen = candidate.get("step")
+        if type(chosen) is not int or chosen < step:
+            raise Refused("latest stable policy precedes trainer launch")
+        if chosen > step:
+            digest = candidate.get("batch_sha256")
+            if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+                raise Refused("completed trainer batch identity is missing")
+            completed = _resume_repair_state(orchestrator_host, "completed", service_dir, chosen, digest)
+            if completed.get("step") != chosen or completed.get("batch_sha256") != digest or type(completed.get("records")) is not int or completed["records"] <= 0:
+                raise Refused("completed rollout evidence differs")
+        step = chosen
+        adapter = f"{service_dir}/broadcasts/step_{step}/adapter_model.safetensors"
     identity = _check_adapter_restart(trainer_head, service_dir, step, "origin", adapter)
     if not isinstance(identity.get("sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", identity["sha256"]):
         raise Refused("stable restart adapter has no exact SHA-256 identity")
@@ -4967,7 +5003,19 @@ def _repair_orchestrator() -> str:
             f"{failed}"
         )
 
-    resume_step = _orchestrator_resume_step(run)
+    resume_step = _orchestrator_resume_step(run, latest=True)
+    if resume_step is not None:
+        _, _, service_dir = _cold_run_paths(run)
+        partial = _resume_repair_state(orchestrator_host, "partial", service_dir, resume_step)
+        if type(partial.get("partial")) is not bool:
+            raise Refused("partial rollout evidence is invalid")
+        if partial["partial"]:
+            if was_running:
+                raise Refused("partial rollout quarantine requires a stopped orchestrator")
+            moved = _resume_repair_state(orchestrator_host, "quarantine", service_dir, resume_step)
+            if not moved.get("quarantined"):
+                raise Refused("partial rollout quarantine was not confirmed")
+            print(f"preserved partial rollout at {moved['quarantined']}")
     client_path = "prime-rl/src/prime_rl/utils/client.py"
     if not deploy(client_path):
         raise RuntimeError(f"orchestrator repair deployment failed for {client_path}")
@@ -4987,6 +5035,8 @@ def _repair_orchestrator() -> str:
         "trainer was idle, rollout requests were zero, inference health/liveness "
         "passed, staging was bounded, and the resume-timeout client was deployed"
     )
+    if resume_step is not None:
+        result += f"; policy {resume_step}, next batch {resume_step + 1}; orchestrator counters reset (skip_progress=true)"
     print(result)
     return result
 

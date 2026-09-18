@@ -6,6 +6,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -33,6 +34,97 @@ class ResumeStateTest(unittest.TestCase):
 
     def check(self, role="origin", step=3, digest=""):
         return resume.check_state(str(self.active), step, role, str(self.weight), digest)
+
+    def completed(self):
+        root = self.active / "rollouts/step_3"
+        trace = root / "train/effective/traces.jsonl"
+        trace.parent.mkdir(parents=True)
+        trace.write_text('{"reward": 1}\n')
+        batch = root / "train_rollouts.bin"
+        batch.write_bytes(b"batch-three")
+        sha = hashlib.sha256(batch.read_bytes()).hexdigest()
+        (root / "train_rollouts.bin.delivered").write_text(sha + "\n")
+        return root, sha
+
+    def partial(self):
+        trace = self.active / "rollouts/step_4/train/all/traces.jsonl"
+        trace.parent.mkdir(parents=True)
+        trace.write_text("partial trace")
+        (self.active / ".batch-sync.lock").touch()
+        return trace
+
+    def test_latest_policy_requires_complete_matching_delivered_batch(self):
+        root, sha = self.completed()
+        self.assertEqual(resume.latest_policy(str(self.active), 1), {"step": 3, "batch_sha256": sha})
+        self.assertEqual(resume.completed_batch(str(self.active), 3, sha)["records"], 1)
+        for name in ("train/effective/traces.jsonl", "train_rollouts.bin", "train_rollouts.bin.delivered"):
+            path = root / name
+            saved = path.read_bytes()
+            path.unlink()
+            with self.subTest(name=name), self.assertRaises((OSError, ValueError)):
+                resume.completed_batch(str(self.active), 3, sha)
+            path.write_bytes(saved)
+        with self.assertRaises(ValueError):
+            resume.completed_batch(str(self.active), 3, "f" * 64)
+
+    def test_latest_policy_keeps_initial_resume_without_batch(self):
+        self.assertEqual(resume.latest_policy(str(self.active), 3), {"step": 3})
+        with self.assertRaises(ValueError):
+            resume.latest_policy(str(self.active), 4)
+        with self.assertRaises(OSError):
+            resume.latest_policy(str(self.active), 1)
+
+    def test_partial_quarantine_preserves_trace_without_reuse(self):
+        trace = self.partial()
+        original = Path.iterdir
+        def entries(path):
+            return iter([]) if path == Path("/proc") else original(path)
+        with mock.patch.object(Path, "iterdir", entries):
+            self.assertEqual(resume.partial_rollout(str(self.active), 3), {"partial": True})
+            moved = resume.partial_rollout(str(self.active), 3, quarantine=True)
+        self.assertFalse(trace.exists())
+        self.assertEqual((Path(moved["quarantined"]) / "train/all/traces.jsonl").read_text(), "partial trace")
+        self.assertEqual(resume.partial_rollout(str(self.active), 3), {"partial": False})
+
+    def test_partial_refuses_complete_unknown_and_symlink_entries(self):
+        self.partial()
+        target = self.active / "rollouts/step_4"
+        for name in ("train_rollouts.bin", "train_rollouts.bin.delivered", "train/effective", "unknown"):
+            path = target / name
+            path.touch()
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                resume.partial_rollout(str(self.active), 3, quarantine=True)
+            path.unlink()
+        trace = target / "train/all/traces.jsonl"
+        trace.unlink()
+        trace.symlink_to(self.weight)
+        with self.assertRaises(ValueError):
+            resume.partial_rollout(str(self.active), 3, quarantine=True)
+        self.assertTrue(target.exists())
+
+    def test_partial_refuses_active_publisher_lock(self):
+        self.partial()
+        with (self.active / ".batch-sync.lock").open() as stream:
+            resume.fcntl.flock(stream, resume.fcntl.LOCK_EX | resume.fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                resume.partial_rollout(str(self.active), 3, quarantine=True)
+        self.assertTrue((self.active / "rollouts/step_4").exists())
+
+    def test_partial_refuses_matching_publisher_process(self):
+        self.partial()
+        original = Path.read_bytes
+        def read(path):
+            if path == Path("/proc/123456/cmdline"):
+                return b"bash\0sync_rollout_batches.sh\0"
+            if path == Path("/proc/123456/environ"):
+                return f"SOURCE_RUN_DIR={self.active}".encode()
+            return original(path)
+        original_iter = Path.iterdir
+        def entries(path):
+            return iter([Path("/proc/123456")]) if path == Path("/proc") else original_iter(path)
+        with mock.patch.object(Path, "read_bytes", read), mock.patch.object(Path, "iterdir", entries):
+            with self.assertRaisesRegex(ValueError, "publisher is still present"):
+                resume.partial_rollout(str(self.active), 3, quarantine=True)
 
     def test_exact_stable_identity_and_trainer_copy(self):
         self.assertEqual(self.check(), {"policy_step": 3, "next_batch": 4, "sha256": self.sha, "size": self.weight.stat().st_size, "config_sha256": self.manifest["config_sha256"], "config_size": 2})

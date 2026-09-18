@@ -1,6 +1,7 @@
 """Validate one adapter restart and create its explicit runtime control."""
 
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -144,9 +145,151 @@ def check_state(service_dir: str, step: int, role: str, adapter: str, expected: 
     return result
 
 
+def exact_run(service_dir: str) -> Path:
+    active = Path(service_dir)
+    if not active.is_absolute() or active.name != f"run_{active.parent.name}" or ".." in active.parts:
+        raise ValueError("repair run directory is not exact")
+    for path in (active, *active.parents):
+        if path.is_symlink():
+            raise ValueError("repair run has a symlink ancestor")
+    return active
+
+
+def latest_policy(service_dir: str, launch_step: int) -> dict:
+    if type(launch_step) is not int or launch_step < 0:
+        raise ValueError("invalid launch step")
+    active = exact_run(service_dir)
+    root = active / "broadcasts"
+    if root.is_symlink():
+        raise ValueError("broadcasts is a symlink")
+    steps = []
+    for path in root.iterdir():
+        if not re.fullmatch(r"step_(0|[1-9][0-9]*)", path.name):
+            continue
+        if path.is_symlink():
+            raise ValueError("policy directory is a symlink")
+        stable = path / "STABLE"
+        if stable.exists() or stable.is_symlink():
+            regular(stable)
+            steps.append(int(path.name[5:]))
+    if not steps or max(steps) < launch_step:
+        raise ValueError("stable policy precedes trainer launch")
+    step = max(steps)
+    result = {"step": step}
+    if step > launch_step:
+        batch = active / "rollouts" / f"step_{step}" / "train_rollouts.bin"
+        for path in batch.parents:
+            if path.is_symlink():
+                raise ValueError("completed batch has a symlink ancestor")
+        if batch.stat().st_size <= 0:
+            raise ValueError("completed trainer batch is empty")
+        result["batch_sha256"] = digest(batch)
+    return result
+
+
+def completed_batch(service_dir: str, step: int, expected: str) -> dict:
+    if type(step) is not int or step < 0:
+        raise ValueError("invalid completed step")
+    active = exact_run(service_dir)
+    root = active / "rollouts" / f"step_{step}"
+    trace = root / "train/effective/traces.jsonl"
+    for path in (trace, *trace.parents):
+        if path.is_symlink():
+            raise ValueError("completed rollout has a symlink")
+    regular(trace)
+    count = 0
+    with trace.open() as stream:
+        for line in stream:
+            if not isinstance(json.loads(line), dict):
+                raise ValueError("effective rollout record is invalid")
+            count += 1
+    if not count or not re.fullmatch(r"[a-f0-9]{64}", expected):
+        raise ValueError("completed effective rollout evidence is missing")
+    if digest(root / "train_rollouts.bin") != expected:
+        raise ValueError("completed batch differs from trainer batch")
+    delivered = root / "train_rollouts.bin.delivered"
+    regular(delivered)
+    if delivered.read_text() != expected + "\n":
+        raise ValueError("completed batch has no exact delivery marker")
+    return {"step": step, "records": count, "batch_sha256": expected}
+
+
+def partial_rollout(service_dir: str, step: int, *, quarantine=False) -> dict:
+    if type(step) is not int or step < 0:
+        raise ValueError("invalid partial rollout step")
+    active = exact_run(service_dir)
+    root = active / "rollouts"
+    if root.is_symlink():
+        raise ValueError("rollouts is a symlink")
+    target = root / f"step_{step + 1}"
+    if not root.exists():
+        return {"partial": False}
+    for path in root.iterdir():
+        match = re.fullmatch(r"step_([0-9]+)", path.name)
+        if match and int(match[1]) > step and path != target:
+            raise ValueError("unexpected later rollout directory")
+    if not target.exists() and not target.is_symlink():
+        return {"partial": False}
+    allowed = {"train", "train/all", "train/all/traces.jsonl"}
+    observed = {}
+    for path in (target, *target.rglob("*")):
+        if path.is_symlink() or (path != target and path.relative_to(target).as_posix() not in allowed):
+            raise ValueError("next rollout is not an exact trace-only partial")
+        if not path.is_dir():
+            regular(path)
+        relative = path.relative_to(target).as_posix()
+        if path.is_dir() == (relative == "train/all/traces.jsonl"):
+            raise ValueError("partial rollout entry has the wrong type")
+        observed[relative] = path.lstat()
+    # The existing publisher owns this lock for its full lifetime. Keep it
+    # locked across the final validation and rename; never stop a publisher.
+    lock = active / ".batch-sync.lock"
+    descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("publisher lock is not regular")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for proc in Path("/proc").iterdir():
+            if not proc.name.isdecimal() or int(proc.name) == os.getpid():
+                continue
+            try:
+                environment = (proc / "environ").read_bytes().split(b"\0")
+            except FileNotFoundError:
+                continue
+            if f"SOURCE_RUN_DIR={active}".encode() in environment:
+                raise ValueError("run publisher is still present")
+        if lock.stat().st_ino != os.fstat(descriptor).st_ino:
+            raise ValueError("publisher lock changed")
+        current = {path.relative_to(target).as_posix(): path.lstat() for path in (target, *target.rglob("*"))}
+        if current != observed:
+            raise ValueError("partial rollout changed during validation")
+        result = {"partial": True}
+        if quarantine:
+            destination = root / f"quarantined-step_{step + 1}-{secrets.token_hex(16)}"
+            directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                if os.stat(target.name, dir_fd=directory, follow_symlinks=False) != observed["."]:
+                    raise ValueError("partial rollout changed before quarantine")
+                if destination.exists() or destination.is_symlink():
+                    raise ValueError("quarantine destination already exists")
+                os.rename(target.name, destination.name, src_dir_fd=directory, dst_dir_fd=directory)
+            finally:
+                os.close(directory)
+            result["quarantined"] = str(destination)
+        return result
+    finally:
+        os.close(descriptor)
+
+
 if __name__ == "__main__":
     try:
-        if sys.argv[1] == "config":
+        if sys.argv[1] == "latest":
+            print(json.dumps(latest_policy(sys.argv[2], int(sys.argv[3]))))
+        elif sys.argv[1] == "completed":
+            print(json.dumps(completed_batch(sys.argv[2], int(sys.argv[3]), sys.argv[4])))
+        elif sys.argv[1] in {"partial", "quarantine"}:
+            print(json.dumps(partial_rollout(sys.argv[2], int(sys.argv[3]), quarantine=sys.argv[1] == "quarantine")))
+        elif sys.argv[1] == "config":
             print(explicit_config(Path(sys.argv[2]).read_text(), int(sys.argv[3])), end="")
         elif sys.argv[1] == "write-config":
             print(write_config(sys.argv[2], sys.argv[3], int(sys.argv[4])))

@@ -563,14 +563,18 @@ class OrchestratorRepairTest(unittest.TestCase):
         ), mock.patch.object(
             training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
         ), mock.patch.object(
-            training_ops, "_orchestrator_resume_step", return_value=1
+            training_ops, "_orchestrator_resume_step", return_value=3
+        ), mock.patch.object(
+            training_ops, "_resume_repair_state", return_value={"partial": False}
         ):
             result = training_ops._repair_orchestrator()
 
         self.assertIn("recreated exact orchestrator", result)
         self.assertIn("[ absent = absent ]", ssh_scripts[-1])
         self.assertIn("start_orchestrator.sh", ssh_scripts[-1])
-        self.assertIn("adapter_resume_step=1 bash", ssh_scripts[-1])
+        self.assertIn("adapter_resume_step=3 bash", ssh_scripts[-1])
+        self.assertNotIn("adapter_resume_step=1 bash", ssh_scripts[-1])
+        self.assertIn("next batch 4", result)
 
     def test_stopped_orchestrator_is_started_after_all_guards_pass(self):
         before = training_ops.Status(
@@ -681,6 +685,25 @@ class OrchestratorResumeStateTest(unittest.TestCase):
         self.run = "glm-perf-3"
         self.directory = f"{training_ops.run_root}/{self.run}/run_{self.run}"
         self.adapter = f"{self.directory}/broadcasts/step_1/adapter_model.safetensors"
+        repair_state = mock.patch.object(training_ops, "_resume_repair_state", return_value={"step": 1})
+        self.repair_state = repair_state.start()
+        self.addCleanup(repair_state.stop)
+
+    def test_latest_completed_policy_replaces_launch_step_before_guards(self):
+        self.repair_state.side_effect = [{"step": 3, "batch_sha256": "b" * 64}, {"step": 3, "batch_sha256": "b" * 64, "records": 16}]
+        state = self.state(f"PRIME_RL_RESUME_ADAPTER={self.adapter}", "PRIME_RL_RESUME_ADAPTER_STEP=1")
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, state)), mock.patch.object(training_ops, "_check_adapter_restart", return_value={"sha256": "a" * 64}) as check:
+            self.assertEqual(training_ops._orchestrator_resume_step(self.run, latest=True), 3)
+        self.assertEqual([call.args[2] for call in check.call_args_list], [3, 3])
+        self.assertTrue(all("step_3/adapter_model.safetensors" in call.args[4] for call in check.call_args_list))
+
+    def test_latest_without_completed_evidence_refuses_before_guards(self):
+        self.repair_state.side_effect = [{"step": 3, "batch_sha256": "b" * 64}, {"step": 3, "records": 0}]
+        state = self.state(f"PRIME_RL_RESUME_ADAPTER={self.adapter}", "PRIME_RL_RESUME_ADAPTER_STEP=1")
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, state)), mock.patch.object(training_ops, "_check_adapter_restart") as check:
+            with self.assertRaises(training_ops.Refused):
+                training_ops._orchestrator_resume_step(self.run, latest=True)
+        check.assert_not_called()
 
     def state(self, *environment, **changes):
         value = {"name": f"/{training_ops.trainer_container}", "running": True, "environment": [f"RUN={self.run}", *environment]}
