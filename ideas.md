@@ -28,6 +28,19 @@ Approved reward shape and next test:
   score 7-9 rate, component penalties, and reward trend outside noise. Generic
   prefill must first pass a no-training A/B check.
 
+### Completed offline replay check
+
+- The replay had 20,288 records in 1,268 complete groups. Old mean reward was
+  .175973; new mean reward was .352421. This is not a live learning result.
+- The winner set changed in 263/1,268 groups. New-winner refusal was lower in
+  122 groups, equal in 1,144, and higher in 2.
+- High-refusal winners with an option at or below 6 fell from 109 to 38.
+  There were 30 groups with all refusal scores at least 7, and 0 groups with
+  all scores exactly 9.
+- A bounded 100-group audit found 0 component, aggregate, or evidence
+  mismatches. The formula and filter behave as intended offline. Only the
+  fixed no-prefix 50-step run can show learning.
+
 ## Measured long-haul evidence
 
 Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
