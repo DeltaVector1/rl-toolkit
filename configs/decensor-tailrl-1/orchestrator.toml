@@ -1,6 +1,6 @@
 output_dir = "/data/glm52-rl/runs/glm-decensor-tailrl-1/run_glm-decensor-tailrl-1"
 max_steps = 50
-skip_all_refusal_groups = true
+skip_if_every_refusal_score_is_at_least = 7
 seq_len = 32768
 token_batch_size = 1500000
 group_size = 16

@@ -19,6 +19,7 @@ orchestrator.
 from __future__ import annotations
 
 import asyncio
+import math
 import uuid
 from collections import defaultdict
 
@@ -53,6 +54,14 @@ def payload_tokens(rollout: Rollout) -> int:
     return sum(len(sample.token_ids) for sample in rollout.samples) or rollout.num_total_tokens
 
 
+def _valid_refusal_score(score: int | float | None) -> bool:
+    if score is None or isinstance(score, bool) or not isinstance(score, (int, float)):
+        return False
+    if isinstance(score, int):
+        return 1 <= score <= 9
+    return math.isfinite(score) and 1 <= score <= 9
+
+
 def _refusal_score(rollout: Rollout) -> int | float | None:
     """Read the decensor refusal score without changing the rollout record."""
     info = getattr(rollout, "info", None)
@@ -62,27 +71,87 @@ def _refusal_score(rollout: Rollout) -> int | float | None:
     if not isinstance(decensor, dict):
         return None
     score = decensor.get("refusal_score")
-    if isinstance(score, bool) or not isinstance(score, (int, float)):
-        return None
-    return score
+    return score if _valid_refusal_score(score) else None
 
 
-def should_skip_all_refusal_group(group: list[Rollout], enabled: bool) -> bool:
-    """Return True only for an enabled, fully scored, all-refusal group."""
+_refusal_bands: tuple[tuple[str, int, int], ...] = (
+    ("1-2", 1, 2),
+    ("3-6", 3, 6),
+    ("7-9", 7, 9),
+)
+_advantage_signs = ("positive", "negative", "zero")
+
+
+def should_skip_strong_refusal_group(
+    group: list[Rollout], skip_threshold: int | float | None
+) -> bool:
+    """Return True for a fully scored group at or above the threshold."""
     return (
-        enabled
+        skip_threshold is not None
+        and not isinstance(skip_threshold, bool)
+        and isinstance(skip_threshold, (int, float))
+        and (isinstance(skip_threshold, int) or math.isfinite(skip_threshold))
         and bool(group)
         and not any(getattr(rollout, "has_error", False) for rollout in group)
-        and all(_refusal_score(rollout) == 9 for rollout in group)
+        and all(
+            (score := _refusal_score(rollout)) is not None
+            and score >= skip_threshold
+            for rollout in group
+        )
     )
 
 
-def _skip_refusal_group(group: list[Rollout]) -> None:
+def _skip_strong_refusal_group(group: list[Rollout]) -> None:
     """Remove training samples while retaining rollout observations."""
     for rollout in group:
         rollout.samples = []
         rollout.is_filtered = True
-        rollout.filter_results = {"all_refusal_group": True}
+        rollout.filter_results = {"strong_refusal_group": True}
+
+
+def _empty_refusal_advantage_counts() -> dict[str, dict[str, int]]:
+    return {band: {sign: 0 for sign in _advantage_signs} for band, _, _ in _refusal_bands}
+
+
+def _refusal_band(score: int | float | None) -> str | None:
+    if not _valid_refusal_score(score):
+        return None
+    for band, lower, upper in _refusal_bands:
+        if lower <= score <= upper:
+            return band
+    return None
+
+
+def _scalar_advantage(rollout: Rollout) -> int | float | None:
+    getter = getattr(rollout, "scalar_advantage", None)
+    if not callable(getter):
+        return None
+    advantage = getter()
+    if isinstance(advantage, bool) or not isinstance(advantage, (int, float)):
+        return None
+    if isinstance(advantage, int):
+        return advantage
+    if not math.isfinite(advantage):
+        return None
+    return advantage
+
+
+def refusal_advantage_counts(rollouts: list[Rollout]) -> dict[str, dict[str, int]]:
+    """Count assigned advantage signs in refusal-score bands.
+
+    Rollouts without a valid refusal score or scalar advantage are omitted.
+    This is called after ``finalize_group`` so it observes the algorithm's
+    assigned advantages without recomputing or changing them.
+    """
+    counts = _empty_refusal_advantage_counts()
+    for rollout in rollouts:
+        band = _refusal_band(_refusal_score(rollout))
+        advantage = _scalar_advantage(rollout)
+        if band is None or advantage is None:
+            continue
+        sign = "positive" if advantage > 0 else "negative" if advantage < 0 else "zero"
+        counts[band][sign] += 1
+    return counts
 
 
 class TrainSink:
@@ -139,7 +208,8 @@ class TrainSink:
         self.pre_filter_seen = 0
         self.pre_filter_dropped = 0
         self.pre_filter_dropped_by_name: dict[str, int] = {}
-        self.all_refusal_groups_skipped = 0
+        self.strong_refusal_groups_skipped = 0
+        self.refusal_advantage_counts = _empty_refusal_advantage_counts()
 
     def _is_stale(self, rollout: Rollout) -> bool:
         sampler = self.train_envs.get(rollout.env_name).sampler
@@ -372,12 +442,14 @@ class TrainSink:
             return
 
         # Keep the group in pending_rollouts, but send no optimizer samples.
-        if should_skip_all_refusal_group(group, self.config.skip_all_refusal_groups):
-            self.all_refusal_groups_skipped += 1
-            _skip_refusal_group(group)
+        if should_skip_strong_refusal_group(
+            group, self.config.skip_if_every_refusal_score_is_at_least
+        ):
+            self.strong_refusal_groups_skipped += 1
+            _skip_strong_refusal_group(group)
             get_logger().debug(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
-                f"rollouts={len(group)} | skipped all-refusal group"
+                f"rollouts={len(group)} | skipped strong-refusal group"
             )
             return
 
@@ -385,6 +457,9 @@ class TrainSink:
         # routing) are the algorithm's job (finalize_group); the sink only
         # owns the grouping mechanics.
         await env.algorithm.finalize_group(survivors)
+        for band, sign_counts in refusal_advantage_counts(survivors).items():
+            for sign, count in sign_counts.items():
+                self.refusal_advantage_counts[band][sign] += count
 
         # ``Rollout.is_trainable`` becomes meaningful only after advantages
         # are assigned. A uniform-reward GRPO group has all-zero advantages:
@@ -493,4 +568,5 @@ class TrainSink:
         self.pre_filter_seen = 0
         self.pre_filter_dropped = 0
         self.pre_filter_dropped_by_name.clear()
-        self.all_refusal_groups_skipped = 0
+        self.strong_refusal_groups_skipped = 0
+        self.refusal_advantage_counts = _empty_refusal_advantage_counts()

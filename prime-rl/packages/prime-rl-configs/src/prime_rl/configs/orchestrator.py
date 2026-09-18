@@ -525,9 +525,11 @@ class OrchestratorConfig(BaseConfig):
     """Filters applied *after* a batch has been assembled. Each filter annotates each rollout;
     rollouts flagged by an enforcing filter are still recorded but not shipped to the trainer."""
 
-    skip_all_refusal_groups: bool = False
-    """When True, skip a complete group only when every rollout has refusal_score=9.
-    Mixed or unscored groups are unchanged."""
+    skip_if_every_refusal_score_is_at_least: int | None = Field(None, ge=1, le=9)
+    """Skip a complete group when every rollout has the environment's aggregate
+    conversation refusal score at or above this threshold. The aggregate score
+    is the environment's max-across-turns conversation score. Mixed, unscored,
+    or lower-scored groups are unchanged. ``None`` disables this filter."""
 
     log: LogConfig = LogConfig()
 

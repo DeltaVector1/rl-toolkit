@@ -1,6 +1,7 @@
 import ast
 import hashlib
 import json
+import math
 import os
 import socket
 import unittest
@@ -119,23 +120,59 @@ def _load_refusal_group_function():
         / "src/prime_rl/orchestrator/train_sink.py"
     )
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
-    wanted = {"_refusal_score", "should_skip_all_refusal_group", "_skip_refusal_group"}
+    wanted = {
+        "_valid_refusal_score",
+        "_refusal_score",
+        "should_skip_strong_refusal_group",
+        "_skip_strong_refusal_group",
+        "_empty_refusal_advantage_counts",
+        "_refusal_band",
+        "_scalar_advantage",
+        "refusal_advantage_counts",
+    }
     body = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in wanted
+        if (isinstance(node, ast.FunctionDef) and node.name in wanted)
+        or (
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name)
+                and target.id in {"_refusal_bands", "_advantage_signs"}
+                for target in (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+            )
+        )
     ]
-    namespace = {"Rollout": object}
+    namespace = {"Rollout": object, "math": math}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(source_path), "exec"), namespace)
-    return namespace["should_skip_all_refusal_group"], namespace["_skip_refusal_group"]
+    return (
+        namespace["should_skip_strong_refusal_group"],
+        namespace["_skip_strong_refusal_group"],
+        namespace["refusal_advantage_counts"],
+    )
 
 
-class RefusalGroupSkipTest(unittest.TestCase):
+def _load_refusal_metric_function():
+    source_path = Path(__file__).resolve().parents[1] / "src/prime_rl/orchestrator/orchestrator.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_refusal_advantage_metrics"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source_path), "exec"), namespace)
+    return namespace["_refusal_advantage_metrics"]
+
+
+class StrongRefusalGroupSkipTest(unittest.TestCase):
     _missing = object()
 
     @staticmethod
     def _rollout(score=_missing):
-        details = {} if score is RefusalGroupSkipTest._missing else {"refusal_score": score}
+        details = {} if score is StrongRefusalGroupSkipTest._missing else {"refusal_score": score}
         return SimpleNamespace(
             info={"decensor": details},
             samples=[object()],
@@ -143,38 +180,48 @@ class RefusalGroupSkipTest(unittest.TestCase):
             has_error=False,
         )
 
-    def test_all_refusal_group_is_skipped_when_enabled(self):
-        skip, _ = _load_refusal_group_function()
-        self.assertTrue(skip([self._rollout(9), self._rollout(9)], enabled=True))
+    def test_strong_refusal_group_is_skipped_at_threshold(self):
+        skip, _, _ = _load_refusal_group_function()
+        self.assertTrue(skip([self._rollout(9), self._rollout(7)], skip_threshold=7))
 
     def test_mixed_refusal_group_is_unchanged(self):
-        skip, _ = _load_refusal_group_function()
-        self.assertFalse(skip([self._rollout(9), self._rollout(8)], enabled=True))
+        skip, _, _ = _load_refusal_group_function()
+        self.assertFalse(skip([self._rollout(9), self._rollout(6)], skip_threshold=7))
 
     def test_invalid_refusal_scores_are_unchanged(self):
-        skip, _ = _load_refusal_group_function()
-        for value in (self._rollout(), self._rollout(None), self._rollout(True), self._rollout("9"), self._rollout(float("nan"))):
+        skip, _, _ = _load_refusal_group_function()
+        for value in (
+            self._rollout(),
+            self._rollout(None),
+            self._rollout(True),
+            self._rollout("9"),
+            self._rollout(float("nan")),
+            self._rollout(0),
+            self._rollout(10),
+            self._rollout(10**1000),
+        ):
             with self.subTest(value=value):
-                self.assertFalse(skip([self._rollout(9), value], enabled=True))
+                self.assertFalse(skip([self._rollout(9), value], skip_threshold=7))
 
     def test_default_off_is_unchanged(self):
-        skip, _ = _load_refusal_group_function()
-        self.assertFalse(skip([self._rollout(9), self._rollout(9)], enabled=False))
+        skip, _, _ = _load_refusal_group_function()
+        self.assertFalse(skip([self._rollout(9), self._rollout(9)], skip_threshold=None))
 
     def test_service_error_is_not_reclassified_as_refusal_skip(self):
-        skip, _ = _load_refusal_group_function()
+        skip, _, _ = _load_refusal_group_function()
         errored = self._rollout(9)
         errored.has_error = True
-        self.assertFalse(skip([errored, self._rollout(9)], enabled=True))
+        self.assertFalse(skip([errored, self._rollout(9)], skip_threshold=7))
 
     def test_skip_removes_effective_samples_but_keeps_observation(self):
-        _, mark_skip = _load_refusal_group_function()
+        _, mark_skip, _ = _load_refusal_group_function()
         group = [self._rollout(9), self._rollout(9)]
         infos = [rollout.info for rollout in group]
         rewards = [rollout.reward for rollout in group]
         mark_skip(group)
         self.assertEqual([rollout.samples for rollout in group], [[], []])
         self.assertTrue(all(rollout.is_filtered for rollout in group))
+        self.assertTrue(all(rollout.filter_results == {"strong_refusal_group": True} for rollout in group))
         self.assertEqual([rollout.info for rollout in group], infos)
         self.assertEqual([rollout.reward for rollout in group], rewards)
 
@@ -189,10 +236,53 @@ class RefusalGroupSkipTest(unittest.TestCase):
             for node in ast.walk(tree)
             if isinstance(node, ast.AnnAssign)
             and isinstance(node.target, ast.Name)
-            and node.target.id == "skip_all_refusal_groups"
+            and node.target.id == "skip_if_every_refusal_score_is_at_least"
         )
-        self.assertIsInstance(field.value, ast.Constant)
-        self.assertFalse(field.value.value)
+        self.assertIsInstance(field.value, ast.Call)
+        self.assertIsNone(field.value.args[0].value)
+
+    def test_refusal_band_advantage_counts(self):
+        _, _, counts = _load_refusal_group_function()
+
+        def rollout(score, advantage):
+            return SimpleNamespace(
+                info={"decensor": {"refusal_score": score}},
+                scalar_advantage=lambda: advantage,
+            )
+
+        self.assertEqual(
+            counts(
+                [
+                    rollout(1, 1.0),
+                    rollout(2, -1.0),
+                    rollout(3, 0.0),
+                    rollout(6, -0.5),
+                    rollout(7, 0.5),
+                    rollout(9, 0.0),
+                    rollout(0, 1.0),
+                    rollout(10, 1.0),
+                    rollout(10**1000, 1.0),
+                ]
+            ),
+            {
+                "1-2": {"positive": 1, "negative": 1, "zero": 0},
+                "3-6": {"positive": 0, "negative": 1, "zero": 1},
+                "7-9": {"positive": 1, "negative": 0, "zero": 1},
+            },
+        )
+
+    def test_refusal_advantage_counts_are_emitted_as_rollout_metrics(self):
+        metrics = _load_refusal_metric_function()(
+            {"1-2": {"positive": 1, "negative": 2, "zero": 3}}
+        )
+        self.assertEqual(
+            metrics,
+            {
+                "rollouts/refusal_advantage/1-2/positive_count": 1.0,
+                "rollouts/refusal_advantage/1-2/negative_count": 2.0,
+                "rollouts/refusal_advantage/1-2/zero_count": 3.0,
+            },
+        )
 
 
 if __name__ == "__main__":

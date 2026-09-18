@@ -117,6 +117,15 @@ monkey_patch_oai_iterable_types()
 monkey_patch_chat_completion_logprobs()
 
 
+def _refusal_advantage_metrics(counts: dict[str, dict[str, int]]) -> dict[str, float]:
+    """Flatten sink counts for the existing per-step rollout metric record."""
+    return {
+        f"rollouts/refusal_advantage/{band}/{sign}_count": float(count)
+        for band, sign_counts in counts.items()
+        for sign, count in sign_counts.items()
+    }
+
+
 # Wall-clock budget for post-training cleanup; force-exit if graceful
 # shutdown wedges (env-server ZMQ recv, vLLM admin aclose, etc)
 SHUTDOWN_TIMEOUT_S = 300
@@ -1653,7 +1662,8 @@ class Orchestrator:
             )
             for name, count in self.train_sink.pre_filter_dropped_by_name.items():
                 metrics[f"pre_filters/all/{name}/rate"] = count / self.train_sink.pre_filter_seen
-        metrics["groups/all_refusal/skipped"] = self.train_sink.all_refusal_groups_skipped
+        metrics |= _refusal_advantage_metrics(self.train_sink.refusal_advantage_counts)
+        metrics["groups/strong_refusal/skipped"] = self.train_sink.strong_refusal_groups_skipped
         self.monitor.log(metrics, step=step)
         self.wait_for_policy_time = 0.0
         self.monitor.log_samples(effective.rollouts, step=step)
