@@ -7344,6 +7344,12 @@ def _archive_action(arguments: list[str]):
     return archive_adapters(arguments[0], steps_to_archive or None, finished=finished)
 
 
+def _stop_action(arguments: list[str]):
+    if arguments:
+        raise Refused("stop does not accept arguments")
+    return stop()
+
+
 actions = {
     "status": lambda a: status(*a),
     "acceptance": lambda a: acceptance(*a),
@@ -7360,7 +7366,7 @@ actions = {
     "start": _start_action,
     "archive": _archive_action,
     "qualify": _qualify_action,
-    "stop": lambda a: stop(),
+    "stop": _stop_action,
     "mounts": lambda a: print("\n".join(mounted_files())),
 }
 
