@@ -221,7 +221,7 @@ while True: time.sleep(0.1)
                 group_signal.assert_not_called()
                 individual_signal.assert_not_called()
 
-    def test_group_and_session_changes_in_each_snapshot_refuse_signals(self):
+    def test_group_and_start_changes_rescan_but_wrong_session_refuses(self):
         group = 987650
         records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group, group + 1)}
         for field in (2, 3, 4):
@@ -232,8 +232,11 @@ while True: time.sleep(0.1)
             for later in (False, True):
                 snapshots = [records, changed] if later else [changed]
                 with self.subTest(field=field, later=later), mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", side_effect=snapshots), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
-                    with self.assertRaisesRegex(ValueError, "changed"):
-                        publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+                    if field == 4:
+                        with self.assertRaisesRegex(ValueError, "unknown member"):
+                            publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+                    else:
+                        self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
                     group_signal.assert_not_called()
                     individual_signal.assert_not_called()
 
@@ -269,10 +272,98 @@ while True: time.sleep(0.1)
         changed = (*record[:3], "102", group)
         records = {pid: record}
         with mock.patch.object(publisher, "process", side_effect=[record, record, changed]), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
-            with self.assertRaisesRegex(ValueError, "changed before signalling"):
-                publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+            self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
         group_signal.assert_not_called()
         individual_signal.assert_not_called()
+
+    def test_running_sleeping_transitions_keep_stable_identity(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group, group + 1)}
+        running = {pid: (record[0], "R", *record[2:]) for pid, record in records.items()}
+        for initial, changed in ((records, running), (running, records)):
+            with self.subTest(state=initial[group][1]), mock.patch.object(publisher, "process", side_effect=changed.get), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=changed), mock.patch.object(publisher.os, "killpg") as group_signal:
+                self.assertTrue(publisher.signal_publishers(initial, self.active, self.script, (1, 2), set()))
+                group_signal.assert_called_once_with(group, signal.SIGTERM)
+
+    def test_child_exit_zombie_or_arrival_discards_plan_then_rescan_succeeds(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group, group + 1)}
+        exited = {group: records[group]}
+        zombie = dict(records)
+        zombie[group + 1] = (records[group + 1][0], "Z", *records[group + 1][2:])
+        appeared = dict(records)
+        appeared[group + 2] = (Path(f"/proc/{group + 2}"), "S", group, "new", group)
+        for changed in (exited, zombie, appeared):
+            with self.subTest(changed=changed), mock.patch.object(publisher, "process", side_effect=records.get) as read, mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=changed), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+                stopped = set()
+                self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), stopped))
+                group_signal.assert_not_called()
+                individual_signal.assert_not_called()
+                self.assertEqual(stopped, set())
+                read.side_effect = changed.get
+                self.assertTrue(publisher.signal_publishers(changed, self.active, self.script, (1, 2), stopped))
+                group_signal.assert_called_once_with(group, signal.SIGTERM)
+
+    def test_child_exit_during_individual_probe_requests_rescan(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group, group + 1)}
+        with mock.patch.object(publisher, "process", side_effect=lambda pid: records[group] if pid == group else None), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher.os, "killpg") as group_signal:
+            self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
+            group_signal.assert_not_called()
+
+    def test_pid_reuse_in_snapshot_never_signals_stale_plan(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group, group + 1)}
+        for reused in (group, group + 1):
+            changed = dict(records)
+            record = changed[reused]
+            changed[reused] = (*record[:3], "reused-start", record[4])
+            with self.subTest(pid=reused), mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=changed), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+                self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
+                group_signal.assert_not_called()
+                individual_signal.assert_not_called()
+
+    def test_unreadable_or_changed_exact_leader_refuses(self):
+        group = 987650
+        records = {group: (Path(f"/proc/{group}"), "S", group, "start", group)}
+        with mock.patch.object(publisher, "process", return_value=None), mock.patch.object(publisher.Path, "exists", return_value=True), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher.os, "killpg") as group_signal:
+            with self.assertRaisesRegex(ValueError, "unreadable leader"):
+                publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+            group_signal.assert_not_called()
+        with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher, "matches", side_effect=[True, True, False]), mock.patch.object(publisher.os, "killpg") as group_signal:
+            with self.assertRaisesRegex(ValueError, "exact ownership"):
+                publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+            group_signal.assert_not_called()
+
+    def test_multigroup_plan_change_sends_no_partial_signals(self):
+        groups = (987650, 987660)
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for group in groups for pid in (group, group + 1)}
+        changed = dict(records)
+        del changed[groups[1] + 1]
+        with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", side_effect=[records, changed]), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+            self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
+            group_signal.assert_not_called()
+            individual_signal.assert_not_called()
+
+    def test_new_publisher_group_discards_all_unsent_plans(self):
+        group = 987650
+        records = {group: (Path(f"/proc/{group}"), "S", group, "start", group)}
+        other = group + 10
+        changed = dict(records)
+        changed[other] = (Path(f"/proc/{other}"), "S", other, "new", other)
+        with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=changed), mock.patch.object(publisher.os, "killpg") as group_signal:
+            self.assertFalse(publisher.signal_publishers(records, self.active, self.script, (1, 2), set()))
+            group_signal.assert_not_called()
+
+    def test_membership_rescan_uses_existing_deadline(self):
+        with mock.patch.object(publisher, "snapshot", return_value={}) as scan, mock.patch.object(publisher, "signal_publishers", side_effect=[False, True]) as plan, mock.patch.object(publisher.time, "sleep"):
+            publisher.drain(str(self.active), self.script, timeout=1)
+            self.assertEqual(plan.call_count, 2)
+            self.assertGreaterEqual(scan.call_count, 3)
+        with mock.patch.object(publisher, "snapshot", return_value={}), mock.patch.object(publisher, "signal_publishers", return_value=False), mock.patch.object(publisher.time, "monotonic", side_effect=[0, 1]), mock.patch.object(publisher.time, "sleep") as sleep:
+            with self.assertRaisesRegex(TimeoutError, "membership did not settle"):
+                publisher.drain(str(self.active), self.script, timeout=1)
+            sleep.assert_not_called()
 
     def test_launcher_drain_failure_exits_before_replacement_start(self):
         source = (Path(__file__).parents[1] / "runtime/h200/start_orchestrator.sh").read_text()
