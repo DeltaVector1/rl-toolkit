@@ -155,6 +155,12 @@ Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
   Its saved optimizer batch had 1,864 samples, 4,522,029 raw tokens,
   2,712,271 loss tokens, and max sequence 24,060. The earlier roughly 3m
   fixed-token result is not comparable.
+- The stopped difficulty-10 step-1 batch had 1,839 sequences, 4,024,960
+  packed tokens, 2,639,688 loss tokens, 123 microbatches, and max sequence
+  18,715. Active forward/backward time was 614.523s. Host health was clean;
+  fixed-rollout volume caused the limit. The next run restores a 1.5M-token
+  cap while preserving group 16, 32K/16K, rank-32 targets, reward logic, and
+  the 600s limit.
 
 ## In progress
 
