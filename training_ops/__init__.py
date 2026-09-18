@@ -4458,8 +4458,61 @@ esac
 """
 
 
+def _orchestrator_resume_step(run: str) -> int | None:
+    """Keep the exact active trainer's explicit adapter restart policy."""
+    _, _, service_dir = _cold_run_paths(run)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", trainer_container):
+        raise Refused("trainer container name is invalid")
+    keys = ("RUN", "PRIME_RL_RESUME_ADAPTER", "PRIME_RL_RESUME_ADAPTER_STEP")
+    # Filter on the remote host so unrelated environment values stay there.
+    probe = (
+        "import json,sys; value=json.load(sys.stdin); "
+        "print(json.dumps({'name':value['Name'], 'running':value['State']['Running'], "
+        f"'environment':[item for item in value['Config']['Env'] if item.partition('=')[0] in {keys!r}]}}))"
+    )
+    code, output = _ssh(
+        trainer_head,
+        "set -euo pipefail\nsudo docker inspect --format '{{json .}}' "
+        f"{shlex.quote(trainer_container)} | python3 -c {shlex.quote(probe)}",
+        timeout=90,
+    )
+    if code:
+        raise Refused("cannot read the exact active trainer resume state")
+    try:
+        value = json.loads(output)
+        if value["name"] != f"/{trainer_container}" or value["running"] is not True:
+            raise ValueError("trainer identity or running state differs")
+        environment = {}
+        if not isinstance(value["environment"], list):
+            raise ValueError("trainer environment is not a list")
+        for item in value["environment"]:
+            key, separator, setting = item.partition("=")
+            if key not in keys or not separator or key in environment:
+                raise ValueError("trainer environment is ambiguous")
+            environment[key] = setting
+        if environment.get("RUN") != run:
+            raise ValueError("trainer run differs")
+        adapter = environment.get("PRIME_RL_RESUME_ADAPTER", "")
+        step_text = environment.get("PRIME_RL_RESUME_ADAPTER_STEP", "")
+        if not adapter and not step_text:
+            return None
+        if not adapter or not re.fullmatch(r"0|[1-9][0-9]*", step_text):
+            raise ValueError("resume adapter and integer step must be set together")
+        step = int(step_text)
+        if adapter != f"{service_dir}/broadcasts/step_{step}/adapter_model.safetensors":
+            raise ValueError("resume adapter is not the exact run policy path")
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        raise Refused(f"invalid active trainer resume state: {error}") from error
+    identity = _check_adapter_restart(trainer_head, service_dir, step, "origin", adapter)
+    if not isinstance(identity.get("sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", identity["sha256"]):
+        raise Refused("stable restart adapter has no exact SHA-256 identity")
+    _check_adapter_restart(orchestrator_host, service_dir, step, "orchestrator", adapter)
+    return step
+
+
 def _recreate_orchestrator_script(
-    run: str, profile: dict, was_running: bool, observed_state: str | None = None
+    run: str, profile: dict, was_running: bool, observed_state: str | None = None,
+    *, resume_step: int | None,
 ) -> str:
     """Recreate only the exact orchestrator with the active run settings."""
     if not isinstance(run, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", run):
@@ -4509,6 +4562,9 @@ def _recreate_orchestrator_script(
     quoted_addresses = shlex.quote(trainer_addresses)
     quoted_trainer = shlex.quote(trainer_container)
     quoted_launcher = shlex.quote(orchestrator_launcher)
+    if resume_step is not None and (type(resume_step) is not int or resume_step < 0):
+        raise Refused("orchestrator resume step must be a non-negative integer")
+    resume_environment = f"adapter_resume_step={resume_step} " if resume_step is not None else ""
     return f"""set -euo pipefail
 container={quoted_orchestrator}
 if [ {shlex.quote(expected_state)} = absent ]; then
@@ -4531,7 +4587,7 @@ RUN={quoted_run} RUN_NAME={quoted_run_name} \\
   ORCH_CONFIG={quoted_config} \\
   TRAINER_ADDRESSES={quoted_addresses} \\
   TRAINER_CT={quoted_trainer} ORCH_CT={quoted_orchestrator} \\
-  bash {quoted_launcher}
+  {resume_environment}bash {quoted_launcher}
 name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
 [ "$name" = "/$container" ] || {{ echo "recreated orchestrator container identity is not exact" >&2; exit 63; }}
 state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
@@ -4688,6 +4744,7 @@ def _repair_adapter_update() -> str:
     if failed_idle:
         raise Refused(f"adapter repair requires idle healthy inference endpoints: {failed_idle}")
     evidence = _adapter_stage_evidence(run, config)
+    resume_step = _orchestrator_resume_step(run)
 
     stopped = _fan(
         inference_hosts,
@@ -4805,7 +4862,8 @@ def _repair_adapter_update() -> str:
     resume_code, resume_output = _ssh(
         orchestrator_host,
         _recreate_orchestrator_script(
-            run, profile, orchestrator_was_running, observed_state=observed_state
+            run, profile, orchestrator_was_running, observed_state=observed_state,
+            resume_step=resume_step,
         ),
         timeout=180,
     )
@@ -4905,13 +4963,15 @@ def _repair_orchestrator() -> str:
             f"{failed}"
         )
 
+    resume_step = _orchestrator_resume_step(run)
     client_path = "prime-rl/src/prime_rl/utils/client.py"
     if not deploy(client_path):
         raise RuntimeError(f"orchestrator repair deployment failed for {client_path}")
     resume_code, resume_output = _ssh(
         orchestrator_host,
         _recreate_orchestrator_script(
-            run, profile, was_running, observed_state=observed_state[0]
+            run, profile, was_running, observed_state=observed_state[0],
+            resume_step=resume_step,
         ),
         timeout=180,
     )

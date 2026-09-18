@@ -164,9 +164,9 @@ while True: time.sleep(0.1)
     def test_matching_child_cannot_authorize_unrelated_group_members(self):
         group = 987650
         records = {
-            group: (Path(f"/proc/{group}"), "S", group, "100"),
-            group + 1: (Path(f"/proc/{group + 1}"), "S", group, "101"),
-            group + 2: (Path(f"/proc/{group + 2}"), "S", group, "102"),
+            group: (Path(f"/proc/{group}"), "S", group, "100", group),
+            group + 1: (Path(f"/proc/{group + 1}"), "S", group, "101", group),
+            group + 2: (Path(f"/proc/{group + 2}"), "S", group, "102", group + 5),
         }
         for unrelated in (group, group + 2):
             with self.subTest(unrelated=unrelated), mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", side_effect=lambda pid, *_args: pid != unrelated), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
@@ -177,7 +177,7 @@ while True: time.sleep(0.1)
 
     def test_all_proven_members_allow_only_the_exact_group_signal(self):
         group = 987650
-        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid)) for pid in (group, group + 1)}
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group, group + 1)}
         stopped = set()
         with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
             publisher.signal_publishers(records, self.active, self.script, (1, 2), stopped)
@@ -185,10 +185,52 @@ while True: time.sleep(0.1)
         individual_signal.assert_not_called()
         self.assertEqual(stopped, {group})
 
+    def test_exact_session_leader_owns_ssh_child_without_script_or_fd9(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group, group + 1)}
+        with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", side_effect=lambda pid, *_args: pid == group), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+            publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+        group_signal.assert_called_once_with(group, signal.SIGTERM)
+        individual_signal.assert_not_called()
+
+    def test_missing_or_unreadable_leader_does_not_authorize_ssh_child(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group + 1, group + 2)}
+        for unreadable in (False, True):
+            with self.subTest(unreadable=unreadable), mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", side_effect=lambda pid, *_args: pid == group + 1), mock.patch.object(publisher.Path, "exists", return_value=unreadable), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+                with self.assertRaisesRegex(ValueError, "unknown member|unreadable leader"):
+                    publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+                group_signal.assert_not_called()
+                individual_signal.assert_not_called()
+
+    def test_group_and_session_changes_in_each_snapshot_refuse_signals(self):
+        group = 987650
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group, group + 1)}
+        for field in (2, 3, 4):
+            changed = dict(records)
+            member = list(changed[group + 1])
+            member[field] = str(group + 9) if field == 3 else group + 9
+            changed[group + 1] = tuple(member)
+            for later in (False, True):
+                snapshots = [records, changed] if later else [changed]
+                with self.subTest(field=field, later=later), mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", side_effect=snapshots), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
+                    with self.assertRaisesRegex(ValueError, "changed"):
+                        publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+                    group_signal.assert_not_called()
+                    individual_signal.assert_not_called()
+
+    def test_nonisolated_leader_and_current_group_refuse_signals(self):
+        for group, session in ((1, 1), (os.getpgrp(), os.getpgrp()), (987650, 987651)):
+            records = {group: (Path(f"/proc/{group}"), "S", group, "100", session)}
+            with self.subTest(group=group, session=session), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher.os, "killpg") as group_signal:
+                with self.assertRaisesRegex(ValueError, "isolated process group|unknown leader"):
+                    publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
+                group_signal.assert_not_called()
+
     def test_orphan_signals_only_rechecked_proven_pids(self):
         group = 987650
         pid = group + 1
-        records = {pid: (Path(f"/proc/{pid}"), "S", group, "101")}
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, "101", group)}
         with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
             publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
         group_signal.assert_not_called()
@@ -196,7 +238,7 @@ while True: time.sleep(0.1)
 
     def test_mixed_orphan_group_signals_nobody(self):
         group = 987650
-        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid)) for pid in (group + 1, group + 2)}
+        records = {pid: (Path(f"/proc/{pid}"), "S", group, str(pid), group) for pid in (group + 1, group + 2)}
         with mock.patch.object(publisher, "process", side_effect=records.get), mock.patch.object(publisher, "matches", side_effect=lambda pid, *_args: pid == group + 1), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
             with self.assertRaisesRegex(ValueError, "unknown member"):
                 publisher.signal_publishers(records, self.active, self.script, (1, 2), set())
@@ -205,8 +247,8 @@ while True: time.sleep(0.1)
 
     def test_orphan_start_time_change_signals_nobody(self):
         group, pid = 987650, 987651
-        record = (Path(f"/proc/{pid}"), "S", group, "101")
-        changed = (*record[:3], "102")
+        record = (Path(f"/proc/{pid}"), "S", group, "101", group)
+        changed = (*record[:3], "102", group)
         records = {pid: record}
         with mock.patch.object(publisher, "process", side_effect=[record, record, changed]), mock.patch.object(publisher, "matches", return_value=True), mock.patch.object(publisher, "snapshot", return_value=records), mock.patch.object(publisher.os, "killpg") as group_signal, mock.patch.object(publisher.os, "kill") as individual_signal:
             with self.assertRaisesRegex(ValueError, "changed before signalling"):

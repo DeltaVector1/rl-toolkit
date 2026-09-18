@@ -809,6 +809,8 @@ class AdapterUpdateTest(unittest.TestCase):
 
         def ssh(_host, script, timeout=120):
             ssh_scripts.append(script)
+            if "--format '{{json .}}'" in script:
+                return 0, json.dumps({"name": f"/{training_ops.trainer_container}", "running": True, "environment": ["RUN=glm-perf-3"]})
             if "configured orchestrator container state is unknown" in script:
                 return 0, "stopped\n"
             return 0, ""
@@ -823,11 +825,14 @@ class AdapterUpdateTest(unittest.TestCase):
             training_ops, "_ssh", side_effect=ssh
         ), mock.patch.object(
             training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+        ), mock.patch.object(
+            training_ops, "_orchestrator_resume_step", return_value=1
         ):
             result = training_ops._repair_adapter_update()
 
         self.assertIn("recreated exact orchestrator", result)
         resume_script = ssh_scripts[-1]
+        self.assertIn("adapter_resume_step=1 bash", resume_script)
         self.assertIn('sudo docker rm -f "$container"', resume_script)
         self.assertIn(
             "bash /data/glm52-rl/deployment/training_ops/runtime/h200/start_orchestrator.sh",
@@ -947,6 +952,8 @@ class AdapterUpdateTest(unittest.TestCase):
 
         def fake_ssh(_host, script, timeout=120):
             ssh_scripts.append(script)
+            if "--format '{{json .}}'" in script:
+                return 0, json.dumps({"name": f"/{training_ops.trainer_container}", "running": True, "environment": ["RUN=glm-perf-3"]})
             if "configured orchestrator container state is unknown" in script:
                 return 0, "absent\n"
             return 0, ""
@@ -1164,7 +1171,7 @@ class AdapterUpdateTest(unittest.TestCase):
         ), mock.patch.object(
             training_ops, "_fan", side_effect=fan
         ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy, mock.patch.object(
-            training_ops, "_ssh", return_value=(0, "")
+            training_ops, "_ssh", return_value=(0, json.dumps({"name": f"/{training_ops.trainer_container}", "running": True, "environment": ["RUN=glm-perf-3"]}))
         ), mock.patch.object(
             training_ops, "_restart_adapter_engine_script"
         ) as restart_script, mock.patch.object(training_ops, "_ssh_address", side_effect=lambda host: training_ops.hosts["trainer_lan"][host]):

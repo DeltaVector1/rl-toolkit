@@ -2,6 +2,7 @@ import ast
 import asyncio
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -549,6 +550,8 @@ class OrchestratorRepairTest(unittest.TestCase):
 
         def fake_ssh(_host, script, timeout=120):
             ssh_scripts.append(script)
+            if "--format '{{json .}}'" in script:
+                return 0, json.dumps({"name": f"/{training_ops.trainer_container}", "running": True, "environment": ["RUN=glm-perf-3"]})
             if "echo absent" in script:
                 return 0, "absent\n"
             return 0, ""
@@ -559,12 +562,15 @@ class OrchestratorRepairTest(unittest.TestCase):
             training_ops, "_ssh", side_effect=fake_ssh
         ), mock.patch.object(
             training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
+        ), mock.patch.object(
+            training_ops, "_orchestrator_resume_step", return_value=1
         ):
             result = training_ops._repair_orchestrator()
 
         self.assertIn("recreated exact orchestrator", result)
         self.assertIn("[ absent = absent ]", ssh_scripts[-1])
         self.assertIn("start_orchestrator.sh", ssh_scripts[-1])
+        self.assertIn("adapter_resume_step=1 bash", ssh_scripts[-1])
 
     def test_stopped_orchestrator_is_started_after_all_guards_pass(self):
         before = training_ops.Status(
@@ -577,6 +583,8 @@ class OrchestratorRepairTest(unittest.TestCase):
 
         def fake_ssh(_host, script, timeout=120):
             ssh_scripts.append((script, timeout))
+            if "--format '{{json .}}'" in script:
+                return 0, json.dumps({"name": f"/{training_ops.trainer_container}", "running": True, "environment": ["RUN=glm-perf-3"]})
             if "configured orchestrator container state is unknown" in script:
                 return 0, "stopped\n"
             if "docker start" in script:
@@ -637,6 +645,8 @@ class OrchestratorRepairTest(unittest.TestCase):
         )
 
         def fake_ssh(_host, script, timeout=120):
+            if "--format '{{json .}}'" in script:
+                return 0, json.dumps({"name": f"/{training_ops.trainer_container}", "running": True, "environment": ["RUN=glm-perf-3"]})
             if "configured orchestrator container state is unknown" in script:
                 return 0, "running\n"
             return 0, ""
@@ -664,6 +674,95 @@ class OrchestratorRepairTest(unittest.TestCase):
             with self.assertRaisesRegex(training_ops.Refused, "idle or waiting"):
                 training_ops._repair_orchestrator()
         deploy.assert_not_called()
+
+
+class OrchestratorResumeStateTest(unittest.TestCase):
+    def setUp(self):
+        self.run = "glm-perf-3"
+        self.directory = f"{training_ops.run_root}/{self.run}/run_{self.run}"
+        self.adapter = f"{self.directory}/broadcasts/step_1/adapter_model.safetensors"
+
+    def state(self, *environment, **changes):
+        value = {"name": f"/{training_ops.trainer_container}", "running": True, "environment": [f"RUN={self.run}", *environment]}
+        value.update(changes)
+        return json.dumps(value)
+
+    def test_absent_or_empty_resume_keeps_base_launch(self):
+        for environment in ((), ("PRIME_RL_RESUME_ADAPTER=", "PRIME_RL_RESUME_ADAPTER_STEP=")):
+            with self.subTest(environment=environment), mock.patch.object(training_ops, "_ssh", return_value=(0, self.state(*environment))), mock.patch.object(training_ops, "_check_adapter_restart") as check, mock.patch.object(training_ops, "_trainer_addresses", return_value="trainer-address"):
+                step = training_ops._orchestrator_resume_step(self.run)
+                script = training_ops._recreate_orchestrator_script(self.run, {"orchestrator": "configs/general-agent/orchestrator.toml"}, False, resume_step=step)
+                self.assertNotIn("adapter_resume_step=", script)
+                self.assertIn("ORCH_CONFIG=/data/glm52-rl/deployment/configs/general-agent/orchestrator.toml", script)
+                check.assert_not_called()
+
+    def test_remote_probe_returns_only_exact_trainer_resume_fields(self):
+        inspection = {"Name": f"/{training_ops.trainer_container}", "State": {"Running": True}, "Config": {"Env": [f"RUN={self.run}", "SECRET=must-stay-remote"]}}
+        def ssh(host, script, timeout=120):
+            self.assertEqual(host, training_ops.trainer_head)
+            self.assertIn("set -euo pipefail", script)
+            probe = training_ops.shlex.split(script.split(" | python3 -c ", 1)[1])[0]
+            result = subprocess.run([sys.executable, "-c", probe], input=json.dumps(inspection), text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("SECRET", result.stdout)
+            self.assertNotIn("must-stay-remote", result.stdout)
+            return result.returncode, result.stdout
+        with mock.patch.object(training_ops, "_ssh", side_effect=ssh):
+            self.assertIsNone(training_ops._orchestrator_resume_step(self.run))
+
+    def test_exact_resume_checks_both_hosts_and_changes_only_launch_environment(self):
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, self.state())) as ssh, mock.patch.object(training_ops, "_check_adapter_restart", return_value={"sha256": "a" * 64}) as check, mock.patch.object(training_ops, "_trainer_addresses", return_value="trainer-address"):
+            step = training_ops._orchestrator_resume_step(self.run)
+            base = training_ops._recreate_orchestrator_script(self.run, {"orchestrator": "configs/general-agent/orchestrator.toml"}, False, resume_step=step)
+            ssh.return_value = (0, self.state(f"PRIME_RL_RESUME_ADAPTER={self.adapter}", "PRIME_RL_RESUME_ADAPTER_STEP=1"))
+            step = training_ops._orchestrator_resume_step(self.run)
+            resumed = training_ops._recreate_orchestrator_script(self.run, {"orchestrator": "configs/general-agent/orchestrator.toml"}, False, resume_step=step)
+        self.assertEqual(resumed.replace("adapter_resume_step=1 ", ""), base)
+        self.assertEqual(check.call_args_list, [mock.call(training_ops.trainer_head, self.directory, 1, "origin", self.adapter), mock.call(training_ops.orchestrator_host, self.directory, 1, "orchestrator", self.adapter)])
+
+    def test_invalid_or_ambiguous_trainer_state_never_reaches_restart_guards(self):
+        resume = f"PRIME_RL_RESUME_ADAPTER={self.adapter}"
+        cases = ["", "not json", "[]", self.state(resume), self.state("PRIME_RL_RESUME_ADAPTER_STEP=1"), self.state(resume, "PRIME_RL_RESUME_ADAPTER_STEP=-1"), self.state(resume, "PRIME_RL_RESUME_ADAPTER_STEP=1.0"), self.state(resume, "PRIME_RL_RESUME_ADAPTER_STEP=2"), self.state(resume, "PRIME_RL_RESUME_ADAPTER_STEP=01"), self.state(resume, resume, "PRIME_RL_RESUME_ADAPTER_STEP=1"), self.state(resume, "PRIME_RL_RESUME_ADAPTER_STEP=1", running=False), self.state(name="/other"), self.state(environment=["RUN=other"]), self.state("PRIME_RL_RESUME_ADAPTER=/other/broadcasts/step_1/adapter_model.safetensors", "PRIME_RL_RESUME_ADAPTER_STEP=1")]
+        for value in cases:
+            with self.subTest(value=value), mock.patch.object(training_ops, "_ssh", return_value=(0, value)), mock.patch.object(training_ops, "_check_adapter_restart") as check:
+                with self.assertRaises(training_ops.Refused):
+                    training_ops._orchestrator_resume_step(self.run)
+                check.assert_not_called()
+
+    def test_unknown_container_and_failed_restart_guard_refuse_resume(self):
+        with mock.patch.object(training_ops, "_ssh", return_value=(1, "inspect failed")):
+            with self.assertRaisesRegex(training_ops.Refused, "cannot read"):
+                training_ops._orchestrator_resume_step(self.run)
+        state = self.state(f"PRIME_RL_RESUME_ADAPTER={self.adapter}", "PRIME_RL_RESUME_ADAPTER_STEP=1")
+        for failure in (training_ops.Refused("STABLE differs"), {}, {"sha256": "invalid"}):
+            with self.subTest(failure=failure), mock.patch.object(training_ops, "_ssh", return_value=(0, state)), mock.patch.object(training_ops, "_check_adapter_restart", side_effect=failure if isinstance(failure, Exception) else None, return_value=failure):
+                with self.assertRaises(training_ops.Refused):
+                    training_ops._orchestrator_resume_step(self.run)
+
+    def test_both_repairs_validate_resume_before_any_mutation(self):
+        before = training_ops.Status(
+            trainer_up=True, orch_up=False,
+            nodes=[training_ops.NodeState(host=training_ops.trainer_head, reachable=True, gpu_util=0)],
+            batch="batch 2/1024; 0 inflight",
+            engines=[training_ops.EngineState(host=host, gen_code="200", probes_ok=1, probes_total=1, container=True, api_listener=True, watchdog=True) for host in training_ops.inference_hosts],
+        )
+        state = self.state(f"PRIME_RL_RESUME_ADAPTER={self.adapter}", "PRIME_RL_RESUME_ADAPTER_STEP=1")
+        for repair in (training_ops._repair_orchestrator, training_ops._repair_adapter_update):
+            for bad_state, guard_failure in ((self.state("PRIME_RL_RESUME_ADAPTER_STEP=1"), False), (state, True)):
+                calls = []
+                def ssh(_host, script, timeout=120):
+                    calls.append(script)
+                    if "--format '{{json .}}'" in script:
+                        return 0, bad_state
+                    if "configured orchestrator container state is unknown" in script:
+                        return 0, "stopped\n"
+                    self.fail("unexpected remote action before resume validation")
+                with self.subTest(repair=repair.__name__, guard_failure=guard_failure), mock.patch.object(training_ops, "current_run", return_value=self.run), mock.patch.object(training_ops, "status", return_value=before), mock.patch.object(training_ops, "_ssh", side_effect=ssh), mock.patch.object(training_ops, "_fan", return_value={host: (0, "idle") for host in training_ops.inference_hosts}) as fan, mock.patch.object(training_ops, "_adapter_stage_evidence", return_value="adapter fault"), mock.patch.object(training_ops, "_check_adapter_restart", side_effect=training_ops.Refused("STABLE differs")), mock.patch.object(training_ops, "deploy") as deploy:
+                    with self.assertRaises(training_ops.Refused):
+                        repair()
+                    deploy.assert_not_called()
+                    self.assertEqual(fan.call_count, 1)
+                    self.assertEqual(len(calls), 2)
 
 
 class SourcePortProbeTest(unittest.TestCase):

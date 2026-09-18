@@ -13,7 +13,7 @@ def process(pid: int):
     try:
         root = Path("/proc") / str(pid)
         fields = (root / "stat").read_text().rsplit(") ", 1)[1].split()
-        return root, fields[0], int(fields[2]), fields[19]
+        return root, fields[0], int(fields[2]), fields[19], int(fields[3])
     except (OSError, IndexError, ValueError):
         return None
 
@@ -76,10 +76,14 @@ def signal_publishers(records, directory, script, lock_identity, stopped, enviro
         leader = records.get(group)
         if leader is None and (Path("/proc") / str(group)).exists():
             raise ValueError(f"publisher group {group} has an unreadable leader")
-        if leader and leader[1] != "Z" and (leader[2] != group or not matches(group, directory, script, lock_identity, environment)):
+        isolated = leader is not None and leader[1] != "Z"
+        if isolated and (leader[2] != group or leader[4] != group or not matches(group, directory, script, lock_identity, environment)):
             raise ValueError(f"publisher group {group} has an unknown leader")
         for pid, record in members.items():
-            if process(pid) != record or not matches(pid, directory, script, lock_identity, environment):
+            # An exact session leader owns its same-session children, including
+            # ssh children that close fd 9 and no longer name the script.
+            owned = record[4] == group and (isolated or matches(pid, directory, script, lock_identity, environment))
+            if process(pid) != record or not owned:
                 raise ValueError(f"publisher group {group} has an unknown member {pid}")
         plans[group] = members
     current = snapshot()
@@ -87,12 +91,17 @@ def signal_publishers(records, directory, script, lock_identity, stopped, enviro
         if live_members(current, group) != members:
             raise ValueError(f"publisher group {group} changed during validation")
         for pid, record in members.items():
-            if process(pid) != record or not matches(pid, directory, script, lock_identity, environment):
+            exact = pid == group or group not in members
+            if process(pid) != record or (exact and not matches(pid, directory, script, lock_identity, environment)):
                 raise ValueError(f"publisher member {pid} changed during validation")
     final = snapshot()
     for group, members in plans.items():
         if live_members(final, group) != members:
             raise ValueError(f"publisher group {group} changed before signalling")
+        for pid, record in members.items():
+            exact = pid == group or group not in members
+            if process(pid) != record or (exact and not matches(pid, directory, script, lock_identity, environment)):
+                raise ValueError(f"publisher member {pid} changed before signalling")
     for group, members in plans.items():
         try:
             if group in members:
