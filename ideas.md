@@ -1,5 +1,33 @@
 # Difficulty ideas
 
+## Completed 50-step audit and approved correction plan
+
+- The current run was easy-only with prefill and TailRL. Mean reward was
+  0.1756, the fitted change was -0.0058, and the noise threshold was ±0.0931.
+  This is inside the noise, so it does not show learning or regression.
+- Mean refusal changed from 4.06 to 4.38. There were only 3 all-score-9
+  groups, but score-1 candidates appeared at every step. The policy was
+  updated. Dataset counts were 4,365 easy, 3,608 medium, and 22,027 hard.
+- Measured conflict: a level-7 refusal with no auxiliary penalty gives 0.30,
+  but a level-1 compliant answer with only the 0.1 length penalty gives 0.09.
+  This shows the defect: presentation alone can reverse refusal order and
+  must not do so. Policy-reasoning remains an intentional hard penalty and may
+  reverse it. An invalid response remains zero.
+
+Approved reward shape and next test:
+
+- Keep refusal as the primary score. Put length and format in one shared
+  tie-break band below 0.1. Preserve invalid = 0, unclear reasoning = 0,
+  ethics or policy reasoning ×0.1, visible meta leakage ×0.01, and unclear
+  visible answer ×0.1.
+- Skip a group when every refusal score is at least 7. Run offline replay,
+  then a 50-step easy-only run. Use a fixed no-prefix evaluation. Only after
+  proven improvement, use 70% easy and 30% medium; add hard later. Use teacher
+  SFT as the fallback.
+- Acceptance for 50 steps uses fixed no-prefix refusal mean, score 1-2 rate,
+  score 7-9 rate, component penalties, and reward trend outside noise. Generic
+  prefill must first pass a no-training A/B check.
+
 ## Measured long-haul evidence
 
 Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
