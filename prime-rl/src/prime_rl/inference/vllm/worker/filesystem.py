@@ -616,6 +616,8 @@ def _reset_staging_directory_identity(
     identity_name: str,
     identity: str,
     label: str,
+    *,
+    resume_source_url: str | None = None,
 ) -> None:
     """Remove a mismatched private directory through held descriptors."""
     try:
@@ -647,7 +649,10 @@ def _reset_staging_directory_identity(
                 )
             except (FileNotFoundError, OSError):
                 existing = None
-            if existing == identity:
+            if existing == identity or (
+                resume_source_url is not None
+                and _legacy_adapter_resume_identity(existing, resume_source_url) == identity
+            ):
                 return
             _remove_opened_directory_entry(
                 parent_fd,
@@ -4829,13 +4834,14 @@ def _stage_chunked_linear_adapter(
     if not isinstance(chunks, list):
         raise OSError("version-two adapter chunks are invalid")
     chunks = sorted(chunks, key=lambda item: int(item["offset"]))
-    transport_identity = json.dumps(transport, sort_keys=True, separators=(",", ":"))
+    transport_identity = _adapter_resume_identity(source_url, transport)
     identity_path = temporary / "transport-manifest.json"
     _reset_staging_directory_identity(
         temporary,
         identity_path.name,
         transport_identity,
         "adapter partial directory",
+        resume_source_url=source_url,
     )
     _ensure_directory(temporary, "adapter partial directory")
     _write_text_atomic(identity_path, transport_identity, encoding="utf-8")
@@ -5391,6 +5397,73 @@ def _stage_chunked_linear_adapter(
     return destination
 
 
+def _adapter_resume_identity(source_url: str, transport: dict[str, object]) -> str:
+    """Identify exact validated bytes and routing, not publication metadata."""
+    fields = (
+        "version", "mode", "transport", "base_url", "base_sha256", "base_size",
+        "base_config_sha256", "base_config_size", "base2_url", "base2_sha256",
+        "base2_size", "base2_config_sha256", "base2_config_size", "target_sha256",
+        "target_size", "config_sha256", "config_size", "data_offset",
+    )
+    identity = {key: transport.get(key) for key in fields}
+    identity["source_url"] = source_url
+    identity["resume_identity_version"] = 1
+    # These constants were checked by the version-two manifest parser. Keep
+    # them explicit so a future encoding change cannot reuse old output.
+    if transport.get("transport") == _ADAPTER_LINEAR_TRANSPORT:
+        manifest = transport.get("source_manifest", {})
+        assert isinstance(manifest, dict)
+        for key in ("chunk_alignment", "chunk_coverage", "predictor", "value_encoding", "mask_encoding"):
+            identity[key] = manifest.get(key)
+    chunk_fields = (
+        "file", "offset", "data_offset", "raw_size", "wire_size",
+        "wire_sha256", "raw_sha256", "codec",
+    )
+    chunks = transport["chunks"]
+    assert isinstance(chunks, list)
+    identity["chunks"] = [{key: chunk.get(key) for key in chunk_fields} for chunk in chunks]
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+
+def _legacy_adapter_resume_identity(value: str | None, source_url: str) -> str | None:
+    """Read the old private format without trusting any of its chunk data."""
+    try:
+        legacy = json.loads(value) if value is not None else None
+        if not isinstance(legacy, dict) or not isinstance(legacy.get("source_manifest"), dict):
+            return None
+        if legacy["source_manifest"].get("target_url", source_url) != source_url:
+            return None
+        return _adapter_resume_identity(source_url, legacy)
+    except (ValueError, KeyError, TypeError, AssertionError, AttributeError):
+        return None
+
+
+def _has_matching_adapter_resume_identity(
+    destination: Path, source_url: str, transport: dict[str, object] | None,
+) -> bool:
+    """Keep only a no-follow private directory with the exact canonical identity."""
+    if not isinstance(transport, dict) or transport.get("transport") not in {
+        _ADAPTER_LINEAR_TRANSPORT, _ADAPTER_DELTA_TRANSPORT, _ADAPTER_FULL_TRANSPORT,
+    }:
+        return False
+    try:
+        expected = _adapter_resume_identity(source_url, transport)
+        directory_fd = _open_directory_nofollow(
+            destination.with_name(f"{destination.name}.partial"),
+            create=False, label="adapter partial directory",
+        )
+        try:
+            actual = _read_text_nofollow(
+                "transport-manifest.json", encoding="utf-8", dir_fd=directory_fd,
+                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+            )
+            return actual == expected
+        finally:
+            os.close(directory_fd)
+    except (OSError, ValueError, KeyError, TypeError, AssertionError):
+        return False
+
+
 def _cleanup_delta_stage_artifacts(
     destination: Path,
     *,
@@ -5519,13 +5592,14 @@ def _stage_chunked_xor_adapter(
     chunks = transport["chunks"]
     assert isinstance(chunks, list)
     chunks = sorted(chunks, key=lambda item: int(item["offset"]))
-    transport_identity = json.dumps(transport, sort_keys=True, separators=(",", ":"))
+    transport_identity = _adapter_resume_identity(source_url, transport)
     identity_path = temporary / "transport-manifest.json"
     _reset_staging_directory_identity(
         temporary,
         identity_path.name,
         transport_identity,
         "adapter partial directory",
+        resume_source_url=source_url,
     )
     _ensure_directory(temporary, "adapter partial directory")
     _write_text_atomic(identity_path, transport_identity, encoding="utf-8")
@@ -7081,7 +7155,9 @@ def stage_lora_adapter_files(
                 try:
                     cleaned = _cleanup_delta_stage_artifacts(
                         destination,
-                        preserve_partial=_preserve_adapter_stage_partial(exc),
+                        preserve_partial=_has_matching_adapter_resume_identity(
+                            destination, source_url, transport,
+                        ),
                         deadline=time.monotonic() + _ADAPTER_CLEANUP_TIMEOUT_S,
                         cancel_event=threading.Event(),
                     )

@@ -711,7 +711,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                     self.assertEqual(filesystem._read_source_bytes(urls[0], max_bytes=1024), payload)
                 self.assertEqual([call.args[0] for call in request.call_args_list], urls)
 
-    def test_metadata_network_failures_preserve_partial_but_complete_errors_do_not(self):
+    def test_metadata_failures_do_not_preserve_a_partial_without_identity(self):
         for failure in ("short", "chunked", "reset", "json", "manifest"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
                 filesystem = load_filesystem_module()
@@ -741,10 +741,7 @@ class DownloadSchedulerTest(unittest.TestCase):
                     with self.assertRaises(exception):
                         filesystem.stage_lora_adapter_files(source, require_delta=True)
                     self.assertEqual(len(calls), 2 if network_failure else 1)
-                    if network_failure:
-                        self.assertEqual(sentinel.read_bytes(), b"retained")
-                    else:
-                        self.assertFalse(partial.exists())
+                    self.assertFalse(partial.exists())
 
     def _persistent_server(self, filesystem, payload, action=None):
         class Handler(http.server.BaseHTTPRequestHandler):

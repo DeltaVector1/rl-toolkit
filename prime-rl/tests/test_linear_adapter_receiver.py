@@ -1003,7 +1003,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 partial = destination.with_name(f"{destination.name}.partial")
                 partial.mkdir(parents=True)
                 (partial / "transport-manifest.json").write_text(
-                    json.dumps(transport, sort_keys=True, separators=(",", ":")),
+                    filesystem._adapter_resume_identity(source_url, transport),
                     encoding="utf-8",
                 )
                 (partial / "transport-chunks").symlink_to(external, target_is_directory=True)
