@@ -495,11 +495,11 @@ class ActiveMetricRowsTest(unittest.TestCase):
 
 
 class AcceptanceProbeTest(unittest.TestCase):
-    def acceptance(self, trainer_rows="", rollout_rows=""):
+    def acceptance(self, trainer_rows="", rollout_rows="", orchestrator_config=""):
         return training_ops._acceptance_from_text(
             "glm52",
             "",
-            "",
+            orchestrator_config,
             "\n".join(json.dumps(row) for row in trainer_rows),
             "\n".join(json.dumps(row) for row in rollout_rows),
             "",
@@ -566,6 +566,23 @@ class AcceptanceProbeTest(unittest.TestCase):
         self.assertTrue(
             any("batch cycle is missing or invalid" in alarm for alarm in report.alarms)
         )
+
+    def test_startup_eval_overhead_is_excluded_only_at_step_one(self):
+        config = "[eval]\ninterval = 10\nskip_first_step = false\n"
+        rows = [
+            {
+                "step": 1,
+                "time/step": 1156.855868612416,
+                "eval/decensor-hard-eval/all/reward/mean": 0.1,
+            },
+            {"step": 2, "time/step": 721.0},
+        ]
+        report = self.acceptance(
+            [{"step": 2, "time/forward_backward": 300.0}], rows, config
+        )
+        self.assertEqual(report.rollout_generation_startup_steps, [1])
+        self.assertTrue(any("batch cycle exceeds" in alarm for alarm in report.alarms))
+        self.assertIn("startup evaluation overhead excluded", report.report())
 
     def test_current_fp8_config_does_not_require_removed_dequant_flags(self):
         report = training_ops._acceptance_from_text(
@@ -657,6 +674,15 @@ dequantize_checkpoint_moe = true
         }]
         logs = "Rollout failed after three attempts: rollout is unscored; its complete group will be replaced"
         self.assertEqual(training_ops._failure_evidence([], [], logs), {})
+        self.assertEqual(training_ops._failure_evidence([], rows, logs), {})
+
+    def test_paired_unscored_rollout_and_dropped_group_is_not_failure(self):
+        rows = [{"step": 2, "train/agg/all/has_error/mean": 0.0025}]
+        logs = (
+            "Rollout failed in group abc — TaskError: rollout is unscored\n"
+            "Finished group | rollouts=16 (errored=1) | dropped complete group; "
+            "consecutive errored groups=1/8"
+        )
         self.assertEqual(training_ops._failure_evidence([], rows, logs), {})
 
     def test_replaced_group_does_not_hide_transport_or_repeated_group_failure(self):

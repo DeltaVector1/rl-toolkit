@@ -1096,6 +1096,7 @@ class AcceptanceReport:
     trainer_compute_seconds: float | None = None
     rollout_generation_step: int | None = None
     rollout_generation_seconds: float | None = None
+    rollout_generation_startup_steps: list[int] = field(default_factory=list)
     large_batch_evidence: bool = False
     reward_verdict: str = "no data"
     failures: dict[str, int] = field(default_factory=dict)
@@ -1142,6 +1143,11 @@ class AcceptanceReport:
             f"active rollout batch cycle (metric time/step): {generation} "
             f"(upper bound {rollout_seconds_max:g}s)"
         )
+        if self.rollout_generation_startup_steps:
+            L.append(
+                "startup evaluation overhead excluded from the batch-cycle limit at steps "
+                + ",".join(map(str, self.rollout_generation_startup_steps))
+            )
         L.append(
             "excluded from both times: policy/check waiting, judging/scoring, batch transfer, "
             "adapter transfer, and checkpoint save"
@@ -1456,10 +1462,26 @@ def _failure_evidence(
     log_lines = list(
         dict.fromkeys(line.strip() for line in logs.splitlines() if line.strip())
     )
+    unscored_pattern = re.compile(r"rollout is unscored", re.I)
     replacement_pattern = re.compile(
         r"rollout is unscored\s*;\s*its complete group will be replaced", re.I
     )
-    replacement_logged = any(replacement_pattern.search(line) for line in log_lines)
+    dropped_group_pattern = re.compile(
+        r"dropped complete group\s*;\s*consecutive errored groups\s*=\s*(\d+)\s*/\s*8",
+        re.I,
+    )
+    replacement_counts = []
+    for index, line in enumerate(log_lines):
+        if not unscored_pattern.search(line):
+            continue
+        if replacement_pattern.search(line):
+            replacement_counts.append(None)
+        for following in log_lines[index + 1 : index + 4]:
+            match = dropped_group_pattern.search(following)
+            if match:
+                replacement_counts.append(int(match.group(1)))
+                break
+    replacement_logged = bool(replacement_counts)
     consecutive_group_pattern = re.compile(
         r"consecutive errored groups\s*=\s*(\d+)\s*/\s*8", re.I
     )
@@ -1477,15 +1499,28 @@ def _failure_evidence(
         if (match := stopped_group_pattern.search(line))
     )
     repeated_group_failure = any(count >= 8 for count in consecutive_group_counts)
-    # The environment records an isolated service failure as an errored rollout,
-    # then explicitly replaces the complete GRPO group. That aggregate metric is
-    # expected in this path. Keep it as failure evidence when the log also shows
-    # a real transport failure or the eight-group stop condition.
-    replacement_only = replacement_logged and not repeated_group_failure
+    transport_signal = re.compile(
+        r"readtimeout|connect(?:ion)?error|transport(?:error| failure)|"
+        r"(?:batch|file).*(?:transfer|sync).*(?:failed|error|mismatch)|"
+        r"checksum.*(?:failed|mismatch)|tunnel.*(?: down|failed)",
+        re.I,
+    )
+
+    def real_transport_line(line: str) -> bool:
+        return bool(
+            transport_signal.search(line)
+            and not re.search(r"adapter|lora", line, re.I)
+        )
+
+    real_transport = any(real_transport_line(line) for line in log_lines)
+    # Ignore only an explicitly replaced unscored group, not transport errors.
+    replacement_only = (
+        replacement_logged and not repeated_group_failure and not real_transport
+    )
 
     def replaced_unscored_row(row: dict) -> bool:
         return replacement_only and float(
-            row.get("train/agg/all/user_sim_failed/mean") or 0.0
+            row.get("train/agg/all/has_error/mean") or 0.0
         ) > 0.0
 
     rollout_error_steps = sum(
@@ -1546,8 +1581,9 @@ def _failure_evidence(
             1
             for line in log_lines
             if pattern.search(line)
-            and not re.search(
-                r"rollout is unscored|complete group will be replaced", line, re.I
+            and not (
+                (unscored_pattern.search(line) or replacement_pattern.search(line))
+                and not real_transport_line(line)
             )
             and not re.search(
                 r"Out of range float values are not JSON compliant:\s*nan",
@@ -1718,6 +1754,17 @@ def _acceptance_from_text(
     if generation:
         rep.rollout_generation_step, rep.rollout_generation_seconds = generation[-1]
 
+    startup_eval = (
+        _last(orch_values, "eval.skip_first_step") is False
+        and any(
+            row["step"] == 1
+            and any(key.startswith("eval/") for key in row)
+            for row in rollout_rows
+        )
+    )
+    if startup_eval:
+        rep.rollout_generation_startup_steps = [1]
+
     rep.large_batch_evidence = _large_batch_evidence(orch_values, trainer_rows, logs)
     rep.failures = _failure_evidence(trainer_rows, rollout_rows, logs)
 
@@ -1772,7 +1819,12 @@ def _acceptance_from_text(
             "no trainer time/forward_backward measurement"
         )
 
-    bad_generation = [step for step, seconds in generation if seconds > rollout_seconds_max]
+    excluded_generation_steps = set(rep.rollout_generation_startup_steps)
+    bad_generation = [
+        step
+        for step, seconds in generation
+        if step not in excluded_generation_steps and seconds > rollout_seconds_max
+    ]
     if invalid_generation:
         rep.alarms.append(
             "active rollout batch cycle is missing or invalid (metric source time/step) at steps "
