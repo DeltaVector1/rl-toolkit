@@ -1474,18 +1474,22 @@ def _failure_evidence(
         r"dropped complete group\s*;\s*consecutive errored groups\s*=\s*(\d+)\s*/\s*8",
         re.I,
     )
-    replacement_counts = []
+    replacement_events: list[str] = []
     for index, line in enumerate(log_lines):
         if not unscored_pattern.search(line):
             continue
-        if replacement_pattern.search(line):
-            replacement_counts.append(None)
+        replacement_line = replacement_pattern.search(line) is not None
+        dropped_count = None
+        evidence_lines = [line]
         for following in log_lines[index + 1 : index + 4]:
             match = dropped_group_pattern.search(following)
             if match:
-                replacement_counts.append(int(match.group(1)))
+                dropped_count = int(match.group(1))
+                evidence_lines.append(following)
                 break
-    replacement_logged = bool(replacement_counts)
+        if replacement_line or dropped_count is not None:
+            replacement_events.append("\n".join(evidence_lines))
+    replacement_logged = bool(replacement_events)
     consecutive_group_pattern = re.compile(
         r"consecutive errored groups\s*=\s*(\d+)\s*/\s*8", re.I
     )
@@ -1522,18 +1526,57 @@ def _failure_evidence(
         for row in rollout_rows
         if float(row.get("train/agg/all/has_error/mean") or 0.0) > 0.0
     ]
-    # Correlate one replacement event with one errored metric row only.
     replacement_log_only = (
         replacement_logged and not repeated_group_failure and not real_transport
     )
+    step_pattern = re.compile(r"\b(?:step|batch)\s*[=:]\s*(\d+)\b", re.I)
+    timestamp_pattern = re.compile(
+        r"\b(?:time|timestamp|ts)\s*[=:]\s*(\d+(?:\.\d+)?)\b", re.I
+    )
+    clock_pattern = re.compile(r"(?<!\d)(\d{1,2}):(\d{2}):(\d{2})(?!\d)")
+
+    # Match the replacement to its metric step, not to row count.
+    def replacement_matches_row(row: dict, evidence: str) -> bool:
+        row_step = row.get("step")
+        step_match = step_pattern.search(evidence)
+        if step_match and isinstance(row_step, (int, float)):
+            return int(row_step) == int(step_match.group(1))
+
+        row_time = row.get("time")
+        cycle = row.get("time/step")
+        if not isinstance(row_time, (int, float)) or not isinstance(
+            cycle, (int, float)
+        ) or cycle < 0:
+            return False
+        timestamp_match = timestamp_pattern.search(evidence)
+        if timestamp_match:
+            event_time = float(timestamp_match.group(1))
+            return row_time - cycle - 1.0 <= event_time <= row_time + 1.0
+        clock_match = clock_pattern.search(evidence)
+        if not clock_match:
+            return False
+        event_clock = (
+            int(clock_match.group(1)) * 3600
+            + int(clock_match.group(2)) * 60
+            + int(clock_match.group(3))
+        )
+        row_clock = float(row_time) % 86400.0
+        elapsed = (event_clock - (row_clock - float(cycle))) % 86400.0
+        return elapsed <= float(cycle) + 1.0
+
+    replacement_rows = [
+        row
+        for row in error_rows
+        if any(replacement_matches_row(row, event) for event in replacement_events)
+    ]
     replacement_only = (
-        replacement_log_only and len(replacement_counts) == 1 and len(error_rows) == 1
+        replacement_log_only
+        and len(replacement_events) == 1
+        and len(replacement_rows) == 1
     )
 
     def replaced_unscored_row(row: dict) -> bool:
-        return replacement_only and float(
-            row.get("train/agg/all/has_error/mean") or 0.0
-        ) > 0.0
+        return replacement_only and row is replacement_rows[0]
 
     rollout_error_steps = sum(
         1

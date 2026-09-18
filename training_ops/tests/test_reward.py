@@ -671,17 +671,38 @@ dequantize_checkpoint_moe = true
     def test_isolated_unscored_rollout_is_not_failure_evidence(self):
         rows = [{
             "step": 1,
+            "time": 1000.0,
+            "time/step": 100.0,
             "train/agg/all/has_error/mean": 1.0,
             "train/agg/all/user_sim_failed/mean": 1.0,
         }]
-        logs = "Rollout failed after three attempts: rollout is unscored; its complete group will be replaced"
+        logs = "timestamp=950 Rollout failed after three attempts: rollout is unscored; its complete group will be replaced"
         self.assertEqual(training_ops._failure_evidence([], [], logs), {})
         self.assertEqual(training_ops._failure_evidence([], rows, logs), {})
 
     def test_paired_unscored_rollout_and_dropped_group_is_not_failure(self):
-        rows = [{"step": 2, "train/agg/all/has_error/mean": 0.0025}]
+        rows = [{
+            "step": 2,
+            "time": 2000.0,
+            "time/step": 100.0,
+            "train/agg/all/has_error/mean": 0.0025,
+        }]
         logs = (
-            "Rollout failed in group abc — TaskError: rollout is unscored\n"
+            "timestamp=1950 Rollout failed in group abc — TaskError: rollout is unscored\n"
+            "Finished group | rollouts=16 (errored=1) | dropped complete group; "
+            "consecutive errored groups=1/8"
+        )
+        self.assertEqual(training_ops._failure_evidence([], rows, logs), {})
+
+    def test_replacement_promise_and_drop_is_one_event(self):
+        rows = [{
+            "step": 2,
+            "time": 2000.0,
+            "time/step": 100.0,
+            "train/agg/all/has_error/mean": 0.0025,
+        }]
+        logs = (
+            "timestamp=1950 rollout is unscored; its complete group will be replaced\n"
             "Finished group | rollouts=16 (errored=1) | dropped complete group; "
             "consecutive errored groups=1/8"
         )
@@ -689,21 +710,28 @@ dequantize_checkpoint_moe = true
 
     def test_replacement_does_not_suppress_a_later_error_row(self):
         rows = [
-            {"step": 2, "train/agg/all/has_error/mean": 0.0025},
+            {
+                "step": 2,
+                "time": 2000.0,
+                "time/step": 100.0,
+                "train/agg/all/has_error/mean": 0.0025,
+            },
             {
                 "step": 3,
+                "time": 3000.0,
+                "time/step": 100.0,
                 "train/agg/all/has_error/mean": 0.0025,
                 "train/agg/all/metrics/decensor_user_sim_failed/mean": 1.0,
             },
         ]
         logs = (
-            "Rollout failed in group abc — TaskError: rollout is unscored\n"
+            "timestamp=1950 Rollout failed in group abc — TaskError: rollout is unscored\n"
             "Finished group | rollouts=16 (errored=1) | dropped complete group; "
             "consecutive errored groups=1/8"
         )
         self.assertEqual(
             training_ops._failure_evidence([], rows, logs),
-            {"environment": 1, "transport/rollout": 2},
+            {"environment": 1, "transport/rollout": 1},
         )
 
     def test_unscored_text_does_not_hide_other_failure_categories(self):
@@ -712,7 +740,12 @@ dequantize_checkpoint_moe = true
             "Finished group | rollouts=16 (errored=1) | dropped complete group; "
             "consecutive errored groups=1/8\n"
         )
-        rows = [{"step": 2, "train/agg/all/has_error/mean": 0.0025}]
+        rows = [{
+            "step": 2,
+            "time": 2000.0,
+            "time/step": 100.0,
+            "train/agg/all/has_error/mean": 0.0025,
+        }]
         for line, category in (
             ("judge failed: rollout is unscored", "judge"),
             ("adapter load failed: rollout is unscored", "adapter"),
