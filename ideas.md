@@ -181,6 +181,19 @@ Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
   is fully scored and error-free and all refusal scores are at least 7.
   Complete 50 steps and require the reward/no-prefix trend to be outside noise.
 
+## Difficulty-11 startup and steps 1-3
+
+- Startup evaluation rewards and mean refusals were easy 0.34851 and
+  2.695, medium 0.05917 and 6.279, and hard 0.013826 and 8.660.
+- Step 1 effective reward was 0.1955. Trainer compute was 399.81s. Step 2
+  reward was 0.1980 and compute was 423.16s. Step 3 rollout reward was 0.2516
+  and compute was 406.07s. Step 3 total time was 10m51s; entropy was 0.4402,
+  grad norm was 0.03394, throughput was 3793 tok/s, and MFU was 6.5%.
+- Three points cannot establish a trend.
+- Batch 4 did not start. Policy 2 transport exhausted the fixed 600s attempt
+  and the bounded retry after an earlier partial batch was lost. The engines stayed
+  on exact policy 1, and the trainer stayed healthy after step 3.
+
 ## Historical prefill and easy-first trial
 
 - The earlier 100% assistant-prefill plan is historical. It is not the active
