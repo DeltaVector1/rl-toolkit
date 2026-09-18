@@ -4490,15 +4490,19 @@ def _orchestrator_resume_step(run: str) -> int | None:
             if key not in keys or not separator or key in environment:
                 raise ValueError("trainer environment is ambiguous")
             environment[key] = setting
-        if environment.get("RUN") != run:
+        if "RUN" in environment and environment["RUN"] != run:
             raise ValueError("trainer run differs")
         adapter = environment.get("PRIME_RL_RESUME_ADAPTER", "")
         step_text = environment.get("PRIME_RL_RESUME_ADAPTER_STEP", "")
         if not adapter and not step_text:
+            if "RUN" not in environment:
+                raise ValueError("trainer has no explicit run or resume policy")
             return None
         if not adapter or not re.fullmatch(r"0|[1-9][0-9]*", step_text):
             raise ValueError("resume adapter and integer step must be set together")
         step = int(step_text)
+        # Older trainer launchers omitted RUN. Only the exact paired resume
+        # policy can identify their run; the checkpoint guards below still apply.
         if adapter != f"{service_dir}/broadcasts/step_{step}/adapter_model.safetensors":
             raise ValueError("resume adapter is not the exact run policy path")
     except (ValueError, KeyError, TypeError, AttributeError) as error:

@@ -729,6 +729,39 @@ class OrchestratorResumeStateTest(unittest.TestCase):
                     training_ops._orchestrator_resume_step(self.run)
                 check.assert_not_called()
 
+    def test_missing_run_accepts_only_exact_paired_resume_with_both_guards(self):
+        environment = [f"PRIME_RL_RESUME_ADAPTER={self.adapter}", "PRIME_RL_RESUME_ADAPTER_STEP=1"]
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, self.state(environment=environment))), mock.patch.object(training_ops, "_check_adapter_restart", return_value={"sha256": "a" * 64}) as check:
+            self.assertEqual(training_ops._orchestrator_resume_step(self.run), 1)
+        self.assertEqual(check.call_args_list, [mock.call(training_ops.trainer_head, self.directory, 1, "origin", self.adapter), mock.call(training_ops.orchestrator_host, self.directory, 1, "orchestrator", self.adapter)])
+
+    def test_run_fallback_refuses_ambiguous_or_incomplete_identity(self):
+        resume = [f"PRIME_RL_RESUME_ADAPTER={self.adapter}", "PRIME_RL_RESUME_ADAPTER_STEP=1"]
+        environments = [
+            [], ["PRIME_RL_RESUME_ADAPTER=", "PRIME_RL_RESUME_ADAPTER_STEP="],
+            resume[:1], resume[1:],
+            [resume[0], "PRIME_RL_RESUME_ADAPTER_STEP=2"],
+            [resume[0].replace(self.run, "other-run"), resume[1]],
+            [resume[0].replace("/broadcasts/", "/../broadcasts/"), resume[1]],
+            [*resume, resume[1]],
+            ["RUN=", *resume], ["RUN=other-run", *resume],
+            [f"RUN={self.run}", f"RUN={self.run}", *resume],
+            [f"RUN={self.run}", "RUN=", *resume],
+        ]
+        for environment in environments:
+            with self.subTest(environment=environment), mock.patch.object(training_ops, "_ssh", return_value=(0, self.state(environment=environment))), mock.patch.object(training_ops, "_check_adapter_restart") as check:
+                with self.assertRaises(training_ops.Refused):
+                    training_ops._orchestrator_resume_step(self.run)
+                check.assert_not_called()
+
+    def test_missing_run_still_requires_exact_running_container(self):
+        environment = [f"PRIME_RL_RESUME_ADAPTER={self.adapter}", "PRIME_RL_RESUME_ADAPTER_STEP=1"]
+        for change in ({"running": False}, {"name": "/other"}):
+            with self.subTest(change=change), mock.patch.object(training_ops, "_ssh", return_value=(0, self.state(environment=environment, **change))), mock.patch.object(training_ops, "_check_adapter_restart") as check:
+                with self.assertRaises(training_ops.Refused):
+                    training_ops._orchestrator_resume_step(self.run)
+                check.assert_not_called()
+
     def test_unknown_container_and_failed_restart_guard_refuse_resume(self):
         with mock.patch.object(training_ops, "_ssh", return_value=(1, "inspect failed")):
             with self.assertRaisesRegex(training_ops.Refused, "cannot read"):
@@ -748,7 +781,15 @@ class OrchestratorResumeStateTest(unittest.TestCase):
         )
         state = self.state(f"PRIME_RL_RESUME_ADAPTER={self.adapter}", "PRIME_RL_RESUME_ADAPTER_STEP=1")
         for repair in (training_ops._repair_orchestrator, training_ops._repair_adapter_update):
-            for bad_state, guard_failure in ((self.state("PRIME_RL_RESUME_ADAPTER_STEP=1"), False), (state, True)):
+            legacy_state = self.state(environment=[f"PRIME_RL_RESUME_ADAPTER={self.adapter}", "PRIME_RL_RESUME_ADAPTER_STEP=1"])
+            cases = (
+                (self.state("PRIME_RL_RESUME_ADAPTER_STEP=1"), []),
+                (state, [training_ops.Refused("STABLE differs")]),
+                (legacy_state, [training_ops.Refused("STABLE differs")]),
+                (legacy_state, [{"sha256": "a" * 64}, training_ops.Refused("STABLE differs")]),
+                (legacy_state, [{"sha256": "invalid"}]),
+            )
+            for bad_state, guard_results in cases:
                 calls = []
                 def ssh(_host, script, timeout=120):
                     calls.append(script)
@@ -757,12 +798,49 @@ class OrchestratorResumeStateTest(unittest.TestCase):
                     if "configured orchestrator container state is unknown" in script:
                         return 0, "stopped\n"
                     self.fail("unexpected remote action before resume validation")
-                with self.subTest(repair=repair.__name__, guard_failure=guard_failure), mock.patch.object(training_ops, "current_run", return_value=self.run), mock.patch.object(training_ops, "status", return_value=before), mock.patch.object(training_ops, "_ssh", side_effect=ssh), mock.patch.object(training_ops, "_fan", return_value={host: (0, "idle") for host in training_ops.inference_hosts}) as fan, mock.patch.object(training_ops, "_adapter_stage_evidence", return_value="adapter fault"), mock.patch.object(training_ops, "_check_adapter_restart", side_effect=training_ops.Refused("STABLE differs")), mock.patch.object(training_ops, "deploy") as deploy:
+                with self.subTest(repair=repair.__name__, guards=len(guard_results)), mock.patch.object(training_ops, "current_run", return_value=self.run), mock.patch.object(training_ops, "status", return_value=before), mock.patch.object(training_ops, "_ssh", side_effect=ssh), mock.patch.object(training_ops, "_fan", return_value={host: (0, "idle") for host in training_ops.inference_hosts}) as fan, mock.patch.object(training_ops, "_adapter_stage_evidence", return_value="adapter fault"), mock.patch.object(training_ops, "_check_adapter_restart", side_effect=guard_results), mock.patch.object(training_ops, "deploy") as deploy:
                     with self.assertRaises(training_ops.Refused):
                         repair()
                     deploy.assert_not_called()
                     self.assertEqual(fan.call_count, 1)
                     self.assertEqual(len(calls), 2)
+
+
+class TrainerRunIdentityLaunchTest(unittest.TestCase):
+    def test_exact_launch_passes_run_and_keeps_config_environment_overrides(self):
+        source = (Path(__file__).resolve().parents[1] / "runtime/china/cluster.sh").read_text()
+        override = "has_trainer_env_override() {" + source.split("has_trainer_env_override() {", 1)[1].split("\n    }", 1)[0] + "\n}\n"
+        launch = "trainer_docker_args=(" + source.split("trainer_docker_args=(", 1)[1].split('    rm -f -- "$trainer_env_file"', 1)[0]
+        for overridden in (False, True):
+            fixture = r'''
+set -euo pipefail
+common=()
+transformers_mount=()
+deployment=/fixture/deployment
+storage=/fixture/storage
+trainer_env_file=/fixture/config.env
+RUN=glm-perf-3
+trainer_container=exact-trainer
+image=fixture-image
+nnodes=8
+rank=0
+node=82
+master_node=82
+run_dir=/fixture/run_glm-perf-3
+trainer_config=/fixture/trainer.toml
+sudo() { printf '%s\0' "$@"; }
+'''
+            fixture += "trainer_env_keys=(RUN TORCHINDUCTOR_COMPILE_THREADS)\n" if overridden else "trainer_env_keys=()\n"
+            with self.subTest(overridden=overridden):
+                result = subprocess.run(["bash", "-c", fixture + override + launch], capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                arguments = result.stdout.rstrip("\0").split("\0")
+                self.assertEqual(arguments[:5], ["docker", "run", "-d", "--name", "exact-trainer"])
+                explicit_environment = [arguments[index + 1] for index, argument in enumerate(arguments) if argument == "-e"]
+                self.assertEqual(explicit_environment.count("RUN=glm-perf-3"), 0 if overridden else 1)
+                self.assertEqual(explicit_environment.count("TORCHINDUCTOR_COMPILE_THREADS=8"), 0 if overridden else 1)
+                env_files = [arguments[index + 1] for index, argument in enumerate(arguments) if argument == "--env-file"]
+                self.assertEqual(env_files, ["/data/trinity/training.env", "/fixture/config.env"])
 
 
 class SourcePortProbeTest(unittest.TestCase):
