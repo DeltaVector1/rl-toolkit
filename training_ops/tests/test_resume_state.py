@@ -392,13 +392,110 @@ class ResumeStateTest(unittest.TestCase):
             resume.quarantine_rollouts(str(self.active), 3, "origin", str(self.weight))
 
     def test_future_cache_rejects_a_later_binary_step(self):
-        for step in (4, 5):
+        for step in (4, 6):
             target = self.active / "rollouts" / f"step_{step}"
             target.mkdir(parents=True)
             (target / "rank_0.bin").write_bytes(b"future")
         with self.assertRaisesRegex(ValueError, "later cached rollout"):
             resume.quarantine_rollouts(str(self.active), 3, "origin", str(self.weight))
         self.assertTrue((self.active / "rollouts/step_4/rank_0.bin").exists())
+
+    def test_future_cache_quarantine_accepts_contiguous_step_seven_and_eight(self):
+        (self.active / "broadcasts/step_6").mkdir()
+        for step in (7, 8):
+            target = self.active / "rollouts" / f"step_{step}"
+            target.mkdir(parents=True)
+            (target / "rank_0.bin").write_bytes(f"future-{step}".encode())
+        result = resume.quarantine_rollouts(str(self.active), 6, "cache", "")
+        self.assertEqual(len(result["quarantined"]), 2)
+        self.assertTrue((self.active / ".rollout-quarantine/resume-step_6/step_7.json").is_file())
+        self.assertTrue((self.active / ".rollout-quarantine/resume-step_6/step_8.json").is_file())
+
+    def test_future_cache_quarantine_rejects_a_gap(self):
+        for step in (7, 9):
+            target = self.active / "rollouts" / f"step_{step}"
+            target.mkdir(parents=True)
+            (target / "rank_0.bin").write_bytes(b"future")
+        with self.assertRaisesRegex(ValueError, "not contiguous"):
+            resume.quarantine_rollouts(str(self.active), 6, "cache", "")
+        self.assertTrue((self.active / "rollouts/step_7/rank_0.bin").exists())
+
+    def test_future_cache_quarantine_step_receipts_are_idempotent(self):
+        for step in (7, 8):
+            target = self.active / "rollouts" / f"step_{step}"
+            target.mkdir(parents=True)
+            (target / "rank_0.bin").write_bytes(f"future-{step}".encode())
+        first = resume.quarantine_rollouts(str(self.active), 6, "cache", "")
+        second = resume.quarantine_rollouts(str(self.active), 6, "cache", "")
+        self.assertEqual(len(first["quarantined"]), 2)
+        self.assertEqual(second["quarantined"], [])
+        self.assertEqual(second["bytes"], 0)
+
+    def test_valid_stale_marker_history_is_preserved(self):
+        payload = b"interrupted marker history"
+        marker = self.active / f".microbatch-sync.marker.stale.{hashlib.sha256(payload).hexdigest()}"
+        marker.write_bytes(payload)
+        target = self.active / "rollouts/step_4"
+        target.mkdir(parents=True)
+        (target / "rank_0.bin").write_bytes(b"future")
+        resume.quarantine_rollouts(str(self.active), 3, "cache", "")
+        self.assertEqual(marker.read_bytes(), payload)
+
+    def test_invalid_stale_marker_history_is_rejected(self):
+        cases = ("not-a-hash", "0" * 64)
+        for suffix in cases:
+            with self.subTest(suffix=suffix):
+                marker = self.active / f".microbatch-sync.marker.stale.{suffix}"
+                marker.write_bytes(b"history")
+                with self.assertRaisesRegex(ValueError, "marker history"):
+                    resume.quarantine_rollouts(str(self.active), 3, "cache", "")
+                marker.unlink()
+
+    def test_stale_marker_history_must_be_regular(self):
+        marker = self.active / f".microbatch-sync.marker.stale.{'0' * 64}"
+        marker.mkdir()
+        with self.assertRaisesRegex(ValueError, "regular"):
+            resume.quarantine_rollouts(str(self.active), 3, "cache", "")
+
+    def test_empty_active_marker_is_accepted(self):
+        marker = self.active / ".microbatch-sync.marker"
+        marker.touch()
+        resume.quarantine_rollouts(str(self.active), 3, "cache", "")
+        self.assertTrue(marker.is_file())
+
+    def test_malformed_active_marker_is_rejected(self):
+        marker = self.active / ".microbatch-sync.marker"
+        marker.write_text("incomplete publication\n")
+        with self.assertRaisesRegex(ValueError, "marker is invalid"):
+            resume.quarantine_rollouts(str(self.active), 3, "cache", "")
+
+    def test_completed_active_marker_is_preserved(self):
+        marker = self.active / ".microbatch-sync.marker"
+        marker.write_text("generation=rollouts/step_3 count=1 sha256=" + "0" * 64 + "\n")
+        resume.quarantine_rollouts(str(self.active), 3, "cache", "")
+        self.assertTrue(marker.is_file())
+
+    def test_future_active_marker_matches_and_moves_with_cache(self):
+        target = self.active / "rollouts/step_4"
+        target.mkdir(parents=True)
+        rank = target / "rank_0.bin"
+        rank.write_bytes(b"future")
+        marker = self.active / ".microbatch-sync.marker"
+        marker.write_text(f"generation=rollouts/step_4 count=1 sha256={hashlib.sha256(rank.read_bytes()).hexdigest()}\n")
+        resume.quarantine_rollouts(str(self.active), 3, "cache", "")
+        self.assertFalse(marker.exists())
+        self.assertTrue((self.active / ".rollout-quarantine/resume-step_3/.microbatch-sync.marker").is_file())
+
+    def test_future_active_marker_mismatch_is_rejected(self):
+        target = self.active / "rollouts/step_4"
+        target.mkdir(parents=True)
+        (target / "rank_0.bin").write_bytes(b"future")
+        marker = self.active / ".microbatch-sync.marker"
+        marker.write_text(f"generation=rollouts/step_4 count=2 sha256={'0' * 64}\n")
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            resume.quarantine_rollouts(str(self.active), 3, "cache", "")
+        self.assertTrue(marker.exists())
+        self.assertTrue((target / "rank_0.bin").exists())
 
     def test_future_cache_rejects_target_inode_change_before_rename(self):
         target = self.active / "rollouts/step_4"

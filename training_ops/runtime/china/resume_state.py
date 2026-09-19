@@ -195,9 +195,10 @@ def _cache_tree(target: Path) -> tuple[int, bool, tuple[int, int, int, int, int]
             _delivered_batch(target / "train_rollouts.bin")
     return total, True, _identity(target), tree
 
-def _future_plan(service_dir: str, step: int) -> list[dict]:
+def _future_plan(service_dir: str, step: int, receipts: dict[str, dict] | None = None) -> list[dict]:
     active = exact_run(service_dir)
     parent = active.parent
+    receipts = receipts or {}
     plans, roots = [], (parent / "rollouts", active / "rollouts", parent / ".incoming" / "rollouts", active / ".incoming" / "rollouts")
     for root in roots:
         if root.parent.is_symlink(): raise ValueError(f"restart rollout parent is a symlink: {root.parent}")  # noqa: E701
@@ -212,25 +213,43 @@ def _future_plan(service_dir: str, step: int) -> list[dict]:
             if not target.is_dir():
                 raise ValueError(f"future rollout step is not a directory: {target}")
             size, used, identity, tree = _cache_tree(target)
-            if used and int(match[1]) != step + 1:
-                raise ValueError(f"later cached rollout step blocks resume: {target}")
             if used:
                 plans.append({"root": root, "target": target, "step": int(match[1]), "bytes": size, "identity": identity, "tree": tree, "root_identity": _identity(root), "owner_identity": _identity(root.parent), "markers": []})
+        used_steps = {item["step"] for item in plans if item["root"] == root}
+        used_steps.update(value["step"] for value in receipts.values() if value["source_root"] == str(root))
+        if used_steps and used_steps != set(range(step + 1, max(used_steps) + 1)):
+            raise ValueError(f"later cached rollout steps are not contiguous: {root}")
         current = root / f"step_{step}"
         if current.is_symlink():
             raise ValueError(f"restart rollout step is a symlink: {current}")
         if current.is_dir() and (current / "train_rollouts.bin").exists():
             _delivered_batch(current / "train_rollouts.bin")
     for owner in {root.parent for root in roots}:
-        for marker in owner.glob(".microbatch-sync.marker*"):
+        if not owner.exists():
+            continue
+        for marker in owner.iterdir():
+            if not marker.name.startswith(".microbatch-sync.marker"):
+                continue
+            if marker.name != ".microbatch-sync.marker":
+                stale = re.fullmatch(r"\.microbatch-sync\.marker\.stale\.([a-f0-9]{64})", marker.name)
+                if not stale or marker.is_symlink():
+                    raise ValueError(f"microbatch marker history is invalid: {marker}")
+                regular(marker)
+                if digest(marker) != stale[1]:
+                    raise ValueError(f"microbatch marker history hash differs: {marker}")
+                continue
             if marker.is_symlink():
                 raise ValueError(f"microbatch marker is a symlink: {marker}")
             regular(marker)
-            match = re.fullmatch(r"generation=rollouts/step_([0-9]+) count=([1-9][0-9]*) sha256=([a-f0-9]{64})", marker.read_text().strip())
+            content = marker.read_text()
+            if not content:
+                continue
+            match = re.fullmatch(r"generation=rollouts/step_([0-9]+) count=([1-9][0-9]*) sha256=([a-f0-9]{64})\n?", content)
             if not match:
                 raise ValueError(f"microbatch marker is invalid: {marker}")
             marker_step = int(match[1])
-            if marker_step <= step: continue  # noqa: E701
+            if marker_step <= step:
+                continue
             matches = [item for item in plans if item["root"] == owner / "rollouts" and item["step"] == marker_step]
             if len(matches) != 1:
                 raise ValueError(f"future marker has no exact cache: {marker}")
@@ -271,10 +290,10 @@ def _write_receipt(path: Path, value: dict) -> dict:
 
 def _verify_receipt(path: Path, value: dict, service_dir: str, step: int) -> dict:
     required = {"run", "service_dir", "resume_step", "step", "source_root", "source", "source_root_identity", "tree", "markers", "bytes", "destination"}
-    if set(value) != required or value["run"] != Path(service_dir).parent.name or value["service_dir"] != service_dir or value["resume_step"] != step or value["step"] != step + 1:
+    if (set(value) != required or value["run"] != Path(service_dir).parent.name or value["service_dir"] != service_dir or value["resume_step"] != step or type(value["step"]) is not int or value["step"] <= step):
         raise ValueError(f"quarantine receipt scope differs: {path}")
     destination = Path(value["destination"])
-    if destination != path.with_suffix("") or destination.parent != path.parent or Path(value["source"]).name != destination.name:
+    if destination != path.with_suffix("") or destination.parent != path.parent or destination.name != f"step_{value['step']}" or Path(value["source"]).name != destination.name:
         raise ValueError(f"quarantine receipt destination differs: {path}")
     source, target = Path(value["source"]), destination
     if source.exists() and target.exists() or not source.exists() and not target.exists(): raise ValueError(f"quarantine receipt has duplicate or missing source/destination: {path}")  # noqa: E701
@@ -316,7 +335,7 @@ def _scan_quarantine(service_dir: str, step: int) -> dict[str, dict]:
 def _move_entry(source: Path, destination: Path, source_parent: tuple, destination_parent: tuple, tree: dict | None = None) -> None:
     source_root = open_directory(source.parent); destination_root = open_directory(destination.parent)  # noqa: E702
     try:
-        if _identity(source.parent) != source_parent or _fd_identity(source_root) != source_parent or _identity(destination.parent) != destination_parent or _fd_identity(destination_root) != destination_parent or tree is not None and _tree_payload(_cache_tree(source)[3]) != tree:
+        if _identity(source.parent) != tuple(source_parent) or _fd_identity(source_root) != tuple(source_parent) or _identity(destination.parent) != tuple(destination_parent) or _fd_identity(destination_root) != tuple(destination_parent) or tree is not None and _tree_payload(_cache_tree(source)[3]) != tree:
             raise ValueError(f"quarantine parent changed before rename: {source}")
         move_no_replace(source.name, destination.name, src_dir_fd=source_root, dst_dir_fd=destination_root)
     finally:
@@ -347,10 +366,12 @@ def quarantine_rollouts(service_dir: str, step: int, role: str, adapter: str, ex
     try:
         check_state(service_dir, step, role, adapter, expected, scan_rollouts=False)
         receipts = _scan_quarantine(service_dir, step)
-        plans, moved = _future_plan(service_dir, step), []
+        plans, moved = _future_plan(service_dir, step, receipts), []
         for item in plans:
             owner = item["root"].parent; destination = _safe_quarantine_dir(owner, step) / item["target"].name  # noqa: E702
             receipt_path = destination.with_name(destination.name + ".json")
+            if item["target"].exists() or item["target"].is_symlink():
+                item["root_identity"] = _identity(item["root"])
             source_present = item["target"].exists() or item["target"].is_symlink()
             value = receipts.get(str(item["target"]), {"run": Path(service_dir).parent.name, "service_dir": service_dir, "resume_step": step, "step": item["step"], "source_root": str(item["root"]), "source": str(item["target"]), "source_root_identity": list(item["root_identity"]), "tree": _tree_payload(item["tree"]), "markers": [{"source": str(marker), "destination": str(destination.parent / marker.name), "identity": list(identity), "sha256": digest(marker)} for marker, identity in item["markers"]], "bytes": item["bytes"], "destination": str(destination)})
             _write_receipt(receipt_path, value)
