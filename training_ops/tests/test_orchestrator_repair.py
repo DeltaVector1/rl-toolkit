@@ -178,6 +178,18 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertNotIn("for proc in /proc/[0-9]*", script)
         self.assertEqual(script.count("drain_rollout_publisher.py"), 2)
 
+    def test_rollout_guard_drain_stdout_cannot_pollute_json_evidence(self):
+        service_dir = "/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3"
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, '{"policy_step":3,"next_batch":4}\n')) as ssh:
+            self.assertEqual(
+                training_ops._resume_repair_state("n82", "rollout", service_dir, 3, role="cache"),
+                {"policy_step": 3, "next_batch": 4},
+            )
+        script = ssh.call_args.args[1]
+        guard = script.split("sudo python3 -", 1)[0]
+        self.assertIn("sync_microbatches.sh --microbatch >/dev/null", guard)
+        self.assertIn("sync_rollout_batches.sh >/dev/null", guard)
+
     def test_rollout_quarantine_reports_partial_hosts_without_parallel_mutation(self):
         run = "glm-perf-3"
         service_dir = f"{training_ops.run_root}/{run}/run_{run}"

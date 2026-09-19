@@ -360,12 +360,13 @@ class ResumeStateTest(unittest.TestCase):
             resume.quarantine_rollouts(str(self.active), 3, "origin", str(self.weight))
         self.assertTrue((target / "rank_0.bin").exists())
 
-    def test_resume_step_batch_requires_exact_delivery_marker_before_quarantine(self):
+    def test_resume_step_batch_without_delivery_marker_is_untouched(self):
         batch = self.active / "rollouts/step_3/train_rollouts.bin"
         batch.parent.mkdir(parents=True)
         batch.write_bytes(b"current")
-        with self.assertRaisesRegex(ValueError, "delivery marker"):
-            resume.quarantine_rollouts(str(self.active), 3, "origin", str(self.weight))
+        result = resume.quarantine_rollouts(str(self.active), 3, "origin", str(self.weight))
+        self.assertEqual(result["quarantined"], [])
+        self.assertEqual(batch.read_bytes(), b"current")
 
     def test_future_cache_quarantine_rejects_symlink_step(self):
         root = self.active / "rollouts"
@@ -381,6 +382,14 @@ class ResumeStateTest(unittest.TestCase):
         target.mkdir(parents=True)
         (target / "train_rollouts.bin.delivered").write_text("bad\n")
         with self.assertRaisesRegex(ValueError, "sidecar"):
+            resume.quarantine_rollouts(str(self.active), 3, "origin", str(self.weight))
+
+    def test_future_cache_rejects_malformed_delivery_marker(self):
+        target = self.active / "rollouts/step_4"
+        target.mkdir(parents=True)
+        (target / "train_rollouts.bin").write_bytes(b"future")
+        (target / "train_rollouts.bin.delivered").write_text("bad\n")
+        with self.assertRaisesRegex(ValueError, "delivery marker differs"):
             resume.quarantine_rollouts(str(self.active), 3, "origin", str(self.weight))
 
     def test_future_cache_rejects_mixed_rank_and_batch_tree(self):

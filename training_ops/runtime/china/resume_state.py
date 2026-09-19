@@ -222,8 +222,6 @@ def _future_plan(service_dir: str, step: int, receipts: dict[str, dict] | None =
         current = root / f"step_{step}"
         if current.is_symlink():
             raise ValueError(f"restart rollout step is a symlink: {current}")
-        if current.is_dir() and (current / "train_rollouts.bin").exists():
-            _delivered_batch(current / "train_rollouts.bin")
     for owner in {root.parent for root in roots}:
         if not owner.exists():
             continue

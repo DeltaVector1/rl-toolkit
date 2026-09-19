@@ -4491,8 +4491,8 @@ def _rollout_quarantine_guard(service_dir: str, *, orchestrator: bool = False) -
 container={shlex.quote(container)}
 state=$(sudo docker inspect --format '{{{{.Name}}}} {{{{.State.Running}}}}' "$container" 2>/dev/null || true)
 if [ -z "$state" ]; then listed=$(sudo docker ps -a --filter "name=^$container$" --format '{{{{.Names}}}}' 2>/dev/null) || exit 62; [ -z "$listed" ] || exit 62; else [ "$state" = "/$container false" ] || exit 62; fi
-sudo python3 {shlex.quote(drain)} {shlex.quote(service_dir)} {shlex.quote(micro)} --microbatch
-sudo python3 {shlex.quote(drain)} {shlex.quote(service_dir)} {shlex.quote(batch)}
+sudo python3 {shlex.quote(drain)} {shlex.quote(service_dir)} {shlex.quote(micro)} --microbatch >/dev/null
+sudo python3 {shlex.quote(drain)} {shlex.quote(service_dir)} {shlex.quote(batch)} >/dev/null
 """
 
 
