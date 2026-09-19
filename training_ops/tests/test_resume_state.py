@@ -231,6 +231,32 @@ class ResumeStateTest(unittest.TestCase):
         self.assertEqual(self.check(), {"policy_step": 3, "next_batch": 4, "sha256": self.sha, "size": self.weight.stat().st_size, "config_sha256": self.manifest["config_sha256"], "config_size": 2})
         self.assertEqual(self.check("trainer", digest=self.sha)["next_batch"], 4)
 
+    def test_cache_role_quarantines_without_a_local_adapter(self):
+        self.weight.unlink()
+        target = self.active / "rollouts/step_4"
+        target.mkdir(parents=True)
+        (target / "rank_0.bin").write_bytes(b"peer-cache")
+        result = resume.quarantine_rollouts(str(self.active), 3, "cache", "")
+        self.assertEqual(result["next_batch"], 4)
+        self.assertFalse(target.exists())
+
+    def test_cache_role_rejects_later_stable_broadcast(self):
+        later = self.active / "broadcasts/step_4/STABLE"
+        later.parent.mkdir()
+        later.touch()
+        with self.assertRaisesRegex(ValueError, "later stable policy"):
+            resume.check_state(str(self.active), 3, "cache", "")
+
+    def test_cache_role_keeps_unrelated_run_data_untouched(self):
+        other = self.active.parent.parent / "other/run_other/rollouts/step_4"
+        other.mkdir(parents=True)
+        (other / "rank_0.bin").write_bytes(b"other-cache")
+        target = self.active / "rollouts/step_4"
+        target.mkdir(parents=True)
+        (target / "rank_0.bin").write_bytes(b"peer-cache")
+        resume.quarantine_rollouts(str(self.active), 3, "cache", "")
+        self.assertTrue((other / "rank_0.bin").exists())
+
     def test_unstable_policy_three_cannot_resume_from_stable_two(self):
         (self.target / "STABLE").unlink()
         previous = self.active / "broadcasts/step_2"

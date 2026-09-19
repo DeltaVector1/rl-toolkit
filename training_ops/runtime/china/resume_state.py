@@ -86,7 +86,7 @@ def write_config(config: str, control: str, step: int) -> str:
 
 
 def check_state(service_dir: str, step: int, role: str, adapter: str, expected: str = "", *, scan_rollouts: bool = True) -> dict:
-    if type(step) is not int or step < 0 or role not in {"origin", "trainer", "orchestrator"}:
+    if type(step) is not int or step < 0 or role not in {"origin", "trainer", "orchestrator", "cache"}:
         raise ValueError("invalid explicit restart state")
     active = Path(service_dir)
     if not active.is_absolute() or active.name != f"run_{active.parent.name}":
@@ -97,7 +97,7 @@ def check_state(service_dir: str, step: int, role: str, adapter: str, expected: 
         if directory.is_symlink():
             raise ValueError(f"restart directory is a symlink: {directory}")
     weight = target / "adapter_model.safetensors"
-    if Path(adapter) != weight:
+    if role != "cache" and Path(adapter) != weight:
         raise ValueError("resume adapter must be the exact requested policy path")
     result = {"policy_step": step, "next_batch": step + 1}
     if role == "origin":
@@ -117,9 +117,9 @@ def check_state(service_dir: str, step: int, role: str, adapter: str, expected: 
     elif role == "trainer":
         if not re.fullmatch(r"[a-f0-9]{64}", expected) or digest(weight) != expected:
             raise ValueError("trainer resume adapter differs from the stable policy")
-    if role in {"origin", "orchestrator"}:
-        regular(target / "STABLE")
-        for published in target.parent.glob("step_*/STABLE"):
+    if role in {"origin", "orchestrator", "cache"}:
+        if role != "cache": regular(target / "STABLE")  # noqa: E701
+        for published in target.parent.glob("step_*/STABLE") if target.parent.exists() else ():
             match = re.fullmatch(r"step_(\d+)", published.parent.name)
             if match and int(match[1]) > step:
                 raise ValueError(f"later stable policy conflicts with restart: {published}")

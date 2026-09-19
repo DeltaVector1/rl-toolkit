@@ -4469,7 +4469,7 @@ def _resume_repair_state(host: str, action: str, service_dir: str, step: int, di
             + '\n)\n[[ "$state" = stopped || "$state" = absent ]] || exit 62\n'
         )
     elif action == "rollout":
-        prefix = _rollout_quarantine_guard(service_dir, orchestrator=role == "orchestrator")
+        prefix = _rollout_quarantine_guard(service_dir, orchestrator=host == orchestrator_host)
     interpreter = "sudo python3" if action in {"partial", "quarantine", "rollout"} or role else "python3"
     code, output = _ssh(host, prefix + f"{interpreter} - {arguments} <<'PY'\n{source}\nPY", timeout=600)
     if code:
@@ -4510,20 +4510,20 @@ def _repair_rollout_quarantine(arguments: list[str]) -> str:
         raise Refused("stable resume adapter has no exact SHA-256 identity")
     hosts_to_check = list(dict.fromkeys([*trainer_hosts, orchestrator_host]))
     for host in trainer_hosts:
-        if host != trainer_head: _resume_repair_state(host, "policy", service_dir, step, digest, role="trainer", adapter=adapter)  # noqa: E701
-    _resume_repair_state(orchestrator_host, "policy", service_dir, step, role="orchestrator", adapter=adapter)
+        if host != trainer_head: _resume_repair_state(host, "policy", service_dir, step, role="cache")  # noqa: E701
+    _resume_repair_state(orchestrator_host, "policy", service_dir, step, role="cache")
     blocked = {}
     for host in hosts_to_check: code, output = _ssh(host, _rollout_quarantine_guard(service_dir, orchestrator=host == orchestrator_host), timeout=180); blocked.update({host: output.strip()} if code else {})  # noqa: E701,E702
     if blocked:
         raise Refused(f"rollout quarantine drain blocked: completed=[] blocked={blocked}")
     receipts, blocked = {}, {}
     for host in hosts_to_check:
-        try: receipts[host] = _resume_repair_state(host, "rollout", service_dir, step, "" if host == orchestrator_host else digest, "orchestrator" if host == orchestrator_host else "trainer", adapter)  # noqa: E701
+        try: receipts[host] = _resume_repair_state(host, "rollout", service_dir, step, "" if host == trainer_head else "", "origin" if host == trainer_head else "cache", adapter if host == trainer_head else "")  # noqa: E701
         except (Refused, RuntimeError, OSError) as error: blocked[host] = str(error)  # noqa: E701
     if blocked:
         raise Refused(f"partial rollout quarantine: completed={sorted(receipts)} blocked={blocked}; retry is required")
-    for host in trainer_hosts: _check_adapter_restart(host, service_dir, step, "origin" if host == trainer_head else "trainer", adapter, "" if host == trainer_head else digest)  # noqa: E701
-    _check_adapter_restart(orchestrator_host, service_dir, step, "orchestrator", adapter)
+    for host in trainer_hosts: _check_adapter_restart(host, service_dir, step, "origin" if host == trainer_head else "cache", adapter if host == trainer_head else "")  # noqa: E701
+    _check_adapter_restart(orchestrator_host, service_dir, step, "cache", "")
     bytes_moved = sum(int(value.get("bytes", 0)) for value in receipts.values()); paths = [f"{host}:{','.join(value.get('quarantined', [])) or 'none'}" for host, value in receipts.items()]  # noqa: E702
     result = f"quarantined future rollout caches: run={run} resume_step={step} next_batch={step + 1} hosts={','.join(hosts_to_check)} bytes={bytes_moved} paths={' ; '.join(paths)}"
     print(result)

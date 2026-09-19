@@ -184,7 +184,7 @@ class OrchestratorRepairTest(unittest.TestCase):
         calls = []
 
         def state(host, action, *_args, **kwargs):
-            calls.append((host, action))
+            calls.append((host, action, kwargs.get("role") or (_args[3] if len(_args) > 3 else "")))
             if action == "policy" and kwargs.get("role") == "origin":
                 return {"sha256": "a" * 64}
             if action == "rollout" and host == training_ops.trainer_hosts[-1]:
@@ -202,7 +202,9 @@ class OrchestratorRepairTest(unittest.TestCase):
                 training_ops._repair_rollout_quarantine(
                     [run, "3", f"{service_dir}/broadcasts/step_3/adapter_model.safetensors"]
                 )
-        self.assertEqual([action for _, action in calls].count("rollout"), len(training_ops.trainer_hosts) + 1)
+        self.assertEqual([action for _, action, _ in calls].count("rollout"), len(training_ops.trainer_hosts) + 1)
+        self.assertIn((training_ops.trainer_head, "rollout", "origin"), calls)
+        self.assertTrue(all(role == "cache" for _, action, role in calls if action == "rollout" and _ != training_ops.trainer_head))
 
     def test_rollout_mutation_rechecks_service_after_drain(self):
         service_dir = "/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3"
