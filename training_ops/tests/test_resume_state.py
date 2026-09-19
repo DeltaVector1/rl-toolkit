@@ -252,6 +252,27 @@ class ResumeStateTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "later stable policy"):
             resume.check_state(str(self.active), 3, "cache", "")
 
+    def test_trainer_cache_rejects_nonempty_optimizer_checkpoint(self):
+        checkpoint = self.active / "checkpoints/step_3/state.pt"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_bytes(b"optimizer")
+        with self.assertRaisesRegex(ValueError, "optimizer checkpoint"):
+            resume.check_state(str(self.active), 3, "cache", "")
+
+    def test_orchestrator_cache_allows_progress_checkpoint_without_adapter(self):
+        self.weight.unlink()
+        progress = self.active / "checkpoints/orchestrator/progress.pt"
+        progress.parent.mkdir(parents=True)
+        progress.write_bytes(b"progress")
+        self.assertEqual(resume.check_state(str(self.active), 3, "orchestrator-cache", "")["next_batch"], 4)
+
+    def test_orchestrator_cache_rejects_later_stable_broadcast(self):
+        later = self.active / "broadcasts/step_4/STABLE"
+        later.parent.mkdir()
+        later.touch()
+        with self.assertRaisesRegex(ValueError, "later stable policy"):
+            resume.check_state(str(self.active), 3, "orchestrator-cache", "")
+
     def test_cache_role_keeps_unrelated_run_data_untouched(self):
         other = self.active.parent.parent / "other/run_other/rollouts/step_4"
         other.mkdir(parents=True)

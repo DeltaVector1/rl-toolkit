@@ -86,19 +86,19 @@ def write_config(config: str, control: str, step: int) -> str:
 
 
 def check_state(service_dir: str, step: int, role: str, adapter: str, expected: str = "", *, scan_rollouts: bool = True) -> dict:
-    if type(step) is not int or step < 0 or role not in {"origin", "trainer", "orchestrator", "cache"}:
+    if type(step) is not int or step < 0 or role not in {"origin", "trainer", "orchestrator", "cache", "orchestrator-cache"}:
         raise ValueError("invalid explicit restart state")
     active = Path(service_dir)
     if not active.is_absolute() or active.name != f"run_{active.parent.name}":
         raise ValueError("restart run directory is not exact")
     parent = active.parent
-    if role == "cache" and any(path.is_symlink() or not path.is_dir() for path in (parent, active, active / "broadcasts")): raise ValueError("cache run scaffolding is missing or unsafe")  # noqa: E701
+    if role in {"cache", "orchestrator-cache"} and any(path.is_symlink() or not path.is_dir() for path in (parent, active, active / "broadcasts")): raise ValueError("cache run scaffolding is missing or unsafe")  # noqa: E701
     target = active / "broadcasts" / f"step_{step}"
     for directory in (parent, active, active / "control", active / "broadcasts", target):
         if directory.is_symlink():
             raise ValueError(f"restart directory is a symlink: {directory}")
     weight = target / "adapter_model.safetensors"
-    if role != "cache" and Path(adapter) != weight:
+    if role not in {"cache", "orchestrator-cache"} and Path(adapter) != weight:
         raise ValueError("resume adapter must be the exact requested policy path")
     result = {"policy_step": step, "next_batch": step + 1}
     if role == "origin":
@@ -118,13 +118,13 @@ def check_state(service_dir: str, step: int, role: str, adapter: str, expected: 
     elif role == "trainer":
         if not re.fullmatch(r"[a-f0-9]{64}", expected) or digest(weight) != expected:
             raise ValueError("trainer resume adapter differs from the stable policy")
-    if role in {"origin", "orchestrator", "cache"}:
-        if role != "cache": regular(target / "STABLE")  # noqa: E701
+    if role in {"origin", "orchestrator", "cache", "orchestrator-cache"}:
+        if role not in {"cache", "orchestrator-cache"}: regular(target / "STABLE")  # noqa: E701
         for published in target.parent.glob("step_*/STABLE") if target.parent.exists() else ():
             match = re.fullmatch(r"step_(\d+)", published.parent.name)
             if match and int(match[1]) > step:
                 raise ValueError(f"later stable policy conflicts with restart: {published}")
-    if role != "orchestrator":
+    if role not in {"orchestrator", "orchestrator-cache"}:
         for checkpoint in (parent / "checkpoints", active / "checkpoints"):
             if checkpoint.is_symlink() or (checkpoint.exists() and any(checkpoint.iterdir())):
                 raise ValueError(f"optimizer checkpoint conflicts with adapter restart: {checkpoint}")

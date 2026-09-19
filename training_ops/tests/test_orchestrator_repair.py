@@ -204,7 +204,7 @@ class OrchestratorRepairTest(unittest.TestCase):
                 )
         self.assertEqual([action for _, action, _ in calls].count("rollout"), len(training_ops.trainer_hosts) + 1)
         self.assertIn((training_ops.trainer_head, "rollout", "origin"), calls)
-        self.assertTrue(all(role == "cache" for _, action, role in calls if action == "rollout" and _ != training_ops.trainer_head))
+        self.assertTrue(all(role == ("orchestrator-cache" if host == training_ops.orchestrator_host else "cache") for host, action, role in calls if action == "rollout" and host != training_ops.trainer_head))
 
     def test_rollout_mutation_rechecks_service_after_drain(self):
         service_dir = "/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3"
