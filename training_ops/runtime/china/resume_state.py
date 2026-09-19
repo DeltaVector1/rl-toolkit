@@ -92,6 +92,7 @@ def check_state(service_dir: str, step: int, role: str, adapter: str, expected: 
     if not active.is_absolute() or active.name != f"run_{active.parent.name}":
         raise ValueError("restart run directory is not exact")
     parent = active.parent
+    if role == "cache" and any(path.is_symlink() or not path.is_dir() for path in (parent, active, active / "broadcasts")): raise ValueError("cache run scaffolding is missing or unsafe")  # noqa: E701
     target = active / "broadcasts" / f"step_{step}"
     for directory in (parent, active, active / "control", active / "broadcasts", target):
         if directory.is_symlink():

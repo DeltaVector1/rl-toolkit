@@ -240,6 +240,11 @@ class ResumeStateTest(unittest.TestCase):
         self.assertEqual(result["next_batch"], 4)
         self.assertFalse(target.exists())
 
+    def test_cache_role_rejects_missing_run_scaffolding(self):
+        missing = Path(self.temporary.name) / "missing/run_missing"
+        with self.assertRaisesRegex(ValueError, "scaffolding"):
+            resume.check_state(str(missing), 3, "cache", "")
+
     def test_cache_role_rejects_later_stable_broadcast(self):
         later = self.active / "broadcasts/step_4/STABLE"
         later.parent.mkdir()
