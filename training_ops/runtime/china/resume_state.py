@@ -85,7 +85,7 @@ def write_config(config: str, control: str, step: int) -> str:
         os.close(descriptor)
 
 
-def check_state(service_dir: str, step: int, role: str, adapter: str, expected: str = "") -> dict:
+def check_state(service_dir: str, step: int, role: str, adapter: str, expected: str = "", *, scan_rollouts: bool = True) -> dict:
     if type(step) is not int or step < 0 or role not in {"origin", "trainer", "orchestrator"}:
         raise ValueError("invalid explicit restart state")
     active = Path(service_dir)
@@ -99,6 +99,36 @@ def check_state(service_dir: str, step: int, role: str, adapter: str, expected: 
     weight = target / "adapter_model.safetensors"
     if Path(adapter) != weight:
         raise ValueError("resume adapter must be the exact requested policy path")
+    result = {"policy_step": step, "next_batch": step + 1}
+    if role == "origin":
+        regular(target / "adapter_manifest.json")
+        manifest = json.loads((target / "adapter_manifest.json").read_text())
+        if type(manifest.get("target_step")) is not int or manifest["target_step"] != step:
+            raise ValueError("stable adapter manifest has a different policy step")
+        actual = digest(weight)
+        if manifest.get("target_sha256") != actual or manifest.get("target_size") != weight.stat().st_size:
+            raise ValueError("stable adapter weight identity differs")
+        config = target / "adapter_config.json"
+        if manifest.get("config_sha256") != digest(config) or manifest.get("config_size") != config.stat().st_size:
+            raise ValueError("stable adapter config identity differs")
+        result.update({"sha256": actual, "size": weight.stat().st_size,
+                       "config_sha256": manifest["config_sha256"],
+                       "config_size": manifest["config_size"]})
+    elif role == "trainer":
+        if not re.fullmatch(r"[a-f0-9]{64}", expected) or digest(weight) != expected:
+            raise ValueError("trainer resume adapter differs from the stable policy")
+    if role in {"origin", "orchestrator"}:
+        regular(target / "STABLE")
+        for published in target.parent.glob("step_*/STABLE"):
+            match = re.fullmatch(r"step_(\d+)", published.parent.name)
+            if match and int(match[1]) > step:
+                raise ValueError(f"later stable policy conflicts with restart: {published}")
+    if role != "orchestrator":
+        for checkpoint in (parent / "checkpoints", active / "checkpoints"):
+            if checkpoint.is_symlink() or (checkpoint.exists() and any(checkpoint.iterdir())):
+                raise ValueError(f"optimizer checkpoint conflicts with adapter restart: {checkpoint}")
+    if not scan_rollouts:
+        return result
     # Do not remove evidence. The operator must quarantine old binaries first.
     for root in (parent / "rollouts", active / "rollouts", parent / ".incoming" / "rollouts", active / ".incoming" / "rollouts"):
         if root.is_symlink():
@@ -114,36 +144,236 @@ def check_state(service_dir: str, step: int, role: str, adapter: str, expected: 
             for cached in directory.rglob("*"):
                 if cached.name == "train_rollouts.bin" or re.fullmatch(r"rank_\d+\.bin", cached.name):
                     raise ValueError(f"cached rollout batch blocks restart: {cached}")
-    if role != "orchestrator":
-        for checkpoint in (parent / "checkpoints", active / "checkpoints"):
-            if checkpoint.is_symlink() or (checkpoint.exists() and any(checkpoint.iterdir())):
-                raise ValueError(f"optimizer checkpoint conflicts with adapter restart: {checkpoint}")
-    if role in {"origin", "orchestrator"}:
-        regular(target / "STABLE")
-        for published in target.parent.glob("step_*/STABLE"):
-            match = re.fullmatch(r"step_(\d+)", published.parent.name)
-            if match and int(match[1]) > step:
-                raise ValueError(f"later stable policy conflicts with restart: {published}")
-    result = {"policy_step": step, "next_batch": step + 1}
-    if role == "origin":
-        regular(target / "adapter_manifest.json")
-        manifest = json.loads((target / "adapter_manifest.json").read_text())
-        if type(manifest.get("target_step")) is not int or manifest["target_step"] != step:
-            raise ValueError("stable adapter manifest has a different policy step")
-        actual = digest(weight)
-        if manifest.get("target_sha256") != actual or manifest.get("target_size") != weight.stat().st_size:
-            raise ValueError("stable adapter weight identity differs")
-        config = target / "adapter_config.json"
-        if manifest.get("config_sha256") != digest(config) or manifest.get("config_size") != config.stat().st_size:
-            raise ValueError("stable adapter config identity differs")
-        result["sha256"] = actual
-        result["size"] = weight.stat().st_size
-        result["config_sha256"] = manifest["config_sha256"]
-        result["config_size"] = manifest["config_size"]
-    elif role == "trainer":
-        if not re.fullmatch(r"[a-f0-9]{64}", expected) or digest(weight) != expected:
-            raise ValueError("trainer resume adapter differs from the stable policy")
     return result
+
+
+def _delivered_batch(batch: Path) -> None:
+    regular(batch); marker = batch.with_name(batch.name + ".delivered")  # noqa: E702
+    try: regular(marker)  # noqa: E701
+    except OSError as error: raise ValueError(f"batch delivery marker is missing: {marker}") from error  # noqa: E701
+    expected = digest(batch)
+    if marker.read_text() != expected + "\n": raise ValueError(f"batch delivery marker differs: {marker}")  # noqa: E701
+
+def _identity(path: Path) -> tuple[int, int, int, int, int]:
+    info = path.lstat()
+    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns
+
+def _tree_payload(tree: dict) -> dict:
+    return {name: {"identity": list(value["identity"]), "sha256": value["sha256"]} for name, value in tree.items()}  # noqa: E501
+
+def _cache_tree(target: Path) -> tuple[int, bool, tuple[int, int, int, int, int], dict]:
+    total, binaries, sidecar, tree = 0, [], False, {}
+    for path in (target, *target.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"cached rollout tree contains a symlink: {path}")
+        relative = "" if path == target else path.relative_to(target).as_posix()
+        if path.is_dir():
+            tree[relative or "."] = {"identity": _identity(path), "sha256": ""}
+            if relative and relative != "train" and not relative.startswith("train/"):
+                raise ValueError(f"cached rollout tree has an unexpected directory: {path}")
+            continue
+        binary = relative in {"train_rollouts.bin", "train_rollouts.bin.delivered"} or re.fullmatch(r"rank_[0-9]+\.bin", relative)
+        trace = relative in {"train/effective/traces.jsonl", "train/all/traces.jsonl"}
+        if not binary and not trace:
+            raise ValueError(f"cached rollout tree has an unexpected entry: {path}")
+        regular(path); total += path.stat().st_size  # noqa: E702
+        tree[relative] = {"identity": _identity(path), "sha256": digest(path)}
+        if relative == "train_rollouts.bin.delivered": sidecar = True  # noqa: E701
+        if binary and relative.endswith(".bin") and relative != "train_rollouts.bin.delivered":
+            binaries.append(relative)
+    if sidecar and "train_rollouts.bin" not in binaries:
+        raise ValueError(f"cached rollout tree has a sidecar without train_rollouts.bin: {target}")
+    if not binaries: return 0, False, _identity(target), tree  # noqa: E701
+    if "train_rollouts.bin" in binaries and any(name.startswith("rank_") for name in binaries):
+        raise ValueError(f"cached rollout tree mixes rank and train_rollouts.bin: {target}")
+    if any(name.startswith("rank_") for name in binaries) and "rank_0.bin" not in binaries:
+        raise ValueError(f"cached rollout tree has no rank_0.bin: {target}")
+    if "train_rollouts.bin" in binaries:
+        delivered = target / "train_rollouts.bin.delivered"
+        if delivered.exists() or delivered.is_symlink():
+            _delivered_batch(target / "train_rollouts.bin")
+    return total, True, _identity(target), tree
+
+def _future_plan(service_dir: str, step: int) -> list[dict]:
+    active = exact_run(service_dir)
+    parent = active.parent
+    plans, roots = [], (parent / "rollouts", active / "rollouts", parent / ".incoming" / "rollouts", active / ".incoming" / "rollouts")
+    for root in roots:
+        if root.parent.is_symlink(): raise ValueError(f"restart rollout parent is a symlink: {root.parent}")  # noqa: E701
+        if root.is_symlink():
+            raise ValueError(f"restart rollout directory is a symlink: {root}")
+        if not root.exists():
+            continue
+        for target in root.iterdir():
+            match = re.fullmatch(r"step_([0-9]+)", target.name)
+            if not match or int(match[1]) <= step: continue  # noqa: E701
+            if target.is_symlink(): raise ValueError(f"future rollout step is a symlink: {target}")  # noqa: E701
+            if not target.is_dir():
+                raise ValueError(f"future rollout step is not a directory: {target}")
+            size, used, identity, tree = _cache_tree(target)
+            if used and int(match[1]) != step + 1:
+                raise ValueError(f"later cached rollout step blocks resume: {target}")
+            if used:
+                plans.append({"root": root, "target": target, "step": int(match[1]), "bytes": size, "identity": identity, "tree": tree, "root_identity": _identity(root), "owner_identity": _identity(root.parent), "markers": []})
+        current = root / f"step_{step}"
+        if current.is_symlink():
+            raise ValueError(f"restart rollout step is a symlink: {current}")
+        if current.is_dir() and (current / "train_rollouts.bin").exists():
+            _delivered_batch(current / "train_rollouts.bin")
+    for owner in {root.parent for root in roots}:
+        for marker in owner.glob(".microbatch-sync.marker*"):
+            if marker.is_symlink():
+                raise ValueError(f"microbatch marker is a symlink: {marker}")
+            regular(marker)
+            match = re.fullmatch(r"generation=rollouts/step_([0-9]+) count=([1-9][0-9]*) sha256=([a-f0-9]{64})", marker.read_text().strip())
+            if not match:
+                raise ValueError(f"microbatch marker is invalid: {marker}")
+            marker_step = int(match[1])
+            if marker_step <= step: continue  # noqa: E701
+            matches = [item for item in plans if item["root"] == owner / "rollouts" and item["step"] == marker_step]
+            if len(matches) != 1:
+                raise ValueError(f"future marker has no exact cache: {marker}")
+            target = matches[0]["target"]
+            source = target / "rank_0.bin"
+            if not source.is_file() or digest(source) != match[3] or int(match[2]) != len(list(target.glob("rank_*.bin"))):
+                raise ValueError(f"future marker does not match rank_0.bin: {marker}")
+            matches[0]["markers"].append((marker, _identity(marker)))
+    return plans
+
+def _safe_quarantine_dir(owner: Path, step: int) -> Path:
+    root = owner / ".rollout-quarantine"
+    for path in (root, root / f"resume-step_{step}"):
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or not path.is_dir() or path.stat().st_uid != os.geteuid() or stat.S_IMODE(path.stat().st_mode) != 0o700: raise ValueError(f"quarantine path is not a private directory: {path}")  # noqa: E701
+        else: path.mkdir(mode=0o700)  # noqa: E701
+    return root / f"resume-step_{step}"
+
+def _fd_identity(descriptor: int) -> tuple[int, int, int, int, int]:
+    info = os.fstat(descriptor); return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns  # noqa: E702
+
+def _verify_tree(path: Path, expected: dict) -> None:
+    actual = _tree_payload(_cache_tree(path)[3])
+    if actual != expected: raise ValueError(f"quarantine tree identity differs: {path}")  # noqa: E701
+
+def _write_receipt(path: Path, value: dict) -> dict:
+    raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    except FileExistsError:
+        info = path.lstat()
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600 or json.loads(path.read_text()) != value:
+            raise ValueError(f"quarantine receipt differs: {path}")
+        return value
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(raw); stream.flush(); os.fsync(stream.fileno())  # noqa: E702
+    return value
+
+def _verify_receipt(path: Path, value: dict, service_dir: str, step: int) -> dict:
+    required = {"run", "service_dir", "resume_step", "step", "source_root", "source", "source_root_identity", "tree", "markers", "bytes", "destination"}
+    if set(value) != required or value["run"] != Path(service_dir).parent.name or value["service_dir"] != service_dir or value["resume_step"] != step or value["step"] != step + 1:
+        raise ValueError(f"quarantine receipt scope differs: {path}")
+    destination = Path(value["destination"])
+    if destination != path.with_suffix("") or destination.parent != path.parent or Path(value["source"]).name != destination.name:
+        raise ValueError(f"quarantine receipt destination differs: {path}")
+    source, target = Path(value["source"]), destination
+    if source.exists() and target.exists() or not source.exists() and not target.exists(): raise ValueError(f"quarantine receipt has duplicate or missing source/destination: {path}")  # noqa: E701
+    if source.exists() and _identity(Path(value["source_root"])) != tuple(value["source_root_identity"]): raise ValueError(f"quarantine source root changed: {path}")  # noqa: E701
+    _verify_tree(source if source.exists() else target, value["tree"])
+    for marker in value["markers"]:
+        source_marker, destination_marker = Path(marker["source"]), Path(marker["destination"])
+        if source_marker.exists() and destination_marker.exists() or not source_marker.exists() and not destination_marker.exists():
+            raise ValueError(f"quarantine receipt marker state differs: {path}")
+        chosen = source_marker if source_marker.exists() else destination_marker
+        if _identity(chosen) != tuple(marker["identity"]) or digest(chosen) != marker["sha256"]:
+            raise ValueError(f"quarantine receipt marker differs: {path}")
+    return value
+
+def _scan_quarantine(service_dir: str, step: int) -> dict[str, dict]:
+    active = exact_run(service_dir)
+    owners = {active.parent, active, active.parent / ".incoming", active / ".incoming"}
+    source_roots = {owner / "rollouts" for owner in owners}
+    receipts = {}
+    for owner in owners:
+        root = owner / ".rollout-quarantine" / f"resume-step_{step}"
+        if not root.exists(): continue  # noqa: E701
+        if root.is_symlink() or not root.is_dir() or root.stat().st_uid != os.geteuid() or stat.S_IMODE(root.stat().st_mode) != 0o700: raise ValueError(f"quarantine path is not a private directory: {root}")  # noqa: E701
+        targets, markers = [], []
+        for path in root.iterdir():
+            if path.name.endswith(".json"):
+                if not re.fullmatch(r"step_[0-9]+\.json", path.name) or path.is_symlink(): raise ValueError(f"quarantine receipt is unsafe: {path}")  # noqa: E701
+                value = json.loads(path.read_text())
+                if Path(value.get("source_root", "")) not in source_roots or Path(value.get("source", "")).parent != Path(value.get("source_root", "")) or value.get("source", "") in receipts: raise ValueError(f"quarantine receipt source differs: {path}")  # noqa: E701
+                receipts[value.get("source", "")] = _verify_receipt(path, value, service_dir, step)
+            elif path.name.startswith("step_"): targets.append(path)  # noqa: E701
+            elif path.name.startswith(".microbatch-sync.marker"): markers.append(path)  # noqa: E701
+            else:
+                raise ValueError(f"quarantine has an unexpected entry: {path}")
+        allowed = {marker.get("destination") for value in receipts.values() for marker in value["markers"]}
+        if any(not any(value.get("destination") == str(target) for value in receipts.values()) for target in targets) or any(str(marker) not in allowed for marker in markers): raise ValueError(f"quarantine entry has no exact receipt: {root}")  # noqa: E701
+    return receipts
+
+def _move_entry(source: Path, destination: Path, source_parent: tuple, destination_parent: tuple, tree: dict | None = None) -> None:
+    source_root = open_directory(source.parent); destination_root = open_directory(destination.parent)  # noqa: E702
+    try:
+        if _identity(source.parent) != source_parent or _fd_identity(source_root) != source_parent or _identity(destination.parent) != destination_parent or _fd_identity(destination_root) != destination_parent or tree is not None and _tree_payload(_cache_tree(source)[3]) != tree:
+            raise ValueError(f"quarantine parent changed before rename: {source}")
+        move_no_replace(source.name, destination.name, src_dir_fd=source_root, dst_dir_fd=destination_root)
+    finally:
+        os.close(source_root); os.close(destination_root)  # noqa: E702
+
+def _publisher_locks(service_dir: str) -> list[int]:
+    active = exact_run(service_dir)
+    locks = []
+    try:
+        for owner in (active.parent, active, active.parent / ".incoming", active / ".incoming"):
+            if owner.is_symlink(): raise ValueError(f"publisher lock owner is a symlink: {owner}")  # noqa: E701
+            for name in (".batch-sync.lock", ".microbatch-sync.lock"):
+                lock = owner / name
+                if lock.is_symlink(): raise ValueError(f"publisher lock is a symlink: {lock}")  # noqa: E701
+                try: descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW); locks.append(descriptor)  # noqa: E701,E702
+                except FileNotFoundError: continue  # noqa: E701
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode) or _fd_identity(descriptor) != (expected := _identity(lock)): raise ValueError(f"publisher lock identity differs: {lock}")  # noqa: E701
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if _identity(lock) != expected or _fd_identity(descriptor) != expected: raise ValueError(f"publisher lock changed during lock: {lock}")  # noqa: E701
+    except BaseException:
+        for descriptor in locks: os.close(descriptor)  # noqa: E701
+        raise
+    return locks
+
+
+def quarantine_rollouts(service_dir: str, step: int, role: str, adapter: str, expected: str = "") -> dict:
+    locks = _publisher_locks(service_dir)
+    try:
+        check_state(service_dir, step, role, adapter, expected, scan_rollouts=False)
+        receipts = _scan_quarantine(service_dir, step)
+        plans, moved = _future_plan(service_dir, step), []
+        for item in plans:
+            owner = item["root"].parent; destination = _safe_quarantine_dir(owner, step) / item["target"].name  # noqa: E702
+            receipt_path = destination.with_name(destination.name + ".json")
+            source_present = item["target"].exists() or item["target"].is_symlink()
+            value = receipts.get(str(item["target"]), {"run": Path(service_dir).parent.name, "service_dir": service_dir, "resume_step": step, "step": item["step"], "source_root": str(item["root"]), "source": str(item["target"]), "source_root_identity": list(item["root_identity"]), "tree": _tree_payload(item["tree"]), "markers": [{"source": str(marker), "destination": str(destination.parent / marker.name), "identity": list(identity), "sha256": digest(marker)} for marker, identity in item["markers"]], "bytes": item["bytes"], "destination": str(destination)})
+            _write_receipt(receipt_path, value)
+            for marker in value["markers"]:
+                source_marker, marker_destination = Path(marker["source"]), Path(marker["destination"])
+                if source_marker.exists() or source_marker.is_symlink():
+                    if _identity(source_marker) != tuple(marker["identity"]): raise ValueError(f"microbatch marker changed before quarantine: {source_marker}")  # noqa: E701
+                    if marker_destination.exists() or marker_destination.is_symlink(): raise ValueError(f"quarantine marker destination exists: {marker_destination}")  # noqa: E701
+                    _move_entry(source_marker, marker_destination, _identity(source_marker.parent), _identity(marker_destination.parent))
+                elif not marker_destination.is_file(): raise ValueError(f"quarantine marker disappeared: {source_marker}")  # noqa: E701
+            if item["target"].exists() or item["target"].is_symlink():
+                if _identity(item["target"]) != item["identity"] or _tree_payload(_cache_tree(item["target"])[3]) != value["tree"]: raise ValueError(f"cached rollout changed before quarantine: {item['target']}")  # noqa: E701
+                if destination.exists() or destination.is_symlink(): raise ValueError(f"quarantine destination already exists: {destination}")  # noqa: E701
+                _move_entry(item["target"], destination, item["root_identity"], _identity(destination.parent), value["tree"])
+            elif not destination.is_dir() or destination.is_symlink():
+                raise ValueError(f"quarantine source disappeared: {item['target']}")
+            _verify_receipt(receipt_path, value, service_dir, step)
+            if source_present: moved.append((str(destination), item["bytes"]))  # noqa: E701
+        result = check_state(service_dir, step, role, adapter, expected)
+        result.update({"quarantined": [path for path, _ in moved], "bytes": sum(size for _, size in moved)})
+        return result
+    finally:
+        for descriptor in locks:
+            os.close(descriptor)
 
 
 def exact_run(service_dir: str) -> Path:
@@ -378,7 +608,14 @@ if __name__ == "__main__":
         elif sys.argv[1] == "completed":
             print(json.dumps(completed_batch(sys.argv[2], int(sys.argv[3]), sys.argv[4])))
         elif sys.argv[1] in {"partial", "quarantine"}:
-            print(json.dumps(partial_rollout(sys.argv[2], int(sys.argv[3]), quarantine=sys.argv[1] == "quarantine")))
+            if sys.argv[1] == "quarantine" and len(sys.argv) >= 7:
+                print(json.dumps(quarantine_rollouts(*[sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6]]), sort_keys=True))
+            else:
+                print(json.dumps(partial_rollout(sys.argv[2], int(sys.argv[3]), quarantine=sys.argv[1] == "quarantine")))
+        elif sys.argv[1] == "policy":
+            print(json.dumps(check_state(sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6], scan_rollouts=False), sort_keys=True))
+        elif sys.argv[1] == "rollout":
+            print(json.dumps(quarantine_rollouts(sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6]), sort_keys=True))
         elif sys.argv[1] == "config":
             print(explicit_config(Path(sys.argv[2]).read_text(), int(sys.argv[3])), end="")
         elif sys.argv[1] == "write-config":
