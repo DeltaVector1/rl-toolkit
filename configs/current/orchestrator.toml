@@ -1,6 +1,7 @@
-output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-11/run_glm-decensor-difficulty-11"
-max_steps = 50
+output_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-12/run_glm-decensor-difficulty-12"
+max_steps = 20
 skip_if_every_refusal_score_is_at_least = 7
+require_usable_response_in_group = true
 seq_len = 32768
 token_batch_size = 1500000
 group_size = 16
@@ -16,9 +17,9 @@ level = "info"
 
 [swanlab]
 project = "glm-runs"
-name = "orchestrator-glm-decensor-difficulty-11"
+name = "orchestrator-glm-decensor-difficulty-12"
 group = "glm-runs"
-tags = ["decensor-diff-11", "glm-5.2", "decensor", "tail_likelihood", "lora-r32", "50-step"]
+tags = ["decensor-diff-12", "glm-5.2", "decensor", "tail_likelihood", "lora-r32", "20-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
@@ -55,11 +56,40 @@ extra_body = { min_tokens = 16 }
 
 [[train.env]]
 name = "decensor-easy"
-ratio = 1.0
+ratio = 0.7
 pool = { type = "static", num_workers = 16 }
 env.taskset.id = "decensor-v1"
 env.taskset.num_examples = 2000
 env.taskset.difficulty = "easy"
+env.taskset.data_split = "train"
+env.taskset.holdout_seed = 73129
+env.taskset.holdout_fraction = 0.25
+env.agent.harness = { id = "null" }
+env.agent.max_output_tokens = 16384
+env.agent.timeout.rollout = 3600
+
+[train.env.sampling]
+max_completion_tokens = 16384
+
+[train.env.env.taskset.task.judge]
+base_url = "http://202.214.223.66:26406/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+max_concurrent_requests = 48
+
+[train.env.env.taskset.task.user]
+base_url = "http://127.0.0.1:26407/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+max_concurrent_requests = 48
+
+[[train.env]]
+name = "decensor-medium"
+ratio = 0.3
+pool = { type = "static", num_workers = 16 }
+env.taskset.id = "decensor-v1"
+env.taskset.num_examples = 2000
+env.taskset.difficulty = "medium"
 env.taskset.data_split = "train"
 env.taskset.holdout_seed = 73129
 env.taskset.holdout_fraction = 0.25
@@ -195,8 +225,8 @@ max_concurrent_requests = 48
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/glm-decensor-difficulty-11"
-source_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-11"
+source_url = "http://127.0.0.1:18100/glm-decensor-difficulty-12"
+source_dir = "/data/glm52-rl/runs/glm-decensor-difficulty-12"
 
 [rollout_transport]
 type = "filesystem"
