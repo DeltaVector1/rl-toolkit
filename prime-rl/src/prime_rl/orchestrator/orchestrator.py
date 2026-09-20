@@ -1664,6 +1664,12 @@ class Orchestrator:
                 metrics[f"pre_filters/all/{name}/rate"] = count / self.train_sink.pre_filter_seen
         metrics |= _refusal_advantage_metrics(self.train_sink.refusal_advantage_counts)
         metrics["groups/strong_refusal/skipped"] = self.train_sink.strong_refusal_groups_skipped
+        metrics["groups/no_usable_response/skipped"] = (
+            self.train_sink.no_usable_response_groups_skipped
+        )
+        metrics["groups/positive_strong_refusal_advantage/skipped"] = (
+            self.train_sink.positive_strong_refusal_advantage_groups_skipped
+        )
         self.monitor.log(metrics, step=step)
         self.wait_for_policy_time = 0.0
         self.monitor.log_samples(effective.rollouts, step=step)

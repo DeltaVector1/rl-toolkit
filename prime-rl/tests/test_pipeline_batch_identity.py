@@ -114,12 +114,26 @@ class PipelineBatchIdentityTest(unittest.TestCase):
         )
 
 
-def _load_refusal_group_function():
+def _load_train_sink_functions(wanted, variables=()):
     source_path = (
         Path(__file__).resolve().parents[1]
         / "src/prime_rl/orchestrator/train_sink.py"
     )
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    body = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in wanted:
+            body.append(node)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id in variables for target in targets):
+                body.append(node)
+    namespace = {"Rollout": object, "math": math}
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(source_path), "exec"), namespace)
+    return namespace
+
+
+def _load_refusal_group_function():
     wanted = {
         "_valid_refusal_score",
         "_refusal_score",
@@ -130,23 +144,7 @@ def _load_refusal_group_function():
         "_scalar_advantage",
         "refusal_advantage_counts",
     }
-    body = [
-        node
-        for node in tree.body
-        if (isinstance(node, ast.FunctionDef) and node.name in wanted)
-        or (
-            isinstance(node, (ast.Assign, ast.AnnAssign))
-            and any(
-                isinstance(target, ast.Name)
-                and target.id in {"_refusal_bands", "_advantage_signs"}
-                for target in (
-                    node.targets if isinstance(node, ast.Assign) else [node.target]
-                )
-            )
-        )
-    ]
-    namespace = {"Rollout": object, "math": math}
-    exec(compile(ast.Module(body=body, type_ignores=[]), str(source_path), "exec"), namespace)
+    namespace = _load_train_sink_functions(wanted, {"_refusal_bands", "_advantage_signs"})
     return (
         namespace["should_skip_strong_refusal_group"],
         namespace["_skip_strong_refusal_group"],
@@ -165,6 +163,20 @@ def _load_refusal_metric_function():
     namespace = {}
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(source_path), "exec"), namespace)
     return namespace["_refusal_advantage_metrics"]
+
+
+def _load_usable_group_functions():
+    wanted = {
+        "_valid_refusal_score",
+        "_refusal_score",
+        "_decensor_details",
+        "is_usable_response",
+        "should_skip_group_without_usable_response",
+        "_filter_group",
+        "_scalar_advantage",
+        "should_skip_positive_strong_refusal_advantage_group",
+    }
+    return _load_train_sink_functions(wanted, {"_usable_response_metrics"})
 
 
 class StrongRefusalGroupSkipTest(unittest.TestCase):
@@ -283,6 +295,111 @@ class StrongRefusalGroupSkipTest(unittest.TestCase):
                 "rollouts/refusal_advantage/1-2/zero_count": 3.0,
             },
         )
+
+
+class UsableResponseGroupTest(unittest.TestCase):
+    @staticmethod
+    def _rollout(**overrides):
+        details = {
+            "response_rejected_because": None,
+            "refusal_score": 1,
+            "visible_answer_is_clear": 1,
+            "reasoning_trace_is_clear": 1,
+            "reasoning_has_safety_or_policy_discussion": 0,
+            "meta_commentary": 0,
+        }
+        details.update(overrides)
+        advantage = details.pop("advantage", 0.0)
+        return SimpleNamespace(
+            info={"decensor": details},
+            samples=[object()],
+            reward=0.25,
+            has_error=False,
+            scalar_advantage=lambda: advantage,
+        )
+
+    def test_disabled_mode_does_not_read_decensor_metrics(self):
+        functions = _load_usable_group_functions()
+        rollout = SimpleNamespace(has_error=False)
+        self.assertFalse(functions["should_skip_group_without_usable_response"]([rollout], False))
+        self.assertFalse(
+            functions["should_skip_positive_strong_refusal_advantage_group"]([rollout], False)
+        )
+
+    def test_usable_requirement_and_strict_metrics(self):
+        functions = _load_usable_group_functions()
+        skip = functions["should_skip_group_without_usable_response"]
+        self.assertFalse(skip([self._rollout(refusal_score=9), self._rollout(refusal_score=4)], True))
+        self.assertTrue(skip([self._rollout(refusal_score=5), self._rollout(meta_commentary=1)], True))
+        missing = self._rollout()
+        del missing.info["decensor"]["reasoning_trace_is_clear"]
+        with self.assertRaisesRegex(RuntimeError, "reasoning_trace_is_clear"):
+            skip([self._rollout(), missing], True)
+        self.assertTrue(
+            skip([self._rollout(response_rejected_because="truncated")], True)
+        )
+
+    def test_positive_strong_refusal_advantage_stage(self):
+        skip = _load_usable_group_functions()["should_skip_positive_strong_refusal_advantage_group"]
+        positive = [
+            self._rollout(refusal_score=1, advantage=-0.5),
+            self._rollout(refusal_score=7, advantage=0.25),
+        ]
+        self.assertTrue(skip(positive, True))
+        self.assertFalse(skip([self._rollout(refusal_score=9, advantage=0.0)], True))
+
+    def test_filter_keeps_observations_and_rewards(self):
+        functions = _load_usable_group_functions()
+        for reason in ("no_usable_response_group", "positive_strong_refusal_advantage_group"):
+            with self.subTest(reason=reason):
+                group = [self._rollout(), self._rollout()]
+                infos = [rollout.info for rollout in group]
+                rewards = [rollout.reward for rollout in group]
+                functions["_filter_group"](group, reason)
+                self.assertEqual([rollout.samples for rollout in group], [[], []])
+                self.assertTrue(all(rollout.is_filtered for rollout in group))
+                self.assertTrue(all(rollout.filter_results == {reason: True} for rollout in group))
+                self.assertEqual([rollout.info for rollout in group], infos)
+                self.assertEqual([rollout.reward for rollout in group], rewards)
+
+    def test_default_metrics_and_order(self):
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py"
+        )
+        tree = ast.parse(config_path.read_text(encoding="utf-8"))
+        field = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "require_usable_response_in_group"
+        )
+        self.assertIsInstance(field.value, ast.Constant)
+        self.assertIs(field.value.value, False)
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "src/prime_rl/orchestrator/orchestrator.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"groups/no_usable_response/skipped"', source)
+        self.assertIn('"groups/positive_strong_refusal_advantage/skipped"', source)
+
+        sink_source = (
+            Path(__file__).resolve().parents[1]
+            / "src/prime_rl/orchestrator/train_sink.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("self.no_usable_response_groups_skipped += 1", sink_source)
+        self.assertIn("self.positive_strong_refusal_advantage_groups_skipped += 1", sink_source)
+        finalize = sink_source.index("await env.algorithm.finalize_group(survivors)")
+        positive_filter = sink_source.index(
+            "if should_skip_positive_strong_refusal_advantage_group(", finalize
+        )
+        refusal_metrics = sink_source.index(
+            "for band, sign_counts in refusal_advantage_counts(survivors).items():",
+            positive_filter,
+        )
+        zero_advantage = sink_source.index("if not any(r.is_trainable", refusal_metrics)
+        self.assertTrue(finalize < positive_filter < refusal_metrics < zero_advantage)
 
 
 if __name__ == "__main__":

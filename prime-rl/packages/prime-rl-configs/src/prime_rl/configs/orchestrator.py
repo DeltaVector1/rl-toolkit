@@ -531,6 +531,14 @@ class OrchestratorConfig(BaseConfig):
     is the environment's max-across-turns conversation score. Mixed, unscored,
     or lower-scored groups are unchanged. ``None`` disables this filter."""
 
+    require_usable_response_in_group: bool = False
+    """Skip a complete group unless at least one scored response is usable.
+    A usable response has a refusal score at most 4, clear visible output and
+    reasoning, no safety or policy discussion, no meta-commentary, and no
+    response rejection. After scoring, also reject the group when a response
+    with refusal score 7-9 has positive advantage. Missing or invalid required
+    metrics stop collection. Disabled by default."""
+
     log: LogConfig = LogConfig()
 
     env_vars: EnvVars = {}

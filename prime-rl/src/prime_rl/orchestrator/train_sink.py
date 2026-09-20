@@ -109,6 +109,69 @@ def _skip_strong_refusal_group(group: list[Rollout]) -> None:
         rollout.filter_results = {"strong_refusal_group": True}
 
 
+_usable_response_metrics = {
+    "visible_answer_is_clear": 1,
+    "reasoning_trace_is_clear": 1,
+    "reasoning_has_safety_or_policy_discussion": 0,
+    "meta_commentary": 0,
+}
+
+
+def _decensor_details(rollout: Rollout) -> dict:
+    info = getattr(rollout, "info", None)
+    if not isinstance(info, dict) or not isinstance(info.get("decensor"), dict):
+        raise RuntimeError(
+            "require_usable_response_in_group needs rollout.info.decensor scoring details"
+        )
+    return info["decensor"]
+
+
+def is_usable_response(rollout: Rollout) -> bool:
+    details = _decensor_details(rollout)
+    if "response_rejected_because" not in details:
+        raise RuntimeError(
+            "require_usable_response_in_group needs decensor metric "
+            "'response_rejected_because'"
+        )
+    if details["response_rejected_because"] is not None:
+        return False
+    refusal_score = details.get("refusal_score")
+    if not _valid_refusal_score(refusal_score):
+        raise RuntimeError(
+            "require_usable_response_in_group needs refusal_score in [1, 9]; "
+            f"got {refusal_score!r}"
+        )
+    for name in _usable_response_metrics:
+        value = details.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value not in (0, 1):
+            raise RuntimeError(
+                f"require_usable_response_in_group needs binary decensor metric {name!r}; "
+                f"got {value!r}"
+            )
+    return refusal_score <= 4 and all(
+        details[name] == expected for name, expected in _usable_response_metrics.items()
+    )
+
+
+def should_skip_group_without_usable_response(
+    group: list[Rollout], enabled: bool
+) -> bool:
+    """Return True when an enabled, fully scored group has no usable response."""
+    if not enabled or not group or any(
+        getattr(rollout, "has_error", False) for rollout in group
+    ):
+        return False
+    usable = [is_usable_response(rollout) for rollout in group]
+    return not any(usable)
+
+
+def _filter_group(group: list[Rollout], reason: str) -> None:
+    for rollout in group:
+        rollout.samples = []
+        rollout.is_filtered = True
+        rollout.filter_results = {reason: True}
+
+
 def _empty_refusal_advantage_counts() -> dict[str, dict[str, int]]:
     return {band: {sign: 0 for sign in _advantage_signs} for band, _, _ in _refusal_bands}
 
@@ -134,6 +197,36 @@ def _scalar_advantage(rollout: Rollout) -> int | float | None:
     if not math.isfinite(advantage):
         return None
     return advantage
+
+
+def should_skip_positive_strong_refusal_advantage_group(
+    group: list[Rollout], enabled: bool
+) -> bool:
+    """Return True when an enabled group rewards a strong refusal."""
+    if not enabled or not group or any(
+        getattr(rollout, "has_error", False) for rollout in group
+    ):
+        return False
+    skip = False
+    for rollout in group:
+        details = _decensor_details(rollout)
+        if details["response_rejected_because"] is not None:
+            continue
+        score = _refusal_score(rollout)
+        if score is None:
+            raise RuntimeError(
+                "require_usable_response_in_group needs refusal_score in [1, 9] "
+                "before checking strong-refusal advantages"
+            )
+        advantage = _scalar_advantage(rollout)
+        if advantage is None:
+            raise RuntimeError(
+                "require_usable_response_in_group needs a finite scalar advantage "
+                "after group scoring"
+            )
+        if score >= 7 and advantage > 0:
+            skip = True
+    return skip
 
 
 def refusal_advantage_counts(rollouts: list[Rollout]) -> dict[str, dict[str, int]]:
@@ -209,6 +302,8 @@ class TrainSink:
         self.pre_filter_dropped = 0
         self.pre_filter_dropped_by_name: dict[str, int] = {}
         self.strong_refusal_groups_skipped = 0
+        self.no_usable_response_groups_skipped = 0
+        self.positive_strong_refusal_advantage_groups_skipped = 0
         self.refusal_advantage_counts = _empty_refusal_advantage_counts()
 
     def _is_stale(self, rollout: Rollout) -> bool:
@@ -441,6 +536,17 @@ class TrainSink:
             )
             return
 
+        if should_skip_group_without_usable_response(
+            group, self.config.require_usable_response_in_group
+        ):
+            self.no_usable_response_groups_skipped += 1
+            _filter_group(group, "no_usable_response_group")
+            get_logger().debug(
+                f"Finished group | env={env_name} task_idx={task_idx} | "
+                f"rollouts={len(group)} | skipped group without usable response"
+            )
+            return
+
         # Keep the group in pending_rollouts, but send no optimizer samples.
         if should_skip_strong_refusal_group(
             group, self.config.skip_if_every_refusal_score_is_at_least
@@ -457,6 +563,19 @@ class TrainSink:
         # routing) are the algorithm's job (finalize_group); the sink only
         # owns the grouping mechanics.
         await env.algorithm.finalize_group(survivors)
+
+        if should_skip_positive_strong_refusal_advantage_group(
+            group, self.config.require_usable_response_in_group
+        ):
+            self.positive_strong_refusal_advantage_groups_skipped += 1
+            _filter_group(group, "positive_strong_refusal_advantage_group")
+            get_logger().debug(
+                f"Finished group | env={env_name} task_idx={task_idx} | "
+                f"rollouts={len(group)} | skipped group with positive "
+                "strong-refusal advantage"
+            )
+            return
+
         for band, sign_counts in refusal_advantage_counts(survivors).items():
             for sign, count in sign_counts.items():
                 self.refusal_advantage_counts[band][sign] += count
@@ -569,4 +688,6 @@ class TrainSink:
         self.pre_filter_dropped = 0
         self.pre_filter_dropped_by_name.clear()
         self.strong_refusal_groups_skipped = 0
+        self.no_usable_response_groups_skipped = 0
+        self.positive_strong_refusal_advantage_groups_skipped = 0
         self.refusal_advantage_counts = _empty_refusal_advantage_counts()
