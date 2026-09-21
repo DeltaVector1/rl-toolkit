@@ -879,11 +879,27 @@ if [ -z "$trainer_ssh_target" ]; then
   echo "nodes config has no trainer SSH target" >&2
   exit 2
 fi
+rollout_transfer_direction=$(python3 - "$nodes_file" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    config = tomllib.load(stream)
+direction = config.get("rollout_transfer", {}).get("direction", "orchestrator_push")
+if direction not in {"orchestrator_push", "trainer_pull"}:
+    raise SystemExit("nodes config has an invalid rollout transfer direction")
+print(direction)
+PY
+)
 transport=$(awk '
   $0 == "[rollout_transport]" { active=1; next }
   /^\[/ { active=0 }
   active && $1 == "type" { gsub(/[ "\047]/, "", $3); print $3; exit }
 ' "$config_file")
+if [ "$rollout_transfer_direction" = trainer_pull ] && [ "$transport" != filesystem ]; then
+  echo "trainer_pull requires filesystem rollout transport" >&2
+  exit 2
+fi
 
 if ! peer_settings=$(python3 - "$nodes_file" "$config_file" <<'PY'
 import ipaddress
@@ -2368,8 +2384,10 @@ peer_repair_missing_remote_lanes() {
 
 china_source_ports_ready() {
   local probe_seconds=40 verified_ports
-  direct_route_control status || return 1
-  direct_route_listeners_ready capture || return 1
+  if [ "$rollout_transfer_direction" != trainer_pull ]; then
+    direct_route_control status || return 1
+    direct_route_listeners_ready capture || return 1
+  fi
   if ! verified_ports=$(timeout --signal=TERM --kill-after=1s "$probe_seconds" \
       python3 - "${lora_source_ports[0]}" "${lora_source_ports[-1]}" <<'PY'
 import asyncio
@@ -3489,6 +3507,7 @@ supervisor_lane_inventory_ready() {
 }
 
 china_tunnel_supervisors_ready() {
+  [ "$rollout_transfer_direction" = trainer_pull ] && return 0
   direct_route_control status
 }
 
@@ -3719,8 +3738,10 @@ adapter_tunnel_exact_snapshot() {
 }
 
 adapter_tunnel_stability_snapshot() {
-  direct_route_control status || return 1
-  direct_route_listeners_ready || return 1
+  if [ "$rollout_transfer_direction" != trainer_pull ]; then
+    direct_route_control status || return 1
+    direct_route_listeners_ready || return 1
+  fi
   peer_tunnel_supervisors_unchanged || return 1
   peer_tunnel_children_unchanged || return 1
   if [ "$peer_enabled" = 1 ]; then
@@ -3968,10 +3989,12 @@ if [ "$china_legacy_cleanup_required" = 1 ] && ! china_tunnel_wait_legacy_clear;
 fi
 repair_remaining >/dev/null || repair_fail "deadline exceeded after cleanup"
 repair_stage=direct-source
-if [ "$restart_tunnels" = 1 ]; then
-  direct_route_control restart || repair_fail "direct source restart failed"
-else
-  direct_route_control start || repair_fail "direct source start failed"
+if [ "$rollout_transfer_direction" != trainer_pull ]; then
+  if [ "$restart_tunnels" = 1 ]; then
+    direct_route_control restart || repair_fail "direct source restart failed"
+  else
+    direct_route_control start || repair_fail "direct source start failed"
+  fi
 fi
 repair_stage=china-source
 china_source_ports_ready || repair_fail "China adapter source check failed"
@@ -4092,27 +4115,47 @@ sudo docker run -d --name "$ORCH_CT" \
   @ "$config_file"
 echo "orchestrator started on $(hostname) with $(basename "$config_file")"
 
-# The China-side supervisor refuses to restart a failed trainer because the
-# optimizer has no resumable checkpoint. Stop rollout production here as soon
-# as any trainer worker is gone, so the run cannot accumulate unusable batches.
-pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
-nohup setsid env RUN="$RUN" RUN_NAME="$RUN_NAME" \
-  TRAINER_ADDRESSES="$TRAINER_ADDRESSES" \
-  TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
-  bash "$deployment/training_ops/runtime/h200/trainer_failure_watchdog.sh" \
-  >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
-trainer_watchdog_pid=$!
-sleep 1
-if ! kill -0 "$trainer_watchdog_pid" 2>/dev/null; then
-  echo "ERROR: trainer failure watchdog exited during startup" >&2
-  sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
-  exit 1
+if [ "$rollout_transfer_direction" = orchestrator_push ]; then
+  # Stop rollout production if the remote trainer cluster fails.
+  pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
+  nohup setsid env RUN="$RUN" RUN_NAME="$RUN_NAME" \
+    TRAINER_ADDRESSES="$TRAINER_ADDRESSES" \
+    TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
+    bash "$deployment/training_ops/runtime/h200/trainer_failure_watchdog.sh" \
+    >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
+  trainer_watchdog_pid=$!
+  sleep 1
+  if ! kill -0 "$trainer_watchdog_pid" 2>/dev/null; then
+    echo "ERROR: trainer failure watchdog exited during startup" >&2
+    sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  echo "trainer failure watchdog started (pid $trainer_watchdog_pid)"
+else
+  pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
+  nohup setsid env MODE=lease RUN="$RUN" RUN_NAME="$RUN_NAME" \
+    LEASE_FILE="/data/glm52-rl/runs/$RUN/$RUN_NAME/.trainer-health-lease" \
+    TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
+    bash "$deployment/training_ops/runtime/h200/trainer_failure_watchdog.sh" \
+    >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
+  trainer_watchdog_pid=$!
+  sleep 1
+  if ! kill -0 "$trainer_watchdog_pid" 2>/dev/null; then
+    echo "ERROR: trainer lease watchdog exited during startup" >&2
+    sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+    exit 1
+  fi
+  echo "trainer lease watchdog started (pid $trainer_watchdog_pid)"
 fi
-echo "trainer failure watchdog started (pid $trainer_watchdog_pid)"
 
 ctl=/data/glm52-rl/runs/$RUN/$RUN_NAME/control/orch.toml
 if [ "$transport" = filesystem ]; then
   publisher_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"
+  if [ "$rollout_transfer_direction" = trainer_pull ]; then
+    python3 "$deployment/training_ops/runtime/h200/drain_rollout_publisher.py" \
+      "$publisher_dir" "$deployment/training_ops/runtime/h200/sync_rollout_batches.sh" || exit 1
+    exit
+  fi
   python3 "$deployment/training_ops/runtime/h200/drain_rollout_publisher.py" \
     "$publisher_dir" "$deployment/training_ops/runtime/h200/sync_rollout_batches.sh" || exit 1
   nohup setsid env SOURCE_RUN_DIR="/data/glm52-rl/runs/$RUN/$RUN_NAME" \

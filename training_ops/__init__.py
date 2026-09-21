@@ -45,6 +45,11 @@ paths = nodes["paths"]
 containers = nodes["containers"]
 models = nodes["models"]
 inference_settings = nodes["inference"]
+rollout_transfer_direction = nodes.get("rollout_transfer", {}).get(
+    "direction", "orchestrator_push"
+)
+if rollout_transfer_direction not in {"orchestrator_push", "trainer_pull"}:
+    raise RuntimeError("rollout transfer direction is invalid")
 
 trainer_head = hosts["trainer_head"]
 trainer_hosts = list(hosts["trainers"])
@@ -61,6 +66,7 @@ run_root = paths["runs"]
 runtime_root = f"{remote_repo}/training_ops/runtime"
 trainer_launcher = f"{runtime_root}/china/cluster.sh"
 orchestrator_launcher = f"{runtime_root}/h200/start_orchestrator.sh"
+rollout_pull_script = f"{runtime_root}/china/pull_rollout_batches.sh"
 trainer_container = containers["trainer"]
 orchestrator_container = containers["orchestrator"]
 adapter_container = containers["adapter"]
@@ -438,6 +444,91 @@ def _trainer_addresses(nodes: list[str]) -> str:
     return " ".join(_ssh_address(host) for host in ordered if host in nodes)
 
 
+def _rollout_pull_environment(run_dir: str) -> dict[str, str]:
+    """Return the exact trainer-to-edge rollout route."""
+    if rollout_transfer_direction != "trainer_pull":
+        raise Refused("rollout pull is not configured")
+    route = nodes.get("adapter_transport")
+    if not isinstance(route, dict):
+        raise Refused("adapter transport is missing")
+    active_trainers = [host for host in trainer_hosts if host not in blocked_hosts]
+    trainer_lan = hosts.get("trainer_lan")
+    if not isinstance(trainer_lan, dict) or any(
+        not isinstance(trainer_lan.get(host), str) for host in active_trainers
+    ):
+        raise Refused("trainer LAN addresses are incomplete")
+    values = {
+        "ROLLOUT_TRANSFER_DIRECTION": "trainer_pull",
+        "RUN": PurePosixPath(run_dir).parent.name,
+        "TRAINER_ADDRESSES": " ".join(trainer_lan[host] for host in active_trainers),
+        "TRAINER_CT": trainer_container,
+        "ORCH_CT": orchestrator_container,
+        "SOURCE_RUN_DIR": run_dir,
+        "DEST_RUN_DIR": run_dir,
+        "SOURCE_HOST": route.get("ssh_host"),
+        "SOURCE_PORT": route.get("ssh_port"),
+        "SOURCE_USER": route.get("ssh_user"),
+        "SOURCE_IDENTITY_FILE": route.get("ssh_identity_file"),
+        "SOURCE_KNOWN_HOSTS_FILE": route.get("ssh_known_hosts_file"),
+    }
+    try:
+        ipaddress.ip_address(values["SOURCE_HOST"])
+    except (TypeError, ValueError) as error:
+        raise Refused("adapter transport SSH host must be an IP address") from error
+    port = values["SOURCE_PORT"]
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise Refused("adapter transport SSH port is invalid")
+    if not isinstance(values["SOURCE_USER"], str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+", values["SOURCE_USER"]
+    ):
+        raise Refused("adapter transport SSH user is invalid")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", values["RUN"]):
+        raise Refused("rollout pull run name is invalid")
+    if not values["TRAINER_ADDRESSES"]:
+        raise Refused("rollout pull trainer addresses are empty")
+    for name in ("SOURCE_RUN_DIR", "DEST_RUN_DIR", "SOURCE_IDENTITY_FILE", "SOURCE_KNOWN_HOSTS_FILE"):
+        value = values[name]
+        if not isinstance(value, str) or not value.startswith("/") or "\n" in value:
+            raise Refused(f"{name.lower()} must be an absolute path")
+    return {name: str(value) for name, value in values.items()}
+
+
+def _rollout_pull_command(run_dir: str, action: str) -> str:
+    if action not in {"start", "stop", "status"}:
+        raise Refused(f"invalid rollout pull action: {action}")
+    environment = " ".join(
+        f"{name}={shlex.quote(value)}"
+        for name, value in _rollout_pull_environment(run_dir).items()
+    )
+    return f"{environment} bash {shlex.quote(rollout_pull_script)} {action}"
+
+
+def _direct_route_command(action: str) -> str:
+    if action not in {"start", "restart", "status", "snapshot", "stop"}:
+        raise Refused(f"invalid direct route action: {action}")
+    script = f"{runtime_root}/china/direct_adapter_route.py"
+    config = f"{remote_repo}/configs/nodes.toml"
+    return f"python3 {shlex.quote(script)} {action} {shlex.quote(config)}"
+
+
+def _start_trainer_pull(run_dir: str, *, restart_route: bool = False) -> None:
+    if rollout_transfer_direction != "trainer_pull":
+        return
+    route_action = "restart" if restart_route else "start"
+    _remote_ok(
+        trainer_head,
+        _direct_route_command(route_action),
+        "direct adapter route start",
+        timeout=300,
+    )
+    _remote_ok(
+        trainer_head,
+        _rollout_pull_command(run_dir, "start"),
+        "rollout puller start",
+        timeout=60,
+    )
+
+
 def _remote_ok(host: str, script: str, label: str, timeout: int = 120) -> str:
     code, output = _ssh(host, script, timeout)
     if code:
@@ -740,6 +831,22 @@ run_dir="__RUN_DIR__"
 batch_sync_ok=0
 if [ "__ROLLOUT_TRANSPORT__" != filesystem ]; then
   batch_sync_ok=1
+elif [ "__ROLLOUT_TRANSFER_DIRECTION__" = trainer_pull ]; then
+  batch_script="__BATCH_SYNC_SCRIPT__"
+  for proc_dir in /proc/[0-9]*; do
+    pid=${proc_dir##*/}
+    [ -r "/proc/$pid/cmdline" ] && [ -r "/proc/$pid/environ" ] || continue
+    batch_command=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//' || true)
+    case "$batch_command" in
+      "bash $batch_script"|"/bin/bash $batch_script"|"/usr/bin/bash $batch_script") ;;
+      *) continue ;;
+    esac
+    process_group=$(awk '{print $5}' "/proc/$pid/stat" 2>/dev/null || true)
+    [ "$process_group" = "$pid" ] || continue
+    batch_environment=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' || true)
+    grep -Fxq "SOURCE_RUN_DIR=$run_dir" <<<"$batch_environment" || continue
+    batch_sync_ok=$((batch_sync_ok + 1))
+  done
 else
   batch_pid=$(cat "$run_dir/.batch-sync.pid" 2>/dev/null || true)
   case "$batch_pid" in ''|*[!0-9]*) ;; *)
@@ -769,9 +876,14 @@ for proc_dir in /proc/[0-9]*; do
   environment=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' || true)
   grep -Fxq "RUN=__RUN__" <<<"$environment" || continue
   grep -Fxq "RUN_NAME=__RUN_NAME__" <<<"$environment" || continue
-  grep -Fxq "TRAINER_ADDRESSES=__TRAINER_ADDRESSES__" <<<"$environment" || continue
   grep -Fxq "TRAINER_CT=__TRAINER_CT__" <<<"$environment" || continue
   grep -Fxq "ORCH_CT=__ORCH__" <<<"$environment" || continue
+  if [ "__ROLLOUT_TRANSFER_DIRECTION__" = trainer_pull ]; then
+    grep -Fxq "MODE=lease" <<<"$environment" || continue
+    grep -Fxq "LEASE_FILE=$run_dir/.trainer-health-lease" <<<"$environment" || continue
+  else
+    grep -Fxq "TRAINER_ADDRESSES=__TRAINER_ADDRESSES__" <<<"$environment" || continue
+  fi
   trainer_fail_wd=$((trainer_fail_wd + 1))
 done
 echo "TRAINER_FAIL_WD $trainer_fail_wd"
@@ -997,7 +1109,14 @@ def _inference_script(
     )
 
 
-def _head_script() -> str:
+def _head_script(run_dir: str) -> str:
+    pull_probe = "echo ROLLOUT_PULL unused"
+    if rollout_transfer_direction == "trainer_pull":
+        command = _rollout_pull_command(run_dir, "status")
+        pull_probe = (
+            f"if {command} >/dev/null 2>&1; then echo ROLLOUT_PULL 1; "
+            "else echo ROLLOUT_PULL 0; fi"
+        )
     return (
         trainer_probe.replace("__TRAINER__", trainer_container)
         .replace(
@@ -1007,7 +1126,9 @@ def _head_script() -> str:
         .replace("__ORCH__", orchestrator_container)
         .replace("__ADAPTER__", str(adapter_port))
         .replace("__ADAPTER_CONTAINER__", adapter_container)
-        + f"\nif python3 {runtime_root}/china/direct_adapter_route.py status {remote_repo}/configs/nodes.toml >/dev/null 2>&1; then echo DIRECT_ROUTE ready; else echo DIRECT_ROUTE failed; fi\n"
+        + f"\nif {_direct_route_command('status')} >/dev/null 2>&1; then echo DIRECT_ROUTE ready; else echo DIRECT_ROUTE failed; fi\n"
+        + pull_probe
+        + "\n"
     )
 
 
@@ -1191,6 +1312,8 @@ class Status:
     orch_up: bool = False
     orch_failed: bool = False
     batch_sync: bool = False
+    legacy_batch_sync: bool = False
+    rollout_transfer_direction: str = rollout_transfer_direction
     trainer_failure_watchdog: bool = False
     trainer_steps: int = 0
     trainer_compute_state: str = "pending"
@@ -1294,6 +1417,7 @@ class Status:
             L.append(
                 f"  supervisors: local=disabled "
                 f"batch-sync={'yes' if self.batch_sync else 'no'} "
+                f"direction={self.rollout_transfer_direction} "
                 f"trainer-check={'yes' if self.trainer_failure_watchdog else 'no'}"
             )
         L.append("trainer nodes")
@@ -2336,7 +2460,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
             edge_orch_rc, edge_orch_out = 0, ""
             engines_out = {}
         else:
-            f_head = ex.submit(_ssh, trainer_head, _head_script(), 300)
+            f_head = ex.submit(_ssh, trainer_head, _head_script(run_dir), 300)
             trainer_nodes = [host for host in trainer_hosts if host not in blocked_hosts]
             trainer_addresses = _trainer_addresses(trainer_nodes)
             if not trainer_addresses:
@@ -2355,6 +2479,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
                 .replace("__RUN_NAME__", run_name)
                 .replace("__RUN_DIR__", run_dir)
                 .replace("__ROLLOUT_TRANSPORT__", rollout_transport)
+                .replace("__ROLLOUT_TRANSFER_DIRECTION__", rollout_transfer_direction)
                 .replace("__BATCH_SYNC_SCRIPT__", f"{runtime_root}/h200/sync_rollout_batches.sh")
                 .replace("__TRAINER_WATCHDOG_SCRIPT__", f"{runtime_root}/h200/trainer_failure_watchdog.sh")
                 .replace("__TRAINER_ADDRESSES__", trainer_addresses)
@@ -2395,8 +2520,16 @@ def status(run: str = "", quiet: bool = False) -> Status:
     head_trainer_up = h.get("TRAINER_UP", "") == "up"
     s.orch_failed = int(h.get("ORCH_FAILED", 0) or 0) > 0
     s.orch_up = h.get("ORCH_UP", "") == "up" and not s.orch_failed
-    s.batch_sync = int(h.get("BATCH_SYNC", 0) or 0) > 0
-    s.trainer_failure_watchdog = int(h.get("TRAINER_FAIL_WD", 0) or 0) == 1
+    if rollout_transfer_direction == "trainer_pull":
+        s.legacy_batch_sync = int(h.get("BATCH_SYNC", 0) or 0) > 0
+        s.batch_sync = (
+            int(h.get("ROLLOUT_PULL", 0) or 0) == 1
+            and not s.legacy_batch_sync
+        )
+        s.trainer_failure_watchdog = int(h.get("TRAINER_FAIL_WD", 0) or 0) == 1
+    else:
+        s.batch_sync = int(h.get("BATCH_SYNC", 0) or 0) > 0
+        s.trainer_failure_watchdog = int(h.get("TRAINER_FAIL_WD", 0) or 0) == 1
     s.trainer_steps = int(h.get("TRAINER_STEPS", 0) or 0)
     state = h.get("TRAINER_COMPUTE_STATE", "pending")
     if state in {"pending", "active", "complete", "unknown"}:
@@ -2571,8 +2704,11 @@ def _warnings(s: Status) -> list[str]:
         )
     if s.orch_up and not s.batch_sync:
         w.append("durable batch publisher is not running; completed rollout batches cannot reach the trainer")
+    if s.legacy_batch_sync:
+        w.append("legacy edge batch publisher is still running with trainer_pull")
     if s.orch_up and not s.trainer_failure_watchdog:
-        w.append("edge trainer-failure watchdog is not running; rollout production will not fail closed")
+        location = "edge lease" if s.rollout_transfer_direction == "trainer_pull" else "edge"
+        w.append(f"{location} trainer-failure watchdog is not running; rollout production will not fail closed")
     trainer_busy = s.trainer_up and any(
         node.reachable and node.gpu_util >= 50 for node in s.nodes
     )
@@ -4817,6 +4953,7 @@ def _repair_adapter_update() -> str:
         ("prime-rl/src/prime_rl/inference/relay.py", [orchestrator_host]),
         ("training_ops/runtime/h200/start_orchestrator.sh", [orchestrator_host]),
         ("training_ops/runtime/h200/sync_rollout_batches.sh", None),
+        ("training_ops/runtime/china/pull_rollout_batches.sh", [trainer_head]),
     )
     for path, nodes in deployment_targets:
         deployed = deploy(path) if nodes is None else deploy(path, nodes=nodes)
@@ -4899,6 +5036,7 @@ def _repair_adapter_update() -> str:
     if failed_post_idle:
         raise RuntimeError(f"inference was not idle after restart: {failed_post_idle}")
 
+    _start_trainer_pull(_cold_run_paths(run)[2])
     resume_code, resume_output = _ssh(
         orchestrator_host,
         _recreate_orchestrator_script(
@@ -4941,6 +5079,7 @@ def _repair_microbatch_sync() -> str:
 def _repair_orchestrator() -> str:
     """Resume the exact orchestrator after proving all peers are safe."""
     run = current_run()
+    _, _, service_dir = _cold_run_paths(run)
     profile = _config_for_run(run)
     if not isinstance(profile.get("orchestrator"), str):
         raise Refused(f"active profile for {run} has no orchestrator config")
@@ -5007,7 +5146,13 @@ def _repair_orchestrator() -> str:
     if resume_step is not None:
         if was_running:
             raise Refused("resume publisher drain requires a stopped or absent orchestrator")
-        _, _, service_dir = _cold_run_paths(run)
+        if rollout_transfer_direction == "trainer_pull":
+            _remote_ok(
+                trainer_head,
+                _rollout_pull_command(service_dir, "stop"),
+                "orchestrator rollout puller drain",
+                timeout=60,
+            )
         drain_source = (repo_root / "training_ops/runtime/h200/drain_rollout_publisher.py").read_text()
         sync_script = f"{runtime_root}/h200/sync_rollout_batches.sh"
         drain_script = (
@@ -5050,6 +5195,7 @@ def _repair_orchestrator() -> str:
     client_path = "prime-rl/src/prime_rl/utils/client.py"
     if not deploy(client_path):
         raise RuntimeError(f"orchestrator repair deployment failed for {client_path}")
+    _start_trainer_pull(service_dir)
     resume_code, resume_output = _ssh(
         orchestrator_host,
         _recreate_orchestrator_script(
@@ -5107,6 +5253,13 @@ def _repair_adapter_tunnels(config_dir: str | None = None, *, reset: bool = Fals
     ):
         if not deploy(path, nodes=destinations):
             raise RuntimeError(f"direct adapter route deployment failed: {path}")
+    if rollout_transfer_direction == "trainer_pull":
+        _remote_ok(
+            trainer_head,
+            _direct_route_command("restart" if reset else "start"),
+            "direct adapter route reconciliation",
+            timeout=300,
+        )
     tunnel_mode = "--restart-tunnels --tunnels-only" if reset else "--tunnels-only"
     command = (
         f"RUN={shlex.quote(run)} RUN_NAME={shlex.quote(run_name)} "
@@ -6648,6 +6801,8 @@ remove_file "$run_dir/final_summary.json"
 remove_file "$run_dir/rollout-metrics.jsonl"
 remove_file "$run_dir/.batch-sync.pid"
 remove_file "$run_dir/.batch-sync.lock"
+remove_file "$run_dir/.rollout-pull.pid"
+remove_file "$run_dir/.rollout-pull.lock"
 remove_file "$run_dir/.microbatch-sync.pid"
 remove_file "$run_dir/.microbatch-sync.lock"
 remove_file "$run_dir/.microbatch-sync.marker"
@@ -6662,7 +6817,6 @@ def _cold_start_cleanup(run: str, nodes: list[str]) -> None:
     _cold_run_paths(run)  # Validate before any host action.
     targets = list(dict.fromkeys([*nodes, orchestrator_host]))
     targets = [_check_host(host) for host in targets]
-
     def phase(script: str, label: str, error_label: str) -> None:
         results = _fan(
             targets,
@@ -7112,6 +7266,9 @@ def start(
         if rc:
             raise RuntimeError(f"edge orchestrator start failed on {orchestrator_host}: {out}")
 
+    def launch_transport(*, restart_route: bool = False) -> None:
+        _start_trainer_pull(service_run_dir, restart_route=restart_route)
+
     def wait_for_orchestrator_control() -> None:
         control_file = f"{service_run_dir}/control/orch.toml"
         script = f"""set -eu
@@ -7184,6 +7341,13 @@ exit 1
         "pkill -f 'bash .*[r]un_supervisor.sh' 2>/dev/null || true; echo done",
         "old local supervisor stop",
     )
+    if rollout_transfer_direction == "trainer_pull":
+        _remote_ok(
+            trainer_head,
+            _rollout_pull_command(service_run_dir, "stop"),
+            "old rollout puller stop",
+            timeout=60,
+        )
     _remote_ok(
         orchestrator_host,
         ("" if resume_adapter is not None else "pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; ")
@@ -7212,6 +7376,7 @@ exit 1
         _cold_adapter_cache_cleanup(initial_adapter_identity)
     if mode == "cold":
         launch_adapter()
+        launch_transport()
         launch_orch()
         wait_for_orchestrator_control()
         launch_trainer()
@@ -7240,6 +7405,7 @@ exit 1
             launch_adapter()
             launch_trainer()
             # The next trainer step needs a fresh batch from the orchestrator.
+            launch_transport()
             launch_orch()
         except Exception as error:
             cleanup_commands = [
@@ -7262,6 +7428,7 @@ exit 1
     else:
         launch_adapter()
         mark_restart_start()
+        launch_transport()
         launch_trainer()
         wait_for_fresh_broadcast()
         launch_orch()
@@ -7398,6 +7565,7 @@ def stop() -> None:
         expected_output_dir = f"{run_root.rstrip('/')}/{run}" if run else ""
         if output_dir != expected_output_dir:
             raise Refused("cannot identify the run whose batch publisher must stop")
+    _, _, service_run_dir = _cold_run_paths(run)
     _remote_ok(
         trainer_head,
         "pkill -f 'bash .*[r]un_supervisor.sh' 2>/dev/null || true; "
@@ -7410,6 +7578,13 @@ def stop() -> None:
         "batch publisher stop",
         timeout=300,
     )
+    if rollout_transfer_direction == "trainer_pull":
+        _remote_ok(
+            trainer_head,
+            _rollout_pull_command(service_run_dir, "stop"),
+            "rollout puller stop",
+            timeout=60,
+        )
     _remote_ok(
         orchestrator_host,
         "pkill -f 'bash .*[t]rainer_failure_watchdog.sh' 2>/dev/null || true; echo done",

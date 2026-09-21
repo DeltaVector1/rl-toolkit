@@ -113,8 +113,12 @@ class OrchestratorRepairTest(unittest.TestCase):
             mock.call("configs/nodes.toml", nodes=[training_ops.trainer_head, training_ops.orchestrator_host]),
             mock.call("training_ops/runtime/china/direct_adapter_route.py", nodes=[training_ops.trainer_head, training_ops.orchestrator_host]),
         ])
-        self.assertEqual(len(ssh_calls), 1)
-        host, script, timeout = ssh_calls[0]
+        self.assertEqual(len(ssh_calls), 2)
+        route_host, route_script, route_timeout = ssh_calls[0]
+        self.assertEqual(route_host, training_ops.trainer_head)
+        self.assertEqual(route_timeout, 300)
+        self.assertIn("direct_adapter_route.py start", route_script)
+        host, script, timeout = ssh_calls[1]
         self.assertEqual(host, training_ops.orchestrator_host)
         self.assertEqual(timeout, 330)
         self.assertIn("RUN=glm-perf-3 RUN_NAME=run_glm-perf-3", script)
@@ -142,8 +146,9 @@ class OrchestratorRepairTest(unittest.TestCase):
             result = training_ops._repair_adapter_tunnels("configs/general-agent", reset=True)
 
         self.assertEqual(result, "adapter tunnel reconciliation complete")
-        self.assertEqual(len(ssh_calls), 1)
-        self.assertTrue(ssh_calls[0][1].endswith("--restart-tunnels --tunnels-only"))
+        self.assertEqual(len(ssh_calls), 2)
+        self.assertIn("direct_adapter_route.py restart", ssh_calls[0][1])
+        self.assertTrue(ssh_calls[1][1].endswith("--restart-tunnels --tunnels-only"))
 
     def test_adapter_tunnels_stops_if_selected_config_cannot_be_verified(self):
         with mock.patch.object(training_ops, "deploy", return_value=False) as deploy, mock.patch.object(
@@ -690,6 +695,9 @@ class OrchestratorPublisherDrainRepairTest(unittest.TestCase):
         events = []
         before = training_ops.Status(trainer_up=True, orch_failed=running, nodes=[training_ops.NodeState(host=training_ops.trainer_head, reachable=True, gpu_util=0)], batch="batch 4/1024; 0 inflight")
         def ssh(host, script, timeout=120):
+            if f"bash {training_ops.rollout_pull_script} stop" in script:
+                events.append("pull-stop")
+                return 0, ""
             if "Drain one run's publisher group" in script:
                 events.append("drain")
                 self.assertEqual(host, training_ops.orchestrator_host)
@@ -725,7 +733,7 @@ class OrchestratorPublisherDrainRepairTest(unittest.TestCase):
             self.assertEqual(kwargs["resume_step"], 3)
             return "recreate"
         error = None
-        with mock.patch.object(training_ops, "current_run", return_value=run), mock.patch.object(training_ops, "status", return_value=before), mock.patch.object(training_ops, "_ssh", side_effect=ssh), mock.patch.object(training_ops, "_fan", side_effect=idle), mock.patch.object(training_ops, "_orchestrator_resume_step", side_effect=guard), mock.patch.object(training_ops, "_resume_repair_state", side_effect=state), mock.patch.object(training_ops, "deploy", side_effect=lambda *_args: events.append("deploy") or True), mock.patch.object(training_ops, "_recreate_orchestrator_script", side_effect=recreate):
+        with mock.patch.object(training_ops, "current_run", return_value=run), mock.patch.object(training_ops, "status", return_value=before), mock.patch.object(training_ops, "_ssh", side_effect=ssh), mock.patch.object(training_ops, "_fan", side_effect=idle), mock.patch.object(training_ops, "_orchestrator_resume_step", side_effect=guard), mock.patch.object(training_ops, "_resume_repair_state", side_effect=state), mock.patch.object(training_ops, "deploy", side_effect=lambda *_args: events.append("deploy") or True), mock.patch.object(training_ops, "_start_trainer_pull", side_effect=lambda directory: events.append("transport")), mock.patch.object(training_ops, "_recreate_orchestrator_script", side_effect=recreate):
             try:
                 training_ops._repair_orchestrator()
             except training_ops.Refused as caught:
@@ -735,19 +743,19 @@ class OrchestratorPublisherDrainRepairTest(unittest.TestCase):
     def test_guards_drain_recheck_quarantine_and_launch_are_ordered(self):
         events, error = self.repair()
         self.assertIsNone(error)
-        self.assertEqual(events, ["state", "idle", "guard", "drain", "state", "idle", "guard", "partial", "quarantine", "deploy", "recreate", "launch"])
+        self.assertEqual(events, ["state", "idle", "guard", "pull-stop", "drain", "state", "idle", "guard", "partial", "quarantine", "deploy", "transport", "recreate", "launch"])
 
     def test_absent_publisher_and_partial_are_idempotent(self):
         events, error = self.repair(partial=False)
         self.assertIsNone(error)
-        self.assertEqual(events, ["state", "idle", "guard", "drain", "state", "idle", "guard", "partial", "deploy", "recreate", "launch"])
+        self.assertEqual(events, ["state", "idle", "guard", "pull-stop", "drain", "state", "idle", "guard", "partial", "deploy", "transport", "recreate", "launch"])
 
     def test_drain_failure_or_unverified_output_blocks_all_later_actions(self):
         for code, output in ((19, "drain failed"), (0, ""), (0, "publisher drained: /other; groups=0; lock=free"), (0, "publisher drained: /other; groups=0; lock=held")):
             with self.subTest(code=code, output=output):
                 events, error = self.repair(drain_code=code, drain_output=output)
                 self.assertIsNotNone(error)
-                self.assertEqual(events, ["state", "idle", "guard", "drain"])
+                self.assertEqual(events, ["state", "idle", "guard", "pull-stop", "drain"])
 
     def test_pre_drain_guard_failure_prevents_drain(self):
         events, error = self.repair(guard_failure=1)
@@ -757,14 +765,14 @@ class OrchestratorPublisherDrainRepairTest(unittest.TestCase):
     def test_publication_completed_during_drain_blocks_quarantine(self):
         events, error = self.repair(guard_failure=2)
         self.assertIsNotNone(error)
-        self.assertEqual(events, ["state", "idle", "guard", "drain", "state", "idle", "guard"])
+        self.assertEqual(events, ["state", "idle", "guard", "pull-stop", "drain", "state", "idle", "guard"])
 
     def test_post_drain_container_or_inference_change_blocks_quarantine(self):
         for options, tail in (({"state_changed": True}, ["state"]), ({"inference_changed": True}, ["state", "idle"])):
             with self.subTest(options=options):
                 events, error = self.repair(**options)
                 self.assertIsNotNone(error)
-                self.assertEqual(events, ["state", "idle", "guard", "drain", *tail])
+                self.assertEqual(events, ["state", "idle", "guard", "pull-stop", "drain", *tail])
 
     def test_running_orchestrator_prevents_drain(self):
         events, error = self.repair(running=True)

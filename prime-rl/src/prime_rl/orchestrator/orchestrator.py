@@ -752,8 +752,18 @@ class Orchestrator:
         # Persist the resolved config alongside the run
         config_dir = config.output_dir / "control"
         config_dir.mkdir(parents=True, exist_ok=True)
-        with open(config_dir / "orch.toml", "wb") as f:
+        control_path = config_dir / "orch.toml"
+        partial_path = config_dir / ".orch.toml.tmp"
+        with open(partial_path, "wb") as f:
             tomli_w.dump(to_toml_dict(config), f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(partial_path, control_path)
+        directory_fd = os.open(config_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
         get_logger().info(f"Initializing tokenizer ({config.tokenizer})")
         self.tokenizer = setup_tokenizer(config.tokenizer)

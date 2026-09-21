@@ -159,6 +159,34 @@ class DirectRouteTest(unittest.TestCase):
                         route_module.operate("stop", route)
                     send.assert_not_called()
 
+    def test_stopped_state_from_old_config_can_be_reconciled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = {**self.route, "state_dir": directory, "digest": "old"}
+            current = {**self.route, "state_dir": directory, "digest": "new"}
+            manager = {"pid": 999999, "start": "1", "argv": route_module.manager_argv(old)}
+            child = {"pid": 999998, "start": "1", "argv": ["old-child"]}
+            route_module.publish(old, {"manager": manager, "digest": "old", "status": "stopped", "children": [child]})
+            with mock.patch.object(route_module, "check_pidfd_support"), mock.patch.object(
+                route_module, "matches", return_value=False
+            ):
+                route_module.operate("stop", current)
+
+    def test_stopped_config_mismatch_refuses_live_or_ambiguous_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = {**self.route, "state_dir": directory, "digest": "old"}
+            current = {**self.route, "state_dir": directory, "digest": "new"}
+            absent = {"pid": 999999, "start": "1", "argv": ["old-manager"]}
+            live = route_module.identity(os.getpid())
+            for manager, children, message in (
+                (live, [], "recorded process is live"),
+                (absent, [live], "recorded process is live"),
+                (absent, [{}], "malformed process identity"),
+            ):
+                with self.subTest(message=message, child=bool(children)):
+                    route_module.publish(old, {"manager": manager, "digest": "old", "status": "stopped", "children": children})
+                    with mock.patch.object(route_module, "check_pidfd_support"), self.assertRaisesRegex(RuntimeError, message):
+                        route_module.operate("stop", current)
+
     def test_stale_private_pending_is_recoverable_but_symlink_is_not(self):
         with tempfile.TemporaryDirectory() as directory:
             route = {**self.route, "state_dir": directory}

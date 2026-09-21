@@ -407,15 +407,28 @@ def verify_snapshot(route, snapshot, listeners):
     return hashlib.sha256(json.dumps(proof, sort_keys=True).encode()).hexdigest()
 
 
-def stored_state(route):
+def stored_state(route, allow_stopped_mismatch=False):
     try:
         fd = state_open(route, "state.json", os.O_RDONLY)
     except FileNotFoundError:
         return None
     with os.fdopen(fd) as stream:
         state = json.load(stream)
-    validate_record(state.get("manager"))
-    if state.get("digest") != route["digest"] or state.get("manager", {}).get("argv") != manager_argv(route):
+    manager = state.get("manager")
+    validate_record(manager)
+    mismatch = (
+        state.get("digest") != route["digest"]
+        or manager.get("argv") != manager_argv(route)
+    )
+    if mismatch and allow_stopped_mismatch:
+        children = state.get("children")
+        if state.get("status") != "stopped" or not isinstance(children, list):
+            raise RuntimeError("stored manager argv or configuration differs; refusing signal")
+        for record in [manager, *children]:
+            validate_record(record)
+            if matches(record):
+                raise RuntimeError("stored route configuration differs and a recorded process is live")
+    elif mismatch:
         raise RuntimeError("stored manager argv or configuration differs; refusing signal")
     return state
 
@@ -628,7 +641,7 @@ def operate(action, route):
         pass
     control = acquire(directory / "control.lock")
     try:
-        state = stored_state(route)
+        state = stored_state(route, allow_stopped_mismatch=True)
         if state and matches(state["manager"]):
             if action == "start":
                 ready(route)

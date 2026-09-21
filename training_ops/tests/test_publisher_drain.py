@@ -10,7 +10,7 @@ from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import training_ops.tests
+import training_ops.tests  # noqa: F401 - installs the local-only network guard.
 
 spec = importlib.util.spec_from_file_location("publisher_drain", Path(__file__).parents[1] / "runtime/h200/drain_rollout_publisher.py")
 publisher = importlib.util.module_from_spec(spec)
@@ -462,7 +462,7 @@ while True: time.sleep(0.1)
         # Preserve the exact drain command and failure operator from the
         # launcher; replace only the background launch with a marker.
         drain = block.split("  nohup setsid", 1)[0]
-        program = 'deployment=/unused; publisher_dir=/unused\npython3() { return 19; }\n' + drain + '\necho replacement-started\n'
+        program = 'deployment=/unused; publisher_dir=/unused; rollout_transfer_direction=orchestrator_push\npython3() { return 19; }\n' + drain + '\necho replacement-started\n'
         result = subprocess.run(["bash", "-uc", program], capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("replacement-started", result.stdout)

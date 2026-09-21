@@ -79,7 +79,7 @@ api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
 [train.env.env.taskset.task.user]
-base_url = "http://127.0.0.1:26407/v1"
+base_url = "http://202.214.223.66:26406/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
@@ -122,7 +122,7 @@ api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
 [eval.env.env.taskset.task.user]
-base_url = "http://127.0.0.1:26407/v1"
+base_url = "http://202.214.223.66:26406/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
@@ -156,7 +156,7 @@ api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
 [eval.env.env.taskset.task.user]
-base_url = "http://127.0.0.1:26407/v1"
+base_url = "http://202.214.223.66:26406/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
@@ -190,7 +190,7 @@ api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48
 
 [eval.env.env.taskset.task.user]
-base_url = "http://127.0.0.1:26407/v1"
+base_url = "http://202.214.223.66:26406/v1"
 model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
 api_key_var = "VLLM_API_KEY"
 max_concurrent_requests = 48

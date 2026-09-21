@@ -906,7 +906,7 @@ class AdapterUpdateTest(unittest.TestCase):
             ),
             deploy.call_args_list,
         )
-        self.assertEqual(deploy.call_count, 10)
+        self.assertEqual(deploy.call_count, 11)
 
     def test_stopped_status_refuses_if_container_is_running(self):
         host = training_ops.inference_hosts[0]
@@ -1211,7 +1211,7 @@ class AdapterUpdateTest(unittest.TestCase):
             {call.args[0] for call in restart_script.call_args_list},
             {"glm52-decensor-h200"},
         )
-        self.assertEqual(deploy.call_count, 10)
+        self.assertEqual(deploy.call_count, 11)
 
     def test_prefetch_script_only_signals_exact_curl_or_timeout(self):
         script = training_ops._adapter_prefetch_stop_script(

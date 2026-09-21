@@ -60,6 +60,9 @@ glm52_inference = "glm52-decensor-h200"
 [models]
 glm52 = "/models/glm52-fp8"
 
+[rollout_transfer]
+direction = "trainer_pull"
+
 [adapter_transport]
 download_streams = 64
 source_host = "n82"
