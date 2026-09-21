@@ -3916,7 +3916,7 @@ adapter_tunnel_readiness() {
 }
 
 adapter_relay_start() {
-  local running relay_ready=0 relay_probe relay_status relay_identity
+  local running relay_ready=0 relay_probe relay_status relay_identity relay_image
   if [ "$peer_enabled" != 1 ]; then
     [ "$tunnels_only" = 1 ] || sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
     return 0
@@ -3926,11 +3926,13 @@ adapter_relay_start() {
   relay_identity=$(sudo docker inspect "$relay_container" \
     --format '{{index .Config.Labels "com.glm52.adapter-relay.source-url"}}' \
     2>/dev/null || true)
+  relay_image=$(sudo docker inspect "$relay_container" --format '{{.Image}}' 2>/dev/null || true)
     relay_probe=$(curl -sS --max-time 2 -H "Host: 127.0.0.1:${lora_source_ports[0]}" \
       -w '%{http_code}' "http://127.0.0.1:$relay_port/" 2>/dev/null || true)
     relay_status=${relay_probe: -3}
     relay_probe=${relay_probe:0:${#relay_probe}-3}
     if [ "$running" = true ] && [ "$relay_identity" = "$relay_source_url" ] && \
+        [ "$relay_image" = "$image" ] && \
         ss -tln 2>/dev/null | grep -q "127.0.0.1:$relay_port" && \
         [ "$relay_status" = 404 ] && [ "$relay_probe" = $'source URL is not configured\n' ]; then
       return 0
@@ -4128,10 +4130,29 @@ for p in "${ports[@]}"; do
   ss -tln 2>/dev/null | grep -q "127.0.0.1:$p" && echo "tunnel :$p up" || echo "tunnel :$p DOWN"
 done
 
+remove_failed_orchestrator() {
+  local launch_label=$1 candidate_id candidate_name candidate_label candidate_image
+  candidate_id=$(sudo docker inspect "$ORCH_CT" --format '{{.Id}}' 2>/dev/null || true)
+  [ -n "$candidate_id" ] || return 0
+  candidate_name=$(sudo docker inspect "$candidate_id" --format '{{.Name}}' 2>/dev/null || true)
+  candidate_label=$(sudo docker inspect "$candidate_id" \
+    --format '{{index .Config.Labels "com.glm52.orchestrator.launch"}}' \
+    2>/dev/null || true)
+  candidate_image=$(sudo docker inspect "$candidate_id" --format '{{.Image}}' 2>/dev/null || true)
+  if [ "$candidate_name" = "/$ORCH_CT" ] && [ "$candidate_label" = "$launch_label" ] && \
+     [ "$candidate_image" = "$image" ]; then
+    sudo docker rm -f "$candidate_id" >/dev/null 2>&1 || true
+  fi
+}
+
 start_orchestrator_container() {
-  local container_id container_name running state startup_checks=0 running_checks=0
+  local container_id container_name running state launch_output launch_status launch_label
+  local startup_checks=0 running_checks=0
+  launch_label="$RUN/$RUN_NAME"
   sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
-  if ! container_id=$(sudo docker run -d --name "$ORCH_CT" --pull=never \
+  container_id=
+  launch_output=$(sudo docker run -d --name "$ORCH_CT" --pull=never \
+    --label "com.glm52.orchestrator.launch=$launch_label" \
     --network host --restart no \
     --env-file /data/trinity/training.env \
     -e VLLM_API_KEY=unused \
@@ -4158,12 +4179,17 @@ start_orchestrator_container() {
     -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
     -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
     --entrypoint /app/.venv/bin/orchestrator "$image" \
-    @ "$config_file"); then
+    @ "$config_file")
+  launch_status=$?
+  if [ "$launch_status" -ne 0 ]; then
     echo "ERROR: orchestrator container launch failed: $ORCH_CT" >&2
+    remove_failed_orchestrator "$launch_label"
     return 1
   fi
+  container_id=$launch_output
   [ -n "$container_id" ] || {
     echo "ERROR: orchestrator container launch returned no container id: $ORCH_CT" >&2
+    remove_failed_orchestrator "$launch_label"
     return 1
   }
   while :; do
@@ -4172,7 +4198,7 @@ start_orchestrator_container() {
     state=$(sudo docker inspect "$container_id" --format '{{.State.Status}}' 2>/dev/null || true)
     if [ "$container_name" = "/$ORCH_CT" ] && [ "$running" = true ]; then
       running_checks=$((running_checks + 1))
-      [ "$running_checks" -ge 20 ] && return 0
+      [ "$running_checks" -ge 21 ] && return 0
     elif [ "$running_checks" -gt 0 ]; then
       break
     elif [ "$container_name" = "/$ORCH_CT" ] && [ "$state" != created ]; then

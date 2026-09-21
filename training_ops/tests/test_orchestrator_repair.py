@@ -266,10 +266,14 @@ class OrchestratorRepairTest(unittest.TestCase):
             'relay_identity=$(sudo docker inspect "$relay_container"', relay_block
         )
         self.assertIn(
+            'relay_image=$(sudo docker inspect "$relay_container"', relay_block
+        )
+        self.assertIn(
             '--format \'{{index .Config.Labels "com.glm52.adapter-relay.source-url"}}\'',
             relay_block,
         )
         self.assertIn('[ "$relay_identity" = "$relay_source_url" ]', relay_block)
+        self.assertIn('[ "$relay_image" = "$image" ]', relay_block)
         self.assertIn(
             '--label "com.glm52.adapter-relay.source-url=$relay_source_url"',
             relay_block,
