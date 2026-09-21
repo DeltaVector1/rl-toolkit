@@ -1747,9 +1747,17 @@ class Orchestrator:
         inflight_eval = self.dispatcher.inflight_eval_count
         queued_train = self.dispatcher.queued_train_count
         scheduling_train = self.dispatcher.pending_train_schedule_count
-        train_batch, train_target, _train_unit = self.train_sink.batch_progress()
+        train_ratio_state = self.train_sink.ratio_batch_state()
+        if train_ratio_state:
+            train_batch_by_env = {
+                name: values["accepted"] for name, values in train_ratio_state.items()
+            }
+            train_batch = sum(train_batch_by_env.values())
+            train_target = self.config.batch_size or 0
+        else:
+            train_batch, train_target, _train_unit = self.train_sink.batch_progress()
+            train_batch_by_env = self.train_sink.pending_batch_by_env()
         train_buffered = self.train_sink.buffered_count()
-        train_batch_by_env = self.train_sink.pending_batch_by_env()
         eval_batches = self.eval_sink.batch_progress() if self.eval_sink is not None else []
         multi_train = len(self.train_envs) > 1
         multi_eval = self.eval_envs is not None and len(self.eval_envs) > 1
@@ -1767,6 +1775,9 @@ class Orchestrator:
             train_batch_part += f" (+{queued_train} queued)"
         if scheduling_train:
             train_batch_part += f" (+{scheduling_train} scheduling)"
+        if train_ratio_state:
+            states = ", ".join(f"{name}: accepted={v['accepted']} carry={v['carry']} wait={v['wait']}" for name, v in train_ratio_state.items())
+            train_batch_part += f" | ratio quota ({states})"
 
         eval_batch_part = ""
         for env, _step, eb, exp, _ebuf in eval_batches:
@@ -1788,6 +1799,9 @@ class Orchestrator:
         body = train_batch_part + eval_batch_part + "; " + inflight_part
 
         payload: dict[str, float] = {**disp_gauges, **disp_drain, **watcher_gauges}
+        for env_name, values in train_ratio_state.items():
+            for state, count in values.items():
+                payload[f"batch_ratio/{env_name}/{state}"] = float(count)
         if lag_stats.n > 0:
             payload["event_loop_lag/min"] = lag_stats.min
             payload["event_loop_lag/mean"] = lag_stats.mean

@@ -54,6 +54,95 @@ def payload_tokens(rollout: Rollout) -> int:
     return sum(len(sample.token_ids) for sample in rollout.samples) or rollout.num_total_tokens
 
 
+def train_batch_ratio_quotas(
+    batch_size: int, env_specs: list[tuple[str, float, int]]
+) -> tuple[dict[str, int], int]:
+    if not env_specs:
+        raise ValueError("keep_train_batch_ratios needs at least one training environment")
+    names = [name for name, _, _ in env_specs]
+    if any(not name for name in names) or len(names) != len(set(names)):
+        raise ValueError("keep_train_batch_ratios needs unique non-empty environment names")
+    group_size = env_specs[0][2]
+    if any(size != group_size for _, _, size in env_specs):
+        raise ValueError("keep_train_batch_ratios requires equal group sizes")
+    if group_size < 1 or batch_size % group_size:
+        raise ValueError("keep_train_batch_ratios requires batch_size divisible by group_size")
+    ratios = [ratio for _, ratio, _ in env_specs]
+    if any(not math.isfinite(ratio) or ratio <= 0 for ratio in ratios):
+        raise ValueError("keep_train_batch_ratios requires finite positive ratios")
+    group_slots = batch_size // group_size
+    raw_groups = [group_slots * ratio / math.fsum(ratios) for ratio in ratios]
+    group_quotas = [math.floor(value) for value in raw_groups]
+    order = sorted(
+        range(len(env_specs)),
+        key=lambda index: (-(raw_groups[index] - group_quotas[index]), index),
+    )
+    for index in order[: group_slots - sum(group_quotas)]:
+        group_quotas[index] += 1
+    if any(quota == 0 for quota in group_quotas):
+        raise ValueError("keep_train_batch_ratios batch is too small for every environment")
+    return (
+        {
+            name: group_quotas[index] * group_size
+            for index, (name, _, _) in enumerate(env_specs)
+        },
+        group_size,
+    )
+
+
+def partition_train_batch(
+    pending_batch: list[Rollout],
+    batch_size: int,
+    rollout_quotas: dict[str, int] | None = None,
+    group_size: int | None = None,
+) -> tuple[list[Rollout], list[Rollout], dict[str, dict[str, int]]]:
+    if rollout_quotas is None:
+        return pending_batch[:batch_size], pending_batch[batch_size:], {}
+    if group_size is None:
+        raise RuntimeError("keep_train_batch_ratios is missing group_size")
+    counts = {name: 0 for name in rollout_quotas}
+    cohort: list[Rollout] = []
+    carry: list[Rollout] = []
+    for start in range(0, len(pending_batch), group_size):
+        group = pending_batch[start : start + group_size]
+        first = group[0]
+        env_name = getattr(first, "env_name", None)
+        group_id = getattr(first, "group_id", None)
+        if (
+            len(group) != group_size
+            or env_name not in rollout_quotas
+            or group_id is None
+            or any(
+                getattr(rollout, "env_name", None) != env_name
+                or getattr(rollout, "group_id", None) != group_id
+                for rollout in group
+            )
+        ):
+            raise RuntimeError("keep_train_batch_ratios requires exactly one rollout trace per group member and valid contiguous group identity")
+        target = cohort if counts[env_name] < rollout_quotas[env_name] else carry
+        target.extend(group)
+        counts[env_name] += group_size
+    state = {
+        name: {
+            "accepted": min(count, rollout_quotas[name]),
+            "carry": max(0, count - rollout_quotas[name]),
+            "wait": max(0, rollout_quotas[name] - count),
+        }
+        for name, count in counts.items()
+    }
+    return cohort, carry, state
+
+
+def reject_ratio_group_after_post_filters(post_filters: list[RolloutFilter], group: list[Rollout]) -> bool:
+    apply_filters(post_filters, group)
+    if not any(rollout.is_filtered for rollout in group):
+        return False
+    for rollout in group:
+        rollout.is_filtered = True
+        rollout.filter_results.setdefault("ratio_group_member_filtered", True)
+    return True
+
+
 def _valid_refusal_score(score: int | float | None) -> bool:
     if score is None or isinstance(score, bool) or not isinstance(score, (int, float)):
         return False
@@ -272,6 +361,21 @@ class TrainSink:
         self.mm_token_type_ids_mapping = mm_token_type_ids_mapping
         self.batch_size = batch_size
         self.token_batch_size = token_batch_size
+        self.train_batch_rollout_quotas: dict[str, int] | None = None
+        self.train_batch_group_size: int | None = None
+        if config.keep_train_batch_ratios:
+            if batch_size is None or config.train.ratio_stages is not None:
+                raise ValueError(
+                    "keep_train_batch_ratios requires rollout batch_size without ratio_stages"
+                )
+            (
+                self.train_batch_rollout_quotas,
+                self.train_batch_group_size,
+            ) = train_batch_ratio_quotas(
+                batch_size,
+                [(env.resolved_name, float(env.ratio), env.group_size) for env in config.train.env],
+            )
+            get_logger().info(f"Final train batch quotas: {self.train_batch_rollout_quotas}")
         # Batch ``step`` trains policy v{step-1}. This value advances only
         # after that batch is shipped.
         self.training_policy_version = training_policy_version
@@ -363,6 +467,12 @@ class TrainSink:
         trainer), so it's an honest 0→target fill. Partial-group arrivals are
         reported separately by ``buffered_count()``."""
         if self.batch_size is not None:
+            if self.train_batch_rollout_quotas is not None:
+                return (
+                    sum(values["accepted"] for values in self.ratio_batch_state().values()),
+                    self.batch_size,
+                    "rollouts",
+                )
             return len(self.pending_batch), self.batch_size, "rollouts"
         assert self.token_batch_size is not None
         return self.pending_tokens, self.token_batch_size, "tokens"
@@ -383,6 +493,17 @@ class TrainSink:
         for r in self.pending_batch:
             counts[r.env_name] += 1
         return dict(counts)
+
+    def ratio_batch_state(self) -> dict[str, dict[str, int]]:
+        if self.train_batch_rollout_quotas is None:
+            return {}
+        _, _, state = partition_train_batch(
+            self.pending_batch,
+            self.batch_size or 0,
+            self.train_batch_rollout_quotas,
+            self.train_batch_group_size,
+        )
+        return state
 
     async def add(self, episode: list[Rollout]) -> TrainBatch | None:
         """Process one episode arrival; finalize the group on the
@@ -407,6 +528,8 @@ class TrainSink:
         # ``pending_batch`` only grows on group finalization, so readiness is
         # only re-checked here — the window of a shipped batch then always
         # contains at least the group that finalized it.
+        if self.train_batch_rollout_quotas is not None:
+            return self.process_batch()
         ready = (
             len(self.pending_batch) >= self.batch_size
             if self.batch_size is not None
@@ -464,6 +587,8 @@ class TrainSink:
             self.pending_rollouts.append(r)
         env_name = group[0].env_name
         task_idx = group[0].task.data.idx
+        if self.train_batch_group_size is not None and len(group) != self.train_batch_group_size:
+            raise RuntimeError("keep_train_batch_ratios requires exactly one rollout trace per group member")
         if any(self._is_stale(r) for r in group):
             self._mark_off_policy(group)
             get_logger().warning(
@@ -606,6 +731,7 @@ class TrainSink:
             apply_filters(self.pre_filters, survivors)
         filtered_by_name: dict[str, int] = {}
         num_filtered = 0
+        clean: list[Rollout] = []
         for r in survivors:
             self.pre_filter_seen += 1
             if r.is_filtered:
@@ -619,6 +745,26 @@ class TrainSink:
             # Reset annotations so the post-batch filter pass starts clean
             r.filter_results = {}
             r.is_filtered = False
+            clean.append(r)
+        if (
+            self.train_batch_rollout_quotas is not None
+            and clean
+            and len(clean) != len(survivors)
+        ):
+            reason = "ratio_group_member_filtered"
+            _filter_group(clean, reason)
+            self.pre_filter_dropped += len(clean)
+            self.pre_filter_dropped_by_name[reason] = (
+                self.pre_filter_dropped_by_name.get(reason, 0) + len(clean)
+            )
+            num_filtered += len(clean)
+            filtered_by_name[reason] = len(clean)
+            clean = []
+        if self.train_batch_rollout_quotas is not None and clean and self.post_filters and reject_ratio_group_after_post_filters(self.post_filters, clean):
+            num_filtered += len(clean)
+            filtered_by_name["post_batch_group"] = len(clean)
+            clean = []
+        for r in clean:
             self.pending_batch.append(r)
             if self.token_batch_size is not None:
                 self.pending_tokens += payload_tokens(r)
@@ -642,18 +788,20 @@ class TrainSink:
         # Delivery invariant: even completed overflow that crossed a batch
         # boundary cannot become trainer samples.
         self._drop_stale_pending()
-        ready = (
-            len(self.pending_batch) >= self.batch_size
-            if self.batch_size is not None
-            else self.pending_tokens >= (self.token_batch_size or 0)
-        )
-        if not ready:
-            return None
         if self.batch_size is not None:
-            cohort = self.pending_batch[: self.batch_size]
-            self.pending_batch = self.pending_batch[self.batch_size :]
+            cohort, carry, state = partition_train_batch(
+                self.pending_batch,
+                self.batch_size,
+                self.train_batch_rollout_quotas,
+                self.train_batch_group_size,
+            )
+            if len(cohort) < self.batch_size or any(values["wait"] for values in state.values()):
+                return None
+            self.pending_batch = carry
         else:
             assert self.token_batch_size is not None
+            if self.pending_tokens < self.token_batch_size:
+                return None
             cut = 0
             running = 0
             for i, r in enumerate(self.pending_batch):
@@ -665,7 +813,7 @@ class TrainSink:
             self.pending_batch = self.pending_batch[cut:]
             self.pending_tokens -= running
 
-        if self.post_filters:
+        if self.post_filters and self.train_batch_rollout_quotas is None:
             apply_filters(self.post_filters, cohort)
 
         # Samples are pre-built by ``process_rollout``; ``process_group`` already stamped the

@@ -539,6 +539,9 @@ class OrchestratorConfig(BaseConfig):
     with refusal score 7-9 has positive advantage. Missing or invalid required
     metrics stop collection. Disabled by default."""
 
+    keep_train_batch_ratios: bool = False
+    """Keep final rollout-count batches in whole-group ``train.env`` ratios."""
+
     log: LogConfig = LogConfig()
 
     env_vars: EnvVars = {}

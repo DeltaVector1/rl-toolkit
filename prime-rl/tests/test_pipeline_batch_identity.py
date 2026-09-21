@@ -128,7 +128,7 @@ def _load_train_sink_functions(wanted, variables=()):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if any(isinstance(target, ast.Name) and target.id in variables for target in targets):
                 body.append(node)
-    namespace = {"Rollout": object, "math": math}
+    namespace = {"Rollout": object, "RolloutFilter": object, "apply_filters": None, "math": math}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(source_path), "exec"), namespace)
     return namespace
 
@@ -400,6 +400,87 @@ class UsableResponseGroupTest(unittest.TestCase):
         )
         zero_advantage = sink_source.index("if not any(r.is_trainable", refusal_metrics)
         self.assertTrue(finalize < positive_filter < refusal_metrics < zero_advantage)
+
+
+def _load_train_batch_ratio_functions():
+    return _load_train_sink_functions({"train_batch_ratio_quotas", "partition_train_batch", "reject_ratio_group_after_post_filters"})
+
+
+class TrainBatchRatioTest(unittest.TestCase):
+    @staticmethod
+    def _group(env_name, group_id, size=16):
+        return [SimpleNamespace(env_name=env_name, group_id=f"{group_id}", is_filtered=False, filter_results={}) for _ in range(size)]
+
+    @classmethod
+    def _groups(cls, env_name, start, count):
+        return [rollout for group_id in range(start, start + count) for rollout in cls._group(env_name, f"{env_name}-{group_id}")]
+
+    def test_disabled_selection_stays_fifo(self):
+        partition = _load_train_batch_ratio_functions()["partition_train_batch"]
+        cohort, carry, state = partition(list(range(10)), 6)
+        self.assertEqual(cohort, list(range(6)))
+        self.assertEqual(carry, list(range(6, 10)))
+        self.assertEqual(state, {})
+
+    def test_exact_ratio_is_independent_of_arrival_order_with_carry(self):
+        functions = _load_train_batch_ratio_functions()
+        quotas, group_size = functions["train_batch_ratio_quotas"](
+            1024, [("easy", 0.7, 16), ("medium", 0.3, 16)]
+        )
+        self.assertEqual(quotas, {"easy": 720, "medium": 304})
+        easy = self._groups("easy", 0, 47)
+        medium = self._groups("medium", 0, 21)
+        for pending in (easy + medium, medium + easy):
+            with self.subTest(first=pending[0].env_name):
+                cohort, carry, state = functions["partition_train_batch"](
+                    pending, 1024, quotas, group_size
+                )
+                self.assertEqual(sum(r.env_name == "easy" for r in cohort), 720)
+                self.assertEqual(sum(r.env_name == "medium" for r in cohort), 304)
+                self.assertEqual(len(carry), 64)
+                self.assertTrue(all(values["wait"] == 0 for values in state.values()))
+        functions["apply_filters"] = lambda _filters, group: vars(group[0]).update(is_filtered=True, filter_results={"zero_advantage": True})
+        rejected = medium[:16]
+        self.assertTrue(functions["reject_ratio_group_after_post_filters"]([object()], rejected))
+        cohort, _, state = functions["partition_train_batch"](
+            easy + medium[16:], 1024, quotas, group_size
+        )
+        self.assertEqual(len(cohort), 1024)
+        self.assertTrue(all(r.is_filtered for r in rejected))
+        self.assertTrue(all(values["wait"] == 0 for values in state.values()))
+
+    def test_insufficient_medium_waits(self):
+        functions = _load_train_batch_ratio_functions()
+        quotas = {"easy": 720, "medium": 304}
+        pending = self._groups("easy", 0, 45) + self._groups("medium", 0, 4)
+        cohort, _, state = functions["partition_train_batch"](
+            pending, 1024, quotas, 16
+        )
+        self.assertEqual(len(cohort), 784)
+        self.assertEqual(state["medium"]["wait"], 240)
+
+    def test_invalid_config_and_group_identity_fail(self):
+        functions = _load_train_batch_ratio_functions()
+        invalid_configs = [
+            (1024, [("easy", 0.7, 16), ("medium", 0.3, 8)]),
+            (16, [("easy", 0.7, 16), ("medium", 0.3, 16)]),
+        ]
+        for args in invalid_configs:
+            with self.subTest(config=args), self.assertRaises(ValueError):
+                functions["train_batch_ratio_quotas"](*args)
+        invalid_groups = [
+            self._group("easy", "partial", 15),
+            [SimpleNamespace(env_name=None, group_id="missing")],
+        ]
+        for pending in invalid_groups:
+            with self.subTest(pending=pending), self.assertRaisesRegex(RuntimeError, "identity"):
+                functions["partition_train_batch"](
+                    pending, 16, {"easy": 16}, 16
+                )
+        with self.assertRaisesRegex(RuntimeError, "exactly one rollout trace per group member"):
+            functions["partition_train_batch"](
+                self._group("easy", "multi-trace", 3), 2, {"easy": 2}, 2
+            )
 
 
 if __name__ == "__main__":
