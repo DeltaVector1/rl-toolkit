@@ -86,7 +86,7 @@ max_concurrent_requests = 48
 
 [eval]
 interval = 10
-skip_first_step = false
+skip_first_step = true
 group_size = 1
 
 [eval.sampling]
