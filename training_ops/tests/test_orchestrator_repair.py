@@ -64,9 +64,10 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertTrue(all(expected_config in script for _, script, _ in ssh_calls))
 
     def test_engine_repair_rejects_missing_explicit_config_before_ssh(self):
+        host = training_ops.inference_hosts[0]
         with mock.patch.object(training_ops, "_ssh") as ssh, mock.patch.object(training_ops, "deploy") as deploy:
             with self.assertRaisesRegex(training_ops.Refused, "no trainer.toml"):
-                training_ops.repair("engine:h200a:configs/missing")
+                training_ops.repair(f"engine:{host}:configs/missing")
         ssh.assert_not_called()
         deploy.assert_not_called()
 

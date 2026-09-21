@@ -46,12 +46,17 @@ class DirectRouteTest(unittest.TestCase):
         for ports, argv in owners:
             self.assertEqual(len(ports), 2)
             self.assertEqual(argv.count("-R"), 2)
-            self.assertEqual(argv[-1], "root@69.63.236.164")
+            self.assertEqual(
+                argv[-1],
+                f"{self.route['ssh_user']}@{self.route['ssh_host']}",
+            )
             for option in ("StrictHostKeyChecking=yes", "BatchMode=yes", "IdentitiesOnly=yes", "AddKeysToAgent=no", "ExitOnForwardFailure=yes", "ForwardAgent=no", "Compression=no", "ControlPath=none", "ProxyCommand=none"):
                 self.assertIn(option, argv)
-            self.assertIn("/home/ubuntu/.ssh/id_ed25519", argv)
-            self.assertIn("UserKnownHostsFile=/home/ubuntu/.ssh/known_hosts", argv)
-            self.assertIn("40299", argv)
+            self.assertIn(self.route["ssh_identity_file"], argv)
+            self.assertIn(
+                f"UserKnownHostsFile={self.route['ssh_known_hosts_file']}", argv
+            )
+            self.assertIn(str(self.route["ssh_port"]), argv)
             for port in ports:
                 self.assertIn(f"127.0.0.1:{port}:127.0.0.1:8100", argv)
 

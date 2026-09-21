@@ -16,6 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import training_ops
 import training_ops.tests  # Install the local-only test guard before any test runs.
 
+dual_inference_hosts = ["h200a", "h200b"]
+dual_inference_settings = {
+    "h200a": {"glm52": {"ports": [8000]}},
+    "h200b": {"glm52": {"ports": [8000]}},
+}
+
 adapter_server_path = (
     Path(__file__).resolve().parents[1] / "runtime" / "china" / "adapter_server.py"
 )
@@ -522,6 +528,8 @@ class AdapterUpdateTest(unittest.TestCase):
                     training_ops._adapter_stage_evidence("glm-perf-3", config)
                 status_evidence.assert_called_once_with("glm-perf-3", config, log)
 
+    @mock.patch.object(training_ops, "inference_hosts", dual_inference_hosts)
+    @mock.patch.object(training_ops, "inference_settings", dual_inference_settings)
     def test_terminal_stage_status_accepts_exact_transport_errors(self):
         config = training_ops._adapter_update_config("glm-perf-3")
         broadcast = training_ops.AdapterBroadcast(
@@ -569,6 +577,8 @@ class AdapterUpdateTest(unittest.TestCase):
             evidence,
         )
 
+    @mock.patch.object(training_ops, "inference_hosts", dual_inference_hosts)
+    @mock.patch.object(training_ops, "inference_settings", dual_inference_settings)
     def test_step_one_terminal_status_uses_600_limit_and_reports_target_overrun(self):
         config = training_ops._adapter_update_config("glm-perf-3")
         broadcast = training_ops.AdapterBroadcast(
@@ -600,6 +610,8 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertIn("operational limit 600s", evidence)
         self.assertIn("300s acceptance target exceeded on h200a, h200b", evidence)
 
+    @mock.patch.object(training_ops, "inference_hosts", dual_inference_hosts)
+    @mock.patch.object(training_ops, "inference_settings", dual_inference_settings)
     def test_terminal_stage_status_refuses_stale_unknown_and_success(self):
         config = training_ops._adapter_update_config("glm-perf-3")
         broadcast = training_ops.AdapterBroadcast(
@@ -771,6 +783,9 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertNotIn("docker start", script)
         self.assertNotIn("docker restart", script)
 
+    @mock.patch.object(training_ops, "inference_hosts", dual_inference_hosts)
+    @mock.patch.object(training_ops, "inference_settings", dual_inference_settings)
+    @mock.patch.object(training_ops, "orchestrator_host", "h200a")
     def test_stopped_orchestrator_is_started_after_guarded_repair(self):
         before = training_ops.Status(
             trainer_up=True,
@@ -894,12 +909,13 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertEqual(deploy.call_count, 10)
 
     def test_stopped_status_refuses_if_container_is_running(self):
+        host = training_ops.inference_hosts[0]
         before = training_ops.Status(
             trainer_up=True,
             orch_up=False,
             engines=[
                 training_ops.EngineState(
-                    host="h200a", gen_code="200", probes_ok=1, probes_total=1,
+                    host=host, gen_code="200", probes_ok=1, probes_total=1,
                     container=True, api_listener=True, watchdog=True
                 )
             ],
@@ -914,6 +930,9 @@ class AdapterUpdateTest(unittest.TestCase):
         evidence.assert_not_called()
         deploy.assert_not_called()
 
+    @mock.patch.object(training_ops, "inference_hosts", dual_inference_hosts)
+    @mock.patch.object(training_ops, "inference_settings", dual_inference_settings)
+    @mock.patch.object(training_ops, "orchestrator_host", "h200a")
     def test_absent_orchestrator_is_recreated_after_inference_reload(self):
         before = training_ops.Status(
             trainer_up=True,
@@ -993,6 +1012,7 @@ class AdapterUpdateTest(unittest.TestCase):
 
     def test_engine_repair_uses_active_run_config(self):
         calls = []
+        host = training_ops.inference_hosts[0]
 
         def ssh(_host, script, timeout=120):
             calls.append(script)
@@ -1001,13 +1021,13 @@ class AdapterUpdateTest(unittest.TestCase):
         with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "_ssh", side_effect=ssh
         ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy:
-            result = training_ops._repair_engine("h200a")
+            result = training_ops._repair_engine(host)
 
         self.assertEqual(result, "issued")
         self.assertEqual(deploy.call_args_list, [
-            mock.call("configs/nodes.toml", nodes=["h200a"]),
-            mock.call("training_ops/runtime/h200/start_inference.sh", nodes=["h200a"]),
-            mock.call("configs/general-agent/inference.toml", nodes=["h200a"]),
+            mock.call("configs/nodes.toml", nodes=[host]),
+            mock.call("training_ops/runtime/h200/start_inference.sh", nodes=[host]),
+            mock.call("configs/general-agent/inference.toml", nodes=[host]),
         ])
         self.process_guard.assert_not_called()
         self.deploy_guard.assert_not_called()
@@ -1074,10 +1094,15 @@ class AdapterUpdateTest(unittest.TestCase):
         current_run.assert_called_once_with()
         config_for_run.assert_called_once_with("glm-decensor-difficulty-8")
         printer.assert_called_once_with(result)
-        self.assertIn("h200a: reloaded exact engine watchdog", result)
-        self.assertEqual({host for host, _, _ in calls}, {"h200a", "h200b"})
-        self.assertEqual(len(calls), 4)
-        for host in ("h200a", "h200b"):
+        self.assertIn(
+            f"{training_ops.inference_hosts[0]}: reloaded exact engine watchdog",
+            result,
+        )
+        self.assertEqual(
+            {host for host, _, _ in calls}, set(training_ops.inference_hosts)
+        )
+        self.assertEqual(len(calls), 2 * len(training_ops.inference_hosts))
+        for host in training_ops.inference_hosts:
             host_calls = [
                 (script, timeout)
                 for called_host, script, timeout in calls
@@ -1118,6 +1143,9 @@ class AdapterUpdateTest(unittest.TestCase):
                 training_ops._repair_supervisors("configs/general-agent")
         ssh.assert_not_called()
 
+    @mock.patch.object(training_ops, "inference_hosts", dual_inference_hosts)
+    @mock.patch.object(training_ops, "inference_settings", dual_inference_settings)
+    @mock.patch.object(training_ops, "orchestrator_host", "h200a")
     def test_healthy_engines_are_reloaded_to_import_receiver_changes(self):
         before = training_ops.Status(
             trainer_up=True,

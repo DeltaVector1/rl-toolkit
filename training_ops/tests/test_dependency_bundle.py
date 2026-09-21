@@ -134,10 +134,14 @@ class DependencyBundleTest(unittest.TestCase):
             )
 
         self.assertEqual(len(uploads), 1)
-        self.assertIn("h200a:", uploads[0][0][-1])
+        edge_destination = training_ops._ssh_destination(
+            training_ops.orchestrator_host
+        )[2]
+        self.assertIn(f"{edge_destination}:", uploads[0][0][-1])
         self.assertTrue(
             any(
-                host == "h200a" and "china-trainer:" in script
+                host == training_ops.orchestrator_host
+                and "china-trainer:" in script
                 for host, script, _ in remote_calls
             )
         )

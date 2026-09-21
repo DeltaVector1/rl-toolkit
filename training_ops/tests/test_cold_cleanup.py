@@ -88,23 +88,26 @@ class ColdCleanupTest(unittest.TestCase):
 
     def test_adapter_cache_cleanup_requires_idle_hosts(self):
         idle = {
-            "h200a": (0, "port=8000 running=0"),
-            "h200b": (0, "port=8000 running=0"),
+            host: (0, "port=8000 running=0")
+            for host in training_ops.inference_hosts
         }
         cleared = {
-            "h200a": (0, "removed=2 free_gib=100"),
-            "h200b": (0, "removed=1 free_gib=500"),
+            host: (0, "removed=1 free_gib=500")
+            for host in training_ops.inference_hosts
         }
         with mock.patch.object(
             training_ops, "_fan", side_effect=[idle, cleared]
         ), mock.patch("builtins.print") as output:
             training_ops._cold_adapter_cache_cleanup()
-        self.assertEqual(output.call_count, 2)
+        self.assertEqual(output.call_count, len(training_ops.inference_hosts))
 
         with mock.patch.object(
             training_ops,
             "_fan",
-            return_value={"h200a": (34, "active requests"), "h200b": (0, "idle")},
+            return_value={
+                host: (34 if index == 0 else 0, "active requests" if index == 0 else "idle")
+                for index, host in enumerate(training_ops.inference_hosts)
+            },
         ):
             with self.assertRaisesRegex(training_ops.Refused, "requires idle"):
                 training_ops._cold_adapter_cache_cleanup()
@@ -154,7 +157,10 @@ class ColdCleanupTest(unittest.TestCase):
                 ):
                     training_ops._cold_start_cleanup("alpha", ["n76"])
 
-                self.assertEqual({host for host, _, _ in calls}, {"n76", "h200a"})
+                self.assertEqual(
+                    {host for host, _, _ in calls},
+                    {"n76", training_ops.orchestrator_host},
+                )
                 self.assertTrue(all(timeout == 300 for _, _, timeout in calls))
                 phases = ["stop" if "stop_only=1" in script else "delete" for _, script, _ in calls]
                 self.assertEqual(len(phases), 4)
@@ -226,7 +232,10 @@ class ColdCleanupTest(unittest.TestCase):
 
                     process.wait(timeout=3)
                     self.assertIsNotNone(process.returncode)
-                    self.assertEqual({host for host, _, _ in calls}, {"n76", "h200a"})
+                    self.assertEqual(
+                        {host for host, _, _ in calls},
+                        {"n76", training_ops.orchestrator_host},
+                    )
                 finally:
                     if process.poll() is None:
                         process.terminate()
