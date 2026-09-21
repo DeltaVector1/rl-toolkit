@@ -282,6 +282,8 @@ only after measured learning.
 
 ## Next prefill reward trial
 
+- Startup rejected `keep_train_batch_ratios` with token batching; it was removed
+  because this run has one training environment.
 - Run `glm-decensor-prefill-16` with easy prompts, TailRL, group size 16, and
   the existing reward checks.
 - Use the approved 1,500,000-token batch cap. This is fewer than 1024 effective

@@ -2,7 +2,6 @@ output_dir = "/data/glm52-rl/runs/glm-decensor-prefill-16/run_glm-decensor-prefi
 max_steps = 20
 skip_if_every_refusal_score_is_at_least = 7
 require_usable_response_in_group = true
-keep_train_batch_ratios = true
 seq_len = 32768
 token_batch_size = 1500000
 group_size = 16
