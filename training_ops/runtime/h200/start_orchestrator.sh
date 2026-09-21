@@ -718,6 +718,47 @@ test -f "$config_file" || {
   echo "orchestrator config is missing: $config_file" >&2
   exit 2
 }
+
+resolve_inference_image() {
+  local inference_container inference_id inference_name inference_running image
+  if ! inference_container=$(python3 - "$nodes_file" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    config = tomllib.load(stream)
+container = config.get("containers", {}).get("glm52_inference")
+if not isinstance(container, str) or not container:
+    raise SystemExit("nodes config has no GLM inference container")
+print(container)
+PY
+  ); then
+    echo "cannot read the configured GLM inference container" >&2
+    return 1
+  fi
+  inference_id=$(sudo docker inspect "$inference_container" --format '{{.Id}}' 2>/dev/null || true)
+  inference_name=$(sudo docker inspect "$inference_container" --format '{{.Name}}' 2>/dev/null || true)
+  inference_running=$(sudo docker inspect "$inference_container" --format '{{.State.Running}}' 2>/dev/null || true)
+  if [ -z "$inference_id" ] || [ "$inference_name" != "/$inference_container" ] || [ "$inference_running" != true ]; then
+    echo "configured GLM inference container is not running: $inference_container" >&2
+    return 1
+  fi
+  image=$(sudo docker inspect "$inference_container" --format '{{.Image}}' 2>/dev/null || true)
+  if [ -z "$image" ]; then
+    echo "configured GLM inference container has no image: $inference_container" >&2
+    return 1
+  fi
+  if [[ ! "$image" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "configured GLM inference image is not an immutable sha256 id: $image" >&2
+    return 1
+  fi
+  if ! sudo docker image inspect "$image" >/dev/null 2>&1; then
+    echo "configured GLM inference image is missing: $image" >&2
+    return 1
+  fi
+  printf '%s %s\n' "$inference_id" "$image"
+}
+
 if [ -n "${adapter_resume_step:-}" ]; then
   case "$adapter_resume_step" in
     *[!0-9]*) echo "adapter resume step must be a non-negative integer" >&2; exit 2 ;;
@@ -729,7 +770,10 @@ if [ -n "${adapter_resume_step:-}" ]; then
     write-config "$config_file" "$resume_control_dir" "$adapter_resume_step")
   config_file=$resume_config
 fi
-image=prime-rl:glm52-decensor
+if ! inference_state=$(resolve_inference_image); then
+  exit 2
+fi
+read -r inference_container_id image <<<"$inference_state"
 if ! lora_source_port_output=$(python3 - "$nodes_file" <<'PY'
 import sys
 import tomllib
@@ -3892,7 +3936,7 @@ adapter_relay_start() {
       return 0
   fi
   sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
-  sudo docker run -d --name "$relay_container" --restart unless-stopped \
+  sudo docker run -d --name "$relay_container" --pull=never --restart unless-stopped \
     --label "com.glm52.adapter-relay.source-url=$relay_source_url" \
     --user 0:0 \
     --network host \
@@ -4084,35 +4128,83 @@ for p in "${ports[@]}"; do
   ss -tln 2>/dev/null | grep -q "127.0.0.1:$p" && echo "tunnel :$p up" || echo "tunnel :$p DOWN"
 done
 
-sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
-sudo docker run -d --name "$ORCH_CT" \
-  --network host --restart no \
-  --env-file /data/trinity/training.env \
-  -e VLLM_API_KEY=unused \
-  -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/general-agent:/app/src" \
-  -e HF_HOME="/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache" \
-  -v /data/glm52-rl:/data/glm52-rl \
-  -v glm52-fp8-model:/models/glm52-fp8:ro \
-  -v "$deployment/prime-rl/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
-  -v "$deployment/prime-rl/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \
-  -v "$deployment/prime-rl/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \
-  -v "$deployment/prime-rl/deps/verifiers/verifiers/v1/harnesses/null/harness.py":/app/deps/verifiers/verifiers/v1/harnesses/null/harness.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/grpo.py":/app/src/prime_rl/orchestrator/algo/grpo.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/__init__.py":/app/src/prime_rl/orchestrator/algo/__init__.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/tail_likelihood.py":/app/src/prime_rl/orchestrator/algo/tail_likelihood.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/orchestrator/dispatcher.py":/app/src/prime_rl/orchestrator/dispatcher.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/orchestrator/train_sink.py":/app/src/prime_rl/orchestrator/train_sink.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/orchestrator/train_source.py":/app/src/prime_rl/orchestrator/train_source.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
-  -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/shared.py":/app/packages/prime-rl-configs/src/prime_rl/configs/shared.py:ro \
-  -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py":/app/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py:ro \
-  -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py":/app/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
-  -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
-  --entrypoint /app/.venv/bin/orchestrator "$image" \
-  @ "$config_file"
+start_orchestrator_container() {
+  local container_id container_name running state startup_checks=0 running_checks=0
+  sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+  if ! container_id=$(sudo docker run -d --name "$ORCH_CT" --pull=never \
+    --network host --restart no \
+    --env-file /data/trinity/training.env \
+    -e VLLM_API_KEY=unused \
+    -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/general-agent:/app/src" \
+    -e HF_HOME="/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache" \
+    -v /data/glm52-rl:/data/glm52-rl \
+    -v glm52-fp8-model:/models/glm52-fp8:ro \
+    -v "$deployment/prime-rl/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
+    -v "$deployment/prime-rl/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \
+    -v "$deployment/prime-rl/deps/verifiers/verifiers/v1/clients/eval.py":/app/deps/verifiers/verifiers/v1/clients/eval.py:ro \
+    -v "$deployment/prime-rl/deps/verifiers/verifiers/v1/harnesses/null/harness.py":/app/deps/verifiers/verifiers/v1/harnesses/null/harness.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/grpo.py":/app/src/prime_rl/orchestrator/algo/grpo.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/__init__.py":/app/src/prime_rl/orchestrator/algo/__init__.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/tail_likelihood.py":/app/src/prime_rl/orchestrator/algo/tail_likelihood.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/orchestrator/dispatcher.py":/app/src/prime_rl/orchestrator/dispatcher.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/orchestrator/train_sink.py":/app/src/prime_rl/orchestrator/train_sink.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/orchestrator/train_source.py":/app/src/prime_rl/orchestrator/train_source.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/orchestrator/watcher.py":/app/src/prime_rl/orchestrator/watcher.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/utils/client.py":/app/src/prime_rl/utils/client.py:ro \
+    -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/shared.py":/app/packages/prime-rl-configs/src/prime_rl/configs/shared.py:ro \
+    -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py":/app/packages/prime-rl-configs/src/prime_rl/configs/orchestrator.py:ro \
+    -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py":/app/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
+    -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
+    --entrypoint /app/.venv/bin/orchestrator "$image" \
+    @ "$config_file"); then
+    echo "ERROR: orchestrator container launch failed: $ORCH_CT" >&2
+    return 1
+  fi
+  [ -n "$container_id" ] || {
+    echo "ERROR: orchestrator container launch returned no container id: $ORCH_CT" >&2
+    return 1
+  }
+  while :; do
+    container_name=$(sudo docker inspect "$container_id" --format '{{.Name}}' 2>/dev/null || true)
+    running=$(sudo docker inspect "$container_id" --format '{{.State.Running}}' 2>/dev/null || true)
+    state=$(sudo docker inspect "$container_id" --format '{{.State.Status}}' 2>/dev/null || true)
+    if [ "$container_name" = "/$ORCH_CT" ] && [ "$running" = true ]; then
+      running_checks=$((running_checks + 1))
+      [ "$running_checks" -ge 20 ] && return 0
+    elif [ "$running_checks" -gt 0 ]; then
+      break
+    elif [ "$container_name" = "/$ORCH_CT" ] && [ "$state" != created ]; then
+      break
+    else
+      startup_checks=$((startup_checks + 1))
+      [ "$startup_checks" -ge 20 ] && break
+    fi
+    sleep 0.5
+  done
+  echo "ERROR: orchestrator container is not running: $ORCH_CT" >&2
+  sudo docker inspect "$container_id" --format 'orchestrator state: {{json .State}}' >&2 || \
+    echo "orchestrator state unavailable: $ORCH_CT" >&2
+  sudo docker logs --tail 100 "$container_id" >&2 || \
+    echo "orchestrator logs unavailable: $ORCH_CT" >&2
+  sudo docker rm -f "$container_id" >/dev/null 2>&1 || true
+  return 1
+}
+
+if ! current_inference_state=$(resolve_inference_image); then
+  exit 2
+fi
+read -r current_inference_container_id current_inference_image <<<"$current_inference_state"
+if [ "$current_inference_container_id" != "$inference_container_id" ] || \
+   [ "$current_inference_image" != "$image" ]; then
+  echo "configured GLM inference container or image changed before orchestrator launch" >&2
+  exit 2
+fi
+
+if ! start_orchestrator_container; then
+  exit 1
+fi
 echo "orchestrator started on $(hostname) with $(basename "$config_file")"
 
 if [ "$rollout_transfer_direction" = orchestrator_push ]; then
