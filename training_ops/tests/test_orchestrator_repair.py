@@ -279,6 +279,33 @@ class OrchestratorRepairTest(unittest.TestCase):
             relay_block,
         )
 
+    def test_normal_launch_holds_adapter_lock_through_watchdog(self):
+        launcher = (
+            Path(__file__).resolve().parents[2]
+            / "training_ops/runtime/h200/start_orchestrator.sh"
+        )
+        source = launcher.read_text(encoding="utf-8")
+        committed = source.index("repair_committed=1")
+        tunnels_only = source.index(
+            'if [ "$tunnels_only" = 1 ]; then', committed
+        )
+        tunnel_release = source.index(
+            'repair_release_lock || repair_fail "could not release adapter tunnel repair lock"',
+            tunnels_only,
+        )
+        launch = source.index("if ! start_orchestrator_container; then", tunnel_release)
+        watchdog = source.index(
+            'if [ "$rollout_transfer_direction" = orchestrator_push ]; then',
+            launch,
+        )
+        normal_release = source.index(
+            'repair_release_lock || repair_fail "could not release adapter tunnel repair lock"',
+            watchdog,
+        )
+        self.assertLess(tunnel_release, launch)
+        self.assertLess(launch, watchdog)
+        self.assertLess(watchdog, normal_release)
+
     def test_orchestrator_prepares_broadcast_steps_for_appuser(self):
         launcher = (
             Path(__file__).resolve().parents[2]

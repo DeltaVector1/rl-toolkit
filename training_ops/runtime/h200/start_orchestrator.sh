@@ -4073,8 +4073,8 @@ repair_created_tunnels=()
 repair_unregistered_tunnels=()
 repair_starting_tunnels=()
 repair_unidentified_tunnels=()
-repair_release_lock || repair_fail "could not release adapter tunnel repair lock"
 if [ "$tunnels_only" = 1 ]; then
+  repair_release_lock || repair_fail "could not release adapter tunnel repair lock"
   echo "adapter tunnel reconciliation complete"
   exit 0
 fi
@@ -4270,6 +4270,8 @@ else
   fi
   echo "trainer lease watchdog started (pid $trainer_watchdog_pid)"
 fi
+
+repair_release_lock || repair_fail "could not release adapter tunnel repair lock"
 
 ctl=/data/glm52-rl/runs/$RUN/$RUN_NAME/control/orch.toml
 if [ "$transport" = filesystem ]; then
