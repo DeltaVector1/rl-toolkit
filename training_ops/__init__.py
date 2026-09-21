@@ -691,6 +691,7 @@ def _select_active_reward_rows(
 # -------------------------------------------------------------------- probes
 
 trainer_compute_probe = r"""
+container_running=$(sudo docker inspect __TRAINER__ --format '{{.State.Running}}' 2>/dev/null | head -1)
 started_at=$(sudo docker inspect __TRAINER__ --format '{{.State.StartedAt}}' 2>/dev/null | head -1)
 started_epoch=$(date -u -d "$started_at" +%s.%N 2>/dev/null || true)
 if [ -z "$started_at" ] || [ -z "$started_epoch" ]; then
@@ -740,6 +741,12 @@ END {
   read -r compute_step compute_seconds compute_pp compute_active compute_start <<EOF
 $compute
 EOF
+  if [ "$compute_active" = 1 ] && [ "$compute_start" != "-" ]; then
+    if [ "$container_running" != true ]; then
+      compute_active=0
+      compute_stopped=1
+    fi
+  fi
   compute_elapsed=""
   if [ "$compute_active" = 1 ] && [ "$compute_start" != "-" ]; then
     compute_start_epoch=$(date -u -d "$compute_start" +%s.%N 2>/dev/null || true)
@@ -758,7 +765,9 @@ EOF
     echo "TRAINER_COMPUTE_PP_SECONDS $compute_pp"
     echo "TRAINER_COMPUTE_ACTIVE $compute_active"
     echo "TRAINER_COMPUTE_ELAPSED_SECONDS $compute_elapsed"
-    if [ "$compute_active" = 1 ]; then
+    if [ "${compute_stopped:-0}" = 1 ]; then
+      echo "TRAINER_COMPUTE_STATE stopped"
+    elif [ "$compute_active" = 1 ]; then
       echo "TRAINER_COMPUTE_STATE active"
     else
       echo "TRAINER_COMPUTE_STATE complete"
@@ -784,7 +793,13 @@ echo "TRAINER_LAST $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -a 'SUCCES
 echo "TRAINER_CURRENT $(sudo docker logs --tail 1 __TRAINER__ 2>&1 | strip | tail -1)"
 __TRAINER_COMPUTE__
 echo "TRAINER_FINISHED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'RL trainer finished|Trainer finished')"
-echo "TRAINER_FAILED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'prime_rl\.trainer\.rl\.train FAILED|CheckpointException')"
+trainer_failed=$(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'prime_rl\.trainer\.rl\.train FAILED|CheckpointException')
+trainer_exit=$(sudo docker inspect __TRAINER__ --format '{{.State.ExitCode}}' 2>/dev/null | head -1)
+case "$trainer_exit" in
+  ""|0|*[!0-9]*) ;;
+  *) trainer_failed=$((trainer_failed + 1)) ;;
+esac
+echo "TRAINER_FAILED $trainer_failed"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
 recent_rollouts=$(sudo docker logs --since 5m __ORCH__ 2>&1 || true)
@@ -821,7 +836,13 @@ echo "TRAINER_LAST $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -a 'SUCCES
 echo "TRAINER_CURRENT $(sudo docker logs --tail 1 __TRAINER__ 2>&1 | strip | tail -1)"
 __TRAINER_COMPUTE__
 echo "TRAINER_FINISHED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'RL trainer finished|Trainer finished')"
-echo "TRAINER_FAILED $(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'prime_rl\.trainer\.rl\.train FAILED|CheckpointException')"
+trainer_failed=$(sudo docker logs __TRAINER__ 2>&1 | strip | grep -aEc 'prime_rl\.trainer\.rl\.train FAILED|CheckpointException')
+trainer_exit=$(sudo docker inspect __TRAINER__ --format '{{.State.ExitCode}}' 2>/dev/null | head -1)
+case "$trainer_exit" in
+  ""|0|*[!0-9]*) ;;
+  *) trainer_failed=$((trainer_failed + 1)) ;;
+esac
+echo "TRAINER_FAILED $trainer_failed"
 echo "TRAINER_LOGAGE $(sudo docker logs -t --tail 1 __TRAINER__ 2>&1 | tail -1 | cut -d' ' -f1)"
 """
 
@@ -1393,6 +1414,11 @@ class Status:
         )
         if self.trainer_compute_state == "unknown":
             compute = "unknown"
+        elif (
+            self.trainer_compute_state == "stopped"
+            and self.trainer_compute_step is not None
+        ):
+            compute = f"step {self.trainer_compute_step} stopped before completion"
         elif (
             self.trainer_compute_state == "active"
             and self.trainer_compute_active
@@ -2546,7 +2572,7 @@ def status(run: str = "", quiet: bool = False) -> Status:
         s.trainer_failure_watchdog = int(h.get("TRAINER_FAIL_WD", 0) or 0) == 1
     s.trainer_steps = int(h.get("TRAINER_STEPS", 0) or 0)
     state = h.get("TRAINER_COMPUTE_STATE", "pending")
-    if state in {"pending", "active", "complete", "unknown"}:
+    if state in {"pending", "active", "complete", "stopped", "unknown"}:
         s.trainer_compute_state = state
     compute = _parse_trainer_compute(h.get("TRAINER_COMPUTE", ""))
     if compute is not None:

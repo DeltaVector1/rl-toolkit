@@ -15,7 +15,13 @@ import training_ops.tests  # Install the local-only test guard before any test r
 
 
 class TrainerComputeProbeTest(unittest.TestCase):
-    def run_probe(self, log, started_at="2026-09-08T22:00:00.000000000Z"):
+    def run_probe(
+        self,
+        log,
+        started_at="2026-09-08T22:00:00.000000000Z",
+        running="true",
+        exit_code="0",
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "sudo").write_text(
@@ -24,6 +30,8 @@ class TrainerComputeProbeTest(unittest.TestCase):
             (root / "docker").write_text(
                 "#!/bin/sh\n"
                 "case \"$*\" in\n"
+                "  *State.Running*) printf '%s\\n' \"$TRAINER_RUNNING\" ;;\n"
+                "  *State.ExitCode*) printf '%s\\n' \"$TRAINER_EXIT_CODE\" ;;\n"
                 "  inspect*) printf '%s\\n' \"$TRAINER_STARTED_AT\" ;;\n"
                 "  *logs*) printf '%s\\n' \"$TRAINER_LOG\" ;;\n"
                 "esac\n",
@@ -39,6 +47,58 @@ class TrainerComputeProbeTest(unittest.TestCase):
                 "PATH": f"{directory}:/usr/bin:/bin",
                 "TRAINER_LOG": log,
                 "TRAINER_STARTED_AT": started_at,
+                "TRAINER_RUNNING": running,
+                "TRAINER_EXIT_CODE": exit_code,
+            }
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return training_ops._kv(result.stdout)
+
+    def run_trainer_probe(self, log, running="false", exit_code="137"):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "sudo").write_text(
+                "#!/bin/sh\nexec \"$@\"\n", encoding="utf-8"
+            )
+            (root / "docker").write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  *State.StartedAt*) printf '%s\\n' \"$TRAINER_STARTED_AT\" ;;\n"
+                "  *trainer*State.Running*) printf '/trainer %s exited\\n' \"$TRAINER_RUNNING\" ;;\n"
+                "  *adapter*State.Running*) printf '/adapter false exited 0\\n' ;;\n"
+                "  *State.Running*) printf '/orch false exited\\n' ;;\n"
+                "  *State.ExitCode*) printf '%s\\n' \"$TRAINER_EXIT_CODE\" ;;\n"
+                "  *logs*) printf '%s\\n' \"$TRAINER_LOG\" ;;\n"
+                "  inspect*) printf '\\n' ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            (root / "curl").write_text(
+                "#!/bin/sh\nprintf 000\n", encoding="utf-8"
+            )
+            for path in (root / "sudo", root / "docker", root / "curl"):
+                path.chmod(0o755)
+            compute = training_ops.trainer_compute_probe.replace(
+                "__TRAINER__", "trainer"
+            )
+            script = training_ops.trainer_probe
+            script = script.replace("__TRAINER__", "trainer")
+            script = script.replace("__ORCH__", "orch")
+            script = script.replace("__ADAPTER__", "9999")
+            script = script.replace("__ADAPTER_CONTAINER__", "adapter")
+            script = script.replace("__TRAINER_COMPUTE__", compute)
+            environment = {
+                "PATH": f"{directory}:/usr/bin:/bin",
+                "TRAINER_LOG": log,
+                "TRAINER_STARTED_AT": "2026-09-08T22:00:00.000000000Z",
+                "TRAINER_RUNNING": running,
+                "TRAINER_EXIT_CODE": exit_code,
             }
             result = subprocess.run(
                 ["bash", "-c", script],
@@ -80,7 +140,7 @@ class TrainerComputeProbeTest(unittest.TestCase):
             training_ops._warnings(active),
         )
 
-    def test_stale_prior_step_and_pp_without_completion_stay_active(self):
+    def test_running_incomplete_step_stays_active(self):
         report = self.run_probe(
             "2026-09-08T22:00:01Z TRAINER_FORWARD_BACKWARD_START step=1\n"
             "2026-09-08T22:04:00Z PP step: 55 micro-batches in 300.00s\n"
@@ -93,6 +153,39 @@ class TrainerComputeProbeTest(unittest.TestCase):
         self.assertEqual(report["TRAINER_COMPUTE_ACTIVE"], "1")
         self.assertEqual(report["TRAINER_COMPUTE_STATE"], "active")
         self.assertTrue(float(report["TRAINER_COMPUTE_ELAPSED_SECONDS"]) >= 0)
+
+    def test_exited_incomplete_step_stops_timer_and_preserves_pp(self):
+        report = self.run_probe(
+            "2026-09-08T22:00:01Z TRAINER_FORWARD_BACKWARD_START step=2\n"
+            "2026-09-08T22:09:50Z PP step: 55 micro-batches in 454.89s\n",
+            running="false",
+            exit_code="1",
+        )
+        self.assertEqual(report["TRAINER_COMPUTE"], "2")
+        self.assertEqual(report["TRAINER_COMPUTE_PP_SECONDS"], "454.89")
+        self.assertEqual(report["TRAINER_COMPUTE_ACTIVE"], "0")
+        self.assertEqual(report["TRAINER_COMPUTE_ELAPSED_SECONDS"], "")
+        self.assertEqual(report["TRAINER_COMPUTE_STATE"], "stopped")
+
+    def test_exited_completed_step_keeps_authoritative_times(self):
+        report = self.run_probe(
+            "2026-09-08T22:00:01Z TRAINER_FORWARD_BACKWARD_START step=2\n"
+            "2026-09-08T22:09:50Z PP step: 55 micro-batches in 454.89s\n"
+            "2026-09-08T22:10:00Z TRAINER_FORWARD_BACKWARD_COMPLETE step=2 seconds=601.000000\n",
+            running="false",
+            exit_code="0",
+        )
+        self.assertEqual(training_ops._parse_trainer_compute(report["TRAINER_COMPUTE"]), (2, 601.0))
+        self.assertEqual(report["TRAINER_COMPUTE_PP_SECONDS"], "454.89")
+        self.assertEqual(report["TRAINER_COMPUTE_ACTIVE"], "0")
+        self.assertEqual(report["TRAINER_COMPUTE_STATE"], "complete")
+
+    def test_nonzero_exit_marks_failure_without_known_fatal_text(self):
+        report = self.run_trainer_probe(
+            "2026-09-08T22:00:01Z TRAINER_FORWARD_BACKWARD_START step=2\n"
+        )
+        self.assertEqual(report["TRAINER_UP"], "down")
+        self.assertEqual(report["TRAINER_FAILED"], "1")
 
     def test_matching_completion_ignores_later_adapter_work(self):
         report = self.run_probe(
