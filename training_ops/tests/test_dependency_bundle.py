@@ -103,7 +103,7 @@ class DependencyBundleTest(unittest.TestCase):
         self.assertNotIn("--append-verify", commands[0])
         self.assertFalse(any(script.startswith("truncate ") for script in ssh_scripts))
 
-    def test_trainer_bundle_uses_one_edge_upload(self):
+    def test_trainer_bundle_stages_on_trainer_head_and_fans_out_without_edge_relay(self):
         uploads = []
         remote_calls = []
 
@@ -134,17 +134,39 @@ class DependencyBundleTest(unittest.TestCase):
             )
 
         self.assertEqual(len(uploads), 1)
-        edge_destination = training_ops._ssh_destination(
-            training_ops.orchestrator_host
-        )[2]
-        self.assertIn(f"{edge_destination}:", uploads[0][0][-1])
+        trainer_destination = training_ops._ssh_destination(training_ops.trainer_head)[2]
+        self.assertIn(f"{trainer_destination}:", uploads[0][0][-1])
+        self.assertIn("-relay.tar.gz", uploads[0][0][-1])
+        self.assertNotIn(
+            f"{training_ops._ssh_destination(training_ops.orchestrator_host)[2]}:",
+            uploads[0][0][-1],
+        )
+        self.assertNotIn("china-trainer", " ".join(uploads[0][0]))
         self.assertTrue(
             any(
-                host == training_ops.orchestrator_host
-                and "china-trainer:" in script
+                host == training_ops.trainer_head
+                and "stat -c %s" in script
                 for host, script, _ in remote_calls
             )
         )
+        self.assertTrue(
+            any(
+                host == training_ops.trainer_head
+                and "10.92.20.76:" in script
+                for host, script, _ in remote_calls
+            )
+        )
+        self.assertTrue(
+            any(
+                host == training_ops.trainer_head
+                and "10.92.20.77:" in script
+                for host, script, _ in remote_calls
+            )
+        )
+        self.assertFalse(
+            any(host == training_ops.orchestrator_host for host, _, _ in remote_calls)
+        )
+        self.assertNotIn("china-trainer", "\n".join(script for _, script, _ in remote_calls))
         scripts = {
             host: script
             for host, script, _ in remote_calls
@@ -152,6 +174,8 @@ class DependencyBundleTest(unittest.TestCase):
         }
         self.assertIn("install_paths=(a.py)", scripts["n76"])
         self.assertIn("install_paths=(nested/b.py)", scripts["n77"])
+        self.assertNotIn("relay", output.getvalue())
+        self.assertIn("staged directly on n82", output.getvalue())
         self.assertIn("trainer dependency bundle: complete", output.getvalue())
 
 

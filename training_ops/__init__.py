@@ -6174,21 +6174,17 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
         ]
         relay_base = remote_archive.removesuffix(".tar.gz")
         relay_archive = relay_base + "-relay.tar.gz"
-        edge_relay_archive = relay_base + "-edge-relay.tar.gz"
-        if any(
-            _dependency_remote_archive_pattern.fullmatch(path) is None
-            for path in (relay_archive, edge_relay_archive)
-        ):
+        if _dependency_remote_archive_pattern.fullmatch(relay_archive) is None:
             raise Refused("invalid trainer dependency relay path")
 
         if trainer_targets:
-            _, scp_options, destination = _ssh_destination(orchestrator_host)
+            _, scp_options, destination = _ssh_destination(trainer_head)
             upload_command = scp_command + scp_options + [
                 str(bundle),
-                f"{destination}:{edge_relay_archive}",
+                f"{destination}:{relay_archive}",
             ]
 
-            def upload_to_edge() -> tuple[int, str]:
+            def upload_to_trainer_head() -> tuple[int, str]:
                 result = _run_process(
                     upload_command,
                     stdin=subprocess.DEVNULL,
@@ -6197,47 +6193,26 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                 return result.returncode, result.stderr or result.stdout
 
             _retry_dependency_copy(
-                f"upload to {orchestrator_host}",
-                upload_to_edge,
-                lambda: _ssh(
-                    orchestrator_host,
-                    f"rm -f -- {shlex.quote(edge_relay_archive)}",
-                    timeout=deployment_mkdir_timeout_seconds,
-                ),
-            )
-
-            def relay_to_trainer() -> tuple[int, str]:
-                return _ssh(
-                    orchestrator_host,
-                    "scp -q -o BatchMode=yes -o ConnectTimeout=25 "
-                    "-o StrictHostKeyChecking=accept-new -- "
-                    f"{shlex.quote(edge_relay_archive)} "
-                    f"{shlex.quote('china-trainer:' + relay_archive)}",
-                    timeout=deployment_bundle_scp_timeout_seconds,
-                )
-
-            _retry_dependency_copy(
-                f"relay to {trainer_head}",
-                relay_to_trainer,
+                f"upload to {trainer_head}",
+                upload_to_trainer_head,
                 lambda: _ssh(
                     trainer_head,
                     f"rm -f -- {shlex.quote(relay_archive)}",
                     timeout=deployment_mkdir_timeout_seconds,
                 ),
             )
-            relay_code, relay_output = _ssh(
+            staged_code, staged_output = _ssh(
                 trainer_head,
                 f"test $(stat -c %s -- {shlex.quote(relay_archive)}) -eq {bundle.stat().st_size}",
                 timeout=deployment_mkdir_timeout_seconds,
             )
-            if relay_code:
+            if staged_code:
                 raise RuntimeError(
-                    "trainer dependency relay size check failed: "
-                    + relay_output.strip()[:160]
+                    "trainer dependency direct stage size check failed: "
+                    + staged_output.strip()[:160]
                 )
             print(
-                f"trainer dependency bundle: relayed through {orchestrator_host} "
-                f"and staged once on {trainer_head} "
+                f"trainer dependency bundle: staged directly on {trainer_head} "
                 f"for {len(trainer_targets)} trainer hosts"
             )
 
@@ -6281,7 +6256,7 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                 try:
                     if host in trainer_hosts:
                         if host == trainer_head:
-                            relay_command = (
+                            fanout_command = (
                                 f"cp -- {shlex.quote(relay_archive)} "
                                 f"{shlex.quote(remote_archive)}"
                             )
@@ -6291,22 +6266,22 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                                 raise RuntimeError(
                                     f"trainer LAN address is missing for {host}"
                                 )
-                            relay_command = (
+                            fanout_command = (
                                 "scp -q -o BatchMode=yes -o ConnectTimeout=10 "
                                 "-o StrictHostKeyChecking=accept-new -- "
                                 f"{shlex.quote(relay_archive)} "
                                 f"{shlex.quote(peer + ':' + remote_archive)}"
                             )
-                        relay_code, relay_output = _ssh(
+                        fanout_code, fanout_output = _ssh(
                             trainer_head,
-                            relay_command,
+                            fanout_command,
                             timeout=deployment_bundle_scp_timeout_seconds,
                         )
                         uploaded = subprocess.CompletedProcess(
-                            args=relay_command,
-                            returncode=relay_code,
+                            args=fanout_command,
+                            returncode=fanout_code,
                             stdout="",
-                            stderr=relay_output,
+                            stderr=fanout_output,
                         )
                     else:
                         if attempt == 1:
@@ -6408,11 +6383,6 @@ def _deploy_dependencies(required_files: list[tuple[str, list[str]]]) -> None:
                 _ssh(
                     trainer_head,
                     f"rm -f -- {shlex.quote(relay_archive)}",
-                    timeout=deployment_mkdir_timeout_seconds,
-                )
-                _ssh(
-                    orchestrator_host,
-                    f"rm -f -- {shlex.quote(edge_relay_archive)}",
                     timeout=deployment_mkdir_timeout_seconds,
                 )
         if failures:
