@@ -277,6 +277,26 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertLess(readiness_call, docker_start)
         self.assertLess(mode_start, docker_start)
 
+    def test_swanlab_secret_check_precedes_launch_mutation(self):
+        launcher = (
+            Path(__file__).resolve().parents[2]
+            / "training_ops/runtime/h200/start_orchestrator.sh"
+        )
+        source = launcher.read_text(encoding="utf-8")
+        check = source.index("if ! check_swanlab_secret; then")
+        exit_trap = source.index("trap 'repair_exit \"$?\"' EXIT")
+        image_read = source.index("if ! inference_state=$(resolve_inference_image); then")
+        lock = source.index("repair_acquire_lock || repair_fail")
+        relay = source.index("if ! adapter_relay_start; then")
+        recheck = source.index("if ! check_training_env_identity; then")
+        launch = source.index("if ! start_orchestrator_container; then")
+        self.assertLess(check, exit_trap)
+        self.assertLess(check, image_read)
+        self.assertLess(check, lock)
+        self.assertLess(check, relay)
+        self.assertLess(recheck, launch)
+        self.assertIn('[ "$tunnels_only" != 1 ] || return 0', source)
+
     def test_relay_check_precedes_prevalidated_tunnel_fast_path(self):
         launcher = (
             Path(__file__).resolve().parents[2]

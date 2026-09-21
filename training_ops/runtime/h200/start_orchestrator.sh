@@ -14,6 +14,112 @@ for argument in "$@"; do
   esac
 done
 
+deployment=/data/glm52-rl/deployment
+config_file=${ORCH_CONFIG:-$deployment/configs/general-agent/orchestrator.toml}
+nodes_file="$deployment/configs/nodes.toml"
+training_env_file=/data/trinity/training.env
+test -f "$config_file" || {
+  echo "orchestrator config is missing: $config_file" >&2
+  exit 2
+}
+
+check_swanlab_secret() {
+  local identity
+  [ "$tunnels_only" != 1 ] || return 0
+  if ! identity=$(python3 - "$config_file" "$training_env_file" <<'PY'
+import os
+import stat
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as stream:
+        config = tomllib.load(stream)
+except (OSError, tomllib.TOMLDecodeError):
+    raise SystemExit("cannot inspect SwanLab configuration")
+
+swanlab = config.get("swanlab")
+if swanlab is None:
+    require_key = False
+elif not isinstance(swanlab, dict):
+    raise SystemExit("invalid SwanLab mode in orchestrator configuration")
+else:
+    mode = swanlab.get("mode", "online")
+    if mode not in {"online", "offline", "local", "disabled"}:
+        raise SystemExit("invalid SwanLab mode in orchestrator configuration")
+    require_key = mode == "online"
+
+count = 0
+nonempty = False
+malformed = False
+go_whitespace = "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+try:
+    descriptor = os.open(sys.argv[2], os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, encoding="utf-8", newline="\n") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError
+        for number, line in enumerate(stream):
+            line = line.removesuffix("\n").removesuffix("\r")
+            if number == 0:
+                line = line.removeprefix("\ufeff")
+            line = line.lstrip(go_whitespace)
+            if not line or line.startswith("#"):
+                continue
+            key, separator, value = line.partition("=")
+            if key == "SWANLAB_API_KEY":
+                count += 1
+                nonempty = bool(separator and value.strip())
+            elif key.rstrip(go_whitespace) == "SWANLAB_API_KEY":
+                malformed = True
+        after = os.fstat(stream.fileno())
+except (OSError, UnicodeError):
+    raise SystemExit("orchestrator launch requires exactly one nonempty SWANLAB_API_KEY")
+
+if malformed or (require_key and (count != 1 or not nonempty)):
+    raise SystemExit("orchestrator launch requires exactly one nonempty SWANLAB_API_KEY")
+before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+if before_identity != after_identity:
+    raise SystemExit("orchestrator environment file changed during preflight")
+print(":".join(map(str, after_identity)))
+PY
+  ); then
+    return 1
+  fi
+  training_env_identity=$identity
+}
+
+check_training_env_identity() {
+  local current
+  if ! current=$(python3 - "$training_env_file" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    descriptor = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor) as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError
+except OSError:
+    raise SystemExit("orchestrator environment file changed after preflight")
+print(":".join(map(str, (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))))
+PY
+  ); then
+    return 1
+  fi
+  if [ "$current" != "$training_env_identity" ]; then
+    echo "orchestrator environment file changed after preflight" >&2
+    return 1
+  fi
+}
+
+if ! check_swanlab_secret; then
+  exit 2
+fi
+
 tunnel_repair_deadline=0
 repair_total_deadline=0
 repair_cleanup_spent_us=0
@@ -711,13 +817,6 @@ RUN_NAME=${RUN_NAME:?set RUN_NAME}
 TRAINER_ADDRESSES=${TRAINER_ADDRESSES:?set TRAINER_ADDRESSES}
 TRAINER_CT=${TRAINER_CT:?set TRAINER_CT}
 ORCH_CT=${ORCH_CT:?set ORCH_CT}
-deployment=/data/glm52-rl/deployment
-config_file=${ORCH_CONFIG:-$deployment/configs/general-agent/orchestrator.toml}
-nodes_file="$deployment/configs/nodes.toml"
-test -f "$config_file" || {
-  echo "orchestrator config is missing: $config_file" >&2
-  exit 2
-}
 
 resolve_inference_image() {
   local inference_container inference_id inference_name inference_running image
@@ -4209,7 +4308,7 @@ start_orchestrator_container() {
   launch_output=$(sudo docker run -d --name "$ORCH_CT" --pull=never \
     --label "com.glm52.orchestrator.launch=$launch_label" \
     --network host --restart no \
-    --env-file /data/trinity/training.env \
+    --env-file "$training_env_file" \
     -e VLLM_API_KEY=unused \
     -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/general-agent:/app/src" \
     -e HF_HOME="/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache" \
@@ -4290,6 +4389,9 @@ read -r current_orchestrator_image_reference current_orchestrator_image_id \
 if [ "$current_orchestrator_image_reference" != "$orchestrator_image_reference" ] || \
    [ "$current_orchestrator_image_id" != "$orchestrator_image_id" ]; then
   echo "configured orchestrator image changed before launch" >&2
+  exit 2
+fi
+if ! check_training_env_identity; then
   exit 2
 fi
 

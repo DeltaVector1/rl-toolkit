@@ -147,6 +147,8 @@ chmod +x "$tmp/bin"/*
 source <(sed -n '/^resolve_inference_image() {/,/^}$/p' "$launcher")
 source <(sed -n '/^resolve_orchestrator_image() {/,/^}$/p' "$launcher")
 source <(sed -n '/^resolve_orchestrator_image_for_launch() {/,/^}$/p' "$launcher")
+source <(sed -n '/^check_swanlab_secret() {/,/^}$/p' "$launcher")
+source <(sed -n '/^check_training_env_identity() {/,/^}$/p' "$launcher")
 source <(sed -n '/^remove_failed_orchestrator() {/,/^}$/p' "$launcher")
 source <(sed -n '/^start_orchestrator_container() {/,/^}$/p' "$launcher")
 source <(sed -n '/^adapter_relay_start() {/,/^}$/p' "$launcher")
@@ -162,6 +164,97 @@ export LAUNCH_LABEL_LOG="$tmp/launch-labels"
 export EXPECTED_IMAGE=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 export EXPECTED_ORCHESTRATOR_IMAGE=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 : >"$CALL_LOG"
+
+config_file="$tmp/orchestrator.toml"
+training_env_file="$tmp/training.env"
+tunnels_only=0
+printf '%s\n' '[swanlab]' 'mode = "online"' >"$config_file"
+for contents in \
+  '' \
+  'SWANLAB_API_KEY=' \
+  $'SWANLAB_API_KEY=fixture-first\nSWANLAB_API_KEY=fixture-second' \
+  'SWANLAB_API_KEY =fixture-secret' \
+  $'SWANLAB_API_KEY\t=fixture-secret' \
+  $'SWANLAB_API_KEY\u00a0=fixture-secret' \
+  $'\xEF\xBB\xBFSWANLAB_API_KEY=fixture-first\nSWANLAB_API_KEY=fixture-second' \
+  $'\u00a0SWANLAB_API_KEY=fixture-first\nSWANLAB_API_KEY=fixture-second' \
+  $'# comment\rSWANLAB_API_KEY=fixture-secret' \
+  $'\u001cSWANLAB_API_KEY=fixture-secret' \
+  $'\u001dSWANLAB_API_KEY=fixture-secret' \
+  $'\u001eSWANLAB_API_KEY=fixture-secret' \
+  $'\u001fSWANLAB_API_KEY=fixture-secret'; do
+  printf '%s\n' "$contents" >"$training_env_file"
+  set +e
+  secret_output=$(check_swanlab_secret 2>"$tmp/swanlab-secret.err")
+  secret_status=$?
+  set -e
+  test "$secret_status" -ne 0
+  test -z "$secret_output"
+  grep -Fx 'orchestrator launch requires exactly one nonempty SWANLAB_API_KEY' "$tmp/swanlab-secret.err"
+  ! grep -F 'fixture' "$tmp/swanlab-secret.err"
+done
+
+for prefix in \
+  ' ' $'\t' $'\n' $'\v' $'\f' $'\r' $'\u0085' $'\u00a0' $'\u1680' \
+  $'\u2000' $'\u2001' $'\u2002' $'\u2003' $'\u2004' $'\u2005' $'\u2006' \
+  $'\u2007' $'\u2008' $'\u2009' $'\u200a' $'\u2028' $'\u2029' $'\u202f' \
+  $'\u205f' $'\u3000'; do
+  printf '%s\n' "${prefix}SWANLAB_API_KEY=test-secret" >"$training_env_file"
+  check_swanlab_secret
+done
+
+printf '%s\n' $'# comment\rSWANLAB_API_KEY=ignored-secret' \
+  'SWANLAB_API_KEY=test-secret' >"$training_env_file"
+check_swanlab_secret
+
+printf '%s\n' '' '  # comment' 'SWANLAB_API_KEY=test-secret' >"$training_env_file"
+check_swanlab_secret >"$tmp/swanlab-present.out" 2>"$tmp/swanlab-present.err"
+test ! -s "$tmp/swanlab-present.out"
+test ! -s "$tmp/swanlab-present.err"
+check_training_env_identity
+
+printf '%s\n' 'SWANLAB_API_KEY=changed-secret' >"$training_env_file"
+set +e
+check_training_env_identity 2>"$tmp/swanlab-changed.err"
+changed_status=$?
+set -e
+test "$changed_status" -ne 0
+grep -Fx 'orchestrator environment file changed after preflight' "$tmp/swanlab-changed.err"
+! grep -F 'changed-secret' "$tmp/swanlab-changed.err"
+
+rm -f "$training_env_file"
+tunnels_only=1
+check_swanlab_secret
+tunnels_only=0
+
+printf '%s\n' '# no secret required' >"$training_env_file"
+for mode in offline local disabled; do
+  printf '%s\n' '[swanlab]' "mode = \"$mode\"" >"$config_file"
+  check_swanlab_secret
+done
+
+printf '%s\n' '[log]' 'level = "info"' >"$config_file"
+check_swanlab_secret
+
+printf '%s\n' '[swanlab]' 'mode = "onlien"' >"$config_file"
+set +e
+check_swanlab_secret 2>"$tmp/swanlab-mode.err"
+mode_status=$?
+set -e
+test "$mode_status" -ne 0
+grep -Fx 'invalid SwanLab mode in orchestrator configuration' "$tmp/swanlab-mode.err"
+
+printf '%s\n' '[swanlab]' >"$config_file"
+printf '%s\n' 'SWANLAB_API_KEY=test-secret' >"$tmp/secret-target"
+rm -f "$training_env_file"
+ln -s "$tmp/secret-target" "$training_env_file"
+set +e
+check_swanlab_secret 2>"$tmp/swanlab-symlink.err"
+symlink_status=$?
+set -e
+test "$symlink_status" -ne 0
+grep -Fx 'orchestrator launch requires exactly one nonempty SWANLAB_API_KEY' "$tmp/swanlab-symlink.err"
+rm -f "$training_env_file"
 
 inference_state=$(DOCKER_MODE=ready resolve_inference_image)
 read -r inference_id image <<<"$inference_state"
@@ -224,6 +317,7 @@ ORCH_CT=orchestrator
 image=$EXPECTED_IMAGE
 orchestrator_image_id=$EXPECTED_ORCHESTRATOR_IMAGE
 config_file=/fixture/orchestrator.toml
+training_env_file=/data/trinity/training.env
 
 set +e
 export DOCKER_MODE=run-failure
