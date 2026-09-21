@@ -59,14 +59,24 @@ class RolloutPullTest(unittest.TestCase):
             run_dir.mkdir(parents=True)
             environment = self.tools(directory)
             old_script = training_ops.rollout_pull_script
+            commands = []
             try:
                 training_ops.rollout_pull_script = str(puller)
                 commands = [training_ops._rollout_pull_command(str(run_dir), action) for action in ("start", "status", "stop")]
                 self.assertNotIn("china-trainer", "\n".join(commands))
-                for command in commands:
+                for command in commands[:2]:
                     result = subprocess.run(["bash", "-c", command], env=environment, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
+                pid_file = run_dir / ".rollout-pull.pid"
+                self.assertTrue(pid_file.is_file())
+                pid_file.unlink()
+                result = subprocess.run(["bash", "-c", commands[2]], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotEqual(subprocess.run(["bash", "-c", commands[1]], env=environment).returncode, 0)
+                self.assertEqual(subprocess.run(["flock", "-n", str(run_dir / ".rollout-pull.lock"), "-c", "true"]).returncode, 0)
             finally:
+                if commands:
+                    subprocess.run(["bash", "-c", commands[2]], env=environment, capture_output=True, timeout=10)
                 training_ops.rollout_pull_script = old_script
 
     def test_pull_is_checksummed_resumable_and_no_replace(self):
@@ -85,7 +95,7 @@ class RolloutPullTest(unittest.TestCase):
                 path.write_bytes(content)
             old = time.time() - 3
             os.utime(source / "control/orch.toml", (old, old))
-            stable = destination / "broadcasts/step_1/STABLE"
+            stable = destination / "broadcasts/step_2/STABLE"
             stable.parent.mkdir(parents=True)
             stable.write_bytes(b"stable")
             environment = self.environment(source, destination, self.tools(directory))
@@ -98,13 +108,56 @@ class RolloutPullTest(unittest.TestCase):
                 self.assertEqual((destination / relative).read_bytes(), content)
                 digest = hashlib.sha256(content).hexdigest()
                 self.assertEqual((source / f"{relative}.delivered").read_text().strip(), digest)
-            self.assertEqual((source / "broadcasts/step_1/STABLE").read_bytes(), b"stable")
+            remote_step = source / "broadcasts/step_2"
+            self.assertEqual((remote_step / "STABLE").read_bytes(), b"stable")
+            self.assertFalse(remote_step.is_symlink())
+            self.assertEqual((remote_step.stat().st_uid, remote_step.stat().st_gid), (1000, 1000))
+            self.assertEqual(remote_step.stat().st_mode & 0o777, 0o755)
+            probe = remote_step / "uid-1000-write-probe"
+            probe.write_bytes(b"writable")
+            probe.unlink()
             self.assertTrue((source / ".trainer-health-lease").read_text().strip().isdigit())
 
-            (source / "rollouts/step_1/train_rollouts.bin").write_bytes(b"changed")
+            control = source / "control/orch.toml"
+            control.write_bytes(b"new-control")
+            os.utime(control, (old, old))
+            result = subprocess.run(["bash", str(puller), "run"], env=environment, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((destination / "control/orch.toml").read_bytes(), b"control")
+
+            (source / "control/orch.toml.delivered").unlink()
+            (destination / "control/orch.toml").unlink()
+            result = subprocess.run(["bash", str(puller), "run"], env=environment, capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((destination / "control/orch.toml").read_bytes(), b"new-control")
+
+            rollout = source / "rollouts/step_1/train_rollouts.bin"
+            (source / "rollouts/step_1/train_rollouts.bin.delivered").unlink()
+            rollout.write_bytes(b"different-rollout")
             result = subprocess.run(["bash", str(puller), "run"], env=environment, capture_output=True, text=True, timeout=20)
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual((destination / "rollouts/step_1/train_rollouts.bin").read_bytes(), files["rollouts/step_1/train_rollouts.bin"])
+            self.assertEqual(
+                (destination / "rollouts/step_1/train_rollouts.bin").read_bytes(),
+                b"rollout-batch",
+            )
+
+    def test_stable_refuses_an_existing_step_with_unexpected_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            step = source / "broadcasts/step_3"
+            step.mkdir(parents=True)
+            step.chmod(0o700)
+            stable = destination / "broadcasts/step_3/STABLE"
+            stable.parent.mkdir(parents=True)
+            stable.write_bytes(b"stable")
+            environment = self.environment(source, destination, self.tools(directory))
+            environment["ONCE"] = "1"
+            result = subprocess.run(["bash", str(puller), "run"], env=environment, capture_output=True, text=True, timeout=20)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(step.stat().st_mode & 0o777, 0o700)
+            self.assertFalse((step / "STABLE").exists())
 
 
 if __name__ == "__main__":

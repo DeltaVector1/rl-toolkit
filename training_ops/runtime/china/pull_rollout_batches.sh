@@ -92,29 +92,49 @@ status() {
   [ "$count" -eq 1 ]
 }
 
+matching_pids() {
+  local proc candidate
+  for proc in /proc/[0-9]*; do
+    candidate=${proc##*/}
+    process_matches "$candidate" && printf '%s\n' "$candidate"
+  done
+}
+
+group_live() {
+  ps -eo pgid=,stat= | awk -v group="$1" '$1 == group && $2 !~ /^Z/ {found=1} END {exit !found}'
+}
+
 stop() {
-  local pid group_live
-  pid=$(cat "$pid_file" 2>/dev/null || true)
-  if ! process_matches "$pid"; then
-    rm -f -- "$pid_file"
+  local pid any_live
+  local -a pids=()
+  local_path_safe "$dest_dir" || return 1
+  mapfile -t pids < <(matching_pids)
+  for pid in "${pids[@]}"; do
+    process_matches "$pid" || continue
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 50); do
+    any_live=0
+    for pid in "${pids[@]}"; do group_live "$pid" && any_live=1; done
+    [ "$any_live" = 1 ] || break
+    sleep 0.1
+  done
+  for pid in "${pids[@]}"; do
+    group_live "$pid" || continue
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  done
+  for _ in $(seq 1 50); do
+    any_live=0
+    for pid in "${pids[@]}"; do group_live "$pid" && any_live=1; done
+    [ "$any_live" = 1 ] || break
+    sleep 0.1
+  done
+  for pid in "${pids[@]}"; do group_live "$pid" && return 1; done
+  [ -z "$(matching_pids)" ] || return 1
+  if [ ! -e "$dest_dir" ]; then
     return 0
   fi
-  kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
-  for _ in $(seq 1 50); do
-    group_live=$(ps -eo pgid=,stat= | awk -v group="$pid" '$1 == group && $2 !~ /^Z/ {print 1; exit}')
-    [ -n "$group_live" ] || break
-    sleep 0.1
-  done
-  group_live=$(ps -eo pgid=,stat= | awk -v group="$pid" '$1 == group && $2 !~ /^Z/ {print 1; exit}')
-  if [ -n "$group_live" ]; then
-    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-  fi
-  for _ in $(seq 1 50); do
-    group_live=$(ps -eo pgid=,stat= | awk -v group="$pid" '$1 == group && $2 !~ /^Z/ {print 1; exit}')
-    [ -n "$group_live" ] || break
-    sleep 0.1
-  done
-  [ -z "$group_live" ] || return 1
+  [ -d "$dest_dir" ] && [ ! -L "$dest_dir" ] || return 1
   flock -n "$lock_file" -c true || return 1
   rm -f -- "$pid_file"
 }
@@ -257,12 +277,14 @@ pull_one() {
 }
 
 push_stable() {
-  local local_file=$1 relative=${1#"$dest_dir"/} remote_file partial digest remote_digest
+  local local_file=$1 relative=${1#"$dest_dir"/} remote_file remote_step partial digest remote_digest
   [[ "$relative" =~ ^broadcasts/step_[0-9]+/STABLE$ ]] || return 1
   remote_file="$source_dir/$relative"
+  remote_step=$(dirname "$remote_file")
   partial="$source_dir/.incoming/$relative"
   local_path_safe "$local_file" || return 1
-  remote_path_safe "$(dirname "$remote_file")" || return 1
+  remote_path_safe "$remote_step" || return 1
+  remote "directory='$remote_step'; parent=\${directory%/*}; [ -d \"\$parent\" ] && [ ! -L \"\$parent\" ] || exit 1; if [ -e \"\$directory\" ]; then [ -d \"\$directory\" ] && [ ! -L \"\$directory\" ] || exit 1; else mkdir -m 0755 -- \"\$directory\" || exit 1; chown 1000:1000 \"\$directory\" || exit 1; fi; [ \"\$(stat -c '%u:%g:%a' \"\$directory\")\" = 1000:1000:755 ]" || return 1
   digest=$(sha256sum -- "$local_file" | awk '{print $1}') || return 1
   remote_digest=$(remote "sha256sum -- '$remote_file' 2>/dev/null | awk '{print \$1}'" || true)
   [ "$remote_digest" = "$digest" ] && return 0
@@ -277,11 +299,12 @@ push_stable() {
 }
 
 scan() {
-  local remote_file local_file status=0
+  local listing remote_file local_file status=0
+  listing=$(remote "{ printf '%s\\n' '$source_dir/control/orch.toml'; find '$source_dir/broadcasts' '$source_dir/rollouts' -type f \( -path '*/broadcasts/step_*/receivers-ready.json' -o -path '*/rollouts/step_*/train_rollouts.bin' \) -print 2>/dev/null; } | while IFS= read -r file; do [ -f \"\$file\" ] || continue; marker=\"\$file.delivered\"; [ ! -L \"\$marker\" ] || exit 1; if [ -e \"\$marker\" ]; then [ -f \"\$marker\" ] || exit 1; continue; fi; if [ \"\$file\" = '$source_dir/control/orch.toml' ] && [ \$(( \$(date +%s) - \$(stat -c %Y \"\$file\") )) -lt 2 ]; then continue; fi; printf '%s\\n' \"\$file\"; done") || return 1
   while IFS= read -r remote_file; do
     [ -n "$remote_file" ] || continue
     pull_one "$remote_file" || status=1
-  done < <(remote "control='$source_dir/control/orch.toml'; if [ -f \"\$control\" ] && [ \$(( \$(date +%s) - \$(stat -c %Y \"\$control\") )) -ge 2 ]; then printf '%s\\n' \"\$control\"; fi; find '$source_dir/broadcasts' '$source_dir/rollouts' -type f \( -path '*/broadcasts/step_*/receivers-ready.json' -o -path '*/rollouts/step_*/train_rollouts.bin' \) -print 2>/dev/null" || true)
+  done <<<"$listing"
   while IFS= read -r -d '' local_file; do
     push_stable "$local_file" || status=1
   done < <(find "$dest_dir/broadcasts" -mindepth 2 -maxdepth 2 -type f -name STABLE -print0 2>/dev/null | sort -z)
