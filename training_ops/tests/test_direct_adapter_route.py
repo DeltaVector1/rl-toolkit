@@ -187,6 +187,148 @@ class DirectRouteTest(unittest.TestCase):
                     with mock.patch.object(route_module, "check_pidfd_support"), self.assertRaisesRegex(RuntimeError, message):
                         route_module.operate("stop", current)
 
+    def test_restart_replaces_authenticated_live_digest_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = {**self.route, "state_dir": directory, "digest": "old"}
+            current = {
+                **self.route,
+                "state_dir": directory,
+                "digest": "new",
+                "ssh_identity_file": str(source),
+                "ssh_known_hosts_file": str(source),
+            }
+            manager = {"pid": 11111, "start": "1", "argv": route_module.manager_argv(old)}
+            child = {"pid": 22222, "start": "2", "argv": ["/usr/bin/ssh", "old-route"]}
+            new = {"pid": 33333, "start": "3", "argv": route_module.manager_argv(current)}
+            route_module.publish(old, {"manager": manager, "digest": "old", "status": "ready", "children": [child]})
+            identities = {manager["pid"]: manager, child["pid"]: child, new["pid"]: new}
+            process = mock.Mock(pid=new["pid"])
+            process.poll.return_value = None
+
+            def stop(record, number):
+                self.assertEqual((record, number), (manager, signal.SIGTERM))
+                identities.pop(manager["pid"])
+                identities.pop(child["pid"])
+
+            with mock.patch.object(route_module, "check_pidfd_support"), mock.patch.object(
+                route_module, "identity", side_effect=identities.get
+            ), mock.patch.object(route_module, "send", side_effect=stop) as send, mock.patch.object(
+                route_module.subprocess, "Popen", return_value=process
+            ) as launch, mock.patch.object(
+                route_module, "ready", return_value={"manager": new}
+            ):
+                route_module.operate("restart", current)
+
+            send.assert_called_once_with(manager, signal.SIGTERM)
+            launch.assert_called_once()
+
+    def test_start_refuses_live_digest_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = {**self.route, "state_dir": directory, "digest": "old"}
+            current = {**self.route, "state_dir": directory, "digest": "new"}
+            manager = {"pid": 11111, "start": "1", "argv": route_module.manager_argv(old)}
+            route_module.publish(old, {"manager": manager, "digest": "old", "status": "ready", "children": []})
+            with mock.patch.object(route_module, "check_pidfd_support"), mock.patch.object(
+                route_module, "identity", return_value=manager
+            ), mock.patch.object(route_module, "send") as send, self.assertRaisesRegex(
+                RuntimeError, "configuration differs; refusing signal"
+            ):
+                route_module.operate("start", current)
+            send.assert_not_called()
+
+    def test_restart_refuses_tampered_manager_or_child_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = {**self.route, "state_dir": directory, "digest": "old"}
+            current = {**self.route, "state_dir": directory, "digest": "new"}
+            manager = {"pid": 11111, "start": "1", "argv": route_module.manager_argv(old)}
+            child = {"pid": 22222, "start": "2", "argv": ["/usr/bin/ssh", "old-route"]}
+            route_module.publish(old, {"manager": manager, "digest": "old", "status": "ready", "children": [child]})
+            for changed, message in (
+                ({manager["pid"]: {**manager, "start": "9"}, child["pid"]: child}, "manager identity differs"),
+                ({manager["pid"]: manager, child["pid"]: {**child, "argv": ["unrelated"]}}, "child identity differs"),
+            ):
+                with self.subTest(message=message), mock.patch.object(
+                    route_module, "check_pidfd_support"
+                ), mock.patch.object(
+                    route_module, "identity", side_effect=changed.get
+                ), mock.patch.object(route_module, "send") as send, self.assertRaisesRegex(
+                    RuntimeError, message
+                ):
+                    route_module.operate("restart", current)
+                send.assert_not_called()
+
+            unrelated = {**manager, "argv": ["/usr/bin/python3", "unrelated"]}
+            route_module.publish(old, {"manager": unrelated, "digest": "old", "status": "ready", "children": [child]})
+            with mock.patch.object(route_module, "check_pidfd_support"), mock.patch.object(
+                route_module, "identity", side_effect={unrelated["pid"]: unrelated, child["pid"]: child}.get
+            ), mock.patch.object(route_module, "send") as send, self.assertRaisesRegex(
+                RuntimeError, "manager argv or configuration differs"
+            ):
+                route_module.operate("restart", current)
+            send.assert_not_called()
+
+    def test_restart_allows_missing_child_for_authenticated_manager_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = {**self.route, "state_dir": directory, "digest": "old"}
+            current = {**self.route, "state_dir": directory, "digest": "new"}
+            manager = {"pid": 11111, "start": "1", "argv": route_module.manager_argv(old)}
+            child = {"pid": 22222, "start": "2", "argv": ["/usr/bin/ssh", "old-route"]}
+            state = {"manager": manager, "digest": "old", "status": "ready", "children": [child]}
+            route_module.publish(old, state)
+            with mock.patch.object(route_module, "identity", side_effect={manager["pid"]: manager}.get):
+                self.assertEqual(route_module.restart_state(current), state)
+
+    def test_restart_live_mismatch_cleanup_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = {**self.route, "state_dir": directory, "digest": "old"}
+            current = {**self.route, "state_dir": directory, "digest": "new", "cleanup_timeout_seconds": 5}
+            manager = {"pid": 11111, "start": "1", "argv": route_module.manager_argv(old)}
+            child = {"pid": 22222, "start": "2", "argv": ["/usr/bin/ssh", "old-route"]}
+            route_module.publish(old, {"manager": manager, "digest": "old", "status": "ready", "children": [child]})
+            identities = {manager["pid"]: manager, child["pid"]: child}
+            with mock.patch.object(route_module, "check_pidfd_support"), mock.patch.object(
+                route_module, "identity", side_effect=identities.get
+            ), mock.patch.object(route_module, "send") as send, mock.patch.object(
+                route_module.subprocess, "Popen"
+            ) as launch, mock.patch.object(
+                route_module.time, "monotonic", side_effect=[0, 0, 0, 9]
+            ), mock.patch.object(route_module.time, "sleep"), self.assertRaisesRegex(
+                TimeoutError, "cleanup deadline exceeded"
+            ):
+                route_module.operate("restart", current)
+            send.assert_called_once_with(manager, signal.SIGTERM)
+            launch.assert_not_called()
+
+    def test_restart_accepts_stopped_digest_mismatch_without_signalling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            old = {**self.route, "state_dir": directory, "digest": "old"}
+            current = {
+                **self.route,
+                "state_dir": directory,
+                "digest": "new",
+                "ssh_identity_file": str(source),
+                "ssh_known_hosts_file": str(source),
+            }
+            manager = {"pid": 11111, "start": "1", "argv": route_module.manager_argv(old)}
+            child = {"pid": 22222, "start": "2", "argv": ["/usr/bin/ssh", "old-route"]}
+            new = {"pid": 33333, "start": "3", "argv": route_module.manager_argv(current)}
+            route_module.publish(old, {"manager": manager, "digest": "old", "status": "stopped", "children": [child]})
+            identities = {}
+            process = mock.Mock(pid=new["pid"])
+            process.poll.return_value = None
+
+            def launch(*args, **kwargs):
+                identities[new["pid"]] = new
+                return process
+
+            with mock.patch.object(route_module, "check_pidfd_support"), mock.patch.object(
+                route_module, "identity", side_effect=identities.get
+            ), mock.patch.object(route_module, "send") as send, mock.patch.object(
+                route_module.subprocess, "Popen", side_effect=launch
+            ), mock.patch.object(route_module, "ready", return_value={"manager": new}):
+                route_module.operate("restart", current)
+            send.assert_not_called()
+
     def test_stale_private_pending_is_recoverable_but_symlink_is_not(self):
         with tempfile.TemporaryDirectory() as directory:
             route = {**self.route, "state_dir": directory}

@@ -407,7 +407,7 @@ def verify_snapshot(route, snapshot, listeners):
     return hashlib.sha256(json.dumps(proof, sort_keys=True).encode()).hexdigest()
 
 
-def stored_state(route, allow_stopped_mismatch=False):
+def load_state(route):
     try:
         fd = state_open(route, "state.json", os.O_RDONLY)
     except FileNotFoundError:
@@ -416,6 +416,14 @@ def stored_state(route, allow_stopped_mismatch=False):
         state = json.load(stream)
     manager = state.get("manager")
     validate_record(manager)
+    return state
+
+
+def stored_state(route, allow_stopped_mismatch=False):
+    state = load_state(route)
+    if state is None:
+        return None
+    manager = state["manager"]
     mismatch = (
         state.get("digest") != route["digest"]
         or manager.get("argv") != manager_argv(route)
@@ -431,6 +439,48 @@ def stored_state(route, allow_stopped_mismatch=False):
     elif mismatch:
         raise RuntimeError("stored manager argv or configuration differs; refusing signal")
     return state
+
+
+def restart_state(route):
+    state = load_state(route)
+    if state is None:
+        return None
+    manager = state["manager"]
+    if manager.get("argv") != manager_argv(route):
+        raise RuntimeError("stored manager argv or configuration differs; refusing signal")
+    mismatch = state.get("digest") != route["digest"]
+    children = state.get("children")
+    if not isinstance(children, list):
+        raise RuntimeError("stored route children are malformed; refusing signal")
+    for record in children:
+        validate_record(record)
+        current = identity(record["pid"])
+        if current is not None and current != record:
+            raise RuntimeError("stored route child identity differs; refusing signal")
+    if not mismatch:
+        return state
+    if state.get("status") == "stopped":
+        for record in [manager, *children]:
+            if identity(record["pid"]) is not None:
+                raise RuntimeError("stored route configuration differs and a recorded process is live")
+        return state
+    if state.get("status") not in {"starting", "recovering", "ready"}:
+        raise RuntimeError("stored route status is invalid; refusing signal")
+    if not matches(manager):
+        raise RuntimeError("stored route manager identity differs; refusing signal")
+    return state
+
+
+def wait_stored_route_exit(state, seconds):
+    records = [state["manager"], *state.get("children", [])]
+    deadline = time.monotonic() + seconds
+    while True:
+        live = [record["pid"] for record in records if matches(record)]
+        if not live:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"route cleanup deadline exceeded for {live}")
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
 
 
 def read_state(route):
@@ -641,17 +691,17 @@ def operate(action, route):
         pass
     control = acquire(directory / "control.lock")
     try:
-        state = stored_state(route, allow_stopped_mismatch=True)
+        state = (
+            restart_state(route)
+            if action == "restart"
+            else stored_state(route, allow_stopped_mismatch=True)
+        )
         if state and matches(state["manager"]):
             if action == "start":
                 ready(route)
                 return
             send(state["manager"], signal.SIGTERM)
-            deadline = time.monotonic() + route["cleanup_timeout_seconds"] + 3
-            while matches(state["manager"]):
-                if time.monotonic() > deadline:
-                    raise TimeoutError("manager cleanup deadline exceeded")
-                time.sleep(0.05)
+            wait_stored_route_exit(state, route["cleanup_timeout_seconds"] + 3)
         elif state and state.get("status") != "stopped":
             # A killed manager's children have a kernel parent-death signal.
             if any(matches(record) for record in state.get("children", [])):
