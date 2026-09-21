@@ -38,6 +38,41 @@ def _load_function(path, name, namespace=None):
 
 
 class OrchestratorRepairTest(unittest.TestCase):
+    def test_orchestrator_image_preflight_returns_immutable_id(self):
+        image_id = "sha256:" + "d" * 64
+        with mock.patch.object(
+            training_ops, "_ssh", return_value=(0, image_id + "\n")
+        ) as ssh:
+            self.assertEqual(training_ops._orchestrator_image_preflight(), image_id)
+
+        host, script = ssh.call_args.args
+        self.assertEqual(host, training_ops.orchestrator_host)
+        self.assertEqual(ssh.call_args.kwargs["timeout"], 30)
+        self.assertIn(
+            f"image={training_ops.orchestrator_image}",
+            script,
+        )
+        self.assertIn("docker image inspect --format '{{.Id}}'", script)
+        self.assertIn('docker image inspect "$image_id"', script)
+
+    def test_orchestrator_image_preflight_rejects_missing_image(self):
+        with mock.patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(1, "configured orchestrator image is missing"),
+        ):
+            with self.assertRaisesRegex(
+                training_ops.Refused, "orchestrator image preflight failed"
+            ):
+                training_ops._orchestrator_image_preflight()
+
+    def test_orchestrator_image_preflight_rejects_invalid_id(self):
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, "not-an-id\n")):
+            with self.assertRaisesRegex(
+                training_ops.Refused, "invalid immutable id"
+            ):
+                training_ops._orchestrator_image_preflight()
+
     def test_engine_repair_accepts_explicit_config_without_current_run(self):
         host = training_ops.inference_hosts[0]
         ssh_calls = []

@@ -56,6 +56,8 @@ case "${1:-}" in
       "{{.Image}}")
         if [ "${DOCKER_MODE:-}" = relay-wrong-image ] && [ "$target" = relay ]; then
           printf '%s\n' sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        elif [ "$target" = container-id ] || [ "$target" = failed-container-id ] || [ "$target" = unrelated-container-id ]; then
+          printf '%s\n' "${EXPECTED_ORCHESTRATOR_IMAGE:?}"
         else
           printf '%s\n' "${EXPECTED_IMAGE:?}"
         fi
@@ -72,7 +74,26 @@ case "${1:-}" in
     esac
     ;;
   image)
-    [ "${DOCKER_MODE:-}" != missing-image ]
+    [ "${2:-}" = inspect ] || exit 1
+    if [ "${3:-}" = --format ]; then
+      [ "${4:-}" = '{{.Id}}' ] || exit 1
+      [ "${5:-}" = configured-orchestrator ] || exit 1
+      [ "${DOCKER_MODE:-}" != missing-orchestrator ] || exit 1
+      if [ "${DOCKER_MODE:-}" = invalid-orchestrator-id ]; then
+        printf 'not-an-image-id\n'
+      else
+        printf '%s\n' "${EXPECTED_ORCHESTRATOR_IMAGE:?}"
+      fi
+    else
+      target=${3:-}
+      if [ "$target" = "${EXPECTED_IMAGE:?}" ]; then
+        [ "${DOCKER_MODE:-}" != missing-image ]
+      elif [ "$target" = "${EXPECTED_ORCHESTRATOR_IMAGE:?}" ]; then
+        [ "${DOCKER_MODE:-}" != missing-orchestrator-id ]
+      else
+        exit 1
+      fi
+    fi
     ;;
   run)
     run_args="$*"
@@ -124,18 +145,22 @@ EOF
 chmod +x "$tmp/bin"/*
 
 source <(sed -n '/^resolve_inference_image() {/,/^}$/p' "$launcher")
+source <(sed -n '/^resolve_orchestrator_image() {/,/^}$/p' "$launcher")
+source <(sed -n '/^resolve_orchestrator_image_for_launch() {/,/^}$/p' "$launcher")
 source <(sed -n '/^remove_failed_orchestrator() {/,/^}$/p' "$launcher")
 source <(sed -n '/^start_orchestrator_container() {/,/^}$/p' "$launcher")
 source <(sed -n '/^adapter_relay_start() {/,/^}$/p' "$launcher")
 
 nodes_file="$tmp/nodes.toml"
-printf '%s\n' '[containers]' 'glm52_inference = "configured-inference"' >"$nodes_file"
+printf '%s\n' '[containers]' 'glm52_inference = "configured-inference"' \
+  'orchestrator_image = "configured-orchestrator"' >"$nodes_file"
 export PATH="$tmp/bin:$PATH"
 export CALL_LOG="$tmp/docker-calls"
 export CONTAINER_STATE_FILE="$tmp/container-state"
 export CONTAINER_LABEL_FILE="$tmp/container-label"
 export LAUNCH_LABEL_LOG="$tmp/launch-labels"
 export EXPECTED_IMAGE=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+export EXPECTED_ORCHESTRATOR_IMAGE=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 : >"$CALL_LOG"
 
 inference_state=$(DOCKER_MODE=ready resolve_inference_image)
@@ -151,11 +176,53 @@ test "$missing_status" -ne 0
 test -z "$missing_output"
 grep -Fx "configured GLM inference image is missing: $EXPECTED_IMAGE" "$tmp/missing-image.err"
 
+orchestrator_state=$(DOCKER_MODE=ready resolve_orchestrator_image)
+read -r orchestrator_reference orchestrator_image_id <<<"$orchestrator_state"
+test "$orchestrator_reference" = configured-orchestrator
+test "$orchestrator_image_id" = "$EXPECTED_ORCHESTRATOR_IMAGE"
+
+set +e
+missing_output=$(DOCKER_MODE=missing-orchestrator resolve_orchestrator_image 2>"$tmp/missing-orchestrator.err")
+missing_status=$?
+set -e
+test "$missing_status" -ne 0
+test -z "$missing_output"
+grep -Fx 'configured orchestrator image is missing: configured-orchestrator' "$tmp/missing-orchestrator.err"
+
+set +e
+invalid_output=$(DOCKER_MODE=invalid-orchestrator-id resolve_orchestrator_image 2>"$tmp/invalid-orchestrator.err")
+invalid_status=$?
+set -e
+test "$invalid_status" -ne 0
+test -z "$invalid_output"
+grep -Fx 'configured orchestrator image has an invalid immutable id: not-an-image-id' "$tmp/invalid-orchestrator.err"
+
+nodes_without_orchestrator_image="$tmp/nodes-without-orchestrator-image.toml"
+printf '%s\n' '[containers]' 'glm52_inference = "configured-inference"' \
+  >"$nodes_without_orchestrator_image"
+nodes_file=$nodes_without_orchestrator_image
+tunnels_only=1
+unset orchestrator_image_reference orchestrator_image_id
+resolve_orchestrator_image_for_launch
+test -z "${orchestrator_image_reference:-}"
+test -z "${orchestrator_image_id:-}"
+
+tunnels_only=0
+set +e
+launch_output=$(resolve_orchestrator_image_for_launch 2>"$tmp/full-launch-image.err")
+launch_status=$?
+set -e
+test "$launch_status" -ne 0
+test -z "$launch_output"
+grep -Fx 'cannot read the configured orchestrator image' "$tmp/full-launch-image.err"
+nodes_file="$tmp/nodes.toml"
+
 deployment=/fixture
 RUN=run
 RUN_NAME=run_run
 ORCH_CT=orchestrator
 image=$EXPECTED_IMAGE
+orchestrator_image_id=$EXPECTED_ORCHESTRATOR_IMAGE
 config_file=/fixture/orchestrator.toml
 
 set +e
@@ -212,6 +279,7 @@ sleep() { sleep_calls=$((sleep_calls + 1)); }
 export DOCKER_MODE=stable
 start_orchestrator_container
 test "$sleep_calls" -eq 20
+grep -F -- "$EXPECTED_ORCHESTRATOR_IMAGE" "$CALL_LOG"
 
 peer_enabled=1
 tunnels_only=0
@@ -228,5 +296,6 @@ adapter_relay_start
 grep -Fx 'rm relay' "$CALL_LOG"
 grep -F 'run -d --name relay --pull=never' "$CALL_LOG"
 grep -F -- "$EXPECTED_IMAGE" "$CALL_LOG"
+! grep -F -- "$EXPECTED_ORCHESTRATOR_IMAGE" "$CALL_LOG"
 
 printf 'orchestrator launch guard checks immutable images, safe cleanup, immediate exit, relay reuse, and a 10s stable window\n'

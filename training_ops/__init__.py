@@ -69,6 +69,14 @@ orchestrator_launcher = f"{runtime_root}/h200/start_orchestrator.sh"
 rollout_pull_script = f"{runtime_root}/china/pull_rollout_batches.sh"
 trainer_container = containers["trainer"]
 orchestrator_container = containers["orchestrator"]
+orchestrator_image = containers.get("orchestrator_image")
+if (
+    not isinstance(orchestrator_image, str)
+    or not orchestrator_image
+    or orchestrator_image.strip() != orchestrator_image
+    or any(character.isspace() for character in orchestrator_image)
+):
+    raise RuntimeError("containers.orchestrator_image must name one exact image")
 adapter_container = containers["adapter"]
 adapter_relay_container = containers["adapter_relay"]
 glm_inference_container = containers["glm52_inference"]
@@ -7026,6 +7034,42 @@ def _check_adapter_restart(host: str, service_dir: str, step: int, role: str, ad
     return result
 
 
+def _orchestrator_image_preflight() -> str:
+    """Require the configured orchestrator image and return its immutable ID."""
+    script = f"""set -euo pipefail
+image={shlex.quote(orchestrator_image)}
+image_id=$(sudo docker image inspect --format '{{{{.Id}}}}' "$image" 2>/dev/null) || {{
+  echo "configured orchestrator image is missing: $image" >&2
+  exit 1
+}}
+case "$image_id" in
+  sha256:[0-9a-f][0-9a-f]*) ;;
+  *) echo "configured orchestrator image has an invalid immutable id: $image_id" >&2; exit 1;;
+esac
+[ "${{#image_id}}" = 71 ] || {{
+  echo "configured orchestrator image has an invalid immutable id: $image_id" >&2
+  exit 1
+}}
+sudo docker image inspect "$image_id" >/dev/null 2>&1 || {{
+  echo "configured orchestrator image id is missing: $image_id" >&2
+  exit 1
+}}
+printf '%s\n' "$image_id"
+"""
+    code, output = _ssh(orchestrator_host, script, timeout=30)
+    image_id = output.strip()
+    if code:
+        raise Refused(
+            f"orchestrator image preflight failed on {orchestrator_host}: "
+            f"{image_id or f'exit {code}'}"
+        )
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise Refused(
+            f"orchestrator image preflight returned an invalid immutable id: {image_id!r}"
+        )
+    return image_id
+
+
 def start(
     run: str,
     mode: str = "cold",
@@ -7078,6 +7122,7 @@ def start(
         _check_adapter_restart(orchestrator_host, service_run_dir, resume_step, "orchestrator", resume_adapter)
     required_files = _start_dependency_inventory(selected, nodes)
     _deploy_dependencies(required_files)
+    _orchestrator_image_preflight()
     name = f"run_{run}"
     trainer_config = f"{remote_repo}/{selected['trainer']}"
     edge_config = f"{remote_repo}/{selected['orchestrator']}"

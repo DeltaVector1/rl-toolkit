@@ -759,6 +759,53 @@ PY
   printf '%s %s\n' "$inference_id" "$image"
 }
 
+resolve_orchestrator_image() {
+  local configured_image image_id
+  if ! configured_image=$(python3 - "$nodes_file" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as stream:
+    config = tomllib.load(stream)
+image = config.get("containers", {}).get("orchestrator_image")
+if (
+    not isinstance(image, str)
+    or not image
+    or image.strip() != image
+    or any(character.isspace() for character in image)
+):
+    raise SystemExit("nodes config has no exact orchestrator image")
+print(image)
+PY
+  ); then
+    echo "cannot read the configured orchestrator image" >&2
+    return 1
+  fi
+  image_id=$(sudo docker image inspect --format '{{.Id}}' "$configured_image" 2>/dev/null || true)
+  if [ -z "$image_id" ]; then
+    echo "configured orchestrator image is missing: $configured_image" >&2
+    return 1
+  fi
+  if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "configured orchestrator image has an invalid immutable id: $image_id" >&2
+    return 1
+  fi
+  if ! sudo docker image inspect "$image_id" >/dev/null 2>&1; then
+    echo "configured orchestrator image id is missing: $image_id" >&2
+    return 1
+  fi
+  printf '%s %s\n' "$configured_image" "$image_id"
+}
+
+resolve_orchestrator_image_for_launch() {
+  local orchestrator_image_state
+  [ "$tunnels_only" != 1 ] || return 0
+  if ! orchestrator_image_state=$(resolve_orchestrator_image); then
+    return 1
+  fi
+  read -r orchestrator_image_reference orchestrator_image_id <<<"$orchestrator_image_state"
+}
+
 if [ -n "${adapter_resume_step:-}" ]; then
   case "$adapter_resume_step" in
     *[!0-9]*) echo "adapter resume step must be a non-negative integer" >&2; exit 2 ;;
@@ -774,6 +821,9 @@ if ! inference_state=$(resolve_inference_image); then
   exit 2
 fi
 read -r inference_container_id image <<<"$inference_state"
+if ! resolve_orchestrator_image_for_launch; then
+  exit 2
+fi
 if ! lora_source_port_output=$(python3 - "$nodes_file" <<'PY'
 import sys
 import tomllib
@@ -4140,7 +4190,7 @@ remove_failed_orchestrator() {
     2>/dev/null || true)
   candidate_image=$(sudo docker inspect "$candidate_id" --format '{{.Image}}' 2>/dev/null || true)
   if [ "$candidate_name" = "/$ORCH_CT" ] && [ "$candidate_label" = "$launch_label" ] && \
-     [ "$candidate_image" = "$image" ]; then
+     [ "$candidate_image" = "$orchestrator_image_id" ]; then
     sudo docker rm -f "$candidate_id" >/dev/null 2>&1 || true
   fi
 }
@@ -4183,7 +4233,7 @@ start_orchestrator_container() {
     -v "$deployment/prime-rl/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py":/app/packages/prime-rl-configs/src/prime_rl/configs/algorithm.py:ro \
     -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
     -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
-    --entrypoint /app/.venv/bin/orchestrator "$image" \
+    --entrypoint /app/.venv/bin/orchestrator "$orchestrator_image_id" \
     @ "$config_file")
   launch_status=$?
   if [ "$launch_status" -ne 0 ]; then
@@ -4230,6 +4280,16 @@ read -r current_inference_container_id current_inference_image <<<"$current_infe
 if [ "$current_inference_container_id" != "$inference_container_id" ] || \
    [ "$current_inference_image" != "$image" ]; then
   echo "configured GLM inference container or image changed before orchestrator launch" >&2
+  exit 2
+fi
+if ! current_orchestrator_image_state=$(resolve_orchestrator_image); then
+  exit 2
+fi
+read -r current_orchestrator_image_reference current_orchestrator_image_id \
+  <<<"$current_orchestrator_image_state"
+if [ "$current_orchestrator_image_reference" != "$orchestrator_image_reference" ] || \
+   [ "$current_orchestrator_image_id" != "$orchestrator_image_id" ]; then
+  echo "configured orchestrator image changed before launch" >&2
   exit 2
 fi
 

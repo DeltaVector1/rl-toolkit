@@ -53,6 +53,7 @@ data_parallel_size = 2
 [containers]
 trainer = "glm52-decensor-trainer"
 orchestrator = "glm52-decensor-orchestrator"
+orchestrator_image = "prime-rl:glm52-orchestrator-v070"
 adapter = "glm52-adapter-http"
 adapter_relay = "glm52-adapter-relay"
 glm52_inference = "glm52-decensor-h200"

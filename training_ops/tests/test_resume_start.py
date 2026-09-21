@@ -63,6 +63,13 @@ class ResumeStartTest(unittest.TestCase):
                 "_config_dir": mock.Mock(return_value={"trainer": "trainer.toml", "orchestrator": "orch.toml"}),
                 "_start_dependency_inventory": mock.Mock(return_value=[]),
                 "_deploy_dependencies": mock.Mock(side_effect=lambda _files: calls.append(("deployment", "deploy dependencies"))),
+                "_orchestrator_image_preflight": mock.Mock(
+                    side_effect=lambda: calls.append(
+                        ("preflight", "check orchestrator image")
+                    )
+                    or "sha256:"
+                    + "d" * 64
+                ),
                 "_ssh": ssh,
                 "_check_adapter_restart": check_state,
                 "_ssh_address": mock.Mock(return_value="127.0.0.1"),
@@ -97,6 +104,9 @@ class ResumeStartTest(unittest.TestCase):
         self.assertEqual(len(control), 1)
         self.assertEqual(calls[control[0]][0], training_ops.trainer_head)
         self.assertLess(control[0], commands.index("deploy dependencies"))
+        image_preflight = commands.index("check orchestrator image")
+        self.assertLess(commands.index("deploy dependencies"), image_preflight)
+        self.assertLess(image_preflight, min(trainer))
         self.assertLess(max(control), min(trainer))
         self.assertLess(max(trainer), orch)
         self.assertIn("adapter_resume_step=1 ", commands[orch])
