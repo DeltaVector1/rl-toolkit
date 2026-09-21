@@ -273,3 +273,18 @@ only after measured learning.
   430.98/404.30/403.49/330.93s; v2 stages were 415.193/406.830s. It stopped
   at 3 completed steps on the H200A free-space guard. Retention fix and cleanup
   evidence were recorded; no reward trend claim.
+
+## D15 stopped result
+
+- D15 stopped at 613.19s during forward/backward with 130 packed microbatches
+  and about 4.26M tokens. It had no OOM or nonfinite values, but did not finish
+  under the 600s gate. The temporary profiler configs are removed.
+
+## Next prefill reward trial
+
+- Run `glm-decensor-prefill-16` with easy prompts, TailRL, group size 16, and
+  the existing reward checks.
+- Use the approved 1,500,000-token batch cap. This is fewer than 1024 effective
+  samples per optimizer step; do not call it batch 1024.
+- Keep 32K context, 16K output, native FP8, rank-32 LoRA, and the existing
+  prefill. Judge reward and refusal rates over the full run, not one step.
