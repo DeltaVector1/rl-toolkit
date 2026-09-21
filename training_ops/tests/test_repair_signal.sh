@@ -693,7 +693,7 @@ case "$full_mode" in
   fail) exit 7 ;;
   signal) repair_signal ;;
   committed)
-    eval "$(sed -n '/^repair_committed=1$/,/^repair_release_lock .*repair_fail/p' "$launcher")"
+    eval "$(sed -n '/^repair_committed=1$/,/^if \[ "\$tunnels_only" = 1 \]; then$/p' "$launcher" | sed '$d')"
     test "${#repair_created_tunnels[@]}" -eq 0 || exit 1
     exit 7
     ;;
