@@ -155,12 +155,22 @@ start() {
     LOG_FILE="$log_file" \
     bash "$script" run >>"$log_file" 2>&1 </dev/null &
   local pid=$!
-  for _ in $(seq 1 20); do
+  local deadline=$((SECONDS + 30))
+  local failure="timeout"
+  while :; do
     status && { echo "rollout puller started (pid $pid)"; return; }
-    kill -0 "$pid" 2>/dev/null || break
+    if ! kill -0 "$pid" 2>/dev/null; then
+      failure="child exited"
+      break
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || break
     sleep 0.1
   done
-  echo "rollout puller did not start" >&2
+  if ! stop || [ -n "$(matching_pids)" ] || [ -e "$pid_file" ] || ! flock -n "$lock_file" -c true; then
+    echo "rollout puller failed to start ($failure); cleanup failed" >&2
+    return 1
+  fi
+  echo "rollout puller did not start ($failure)" >&2
   return 1
 }
 

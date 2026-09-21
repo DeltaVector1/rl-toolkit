@@ -23,6 +23,8 @@ class RolloutPullTest(unittest.TestCase):
         tools.mkdir()
         (tools / "ssh").write_text(
             "#!/usr/bin/env bash\nset -eu\nlast=${!#}\n"
+            "[ -z \"${SSH_DELAY:-}\" ] || sleep \"$SSH_DELAY\"\n"
+            "[ -n \"${SSH_FAIL:-}\" ] && exit 1 || true\n"
             "case \" $* \" in *'@'*) exec bash -c \"$last\" ;; esac\n"
             "printf '%s\\n' \"$TRAINER_CT\"\n"
         )
@@ -77,6 +79,54 @@ class RolloutPullTest(unittest.TestCase):
             finally:
                 if commands:
                     subprocess.run(["bash", "-c", commands[2]], env=environment, capture_output=True, timeout=10)
+                training_ops.rollout_pull_script = old_script
+
+    def test_start_waits_for_delayed_readiness_and_cleans_up_failed_child(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.tools(directory)
+            old_script = training_ops.rollout_pull_script
+            commands = []
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                command = training_ops._rollout_pull_command(str(run_dir), "start")
+                commands = [training_ops._rollout_pull_command(str(run_dir), action) for action in ("stop", "status")]
+                environment["SSH_DELAY"] = "3"
+                started = subprocess.run(
+                    ["bash", "-c", command], env=environment, capture_output=True, text=True, timeout=10
+                )
+                self.assertEqual(started.returncode, 0, started.stderr)
+                self.assertTrue((run_dir / ".rollout-pull.pid").is_file())
+                self.assertEqual(
+                    subprocess.run(["bash", "-c", commands[1]], env=environment, capture_output=True).returncode,
+                    0,
+                )
+                stopped = subprocess.run(
+                    ["bash", "-c", commands[0]], env=environment, capture_output=True, text=True, timeout=10
+                )
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+
+                environment["SSH_FAIL"] = "1"
+                failed = subprocess.run(
+                    ["bash", "-c", command], env=environment, capture_output=True, text=True, timeout=10
+                )
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertFalse((run_dir / ".rollout-pull.pid").exists())
+                self.assertEqual(
+                    subprocess.run(
+                        ["flock", "-n", str(run_dir / ".rollout-pull.lock"), "-c", "true"],
+                        env=environment,
+                    ).returncode,
+                    0,
+                )
+                self.assertNotEqual(
+                    subprocess.run(["bash", "-c", commands[1]], env=environment, capture_output=True).returncode,
+                    0,
+                )
+            finally:
+                if commands:
+                    subprocess.run(["bash", "-c", commands[0]], env=environment, capture_output=True, timeout=10)
                 training_ops.rollout_pull_script = old_script
 
     def test_pull_is_checksummed_resumable_and_no_replace(self):
