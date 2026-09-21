@@ -988,6 +988,7 @@ fi
 for port in __PORTS__; do
   total=$((total+1))
   started=$(date +%s%N)
+  active_model=
   stage_json=$(curl -fsS -m 10 "http://127.0.0.1:$port/staging_status" 2>/dev/null || true)
   stage_state=$(printf '%s' "$stage_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status", ""))' 2>/dev/null || true)
   if [ "$stage_state" = staging ]; then
@@ -1013,7 +1014,7 @@ for port in __PORTS__; do
     :
   elif [ "$code" = STAGING ]; then
     policy_state=staging
-  elif [ "$policy_state" = ready ]; then
+  elif [ "$policy_state" = ready ] && [ -z "$active_model" ]; then
     policy_state=mismatch
   fi
   if [ "$code" = 200 ]; then
