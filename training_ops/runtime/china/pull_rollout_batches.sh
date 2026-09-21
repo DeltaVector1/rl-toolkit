@@ -31,8 +31,10 @@ ssh_opts=(
   -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no
   -i "$source_identity" -p "$source_port"
 )
-printf -v rsync_ssh 'ssh %q ' "${ssh_opts[@]}"
-rsync_ssh=${rsync_ssh% }
+rsync_ssh=
+rsync_ssh_dir=
+rsync_ssh_wrapper=
+pid_owned=0
 
 remote() {
   ssh "${ssh_opts[@]}" "$source_target" "$1"
@@ -184,11 +186,33 @@ esac
 
 local_path_safe "$dest_dir"
 remote_path_safe "$source_dir"
+
+cleanup() {
+  if [ "$pid_owned" = 1 ]; then
+    rm -f -- "$pid_file"
+  fi
+  [ -z "$rsync_ssh_wrapper" ] || rm -f -- "$rsync_ssh_wrapper"
+  [ -z "$rsync_ssh_dir" ] || rmdir -- "$rsync_ssh_dir" 2>/dev/null || true
+}
+
+trap cleanup EXIT
+
+rsync_ssh_dir=$(mktemp -d -- /tmp/rollout-pull-ssh.XXXXXX)
+rsync_ssh_wrapper="$rsync_ssh_dir/ssh"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf 'exec ssh'
+  printf ' %q' "${ssh_opts[@]}"
+  printf ' "$@"\n'
+} >"$rsync_ssh_wrapper"
+chmod 700 "$rsync_ssh_wrapper"
+rsync_ssh="$rsync_ssh_wrapper"
+
 mkdir -p "$dest_dir"
 exec 9>"$lock_file"
 flock -n 9 || exit 0
 echo "$$" >"$pid_file"
-trap 'rm -f -- "$pid_file"' EXIT
+pid_owned=1
 
 valid_pull_path() {
   local relative=$1
