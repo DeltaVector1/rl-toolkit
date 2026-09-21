@@ -36,9 +36,11 @@ case "${1:-}" in
         ;;
       '{{index .Config.Labels "com.glm52.orchestrator.launch"}}')
         if [ "${DOCKER_MODE:-}" = unrelated ]; then
-          printf 'other/run\n'
+          printf 'run/run_run/different-nonce\n'
+        elif [ -s "${CONTAINER_LABEL_FILE:?}" ]; then
+          cat "$CONTAINER_LABEL_FILE"
         else
-          printf 'run/run_run\n'
+          printf 'run/run_run/unknown\n'
         fi
         ;;
       '{{index .Config.Labels "com.glm52.adapter-relay.source-url"}}')
@@ -73,7 +75,19 @@ case "${1:-}" in
     [ "${DOCKER_MODE:-}" != missing-image ]
     ;;
   run)
-    printf 'run %s\n' "$*" >>"${CALL_LOG:?}"
+    run_args="$*"
+    launch_label=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --label ] && [ "$2" != '' ]; then
+        launch_label=${2#com.glm52.orchestrator.launch=}
+      fi
+      shift
+    done
+    printf 'run %s\n' "$run_args" >>"${CALL_LOG:?}"
+    if [ -n "$launch_label" ]; then
+      printf '%s\n' "$launch_label" >"${CONTAINER_LABEL_FILE:?}"
+      printf '%s\n' "$launch_label" >>"${LAUNCH_LABEL_LOG:?}"
+    fi
     if [ "${DOCKER_MODE:-}" = run-failure ]; then
       printf 'failed-container-id\n' >"${CONTAINER_STATE_FILE:?}"
       printf 'daemon rejected orchestrator launch\n' >&2
@@ -84,6 +98,7 @@ case "${1:-}" in
         printf 'failed-container-id\n' >"${CONTAINER_STATE_FILE:?}"
       else
         printf 'unrelated-container-id\n' >"${CONTAINER_STATE_FILE:?}"
+        printf 'run/run_run/different-nonce\n' >"${CONTAINER_LABEL_FILE:?}"
       fi
       exit 0
     fi
@@ -97,6 +112,7 @@ case "${1:-}" in
     printf 'rm %s\n' "${3:-}" >>"${CALL_LOG:?}"
     if [ -s "${CONTAINER_STATE_FILE:?}" ] && [ "$(cat "$CONTAINER_STATE_FILE")" = "${3:-}" -o "${3:-}" = orchestrator ]; then
       : >"$CONTAINER_STATE_FILE"
+      : >"$CONTAINER_LABEL_FILE"
     fi
     ;;
   *)
@@ -117,6 +133,8 @@ printf '%s\n' '[containers]' 'glm52_inference = "configured-inference"' >"$nodes
 export PATH="$tmp/bin:$PATH"
 export CALL_LOG="$tmp/docker-calls"
 export CONTAINER_STATE_FILE="$tmp/container-state"
+export CONTAINER_LABEL_FILE="$tmp/container-label"
+export LAUNCH_LABEL_LOG="$tmp/launch-labels"
 export EXPECTED_IMAGE=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 : >"$CALL_LOG"
 
@@ -162,6 +180,8 @@ test -z "$start_output"
 grep -Fx 'ERROR: orchestrator container launch returned no container id: orchestrator' "$tmp/empty-id.err"
 grep -Fx 'rm failed-container-id' "$CALL_LOG"
 test ! -s "$CONTAINER_STATE_FILE"
+test "$(sed -n '1p' "$LAUNCH_LABEL_LOG")" != "$(sed -n '2p' "$LAUNCH_LABEL_LOG")"
+grep -Eq '^run/run_run/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "$LAUNCH_LABEL_LOG"
 
 set +e
 export DOCKER_MODE=unrelated
@@ -173,6 +193,7 @@ test -z "$start_output"
 grep -Fx 'ERROR: orchestrator container launch returned no container id: orchestrator' "$tmp/unrelated.err"
 ! grep -Fx 'rm unrelated-container-id' "$CALL_LOG"
 grep -Fx 'unrelated-container-id' "$CONTAINER_STATE_FILE"
+grep -Fx 'run/run_run/different-nonce' "$CONTAINER_LABEL_FILE"
 
 set +e
 export DOCKER_MODE=immediate-exit

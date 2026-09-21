@@ -4146,9 +4146,14 @@ remove_failed_orchestrator() {
 }
 
 start_orchestrator_container() {
-  local container_id container_name running state launch_output launch_status launch_label
+  local container_id container_name running state launch_output launch_status launch_label launch_nonce
   local startup_checks=0 running_checks=0
-  launch_label="$RUN/$RUN_NAME"
+  launch_nonce=$(< /proc/sys/kernel/random/uuid)
+  if [[ ! "$launch_nonce" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    echo "ERROR: could not create an orchestrator launch nonce" >&2
+    return 1
+  fi
+  launch_label="$RUN/$RUN_NAME/$launch_nonce"
   sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
   container_id=
   launch_output=$(sudo docker run -d --name "$ORCH_CT" --pull=never \
