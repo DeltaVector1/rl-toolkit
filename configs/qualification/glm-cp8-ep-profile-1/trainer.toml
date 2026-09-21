@@ -26,7 +26,7 @@ group = "glm-runs"
 tags = ["glm-cp8-ep-profile-1", "glm-5.2", "fp8", "ep-profile", "lora-r32"]
 
 [file_monitor]
-filename = "run_glm-cp8-ep-profile-1/trainer-metrics.jsonl"
+filename = "trainer-metrics.jsonl"
 
 [model]
 name = "/data/ZiphuAI/GLM-5.2-FP8"
