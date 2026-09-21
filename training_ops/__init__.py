@@ -1038,21 +1038,26 @@ echo "TPUT $(sudo docker logs --since 60s __ENGINE__ 2>&1 | grep -aoE 'generatio
 watchdog_ok=0
 watchdog_script="__WATCHDOG_SCRIPT__"
 watchdog_identity="engine-watchdog:__ENGINE_HOST__:__RUN__:__API_PORT__"
-for proc_dir in /proc/[0-9]*; do
-  pid=${proc_dir##*/}
-  [ -r "/proc/$pid/cmdline" ] && [ -r "/proc/$pid/environ" ] || continue
-  command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//' || true)
-  case "$command_line" in
-    "bash $watchdog_script"|"/bin/bash $watchdog_script"|"/usr/bin/bash $watchdog_script") ;;
-    *) continue ;;
-  esac
-  environment=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' || true)
-  grep -Fxq "WATCHDOG_IDENTITY=$watchdog_identity" <<<"$environment" || continue
-  grep -Fxq "PORT=__API_PORT__" <<<"$environment" || continue
-  grep -Fxq "ENGINE_CONTAINER=__ENGINE__" <<<"$environment" || continue
-  grep -Fxq "START=__START_SCRIPT__" <<<"$environment" || continue
-  grep -Fxq "MODEL=__MODEL__" <<<"$environment" || continue
-  watchdog_ok=$((watchdog_ok + 1))
+for watchdog_scan in 1 2 3; do
+  watchdog_ok=0
+  for proc_dir in /proc/[0-9]*; do
+    pid=${proc_dir##*/}
+    [ -r "/proc/$pid/cmdline" ] && [ -r "/proc/$pid/environ" ] || continue
+    command_line=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ' | sed 's/[[:space:]]*$//' || true)
+    case "$command_line" in
+      "bash $watchdog_script"|"/bin/bash $watchdog_script"|"/usr/bin/bash $watchdog_script") ;;
+      *) continue ;;
+    esac
+    environment=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n' || true)
+    grep -Fxq "WATCHDOG_IDENTITY=$watchdog_identity" <<<"$environment" || continue
+    grep -Fxq "PORT=__API_PORT__" <<<"$environment" || continue
+    grep -Fxq "ENGINE_CONTAINER=__ENGINE__" <<<"$environment" || continue
+    grep -Fxq "START=__START_SCRIPT__" <<<"$environment" || continue
+    grep -Fxq "MODEL=__MODEL__" <<<"$environment" || continue
+    watchdog_ok=$((watchdog_ok + 1))
+  done
+  [ "$watchdog_ok" -gt 0 ] && break
+  [ "$watchdog_scan" -lt 3 ] && sleep 0.1
 done
 echo "WD $watchdog_ok"
 """
