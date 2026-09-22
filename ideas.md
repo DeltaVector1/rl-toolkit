@@ -2,19 +2,21 @@
 
 ## Final failed-experiment audit
 
-- **Fixed balanced difficulty — failed acceptance.** The 50-step evidence did
-  not show a per-difficulty reward change outside noise. Later changes to the
-  prompt mix also made the aggregate result unsuitable for a clean comparison.
+- **Equal 1:1:1 difficulty — failed.** It did not show a per-difficulty reward
+  change outside noise and did not meet the learning acceptance test.
 - **Hard-heavy staged curriculum — failed.** The full run had mean reward
   0.0574 and fitted change -0.0701. The harder later mix confounds the raw fall,
   but no easy, medium, or hard bucket proved learning.
 - **Prefill runs 1-16 — inconclusive until the final run.** Runs 1-15 mainly
   exposed collection, storage, timeout, and fixed-batch faults or ended after
   too few steps. They do not support a reward trend.
-- **TailRL plus fixed prefill, 50 steps — failed.** Mean reward was 0.1756,
-  fitted change was -0.0058, and the noise threshold was 0.0931. The result was
-  inside noise. The final steps 21-31 window also had mean 0.4123 and fitted
-  change +0.0048 versus a 0.1288 noise threshold, so it was inside noise.
+- **Older TailRL plus fixed-prefill, 50 steps — failed.** Mean reward was
+  0.1756, fitted change was -0.0058, and the noise threshold was 0.0931. The
+  result was inside noise.
+- **Run `glm-decensor-prefill-16` — failed.** Steps 21-31 had mean 0.4123 and
+  fitted change +0.0048 versus a 0.1288 noise threshold, so the result was
+  inside noise. Fixed no-prefix v28 evaluation was easy 0.3396 versus 0.3387,
+  medium 0.0532 versus 0.0535, and hard 0.0116 versus 0.0147.
 - **Reward-ordering rewrite — failed design test.** Offline replay changed
   263/1,268 winners and reduced high-refusal winners, but it was not a live
   learning result and replaced the approved multiplicative reward contract.
@@ -23,13 +25,12 @@
   run proved a gain. The changed accepted difficulty mix was a confound.
 - **Easy/medium schedules — inconclusive.** Short easy-only and proposed
   70% easy/30% medium phases did not produce a completed controlled result.
-- **Fixed holdout — useful measurement, no proven gain.** The no-prefix v28
-  comparison was easy 0.3396 versus 0.3387, medium 0.0532 versus 0.0535, and
-  hard 0.0116 versus 0.0147. These small changes did not establish improvement.
+- **Fixed holdout — useful measurement, no proven gain.** The v28 results above
+  did not establish improvement.
 
-The current selection returns to plain GRPO with equal easy, medium, and hard
-ratios. It has no fixed prefill, TailRL, staged ratios, group filters, or
-held-out split wiring.
+The active selection is plain GRPO on the pre-difficulty
+`NewEden/RL-seed-Decensor` dataset with one `decensor` environment. It has
+no fixed prefill, TailRL, staged ratios, group filters, or held-out split wiring.
 
 ## Measured long-haul evidence
 
