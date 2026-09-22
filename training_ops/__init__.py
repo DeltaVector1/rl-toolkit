@@ -70,6 +70,7 @@ rollout_pull_script = f"{runtime_root}/china/pull_rollout_batches.sh"
 trainer_container = containers["trainer"]
 orchestrator_container = containers["orchestrator"]
 orchestrator_image = containers.get("orchestrator_image")
+trainer_image = "prime-rl:glm52-fp8"
 if (
     not isinstance(orchestrator_image, str)
     or not orchestrator_image
@@ -106,6 +107,13 @@ dependency_manifest_name = ".training-ops-manifest"
 _dependency_remote_archive_pattern = re.compile(
     r"^/tmp/trainer-dependencies-[A-Za-z0-9._-]+\.tar(?:\.gz)?$"
 )
+
+_TRINITY_AFMOE_OVERLAY_SHA256 = "37a7f80fd65651fbf35cc1fdf00a28c69f451e045a89bc0c3cac03f03b328cbd"
+_TRINITY_AFMOE_BASE_HASHES = {
+    "prime_rl/trainer/models/afmoe/__init__.py": "7065e20971ac342c216dd03160f263c59ff8a0fd9d7df49c814e9b5152bf454c",
+    "prime_rl/trainer/models/afmoe/configuration_afmoe.py": "fbaa7caae85b8891d89367d87527420f9331538429efc1b8878356313cea4df9",
+    "prime_rl/trainer/models/afmoe/converting_afmoe.py": "2743fc844d285b29ade3089e18216044492d392f0d9d1c017ee35fe0e5fcf41b",
+}
 
 
 def _adapter_stage_limit_seconds(policy_step: int) -> int:
@@ -7132,6 +7140,55 @@ printf '%s\n' "$image_id"
     return image_id
 
 
+def _validate_trinity_afmoe_overlay() -> None:
+    path = repo_root / "prime-rl/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py"
+    if not path.is_file():
+        raise Refused(f"Trinity AFMoE overlay is missing: {path}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != _TRINITY_AFMOE_OVERLAY_SHA256:
+        raise Refused(
+            "Trinity AFMoE overlay hash mismatch: "
+            f"expected {_TRINITY_AFMOE_OVERLAY_SHA256}, got {digest}"
+        )
+
+
+def _trinity_trainer_preflight(nodes: list[str]) -> None:
+    base_script = "set -euo pipefail\n"
+    for path, digest in _TRINITY_AFMOE_BASE_HASHES.items():
+        base_script += (
+            f"test -f /app/src/{path} || exit 31\n"
+            f"actual=$(sha256sum /app/src/{path} | awk '{{print $1}}')\n"
+            f"test \"$actual\" = {digest} || {{ echo \"AFMoE base hash mismatch for /app/src/{path}\" >&2; exit 32; }}\n"
+        )
+    base_script += "printf '%s\\n' AFMOE_BASE_OK\n"
+    overlay = f"{remote_repo}/prime-rl/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py"
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f"image={shlex.quote(trainer_image)}",
+            f"overlay={shlex.quote(overlay)}",
+            f"expected_overlay={shlex.quote(_TRINITY_AFMOE_OVERLAY_SHA256)}",
+            'test -f "$overlay" || { echo "missing Trinity AFMoE overlay: $overlay" >&2; exit 11; }',
+            'actual_overlay=$(sha256sum "$overlay" | awk \'{print $1}\')',
+            'test "$actual_overlay" = "$expected_overlay" || { echo "Trinity AFMoE overlay hash mismatch" >&2; exit 12; }',
+            'image_id=$(sudo docker image inspect --format \'{{.Id}}\' "$image" 2>/dev/null) || { echo "missing trainer image: $image" >&2; exit 13; }',
+            'case "$image_id" in sha256:*) ;; *) echo "trainer image has invalid immutable id: $image_id" >&2; exit 14;; esac',
+            'image_digest=${image_id#sha256:}; [ "${#image_digest}" -eq 64 ] && [[ "$image_digest" =~ ^[0-9a-f]+$ ]] || { echo "trainer image has invalid immutable id: $image_id" >&2; exit 14; }',
+            f"base_result=$(sudo docker run --rm --pull=never --network none --entrypoint /bin/sh \"$image\" -c {shlex.quote(base_script)}) || {{ echo \"trainer image AFMoE base preflight failed\" >&2; exit 23; }}",
+            'test "$base_result" = AFMOE_BASE_OK || { echo "unexpected trainer image AFMoE preflight output: $base_result" >&2; exit 24; }',
+            'printf \'%s\\n\' "TRINITY_AFMOE_OK image=$image_id"',
+        ]
+    )
+    results = _fan(nodes, lambda host: _ssh(host, script, timeout=180))
+    failures = {
+        host: output.strip() or f"exit {code}"
+        for host, (code, output) in results.items()
+        if code
+    }
+    if failures:
+        raise Refused(f"Trinity trainer preflight failed: {failures}")
+
+
 def start(
     run: str,
     mode: str = "cold",
@@ -7182,8 +7239,12 @@ def start(
         if not isinstance(resume_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", resume_digest):
             raise Refused("stable restart adapter has no exact SHA-256 identity")
         _check_adapter_restart(orchestrator_host, service_run_dir, resume_step, "orchestrator", resume_adapter)
+    if selected.get("kind") == "trinity":
+        _validate_trinity_afmoe_overlay()
     required_files = _start_dependency_inventory(selected, nodes)
     _deploy_dependencies(required_files)
+    if selected.get("kind") == "trinity":
+        _trinity_trainer_preflight(nodes)
     _orchestrator_image_preflight()
     name = f"run_{run}"
     trainer_config = f"{remote_repo}/{selected['trainer']}"

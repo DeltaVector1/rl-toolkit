@@ -131,6 +131,7 @@ def _is_compressed_tensors_fp8_block(qconfig: Mapping) -> bool:
     if (
         str(_config_value(qconfig.get("quant_method", ""))).lower() != "compressed-tensors"
         or str(_config_value(qconfig.get("format", ""))).lower() != "float-quantized"
+        or str(_config_value(qconfig.get("quantization_status", ""))).lower() != "compressed"
     ):
         return False
     groups = _config_mapping(qconfig.get("config_groups"))

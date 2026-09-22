@@ -74,8 +74,11 @@ def _validate_fp8_scale_metadata(metadata) -> None:
         scale_meta = state[scale]
         if scale_meta.properties.dtype not in {torch.bfloat16, torch.float32}:
             raise TypeError(f"FP8 scale has unsupported dtype: {scale}")
-        if scale.endswith(".weight_scale") and scale_meta.properties.dtype != torch.bfloat16:
-            raise TypeError(f"compressed-tensors FP8 scale must be bfloat16: {scale}")
+        if scale.endswith(".weight_scale"):
+            if state[weight].properties.dtype != torch.float8_e4m3fn:
+                raise TypeError(f"compressed-tensors FP8 weight must use float8_e4m3fn: {weight}")
+            if scale_meta.properties.dtype != torch.bfloat16:
+                raise TypeError(f"compressed-tensors FP8 scale must be bfloat16: {scale}")
         if len(weight_meta := state[weight].size) != 2 or len(scale_meta.size) != 2:
             raise ValueError(f"FP8 weight and scale must be rank 2: {weight}")
         rows, cols = map(int, weight_meta)

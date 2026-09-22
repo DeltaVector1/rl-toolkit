@@ -64,6 +64,8 @@ if [ -n "${TRANSFORMERS_OVERRIDE_DIR:-}" ]; then
   transformers_mount=(-v "$TRANSFORMERS_OVERRIDE_DIR/transformers":/app/.venv/lib/python3.12/site-packages/transformers:ro)
 fi
 
+afmoe_mount=()
+
 verify_trinity_afmoe_image() {
   local overlay="$deployment/prime-rl/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py"
   local overlay_sha image_files
@@ -72,9 +74,9 @@ verify_trinity_afmoe_image() {
     exit 1
   }
   overlay_sha=$(sha256sum "$overlay" | awk '{print $1}')
-  test "$overlay_sha" = c0c78212b1033a53bb728e6c6c7212f36651c8f3cac80c3cd2b3d5c97ac62426 || {
+  test "$overlay_sha" = 37a7f80fd65651fbf35cc1fdf00a28c69f451e045a89bc0c3cac03f03b328cbd || {
     echo "Trinity AFMoE modeling overlay hash is not the pinned checkout source" >&2
-    echo "expected c0c78212b1033a53bb728e6c6c7212f36651c8f3cac80c3cd2b3d5c97ac62426, got $overlay_sha" >&2
+    echo "expected 37a7f80fd65651fbf35cc1fdf00a28c69f451e045a89bc0c3cac03f03b328cbd, got $overlay_sha" >&2
     exit 1
   }
   sudo docker image inspect "$image" >/dev/null 2>&1 || {
@@ -226,6 +228,9 @@ PY
     sudo install -d -o 1000 -g 1000 -m 0755 "$storage/cache/batch_pp"
     if [ "$trinity_profile" = 1 ]; then
       verify_trinity_afmoe_image
+      afmoe_mount=(
+        -v "$deployment/prime-rl/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py":/app/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py:ro
+      )
     fi
     # nccl shm segments leak on every trainer crash (~33MB each, observed
     # 1500+ per node = 50GB+); the container is removed below, so purge.
@@ -265,7 +270,7 @@ PY
       -v "$deployment/prime-rl/src/prime_rl/trainer/rl/broadcast/filesystem.py":/app/src/prime_rl/trainer/rl/broadcast/filesystem.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py:ro \
-      -v "$deployment/prime-rl/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py":/app/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py:ro \
+      "${afmoe_mount[@]}" \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/lora/multi_linear.py":/app/src/prime_rl/trainer/models/layers/lora/multi_linear.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py":/app/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/lora.py":/app/src/prime_rl/trainer/lora.py:ro \

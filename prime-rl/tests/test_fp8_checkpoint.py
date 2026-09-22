@@ -1,6 +1,7 @@
 import ast
 import copy
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,7 +25,7 @@ def _load_functions(path, names, namespace):
 class FP8CheckpointTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.namespace = {"torch": torch}
+        cls.namespace = {"torch": torch, "Mapping": Mapping}
         _load_functions(
             MODEL_PATH,
             {"_config_mapping", "_config_value", "_is_compressed_tensors_fp8_block"},
@@ -44,6 +45,7 @@ class FP8CheckpointTest(unittest.TestCase):
         config = {
             "quant_method": "compressed-tensors",
             "format": "float-quantized",
+            "quantization_status": "compressed",
             "config_groups": {
                 "group_0": {
                     "format": "float-quantized",
@@ -70,6 +72,9 @@ class FP8CheckpointTest(unittest.TestCase):
         }
         check = self.namespace["_is_compressed_tensors_fp8_block"]
         self.assertTrue(check(config))
+        missing_status = copy.deepcopy(config)
+        missing_status.pop("quantization_status")
+        self.assertFalse(check(missing_status))
         invalid = copy.deepcopy(config)
         invalid["config_groups"]["group_0"]["weights"]["block_structure"] = [64, 128]
         self.assertFalse(check(invalid))
@@ -121,6 +126,14 @@ class FP8CheckpointTest(unittest.TestCase):
             }
         )
         validate(valid)
+        validate(
+            self._metadata(
+                {
+                    "legacy.weight": (torch.float8_e5m2, (256, 384)),
+                    "legacy.weight_scale_inv": (torch.float32, (2, 3)),
+                }
+            )
+        )
         cases = [
             {
                 "x.weight": (torch.float8_e4m3fn, (256, 384)),
@@ -132,6 +145,10 @@ class FP8CheckpointTest(unittest.TestCase):
             {
                 "x.weight": (torch.float8_e4m3fn, (256, 384)),
                 "x.weight_scale": (torch.float32, (2, 3)),
+            },
+            {
+                "x.weight": (torch.float8_e5m2, (256, 384)),
+                "x.weight_scale": (torch.bfloat16, (2, 3)),
             },
             {
                 "x.weight": (torch.float8_e4m3fn, (257, 384)),

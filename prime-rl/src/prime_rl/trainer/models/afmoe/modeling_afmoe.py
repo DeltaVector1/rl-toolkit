@@ -386,9 +386,12 @@ class AfmoeModel(AfmoePreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         routed_experts: Optional[torch.LongTensor] = None,
+        sparse_indices_cache: Optional[torch.LongTensor] = None,
         *,
         seq_lens: torch.LongTensor,
         seq_lens_are_pre_shard: bool = False,
+        pipeline_layer_indices: Optional[tuple[int, ...]] = None,
+        pipeline_apply_norm: bool = True,
     ) -> MoeModelOutputWithPast:
         """
         routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
@@ -420,7 +423,20 @@ class AfmoeModel(AfmoePreTrainedModel):
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        # The sparse cache is accepted for the universal PP model contract;
+        # AFMoE attention does not consume it.
+        del sparse_indices_cache
+        if pipeline_layer_indices is not None:
+            if isinstance(self.layers, nn.ModuleDict):
+                layer_items = [(index, self.layers[str(index)]) for index in pipeline_layer_indices]
+            else:
+                layer_items = [(index, self.layers[index]) for index in pipeline_layer_indices]
+        elif isinstance(self.layers, nn.ModuleDict):
+            layer_items = [(int(name), module) for name, module in self.layers.items()]
+        else:
+            layer_items = list(enumerate(self.layers[: self.config.num_hidden_layers]))
+
+        for layer_idx, decoder_layer in layer_items:
             if isinstance(decoder_layer, nn.Identity):
                 continue
             mask = causal_mask_mapping[decoder_layer.attention_type] if causal_mask_mapping is not None else None
@@ -437,7 +453,8 @@ class AfmoeModel(AfmoePreTrainedModel):
                 routed_experts=routed_experts_layer,
             )
 
-        hidden_states = self.norm(hidden_states)
+        if pipeline_apply_norm and self.norm is not None:
+            hidden_states = self.norm(hidden_states)
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
         )
@@ -488,6 +505,9 @@ class AfmoeForCausalLM(AfmoePreTrainedModel, GenerationMixin):
         token_type_ids: Optional[torch.Tensor] = None,  # will be ignored
         temperature: Optional[torch.Tensor] = None,
         routed_experts: Optional[torch.LongTensor] = None,
+        sparse_indices_cache: Optional[torch.LongTensor] = None,
+        pipeline_layer_indices: Optional[tuple[int, ...]] = None,
+        pipeline_apply_norm: bool = True,
         *,
         seq_lens: torch.LongTensor,
         seq_lens_are_pre_shard: bool = False,
@@ -515,8 +535,11 @@ class AfmoeForCausalLM(AfmoePreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             routed_experts=routed_experts,
+            sparse_indices_cache=sparse_indices_cache,
             seq_lens=seq_lens,
             seq_lens_are_pre_shard=seq_lens_are_pre_shard,
+            pipeline_layer_indices=pipeline_layer_indices,
+            pipeline_apply_norm=pipeline_apply_norm,
         )
 
         hidden_states = outputs.last_hidden_state
