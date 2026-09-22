@@ -31,8 +31,10 @@ class RolloutPullTest(unittest.TestCase):
             "printf -v command '%s ' \"${args[@]:i+1}\"; exec bash -c \"exec /usr/bin/rsync $command\"; fi; done; fi; exit 1; fi\n"
             "[ -z \"${SSH_DELAY:-}\" ] || sleep \"$SSH_DELAY\"\n"
             "[ -n \"${SSH_FAIL:-}\" ] && exit 1 || true\n"
+            "if [ -n \"${SSH_LISTING_DELAY:-}\" ] && [[ \"$last\" == *receivers-ready.json* ]]; then sleep \"$SSH_LISTING_DELAY\"; fi\n"
             "if [ \"${SSH_FAIL_STABLE:-0}\" = 1 ] && [[ \"$last\" == */STABLE* ]]; then exit 1; fi\n"
             "if [ \"${SSH_FAIL_STABLE_ATTEMPTS:-0}\" -gt 0 ] && [[ \"$last\" == */STABLE* ]]; then state=${SSH_FAIL_STABLE_STATE:?}; count=0; [ -f \"$state\" ] && count=$(cat \"$state\"); if [ \"$count\" -lt \"$SSH_FAIL_STABLE_ATTEMPTS\" ]; then printf '%s' $((count + 1)) >\"$state\"; exit 1; fi; fi\n"
+            "if [ -n \"${SSH_MISSING_TRAINER:-}\" ] && [[ \" $* \" == *\" $SSH_MISSING_TRAINER \"* ]] && [[ \"$last\" == *\"docker ps\"* ]]; then printf '%s\\n' missing; exit 0; fi\n"
             "if [ \"${SSH_FAIL_LISTING:-0}\" = 1 ] && [[ \"$last\" == *receivers-ready.json* ]]; then exit 1; fi\n"
             "case \" $* \" in *'@'*) exec bash -c \"$last\" ;; esac\n"
             "printf '%s\\n' \"$TRAINER_CT\"\n"
@@ -138,6 +140,100 @@ class RolloutPullTest(unittest.TestCase):
                 if commands:
                     subprocess.run(["bash", "-c", commands[0]], env=environment, capture_output=True, timeout=10)
                 training_ops.rollout_pull_script = old_script
+
+    def test_stop_kills_health_lease_companion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.tools(directory)
+            old_script = training_ops.rollout_pull_script
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                command = training_ops._rollout_pull_command(str(run_dir), "start")
+                stop_command = training_ops._rollout_pull_command(str(run_dir), "stop")
+                started = subprocess.run(
+                    ["bash", "-c", command], env=environment, capture_output=True, text=True, timeout=10
+                )
+                self.assertEqual(started.returncode, 0, started.stderr)
+                health = subprocess.run(
+                    ["pgrep", "-f", "^rollout-pull-health -c health_lease_loop$"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(health.returncode, 0, health.stderr)
+
+                stopped = subprocess.run(
+                    ["bash", "-c", stop_command], env=environment, capture_output=True, text=True, timeout=10
+                )
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                for _ in range(20):
+                    health = subprocess.run(
+                        ["pgrep", "-f", "^rollout-pull-health -c health_lease_loop$"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if health.returncode != 0:
+                        break
+                    time.sleep(0.1)
+                self.assertNotEqual(health.returncode, 0, health.stdout)
+            finally:
+                subprocess.run(["bash", "-c", stop_command], env=environment, capture_output=True, timeout=10)
+                training_ops.rollout_pull_script = old_script
+
+    def test_health_lease_renews_during_blocked_scan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            (source / "broadcasts").mkdir(parents=True)
+            (source / "rollouts").mkdir()
+            environment = self.environment(source, destination, self.tools(directory))
+            environment.update(
+                SSH_LISTING_DELAY="4",
+                TRAINER_ADDRESSES="a b c d e f g h",
+            )
+            process = subprocess.Popen(
+                ["bash", str(puller), "run"],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                time.sleep(1)
+                self.assertIsNone(process.poll())
+                lease = source / ".trainer-health-lease"
+                self.assertTrue(lease.is_file())
+            finally:
+                os.killpg(process.pid, signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=10)
+            self.assertNotEqual(process.returncode, 0, stderr or stdout)
+
+    def test_missing_trainer_does_not_refresh_health_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            (source / "broadcasts").mkdir(parents=True)
+            (source / "rollouts").mkdir()
+            lease = source / ".trainer-health-lease"
+            lease.write_text("old\n")
+            environment = self.environment(source, destination, self.tools(directory))
+            environment.update(
+                ONCE="1",
+                SSH_MISSING_TRAINER="h",
+                TRAINER_ADDRESSES="a b c d e f g h",
+            )
+            result = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(lease.read_text(), "old\n")
 
     def test_lock_loser_preserves_owner_pid_and_owner_signal_cleans_up(self):
         with tempfile.TemporaryDirectory() as directory:

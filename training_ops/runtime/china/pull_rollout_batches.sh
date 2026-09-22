@@ -35,6 +35,8 @@ rsync_ssh=
 rsync_ssh_dir=
 rsync_ssh_wrapper=
 pid_owned=0
+health_lease_pid=
+health_probe_pids=()
 
 remote() {
   ssh "${ssh_opts[@]}" "$source_target" "$1"
@@ -188,6 +190,11 @@ local_path_safe "$dest_dir"
 remote_path_safe "$source_dir"
 
 cleanup() {
+  if [ -n "$health_lease_pid" ]; then
+    kill -- "-$health_lease_pid" 2>/dev/null || kill "$health_lease_pid" 2>/dev/null || true
+    wait "$health_lease_pid" 2>/dev/null || true
+    health_lease_pid=
+  fi
   if [ "$pid_owned" = 1 ]; then
     rm -f -- "$pid_file"
   fi
@@ -357,17 +364,68 @@ scan() {
 }
 
 refresh_health_lease() {
-  local host state now
+  local host state now status=0
+  health_probe_pids=()
   for host in $trainer_addresses; do
-    state=$(ssh -n -o BatchMode=yes -o ConnectTimeout=20 "$host" \
-      "sudo docker ps --filter name=^${trainer_container}$ --format '{{.Names}}' 2>/dev/null | head -1" \
-      2>/dev/null || true)
-    [ "$state" = "$trainer_container" ] || return 0
+    (
+      state=$(ssh -n -o BatchMode=yes -o ConnectTimeout=20 "$host" \
+        "sudo docker ps --filter name=^${trainer_container}$ --format '{{.Names}}' 2>/dev/null | head -1" \
+        2>/dev/null || true)
+      [ "$state" = "$trainer_container" ]
+    ) &
+    health_probe_pids+=("$!")
   done
+  for pid in "${health_probe_pids[@]}"; do
+    wait "$pid" || status=1
+  done
+  health_probe_pids=()
+  [ "$status" = 0 ] || return 1
   now=$(date +%s)
-  remote "mkdir -p '$source_dir'; lease='$source_dir/.trainer-health-lease'; partial=\$(mktemp -- \"\${lease}.tmp.XXXXXX\") || exit 1; printf '%s\\n' '$now' >\"\$partial\" && mv -- \"\$partial\" \"\$lease\""
+  health_remote "mkdir -p '$source_dir'; lease='$source_dir/.trainer-health-lease'; partial=\$(mktemp -- \"\${lease}.tmp.XXXXXX\") || exit 1; printf '%s\\n' '$now' >\"\$partial\" && mv -- \"\$partial\" \"\$lease\""
 }
 
+health_lease_shutdown() {
+  local pid
+  trap - TERM INT EXIT
+  for pid in "${health_probe_pids[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${health_probe_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  health_probe_pids=()
+  exit 0
+}
+
+health_lease_loop() {
+  trap health_lease_shutdown TERM INT EXIT
+  while :; do
+    if ! refresh_health_lease; then
+      echo "$(date -u +%FT%TZ) trainer health lease update failed; retrying" >&2
+    fi
+    sleep "${HEALTH_LEASE_INTERVAL:-30}" || exit 0
+  done
+}
+
+start_health_lease() {
+  [ "${ONCE:-0}" = 1 ] && return
+  export source_dir source_host source_port source_user source_identity source_known_hosts
+  export trainer_addresses trainer_container
+  export -f health_remote refresh_health_lease health_lease_shutdown health_lease_loop
+  setsid bash -c 'exec -a rollout-pull-health bash -c health_lease_loop' &
+  health_lease_pid=$!
+}
+
+health_remote() {
+  ssh -n -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$source_known_hosts" \
+    -o GlobalKnownHostsFile=/dev/null -o UpdateHostKeys=no \
+    -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=8 \
+    -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+    -i "$source_identity" -p "$source_port" "$source_user@$source_host" "$1"
+}
+
+start_health_lease
 while true; do
   status=0
   scan || {
