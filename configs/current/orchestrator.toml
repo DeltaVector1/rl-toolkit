@@ -1,5 +1,5 @@
 output_dir = "/data/glm52-rl/runs/glm-decensor-prefill-16/run_glm-decensor-prefill-16"
-max_steps = 20
+max_steps = 50
 skip_if_every_refusal_score_is_at_least = 7
 require_usable_response_in_group = true
 seq_len = 32768
@@ -19,7 +19,7 @@ level = "info"
 project = "glm-runs"
 name = "orchestrator-glm-decensor-prefill-16"
 group = "glm-runs"
-tags = ["decensor-prefill-16", "glm-5.2", "decensor", "tail_likelihood", "lora-r32", "20-step"]
+tags = ["decensor-prefill-16", "glm-5.2", "decensor", "tail_likelihood", "lora-r32", "50-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
