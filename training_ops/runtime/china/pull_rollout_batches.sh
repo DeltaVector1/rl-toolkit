@@ -333,9 +333,20 @@ push_stable() {
 }
 
 scan() {
-  local listing remote_file local_file status=0
+  local listing remote_file local_file status=0 attempt pushed
   while IFS= read -r -d '' local_file; do
-    push_stable "$local_file" || status=1
+    pushed=0
+    for attempt in 1 2 3; do
+      if push_stable "$local_file"; then
+        pushed=1
+        break
+      fi
+      [ "$attempt" -lt 3 ] && sleep 1
+    done
+    if [ "$pushed" = 0 ]; then
+      echo "stable marker push failed after 3 attempts: ${local_file#"$dest_dir"/}" >&2
+      return 1
+    fi
   done < <(find "$dest_dir/broadcasts" -mindepth 2 -maxdepth 2 -type f -name STABLE -print0 2>/dev/null | sort -z)
   listing=$(remote "{ printf '%s\\n' '$source_dir/control/orch.toml'; find '$source_dir/broadcasts' '$source_dir/rollouts' -type f \( -path '*/broadcasts/step_*/receivers-ready.json' -o -path '*/rollouts/step_*/train_rollouts.bin' \) -print 2>/dev/null; } | while IFS= read -r file; do [ -f \"\$file\" ] || continue; marker=\"\$file.delivered\"; [ ! -L \"\$marker\" ] || exit 1; if [ -e \"\$marker\" ]; then [ -f \"\$marker\" ] || exit 1; continue; fi; if [ \"\$file\" = '$source_dir/control/orch.toml' ] && [ \$(( \$(date +%s) - \$(stat -c %Y \"\$file\") )) -lt 2 ]; then continue; fi; printf '%s\\n' \"\$file\"; done") || return 1
   while IFS= read -r remote_file; do

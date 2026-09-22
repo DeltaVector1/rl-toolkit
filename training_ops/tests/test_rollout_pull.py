@@ -31,6 +31,8 @@ class RolloutPullTest(unittest.TestCase):
             "printf -v command '%s ' \"${args[@]:i+1}\"; exec bash -c \"exec /usr/bin/rsync $command\"; fi; done; fi; exit 1; fi\n"
             "[ -z \"${SSH_DELAY:-}\" ] || sleep \"$SSH_DELAY\"\n"
             "[ -n \"${SSH_FAIL:-}\" ] && exit 1 || true\n"
+            "if [ \"${SSH_FAIL_STABLE:-0}\" = 1 ] && [[ \"$last\" == */STABLE* ]]; then exit 1; fi\n"
+            "if [ \"${SSH_FAIL_STABLE_ATTEMPTS:-0}\" -gt 0 ] && [[ \"$last\" == */STABLE* ]]; then state=${SSH_FAIL_STABLE_STATE:?}; count=0; [ -f \"$state\" ] && count=$(cat \"$state\"); if [ \"$count\" -lt \"$SSH_FAIL_STABLE_ATTEMPTS\" ]; then printf '%s' $((count + 1)) >\"$state\"; exit 1; fi; fi\n"
             "if [ \"${SSH_FAIL_LISTING:-0}\" = 1 ] && [[ \"$last\" == *receivers-ready.json* ]]; then exit 1; fi\n"
             "case \" $* \" in *'@'*) exec bash -c \"$last\" ;; esac\n"
             "printf '%s\\n' \"$TRAINER_CT\"\n"
@@ -414,6 +416,66 @@ class RolloutPullTest(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual((source / "broadcasts/step_4/STABLE").read_bytes(), b"stable")
+
+    def test_stable_push_retries_transient_failure_before_rollout_pull(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            (source / "broadcasts").mkdir(parents=True)
+            (source / "rollouts/step_1").mkdir(parents=True)
+            (source / "rollouts/step_1/train_rollouts.bin").write_bytes(b"rollout")
+            stable = destination / "broadcasts/step_4/STABLE"
+            stable.parent.mkdir(parents=True)
+            stable.write_bytes(b"stable")
+            state = base / "stable-failures"
+            environment = self.environment(source, destination, self.tools(directory))
+            environment.update(
+                ONCE="1",
+                SSH_FAIL_STABLE_ATTEMPTS="2",
+                SSH_FAIL_STABLE_STATE=str(state),
+            )
+
+            result = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((source / "broadcasts/step_4/STABLE").read_bytes(), b"stable")
+            self.assertEqual(
+                (destination / "rollouts/step_1/train_rollouts.bin").read_bytes(),
+                b"rollout",
+            )
+
+    def test_persistent_stable_push_failure_blocks_rollout_pull(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            (source / "broadcasts").mkdir(parents=True)
+            (source / "rollouts/step_1").mkdir(parents=True)
+            (source / "rollouts/step_1/train_rollouts.bin").write_bytes(b"rollout")
+            stable = destination / "broadcasts/step_4/STABLE"
+            stable.parent.mkdir(parents=True)
+            stable.write_bytes(b"stable")
+            environment = self.environment(source, destination, self.tools(directory))
+            environment.update(ONCE="1", SSH_FAIL_STABLE="1")
+
+            result = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((source / "broadcasts/step_4/STABLE").exists())
+            self.assertFalse((destination / "rollouts/step_1/train_rollouts.bin").exists())
 
 
 if __name__ == "__main__":
