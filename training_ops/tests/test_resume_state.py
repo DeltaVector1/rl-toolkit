@@ -46,11 +46,12 @@ class ResumeStateTest(unittest.TestCase):
         (root / "train_rollouts.bin.delivered").write_text(sha + "\n")
         return root, sha
 
-    def partial(self):
+    def partial(self, lock=True):
         trace = self.active / "rollouts/step_4/train/all/traces.jsonl"
         trace.parent.mkdir(parents=True)
         trace.write_text("partial trace")
-        (self.active / ".batch-sync.lock").touch()
+        if lock:
+            (self.active / ".batch-sync.lock").touch()
         return trace
 
     def test_latest_policy_requires_complete_matching_delivered_batch(self):
@@ -85,6 +86,59 @@ class ResumeStateTest(unittest.TestCase):
         self.assertFalse(trace.exists())
         self.assertEqual((Path(moved["quarantined"]) / "train/all/traces.jsonl").read_text(), "partial trace")
         self.assertEqual(resume.partial_rollout(str(self.active), 3), {"partial": False})
+
+    def test_partial_creates_and_preserves_missing_publisher_lock(self):
+        trace = self.partial(lock=False)
+        original = Path.iterdir
+        def entries(path):
+            return iter([]) if path == Path("/proc") else original(path)
+        with mock.patch.object(Path, "iterdir", entries):
+            result = resume.partial_rollout(str(self.active), 3, quarantine=True)
+        lock = self.active / ".batch-sync.lock"
+        self.assertEqual(result["partial"], True)
+        self.assertFalse(trace.exists())
+        self.assertTrue(lock.is_file())
+        self.assertFalse(lock.is_symlink())
+        with lock.open() as stream:
+            resume.fcntl.flock(stream, resume.fcntl.LOCK_EX | resume.fcntl.LOCK_NB)
+
+    def test_partial_rejects_missing_lock_symlink(self):
+        self.partial(lock=False)
+        lock = self.active / ".batch-sync.lock"
+        outside = Path(self.temporary.name) / "outside-lock"
+        outside.touch()
+        lock.symlink_to(outside)
+        with self.assertRaises(OSError):
+            resume.partial_rollout(str(self.active), 3)
+        self.assertTrue(lock.is_symlink())
+
+    def test_partial_rejects_lock_creation_race(self):
+        self.partial(lock=False)
+        lock = self.active / ".batch-sync.lock"
+        original = resume.os.open
+        def raced(path, flags, *args, **kwargs):
+            if path == ".batch-sync.lock" and flags & resume.os.O_CREAT:
+                lock.touch()
+            return original(path, flags, *args, **kwargs)
+        with mock.patch.object(resume.os, "open", side_effect=raced):
+            with self.assertRaisesRegex(ValueError, "changed during creation"):
+                resume.partial_rollout(str(self.active), 3)
+        self.assertTrue(lock.is_file())
+
+    def test_partial_rejects_active_publisher_without_existing_lock(self):
+        self.partial(lock=False)
+        original = Path.read_bytes
+        def read(path):
+            if path == Path("/proc/123456/environ"):
+                return f"SOURCE_RUN_DIR={self.active}".encode()
+            return original(path)
+        original_iter = Path.iterdir
+        def entries(path):
+            return iter([Path("/proc/123456")]) if path == Path("/proc") else original_iter(path)
+        with mock.patch.object(Path, "read_bytes", read), mock.patch.object(Path, "iterdir", entries):
+            with self.assertRaisesRegex(ValueError, "publisher is still present"):
+                resume.partial_rollout(str(self.active), 3)
+        self.assertTrue((self.active / ".batch-sync.lock").is_file())
 
     def test_partial_refuses_complete_unknown_and_symlink_entries(self):
         self.partial()

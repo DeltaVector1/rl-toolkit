@@ -343,11 +343,38 @@ def partial_rollout(service_dir: str, step: int, *, quarantine=False) -> dict:
         observed[relative] = path.lstat()
     # The existing publisher owns this lock for its full lifetime. Keep it
     # locked across the final validation and rename; never stop a publisher.
-    lock = active / ".batch-sync.lock"
-    descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW)
+    # Pin the exact run directory before probing or creating its lock.
+    lock_directory = open_directory(active)
+    created_lock = False
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        try:
+            descriptor = os.open(
+                ".batch-sync.lock",
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=lock_directory,
+            )
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(
+                    ".batch-sync.lock",
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=lock_directory,
+                )
+            except FileExistsError as error:
+                raise ValueError("publisher lock changed during creation") from error
+            created_lock = True
+    except BaseException:
+        os.close(lock_directory)
+        raise
+    try:
+        descriptor_info = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_info.st_mode):
             raise ValueError("publisher lock is not regular")
+        if created_lock:
+            created = os.stat(".batch-sync.lock", dir_fd=lock_directory, follow_symlinks=False)
+            if (created.st_dev, created.st_ino) != (descriptor_info.st_dev, descriptor_info.st_ino):
+                raise ValueError("publisher lock changed")
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for proc in Path("/proc").iterdir():
             if not proc.name.isdecimal() or int(proc.name) == os.getpid():
@@ -358,7 +385,8 @@ def partial_rollout(service_dir: str, step: int, *, quarantine=False) -> dict:
                 continue
             if f"SOURCE_RUN_DIR={active}".encode() in environment:
                 raise ValueError("run publisher is still present")
-        if lock.stat().st_ino != os.fstat(descriptor).st_ino:
+        current_lock = os.stat(".batch-sync.lock", dir_fd=lock_directory, follow_symlinks=False)
+        if (current_lock.st_dev, current_lock.st_ino) != (descriptor_info.st_dev, descriptor_info.st_ino):
             raise ValueError("publisher lock changed")
         current = {path.relative_to(target).as_posix(): path.lstat() for path in (target, *target.rglob("*"))}
         if current != observed:
@@ -369,6 +397,7 @@ def partial_rollout(service_dir: str, step: int, *, quarantine=False) -> dict:
         return result
     finally:
         os.close(descriptor)
+        os.close(lock_directory)
 
 
 if __name__ == "__main__":
