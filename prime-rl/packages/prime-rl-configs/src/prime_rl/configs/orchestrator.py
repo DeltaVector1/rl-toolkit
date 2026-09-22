@@ -207,13 +207,6 @@ class EnvConfig(vf.EnvServerConfig):
         return self
 
 
-class RatioStageConfig(BaseConfig):
-    """Sampling weights for all training environments from a given step."""
-
-    start_step: int = Field(..., ge=1)
-    ratios: dict[str, Annotated[float, Field(gt=0)]] = Field(default_factory=dict)
-
-
 class TrainEnvConfig(EnvConfig):
     sampling: TrainSamplingConfig = TrainSamplingConfig()
     """Per-env sampling overrides. Unset fields inherit from the group-level train sampling config."""
@@ -248,10 +241,6 @@ class TrainConfig(BaseConfig):
     sampling: TrainSamplingConfig = TrainSamplingConfig()
     """Shared training sampling configuration."""
 
-    ratio_stages: list[RatioStageConfig] | None = None
-    """Optional step-based sampling weights. Each stage names every train
-    environment and starts at ``start_step``."""
-
     @model_validator(mode="after")
     def resolve_env_defaults(self):
         """Resolve per-env overrides: inherit group-level sampling (the worker ``pool``
@@ -273,30 +262,6 @@ class TrainConfig(BaseConfig):
             raise ValueError(
                 f"Duplicate training environment names: {set(duplicates)}. Each env must have a unique name."
             )
-        return self
-
-    @model_validator(mode="after")
-    def validate_ratio_stages(self):
-        stages = self.ratio_stages
-        if stages is None:
-            return self
-        if not stages:
-            raise ValueError("ratio_stages must not be empty")
-        env_names = {env.resolved_name for env in self.env}
-        starts = [stage.start_step for stage in stages]
-        if starts[0] != 1:
-            raise ValueError("ratio_stages must start at step 1")
-        if starts != sorted(starts) or len(starts) != len(set(starts)):
-            raise ValueError("ratio_stages must use strictly increasing start_step values")
-        for stage in stages:
-            stage_names = set(stage.ratios)
-            if stage_names != env_names:
-                missing = sorted(env_names - stage_names)
-                extra = sorted(stage_names - env_names)
-                raise ValueError(
-                    "ratio_stages ratios must exactly match training environment names; "
-                    f"missing: {missing}, extra: {extra}"
-                )
         return self
 
 
@@ -524,23 +489,6 @@ class OrchestratorConfig(BaseConfig):
     ]
     """Filters applied *after* a batch has been assembled. Each filter annotates each rollout;
     rollouts flagged by an enforcing filter are still recorded but not shipped to the trainer."""
-
-    skip_if_every_refusal_score_is_at_least: int | None = Field(None, ge=1, le=9)
-    """Skip a complete group when every rollout has the environment's aggregate
-    conversation refusal score at or above this threshold. The aggregate score
-    is the environment's max-across-turns conversation score. Mixed, unscored,
-    or lower-scored groups are unchanged. ``None`` disables this filter."""
-
-    require_usable_response_in_group: bool = False
-    """Skip a complete group unless at least one scored response is usable.
-    A usable response has a refusal score at most 4, clear visible output and
-    reasoning, no safety or policy discussion, no meta-commentary, and no
-    response rejection. After scoring, also reject the group when a response
-    with refusal score 7-9 has positive advantage. Missing or invalid required
-    metrics stop collection. Disabled by default."""
-
-    keep_train_batch_ratios: bool = False
-    """Keep final rollout-count batches in whole-group ``train.env`` ratios."""
 
     log: LogConfig = LogConfig()
 

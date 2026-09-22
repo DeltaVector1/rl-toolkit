@@ -1,4 +1,4 @@
-output_dir = "/data/glm52-rl/runs/glm-decensor-prefill-16"
+output_dir = "/data/glm52-rl/runs/glm-decensor"
 max_steps = 50
 dist_timeout_seconds = 5400
 enable_router_replay = false
@@ -19,12 +19,12 @@ ranks_filter = [0]
 
 [swanlab]
 project = "glm-runs"
-name = "trainer-glm-decensor-prefill-16"
+name = "trainer-glm-decensor"
 group = "glm-runs"
-tags = ["decensor-prefill-16", "glm-5.2", "decensor", "tail_likelihood", "lora-r32", "50-step"]
+tags = ["glm-decensor", "glm-5.2", "decensor", "grpo", "lora-r32", "50-step"]
 
 [file_monitor]
-filename = "run_glm-decensor-prefill-16/trainer-metrics.jsonl"
+filename = "run_glm-decensor/trainer-metrics.jsonl"
 
 [model]
 name = "/data/ZiphuAI/GLM-5.2-FP8"

@@ -50,7 +50,6 @@ COPY --chmod=644 prime-rl/src/prime_rl/utils/monitor/swanlab.py /app/src/prime_r
 COPY --chmod=644 prime-rl/src/prime_rl/orchestrator/orchestrator.py /app/src/prime_rl/orchestrator/orchestrator.py
 COPY --chmod=644 prime-rl/src/prime_rl/orchestrator/algo/__init__.py /app/src/prime_rl/orchestrator/algo/__init__.py
 COPY --chmod=644 prime-rl/src/prime_rl/orchestrator/algo/grpo.py /app/src/prime_rl/orchestrator/algo/grpo.py
-COPY --chmod=644 prime-rl/src/prime_rl/orchestrator/algo/tail_likelihood.py /app/src/prime_rl/orchestrator/algo/tail_likelihood.py
 COPY --chmod=644 prime-rl/src/prime_rl/orchestrator/dispatcher.py /app/src/prime_rl/orchestrator/dispatcher.py
 COPY --chmod=644 prime-rl/src/prime_rl/orchestrator/watcher.py /app/src/prime_rl/orchestrator/watcher.py
 COPY --chmod=644 prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py /app/src/prime_rl/inference/vllm/worker/filesystem.py

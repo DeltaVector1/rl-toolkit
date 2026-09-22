@@ -200,15 +200,6 @@ class GRPOAlgoConfig(BaseAlgoConfig):
     """Linear length penalty subtracted from each reward before the GRPO baseline (see ``LinearLengthPenaltyConfig``): a ``pass_rate``-scaled sum of output-token, input-token, and turns terms, each normalized by the group's own max for that quantity. None disables it."""
 
 
-class TailRLAlgoConfig(BaseAlgoConfig):
-    type: Literal["tail_likelihood"] = "tail_likelihood"
-    """Canonical TailRL group weights, centered and scaled by group size.
-    Requires finite rewards in [0, 1]; no standard-deviation normalization.
-    The existing trainer RL loss and global token normalization are unchanged."""
-
-    action_loss_type: ClassVar[ActionLossType] = "rl"
-
-
 class EchoAlgoConfig(GRPOAlgoConfig):
     type: Literal["echo"] = "echo"  # type: ignore[assignment]
     """ECHO: group-relative advantage on action tokens (GRPO), plus weighted
@@ -335,7 +326,7 @@ class SFTAlgoConfig(BaseAlgoConfig):
 
 
 AlgoConfig: TypeAlias = Annotated[
-    GRPOAlgoConfig | TailRLAlgoConfig | EchoAlgoConfig | MaxRLAlgoConfig | RAEAlgoConfig | OPDAlgoConfig | OPSDAlgoConfig | SFTAlgoConfig,
+    GRPOAlgoConfig | EchoAlgoConfig | MaxRLAlgoConfig | RAEAlgoConfig | OPDAlgoConfig | OPSDAlgoConfig | SFTAlgoConfig,
     Field(discriminator="type"),
 ]
 """The training algorithm: sampling plus the per-token training signal (credit

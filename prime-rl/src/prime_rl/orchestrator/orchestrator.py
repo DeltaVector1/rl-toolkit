@@ -117,15 +117,6 @@ monkey_patch_oai_iterable_types()
 monkey_patch_chat_completion_logprobs()
 
 
-def _refusal_advantage_metrics(counts: dict[str, dict[str, int]]) -> dict[str, float]:
-    """Flatten sink counts for the existing per-step rollout metric record."""
-    return {
-        f"rollouts/refusal_advantage/{band}/{sign}_count": float(count)
-        for band, sign_counts in counts.items()
-        for sign, count in sign_counts.items()
-    }
-
-
 # Wall-clock budget for post-training cleanup; force-exit if graceful
 # shutdown wedges (env-server ZMQ recv, vLLM admin aclose, etc)
 SHUTDOWN_TIMEOUT_S = 300
@@ -1328,9 +1319,7 @@ class Orchestrator:
                 self.policy.version = sync_version
                 await self.policy_inference.wait_for_ready(self.policy.model_name)
 
-        self.train_source = TrainSource(
-            self.train_envs, seed=42, ratio_stages=config.train.ratio_stages
-        )
+        self.train_source = TrainSource(self.train_envs, seed=42)
         self.eval_source: EvalSource | None = (
             EvalSource(
                 self.eval_envs,
@@ -1354,7 +1343,6 @@ class Orchestrator:
             max_inflight_rollouts=config.max_inflight_rollouts,
             tasks_per_minute=config.tasks_per_minute,
             max_off_policy_steps=config.max_off_policy_steps,
-            train_step=lambda: self.progress.step,
         )
         self.train_sink = TrainSink(
             config,
@@ -1672,14 +1660,6 @@ class Orchestrator:
             )
             for name, count in self.train_sink.pre_filter_dropped_by_name.items():
                 metrics[f"pre_filters/all/{name}/rate"] = count / self.train_sink.pre_filter_seen
-        metrics |= _refusal_advantage_metrics(self.train_sink.refusal_advantage_counts)
-        metrics["groups/strong_refusal/skipped"] = self.train_sink.strong_refusal_groups_skipped
-        metrics["groups/no_usable_response/skipped"] = (
-            self.train_sink.no_usable_response_groups_skipped
-        )
-        metrics["groups/positive_strong_refusal_advantage/skipped"] = (
-            self.train_sink.positive_strong_refusal_advantage_groups_skipped
-        )
         self.monitor.log(metrics, step=step)
         self.wait_for_policy_time = 0.0
         self.monitor.log_samples(effective.rollouts, step=step)

@@ -55,7 +55,7 @@ def _score_for_test(
     )
 
 
-def test_refusal_ordering_and_presentation_boundaries():
+def test_scoring_uses_baseline_multiplicative_penalties():
     minimum_presentation = dict(
         content="No.",
         response_format="markdown",
@@ -64,20 +64,30 @@ def test_refusal_ordering_and_presentation_boundaries():
     )
     refusal_one = _score_for_test(refusal=1, **minimum_presentation)
     refusal_nine = _score_for_test(refusal=9, **minimum_presentation)
-    assert refusal_one.reward == pytest.approx(0.819)
-    assert refusal_nine.reward == pytest.approx(0.019)
+    assert refusal_one.reward == pytest.approx(
+        refusal_one.details["base_reward"]
+        * refusal_one.details["word_multiplier"]
+        * refusal_one.details["markdown_presence_multiplier"]
+        * refusal_one.details["markdown_correctness_multiplier"]
+    )
+    assert refusal_nine.reward == pytest.approx(
+        refusal_nine.details["base_reward"]
+        * refusal_nine.details["word_multiplier"]
+        * refusal_nine.details["markdown_presence_multiplier"]
+        * refusal_nine.details["markdown_correctness_multiplier"]
+    )
     assert refusal_one.reward > refusal_nine.reward
     assert refusal_one.details["final_reward_formula"] == (
-        "(base_reward - presentation_deduction) * "
-        "visible_answer_multiplier * reasoning_multiplier * meta_mult"
+        "base_reward * word_multiplier * visible_answer_multiplier * "
+        "markdown_presence_multiplier * markdown_correctness_multiplier * "
+        "reasoning_multiplier * meta_mult"
     )
     disabled = _score_for_test(
         content="No.",
         response_format="markdown",
         config=ScoringConfig(enable_word_count=False, enable_markdown_judges=False),
     )
-    assert disabled.details["presentation_quality"] == 1.0
-    assert disabled.details["presentation_value"] == disabled.details["base_reward"]
+    assert disabled.reward == disabled.details["base_reward"]
 
 
 def test_scoring_preserves_response_and_penalty_rules():
@@ -95,7 +105,7 @@ def test_scoring_preserves_response_and_penalty_rules():
         )
 
 
-def test_multiturn_presentation_uses_worst_turn_values():
+def test_multiturn_scoring_uses_worst_turn_values():
     result = _score_for_test(
         response_format="markdown",
         markdown_present=1,
@@ -113,8 +123,11 @@ def test_multiturn_presentation_uses_worst_turn_values():
     assert result.details["word_multiplier"] == min(
         result.details["word_multipliers"]
     )
-    assert result.details["presentation_quality"] == pytest.approx(0.1)
-    assert result.reward == pytest.approx(0.819)
+    assert result.reward == pytest.approx(
+        result.details["base_reward"]
+        * result.details["word_multiplier"]
+        * result.details["markdown_correctness_multiplier"]
+    )
 
 
 def test_newer_verifiers_exports_environment():

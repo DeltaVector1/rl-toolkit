@@ -4320,7 +4320,6 @@ start_orchestrator_container() {
     -v "$deployment/prime-rl/deps/verifiers/verifiers/v1/harnesses/null/harness.py":/app/deps/verifiers/verifiers/v1/harnesses/null/harness.py:ro \
     -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/grpo.py":/app/src/prime_rl/orchestrator/algo/grpo.py:ro \
     -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/__init__.py":/app/src/prime_rl/orchestrator/algo/__init__.py:ro \
-    -v "$deployment/prime-rl/src/prime_rl/orchestrator/algo/tail_likelihood.py":/app/src/prime_rl/orchestrator/algo/tail_likelihood.py:ro \
     -v "$deployment/prime-rl/src/prime_rl/orchestrator/dispatcher.py":/app/src/prime_rl/orchestrator/dispatcher.py:ro \
     -v "$deployment/prime-rl/src/prime_rl/orchestrator/orchestrator.py":/app/src/prime_rl/orchestrator/orchestrator.py:ro \
     -v "$deployment/prime-rl/src/prime_rl/orchestrator/train_sink.py":/app/src/prime_rl/orchestrator/train_sink.py:ro \

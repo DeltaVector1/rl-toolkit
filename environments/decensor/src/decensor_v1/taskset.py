@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Literal
-
-from pydantic import Field
+from typing import Any
 
 import verifiers.v1 as vf
 
@@ -73,9 +71,6 @@ class DecensorTasksetConfig(vf.TasksetConfig):
     num_examples: int = 2000
     dataset_seed: int = 42
     difficulty: str = "easy"
-    data_split: Literal["all", "train", "heldout"] = "all"
-    holdout_seed: int = 42
-    holdout_fraction: float = Field(default=0.25, gt=0.0, lt=1.0)
     turn_decay_ratio: float = 0.5
     max_turns: int = 6
     style_probability: float = 0.25
@@ -452,9 +447,6 @@ class DecensorTaskset(vf.Taskset[DecensorTask, DecensorTasksetConfig]):
             enable_length_prompts=config.enable_length_prompts,
             output_prompt=config.reasoning_output_prompt,
             difficulty=config.difficulty,
-            data_split=config.data_split,
-            holdout_seed=config.holdout_seed,
-            holdout_fraction=config.holdout_fraction,
         )
         tasks: list[DecensorTask] = []
         for index, row in enumerate(rows):

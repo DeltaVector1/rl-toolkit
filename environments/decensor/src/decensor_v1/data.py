@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import random
 from collections import Counter
-from math import ceil
-from typing import Any, Literal
+from typing import Any
 
 from datasets import load_dataset
 
@@ -70,67 +69,6 @@ def stratified_sample_by_key(
     return selected
 
 
-def _unique_stratified_sample_by_key(
-    rows_by_key: dict[str, list[Any]], target: int, seed: int
-) -> list[Any]:
-    pools = {
-        key: list(dict.fromkeys(values))
-        for key, values in rows_by_key.items()
-        if values
-    }
-    available = sum(len(values) for values in pools.values())
-    if target > available:
-        raise ValueError(
-            f"requested {target} heldout rows but only {available} unique rows are available"
-        )
-    if not pools or target <= 0:
-        return []
-
-    rng = random.Random(seed)
-    keys = sorted(pools)
-    for values in pools.values():
-        rng.shuffle(values)
-    selected: list[Any] = []
-    while len(selected) < target:
-        for key in keys:
-            if pools[key]:
-                selected.append(pools[key].pop())
-                if len(selected) == target:
-                    break
-    rng.shuffle(selected)
-    return selected
-
-
-def _heldout_source_indices(
-    rows: list[dict[str, Any]], difficulty: str, seed: int, fraction: float
-) -> set[int]:
-    unique_rows: dict[int, dict[str, Any]] = {}
-    for row in sorted(
-        rows,
-        key=lambda item: (
-            int(item["source_index"]),
-            str(item["harm_type"]),
-            str(item["prompt"]),
-        ),
-    ):
-        unique_rows.setdefault(int(row["source_index"]), row)
-    rows_by_harm: dict[str, list[int]] = {}
-    for source_index, row in unique_rows.items():
-        rows_by_harm.setdefault(str(row["harm_type"]), []).append(source_index)
-
-    heldout: set[int] = set()
-    for harm_type in sorted(rows_by_harm):
-        source_indices = sorted(rows_by_harm[harm_type])
-        random.Random(f"{seed}:{difficulty}:{harm_type}").shuffle(source_indices)
-        heldout.update(source_indices[: ceil(len(source_indices) * fraction)])
-    return heldout
-
-
-def _validate_holdout_fraction(fraction: float) -> None:
-    if not 0.0 < fraction < 1.0:
-        raise ValueError("holdout_fraction must be greater than zero and less than one")
-
-
 def assign_response_formats(
     count: int, markdown_probability: float, seed: int
 ) -> list[str]:
@@ -191,13 +129,7 @@ def build_decensor_pool(
     max_turns: int,
     seed: int,
     difficulty: str,
-    data_split: Literal["all", "train", "heldout"] = "all",
-    holdout_seed: int = 42,
-    holdout_fraction: float = 0.25,
 ) -> list[tuple[list[dict[str, str]], int, str, int]]:
-    if data_split not in {"all", "train", "heldout"}:
-        raise ValueError("data_split must be all, train, or heldout")
-    _validate_holdout_fraction(holdout_fraction)
     if target <= 0:
         return []
     all_rows: list[dict[str, Any]] = []
@@ -232,51 +164,7 @@ def build_decensor_pool(
     if not all_rows:
         raise ValueError(f"the difficulty dataset has no {difficulty} rows")
 
-    if data_split == "all":
-        selected = stratified_sample_by_key(rows_by_harm, target, seed + 7919)
-    else:
-        heldout_source_indices = _heldout_source_indices(
-            all_rows, difficulty, holdout_seed, holdout_fraction
-        )
-        if data_split == "train":
-            rows_by_split_harm = {
-                harm_type: [
-                    row_idx
-                    for row_idx in row_indices
-                    if all_rows[row_idx]["source_index"] not in heldout_source_indices
-                ]
-                for harm_type, row_indices in rows_by_harm.items()
-            }
-            rows_by_split_harm = {
-                harm_type: row_indices
-                for harm_type, row_indices in rows_by_split_harm.items()
-                if row_indices
-            }
-            selected = stratified_sample_by_key(
-                rows_by_split_harm, target, seed + 7919
-            )
-        else:
-            unique_rows_by_harm: dict[str, list[int]] = {}
-            unique_row_indices: dict[int, int] = {}
-            for row_idx, row in sorted(
-                enumerate(all_rows),
-                key=lambda item: (
-                    int(item[1]["source_index"]),
-                    str(item[1]["harm_type"]),
-                    str(item[1]["prompt"]),
-                ),
-            ):
-                unique_row_indices.setdefault(int(row["source_index"]), row_idx)
-            for source_index, row_idx in unique_row_indices.items():
-                if source_index not in heldout_source_indices:
-                    continue
-                row = all_rows[row_idx]
-                unique_rows_by_harm.setdefault(str(row["harm_type"]), []).append(
-                    row_idx
-                )
-            selected = _unique_stratified_sample_by_key(
-                unique_rows_by_harm, target, seed + 7919
-            )
+    selected = stratified_sample_by_key(rows_by_harm, target, seed + 7919)
     turn_counts = sample_turn_counts(target, decay, max_turns, seed)
     if len(selected) != target or len(turn_counts) != target:
         raise ValueError("could not build the requested number of tasks")
@@ -306,13 +194,7 @@ def build_rows(
     enable_length_prompts: bool,
     output_prompt: str | None,
     difficulty: str,
-    data_split: Literal["all", "train", "heldout"] = "all",
-    holdout_seed: int = 42,
-    holdout_fraction: float = 0.25,
 ) -> list[dict[str, Any]]:
-    if data_split not in {"all", "train", "heldout"}:
-        raise ValueError("data_split must be all, train, or heldout")
-    _validate_holdout_fraction(holdout_fraction)
     system_prompts = load_system_prompts()
     pool = build_decensor_pool(
         num_examples,
@@ -320,9 +202,6 @@ def build_rows(
         max_turns,
         seed + 2,
         difficulty,
-        data_split,
-        holdout_seed,
-        holdout_fraction,
     )
     response_formats = assign_response_formats(
         len(pool),

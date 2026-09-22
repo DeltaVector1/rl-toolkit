@@ -1,45 +1,35 @@
 # Difficulty ideas
 
-## Completed 50-step audit and approved correction plan
+## Final failed-experiment audit
 
-- The current run was easy-only with prefill and TailRL. Mean reward was
-  0.1756, the fitted change was -0.0058, and the noise threshold was ±0.0931.
-  This is inside the noise, so it does not show learning or regression.
-- Mean refusal changed from 4.06 to 4.38. There were only 3 all-score-9
-  groups, but score-1 candidates appeared at every step. The policy was
-  updated. Dataset counts were 4,365 easy, 3,608 medium, and 22,027 hard.
-- Measured conflict: a level-7 refusal with no auxiliary penalty gives 0.30,
-  but a level-1 compliant answer with only the 0.1 length penalty gives 0.09.
-  This shows the defect: presentation alone can reverse refusal order and
-  must not do so. Policy-reasoning remains an intentional hard penalty and may
-  reverse it. An invalid response remains zero.
+- **Fixed balanced difficulty — failed acceptance.** The 50-step evidence did
+  not show a per-difficulty reward change outside noise. Later changes to the
+  prompt mix also made the aggregate result unsuitable for a clean comparison.
+- **Hard-heavy staged curriculum — failed.** The full run had mean reward
+  0.0574 and fitted change -0.0701. The harder later mix confounds the raw fall,
+  but no easy, medium, or hard bucket proved learning.
+- **Prefill runs 1-16 — inconclusive until the final run.** Runs 1-15 mainly
+  exposed collection, storage, timeout, and fixed-batch faults or ended after
+  too few steps. They do not support a reward trend.
+- **TailRL plus fixed prefill, 50 steps — failed.** Mean reward was 0.1756,
+  fitted change was -0.0058, and the noise threshold was 0.0931. The result was
+  inside noise. The final steps 21-31 window also had mean 0.4123 and fitted
+  change +0.0048 versus a 0.1288 noise threshold, so it was inside noise.
+- **Reward-ordering rewrite — failed design test.** Offline replay changed
+  263/1,268 winners and reduced high-refusal winners, but it was not a live
+  learning result and replaced the approved multiplicative reward contract.
+- **All/strong-refusal and usable-response group filters — inconclusive for
+  learning.** The filters removed known low-signal groups, but no controlled
+  run proved a gain. The changed accepted difficulty mix was a confound.
+- **Easy/medium schedules — inconclusive.** Short easy-only and proposed
+  70% easy/30% medium phases did not produce a completed controlled result.
+- **Fixed holdout — useful measurement, no proven gain.** The no-prefix v28
+  comparison was easy 0.3396 versus 0.3387, medium 0.0532 versus 0.0535, and
+  hard 0.0116 versus 0.0147. These small changes did not establish improvement.
 
-Approved reward shape and next test:
-
-- Keep refusal as the primary score. Put length and format in one shared
-  tie-break band below 0.1. Preserve invalid = 0, unclear reasoning = 0,
-  ethics or policy reasoning ×0.1, visible meta leakage ×0.01, and unclear
-  visible answer ×0.1.
-- Skip a group when every refusal score is at least 7. Run offline replay,
-  then a 50-step easy-only run. Use a fixed no-prefix evaluation. Only after
-  proven improvement, use 70% easy and 30% medium; add hard later. Use teacher
-  SFT as the fallback.
-- Acceptance for 50 steps uses fixed no-prefix refusal mean, score 1-2 rate,
-  score 7-9 rate, component penalties, and reward trend outside noise. Generic
-  prefill must first pass a no-training A/B check.
-
-### Completed offline replay check
-
-- The replay had 20,288 records in 1,268 complete groups. Old mean reward was
-  .175973; new mean reward was .352421. This is not a live learning result.
-- The winner set changed in 263/1,268 groups. New-winner refusal was lower in
-  122 groups, equal in 1,144, and higher in 2.
-- High-refusal winners with an option at or below 6 fell from 109 to 38.
-  There were 30 groups with all refusal scores at least 7, and 0 groups with
-  all scores exactly 9.
-- A bounded 100-group audit found 0 component, aggregate, or evidence
-  mismatches. The formula and filter behave as intended offline. Only the
-  fixed no-prefix 50-step run can show learning.
+The current selection returns to plain GRPO with equal easy, medium, and hard
+ratios. It has no fixed prefill, TailRL, staged ratios, group filters, or
+held-out split wiring.
 
 ## Measured long-haul evidence
 
