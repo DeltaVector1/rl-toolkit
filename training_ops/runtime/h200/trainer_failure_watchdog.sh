@@ -13,6 +13,7 @@ TRAINER_CT=${TRAINER_CT:?set TRAINER_CT}
 ORCH_CT=${ORCH_CT:?set ORCH_CT}
 run_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"
 LEASE_FILE=${LEASE_FILE:-"$run_dir/.trainer-health-lease"}
+STATUS_FILE=${STATUS_FILE:-"$run_dir/.trainer-health-status"}
 LEASE_MAX_AGE=${LEASE_MAX_AGE:-90}
 
 case "$MODE" in
@@ -63,30 +64,64 @@ lease_fresh() {
   [ "$age" -ge 0 ] && [ "$age" -le "$LEASE_MAX_AGE" ]
 }
 
+health_status() {
+  local state epoch extra owner age
+  [ -f "$STATUS_FILE" ] && [ ! -L "$STATUS_FILE" ] || return 1
+  owner=$(stat -c '%u:%g:%a' "$STATUS_FILE" 2>/dev/null) || return 1
+  [ "$owner" = "1000:1000:600" ] || return 1
+  read -r state epoch extra <"$STATUS_FILE" || return 1
+  [ -z "${extra:-}" ] || return 1
+  case "$state" in
+    healthy|missing|unknown) ;;
+    *) return 1 ;;
+  esac
+  case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
+  age=$(( $(date +%s) - epoch ))
+  [ "$age" -ge 0 ] && [ "$age" -le "$LEASE_MAX_AGE" ] || return 1
+  printf '%s %s\n' "$state" "$epoch"
+}
+
 log "trainer failure watchdog started (RUN=$RUN mode=$MODE interval=${INTERVAL}s)"
 deadline=$(( $(date +%s) + STARTUP_GRACE ))
 if [ "$MODE" = lease ]; then
-  while ! lease_fresh; do
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      log "FATAL: trainer health lease did not become fresh"
-      stop_edge
-      exit 1
-    fi
-    sleep 15
-  done
-  misses=0
+  missing_epoch=
+  missing_count=0
   while true; do
-    if lease_fresh; then
-      misses=0
-      log "healthy: trainer health lease is fresh"
+    snapshot=$(health_status 2>/dev/null || true)
+    if [ -z "$snapshot" ]; then
+      missing_epoch=
+      missing_count=0
+      log "trainer health status unknown; no failure recorded"
     else
-      misses=$((misses + 1))
-      log "trainer lease miss $misses/$MAX_MISSES"
-    fi
-    if [ "$misses" -ge "$MAX_MISSES" ]; then
-      log "FATAL: trainer health lease is stale; stopping orchestrator"
-      stop_edge
-      exit 1
+      read -r state epoch <<<"$snapshot"
+      case "$state" in
+        healthy)
+          missing_epoch=
+          missing_count=0
+          if lease_fresh; then
+            log "healthy: trainer health lease is fresh"
+          else
+            log "trainer health lease is stale; status is unknown"
+          fi
+          ;;
+        unknown)
+          missing_epoch=
+          missing_count=0
+          log "trainer health probe unknown; no failure recorded"
+          ;;
+        missing)
+          if [ "$epoch" != "$missing_epoch" ]; then
+            missing_epoch=$epoch
+            missing_count=$((missing_count + 1))
+          fi
+          log "confirmed trainer probe missing epoch $epoch ($missing_count/$MAX_MISSES)"
+          if [ "$missing_count" -ge "$MAX_MISSES" ]; then
+            log "FATAL: trainer probes confirmed missing; stopping orchestrator"
+            stop_edge
+            exit 1
+          fi
+          ;;
+      esac
     fi
     sleep "$INTERVAL"
   done

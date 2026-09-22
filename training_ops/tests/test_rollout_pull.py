@@ -205,6 +205,12 @@ class RolloutPullTest(unittest.TestCase):
                 self.assertIsNone(process.poll())
                 lease = source / ".trainer-health-lease"
                 self.assertTrue(lease.is_file())
+                health_status = source / ".trainer-health-status"
+                self.assertTrue(health_status.read_text().startswith("healthy "))
+                self.assertEqual(
+                    (health_status.stat().st_uid, health_status.stat().st_gid, health_status.stat().st_mode & 0o777),
+                    (1000, 1000, 0o600),
+                )
             finally:
                 os.killpg(process.pid, signal.SIGTERM)
                 stdout, stderr = process.communicate(timeout=10)
@@ -234,6 +240,7 @@ class RolloutPullTest(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(lease.read_text(), "old\n")
+            self.assertTrue((source / ".trainer-health-status").read_text().startswith("missing "))
 
     def test_lock_loser_preserves_owner_pid_and_owner_signal_cleans_up(self):
         with tempfile.TemporaryDirectory() as directory:

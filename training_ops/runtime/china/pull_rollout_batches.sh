@@ -364,24 +364,43 @@ scan() {
 }
 
 refresh_health_lease() {
-  local host state now status=0
+  local host state now probe_status unknown=0 missing=0 health_state
   health_probe_pids=()
   for host in $trainer_addresses; do
     (
-      state=$(ssh -n -o BatchMode=yes -o ConnectTimeout=20 "$host" \
-        "sudo docker ps --filter name=^${trainer_container}$ --format '{{.Names}}' 2>/dev/null | head -1" \
-        2>/dev/null || true)
-      [ "$state" = "$trainer_container" ]
+      if state=$(ssh -n -o BatchMode=yes -o ConnectTimeout=20 "$host" \
+        "sudo docker ps --filter name=^${trainer_container}$ --format '{{.Names}}' 2>/dev/null" \
+        2>/dev/null); then
+        [ "$state" = "$trainer_container" ] || exit 1
+      else
+        exit 2
+      fi
     ) &
     health_probe_pids+=("$!")
   done
   for pid in "${health_probe_pids[@]}"; do
-    wait "$pid" || status=1
+    if wait "$pid"; then
+      continue
+    else
+      probe_status=$?
+      case "$probe_status" in
+        1) missing=1 ;;
+        *) unknown=1 ;;
+      esac
+    fi
   done
   health_probe_pids=()
-  [ "$status" = 0 ] || return 1
+  health_state=healthy
+  [ "$unknown" = 0 ] || health_state=unknown
+  [ "$unknown" = 1 ] || { [ "$missing" = 0 ] || health_state=missing; }
   now=$(date +%s)
-  health_remote "mkdir -p '$source_dir'; lease='$source_dir/.trainer-health-lease'; partial=\$(mktemp -- \"\${lease}.tmp.XXXXXX\") || exit 1; printf '%s\\n' '$now' >\"\$partial\" && mv -- \"\$partial\" \"\$lease\""
+  health_publish_state "$health_state" "$now" || return 1
+  [ "$health_state" = healthy ]
+}
+
+health_publish_state() {
+  local health_state=$1 now=$2
+  health_remote "set -eu; status='$source_dir/.trainer-health-status'; partial=\$(mktemp -- \"\${status}.tmp.XXXXXX\"); printf '%s %s\\n' '$health_state' '$now' >\"\$partial\"; chmod 600 \"\$partial\"; chown 1000:1000 \"\$partial\"; mv -- \"\$partial\" \"\$status\"; if [ '$health_state' = healthy ]; then lease='$source_dir/.trainer-health-lease'; lease_partial=\$(mktemp -- \"\${lease}.tmp.XXXXXX\"); printf '%s\\n' '$now' >\"\$lease_partial\"; chown 1000:1000 \"\$lease_partial\"; mv -- \"\$lease_partial\" \"\$lease\"; fi"
 }
 
 health_lease_shutdown() {
@@ -411,7 +430,7 @@ start_health_lease() {
   [ "${ONCE:-0}" = 1 ] && return
   export source_dir source_host source_port source_user source_identity source_known_hosts
   export trainer_addresses trainer_container
-  export -f health_remote refresh_health_lease health_lease_shutdown health_lease_loop
+  export -f health_remote health_publish_state refresh_health_lease health_lease_shutdown health_lease_loop
   setsid bash -c 'exec -a rollout-pull-health bash -c health_lease_loop' &
   health_lease_pid=$!
 }
