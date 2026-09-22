@@ -64,6 +64,46 @@ if [ -n "${TRANSFORMERS_OVERRIDE_DIR:-}" ]; then
   transformers_mount=(-v "$TRANSFORMERS_OVERRIDE_DIR/transformers":/app/.venv/lib/python3.12/site-packages/transformers:ro)
 fi
 
+verify_trinity_afmoe_image() {
+  local overlay="$deployment/prime-rl/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py"
+  local overlay_sha image_files
+  test -f "$overlay" || {
+    echo "Trinity requires the AFMoE modeling overlay: $overlay" >&2
+    exit 1
+  }
+  overlay_sha=$(sha256sum "$overlay" | awk '{print $1}')
+  test "$overlay_sha" = c0c78212b1033a53bb728e6c6c7212f36651c8f3cac80c3cd2b3d5c97ac62426 || {
+    echo "Trinity AFMoE modeling overlay hash is not the pinned checkout source" >&2
+    echo "expected c0c78212b1033a53bb728e6c6c7212f36651c8f3cac80c3cd2b3d5c97ac62426, got $overlay_sha" >&2
+    exit 1
+  }
+  sudo docker image inspect "$image" >/dev/null 2>&1 || {
+    echo "Trinity requires the local trainer image $image; image is absent" >&2
+    exit 1
+  }
+  if ! image_files=$(sudo docker run --rm --pull=never --network none --entrypoint /bin/sh "$image" -c '
+set -eu
+for expected in \
+  "prime_rl/trainer/models/afmoe/__init__.py 7065e20971ac342c216dd03160f263c59ff8a0fd9d7df49c814e9b5152bf454c" \
+  "prime_rl/trainer/models/afmoe/configuration_afmoe.py fbaa7caae85b8891d89367d87527420f9331538429efc1b8878356313cea4df9" \
+  "prime_rl/trainer/models/afmoe/converting_afmoe.py 2743fc844d285b29ade3089e18216044492d392f0d9d1c017ee35fe0e5fcf41b"; do
+  set -- $expected
+  path="/app/src/$1"
+  test -f "$path" || { echo "missing $path" >&2; exit 2; }
+  actual=$(sha256sum "$path" | awk "{print \$1}")
+  test "$actual" = "$2" || { echo "hash mismatch for $path: expected $2, got $actual" >&2; exit 3; }
+done
+printf "%s\n" "AFMOE_BASE_OK"
+') ; then
+    echo "Trinity trainer image does not contain the pinned AFMoE base modules" >&2
+    exit 1
+  fi
+  test "$image_files" = AFMOE_BASE_OK || {
+    echo "Trinity AFMoE base-module verification returned unexpected output" >&2
+    exit 1
+  }
+}
+
 case ${1:-} in
   trainer)
     # trainer_nodes lists the participating nodes in rank order; a node's rank
@@ -84,7 +124,7 @@ case ${1:-} in
     trainer_env_file=$(mktemp)
     chmod 600 "$trainer_env_file"
     trap 'rm -f -- "$trainer_env_file"' EXIT
-    if ! read -r rollout_transport trainer_output fake_data < <(
+    if ! read -r rollout_transport trainer_output fake_data trinity_profile < <(
       python3 - "$trainer_config" "$trainer_env_file" <<'PY'
 import re
 import sys
@@ -123,6 +163,7 @@ print(
     config["rollout_transport"]["type"],
     config["output_dir"],
     int("fake" in config.get("data", {})),
+    int(config.get("model", {}).get("name") == "/data/trinity-thinking-fp8"),
 )
 PY
     ); then
@@ -183,8 +224,11 @@ PY
     sudo install -d -o 1000 -g 1000 -m 1777 "$storage/cache/tmp"
     # Batch replay cache (PRIME_BATCH_CACHE), written by the container user.
     sudo install -d -o 1000 -g 1000 -m 0755 "$storage/cache/batch_pp"
+    if [ "$trinity_profile" = 1 ]; then
+      verify_trinity_afmoe_image
+    fi
     # nccl shm segments leak on every trainer crash (~33MB each, observed
-    # 1500+ per node = 50GB+); the container was just removed, so purge.
+    # 1500+ per node = 50GB+); the container is removed below, so purge.
     sudo rm -f /dev/shm/nccl-* 2>/dev/null || true
     sudo docker rm -f "$trainer_container" >/dev/null 2>&1 || true
     # Keep the optional checkpoint cache disabled. It is not selected by the
@@ -221,6 +265,7 @@ PY
       -v "$deployment/prime-rl/src/prime_rl/trainer/rl/broadcast/filesystem.py":/app/src/prime_rl/trainer/rl/broadcast/filesystem.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py":/app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py:ro \
+      -v "$deployment/prime-rl/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py":/app/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/lora/multi_linear.py":/app/src/prime_rl/trainer/models/layers/lora/multi_linear.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py":/app/src/prime_rl/trainer/models/layers/lora/native_fp8_moe.py:ro \
       -v "$deployment/prime-rl/src/prime_rl/trainer/lora.py":/app/src/prime_rl/trainer/lora.py:ro \
