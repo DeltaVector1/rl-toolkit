@@ -1,0 +1,75 @@
+# Hugging Face revision: 6412c1ad1588c664977b0f830b80a20273173318
+
+output_dir = "/data/glm52-rl/runs/trinity-decensor"
+max_steps = 50
+dist_timeout_seconds = 5400
+enable_router_replay = false
+
+[log]
+level = "info"
+ranks_filter = [0]
+
+[swanlab]
+project = "trinity-runs"
+name = "trainer-trinity-decensor"
+group = "trinity-decensor"
+tags = ["trinity-large-thinking", "decensor", "grpo", "lora-r32", "50-step"]
+
+[file_monitor]
+filename = "run_trinity-decensor/trainer-metrics.jsonl"
+
+[model]
+name = "arcee-ai/Trinity-Large-Thinking-FP8-Block"
+impl = "custom"
+seq_len = 32768
+attn = "flash_attention_2"
+cp = 8
+cp_style = "ulysses"
+pp = 8
+pp_schedule = "1f1b"
+pp_boundary_plan = "balanced"
+ep = 8
+global_ep = false
+ep_comm_backend = "torch"
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+moe_router_dtype = "float32"
+moe_use_grouped_mm = true
+fused_lm_head_token_chunk_size = 1024
+
+[model.quantization]
+type = "fp8"
+dequantize_checkpoint = false
+expert_activation_transport = "bf16"
+
+[model.lora]
+rank = 32
+alpha = 64
+dropout = 0.0
+target_modules = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "shared_expert",
+    "experts",
+]
+
+[optim]
+type = "muon"
+lr = 8e-6
+weight_decay = 0.0
+max_norm = 1.0
+
+[scheduler]
+type = "constant"
+
+[weight_broadcast]
+type = "filesystem"
+save_format = "safetensors"
+
+[rollout_transport]
+type = "filesystem"
