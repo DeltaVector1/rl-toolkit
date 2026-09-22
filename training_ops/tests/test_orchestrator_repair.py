@@ -691,7 +691,9 @@ class OrchestratorRepairTest(unittest.TestCase):
 
         with mock.patch.object(training_ops, "current_run", return_value="glm-perf-3"), mock.patch.object(
             training_ops, "status", return_value=before
-        ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy:
+        ), mock.patch.object(training_ops, "deploy", return_value=True) as deploy, mock.patch.object(
+            training_ops, "_orchestrator_resume_step", return_value=None
+        ):
             with mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh), mock.patch.object(
                 training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
             ):
@@ -755,7 +757,7 @@ class OrchestratorRepairTest(unittest.TestCase):
             training_ops, "_ssh", side_effect=fake_ssh
         ), mock.patch.object(
             training_ops, "_ssh_address", side_effect=lambda host: f"addr-{host}"
-        ):
+        ), mock.patch.object(training_ops, "_orchestrator_resume_step", return_value=None):
             result = training_ops._repair_orchestrator()
 
         self.assertIn("recreated exact orchestrator", result)
@@ -891,6 +893,44 @@ class OrchestratorResumeStateTest(unittest.TestCase):
             with self.assertRaises(training_ops.Refused):
                 training_ops._orchestrator_resume_step(self.run, latest=True)
         check.assert_not_called()
+
+    def test_cold_latest_policy_starts_at_zero_and_checks_completed_batch(self):
+        self.repair_state.side_effect = [
+            {"step": 5, "batch_sha256": "b" * 64},
+            {"step": 5, "batch_sha256": "b" * 64, "records": 432},
+        ]
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, self.state())), mock.patch.object(
+            training_ops, "_check_adapter_restart", return_value={"sha256": "a" * 64}
+        ) as check:
+            self.assertEqual(training_ops._orchestrator_resume_step(self.run, latest=True), 5)
+        self.assertEqual(
+            self.repair_state.call_args_list,
+            [
+                mock.call(training_ops.trainer_head, "latest", self.directory, 0),
+                mock.call(training_ops.orchestrator_host, "completed", self.directory, 5, "b" * 64),
+            ],
+        )
+        self.assertEqual(
+            check.call_args_list,
+            [
+                mock.call(training_ops.trainer_head, self.directory, 5, "origin", f"{self.directory}/broadcasts/step_5/adapter_model.safetensors"),
+                mock.call(training_ops.orchestrator_host, self.directory, 5, "orchestrator", f"{self.directory}/broadcasts/step_5/adapter_model.safetensors"),
+            ],
+        )
+
+    def test_cold_latest_policy_refuses_without_h200_stable_marker(self):
+        self.repair_state.side_effect = [
+            {"step": 5, "batch_sha256": "b" * 64},
+            {"step": 5, "batch_sha256": "b" * 64, "records": 432},
+        ]
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, self.state())), mock.patch.object(
+            training_ops,
+            "_check_adapter_restart",
+            side_effect=[{"sha256": "a" * 64}, training_ops.Refused("stable policy marker is missing")],
+        ) as check:
+            with self.assertRaisesRegex(training_ops.Refused, "stable policy marker"):
+                training_ops._orchestrator_resume_step(self.run, latest=True)
+        self.assertEqual(check.call_count, 2)
 
     def state(self, *environment, **changes):
         value = {"name": f"/{training_ops.trainer_container}", "running": True, "environment": [f"RUN={self.run}", *environment]}

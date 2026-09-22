@@ -4692,17 +4692,25 @@ def _orchestrator_resume_step(run: str, *, latest: bool = False) -> int | None:
             raise ValueError("trainer run differs")
         adapter = environment.get("PRIME_RL_RESUME_ADAPTER", "")
         step_text = environment.get("PRIME_RL_RESUME_ADAPTER_STEP", "")
-        if not adapter and not step_text:
+        cold_latest = not adapter and not step_text
+        if cold_latest:
             if "RUN" not in environment:
                 raise ValueError("trainer has no explicit run or resume policy")
-            return None
+            if not latest:
+                return None
+            # A trainer launched from the base policy has no adapter identity
+            # in its environment.  Treat step zero as its explicit launch
+            # policy, then validate the latest published policy below.
+            step = 0
         if not adapter or not re.fullmatch(r"0|[1-9][0-9]*", step_text):
-            raise ValueError("resume adapter and integer step must be set together")
-        step = int(step_text)
-        # Older trainer launchers omitted RUN. Only the exact paired resume
-        # policy can identify their run; the checkpoint guards below still apply.
-        if adapter != f"{service_dir}/broadcasts/step_{step}/adapter_model.safetensors":
-            raise ValueError("resume adapter is not the exact run policy path")
+            if not cold_latest:
+                raise ValueError("resume adapter and integer step must be set together")
+        if not cold_latest:
+            step = int(step_text)
+            # Older trainer launchers omitted RUN. Only the exact paired resume
+            # policy can identify their run; the checkpoint guards below still apply.
+            if adapter != f"{service_dir}/broadcasts/step_{step}/adapter_model.safetensors":
+                raise ValueError("resume adapter is not the exact run policy path")
     except (ValueError, KeyError, TypeError, AttributeError) as error:
         raise Refused(f"invalid active trainer resume state: {error}") from error
     if latest:
