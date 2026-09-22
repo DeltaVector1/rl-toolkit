@@ -31,6 +31,7 @@ class RolloutPullTest(unittest.TestCase):
             "printf -v command '%s ' \"${args[@]:i+1}\"; exec bash -c \"exec /usr/bin/rsync $command\"; fi; done; fi; exit 1; fi\n"
             "[ -z \"${SSH_DELAY:-}\" ] || sleep \"$SSH_DELAY\"\n"
             "[ -n \"${SSH_FAIL:-}\" ] && exit 1 || true\n"
+            "if [ \"${SSH_FAIL_LISTING:-0}\" = 1 ] && [[ \"$last\" == *receivers-ready.json* ]]; then exit 1; fi\n"
             "case \" $* \" in *'@'*) exec bash -c \"$last\" ;; esac\n"
             "printf '%s\\n' \"$TRAINER_CT\"\n"
         )
@@ -390,6 +391,29 @@ class RolloutPullTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(step.stat().st_mode & 0o777, 0o700)
             self.assertFalse((step / "STABLE").exists())
+
+    def test_stable_push_precedes_rollout_listing_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            (source / "broadcasts").mkdir(parents=True)
+            stable = destination / "broadcasts/step_4/STABLE"
+            stable.parent.mkdir(parents=True)
+            stable.write_bytes(b"stable")
+            environment = self.environment(source, destination, self.tools(directory))
+            environment.update(ONCE="1", SSH_FAIL_LISTING="1")
+
+            result = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((source / "broadcasts/step_4/STABLE").read_bytes(), b"stable")
 
 
 if __name__ == "__main__":
