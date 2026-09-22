@@ -345,12 +345,13 @@ def partial_rollout(service_dir: str, step: int, *, quarantine=False) -> dict:
     # locked across the final validation and rename; never stop a publisher.
     # Pin the exact run directory before probing or creating its lock.
     lock_directory = open_directory(active)
+    run_directory_info = os.fstat(lock_directory)
     created_lock = False
     try:
         try:
             descriptor = os.open(
                 ".batch-sync.lock",
-                os.O_RDONLY | os.O_NOFOLLOW,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                 dir_fd=lock_directory,
             )
         except FileNotFoundError:
@@ -372,9 +373,25 @@ def partial_rollout(service_dir: str, step: int, *, quarantine=False) -> dict:
         if not stat.S_ISREG(descriptor_info.st_mode):
             raise ValueError("publisher lock is not regular")
         if created_lock:
+            os.fchown(descriptor, run_directory_info.st_uid, run_directory_info.st_gid)
+            os.fchmod(descriptor, 0o600)
+            descriptor_info = os.fstat(descriptor)
+            if (
+                descriptor_info.st_uid != run_directory_info.st_uid
+                or descriptor_info.st_gid != run_directory_info.st_gid
+                or stat.S_IMODE(descriptor_info.st_mode) != 0o600
+            ):
+                raise ValueError("new publisher lock ownership or mode is unsafe")
             created = os.stat(".batch-sync.lock", dir_fd=lock_directory, follow_symlinks=False)
             if (created.st_dev, created.st_ino) != (descriptor_info.st_dev, descriptor_info.st_ino):
                 raise ValueError("publisher lock changed")
+        elif (
+            # An existing inode has no creation provenance. Do not chown it.
+            descriptor_info.st_uid != run_directory_info.st_uid
+            or descriptor_info.st_gid != run_directory_info.st_gid
+            or not descriptor_info.st_mode & stat.S_IWUSR
+        ):
+            raise ValueError("existing publisher lock ownership or mode is unsafe")
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         for proc in Path("/proc").iterdir():
             if not proc.name.isdecimal() or int(proc.name) == os.getpid():

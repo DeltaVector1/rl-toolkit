@@ -1,9 +1,12 @@
 import hashlib
 import importlib.util
 import json
+import os
+import stat
 import subprocess
 import sys
 import tempfile
+import types
 import tomllib
 import unittest
 from unittest import mock
@@ -99,8 +102,38 @@ class ResumeStateTest(unittest.TestCase):
         self.assertFalse(trace.exists())
         self.assertTrue(lock.is_file())
         self.assertFalse(lock.is_symlink())
+        directory = self.active.stat()
+        self.assertEqual((lock.stat().st_uid, lock.stat().st_gid), (directory.st_uid, directory.st_gid))
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+        with lock.open("wb"):
+            pass
         with lock.open() as stream:
             resume.fcntl.flock(stream, resume.fcntl.LOCK_EX | resume.fcntl.LOCK_NB)
+
+    def test_partial_rejects_existing_lock_owned_by_another_uid(self):
+        self.partial()
+        actual_fstat = resume.os.fstat
+        calls = 0
+        directory = self.active.stat()
+        other_uid = 0 if directory.st_uid else 1
+        def fstat(fd):
+            nonlocal calls
+            calls += 1
+            value = actual_fstat(fd)
+            if calls == 1:
+                return types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=directory.st_uid, st_gid=directory.st_gid)
+            if calls == 2:
+                return types.SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=other_uid, st_gid=directory.st_gid)
+            return value
+        with mock.patch.object(resume.os, "fstat", side_effect=fstat):
+            with self.assertRaisesRegex(ValueError, "existing publisher lock ownership"):
+                resume.partial_rollout(str(self.active), 3)
+
+    def test_partial_rejects_fifo_lock_without_blocking(self):
+        self.partial(lock=False)
+        os.mkfifo(self.active / ".batch-sync.lock")
+        with self.assertRaisesRegex(ValueError, "publisher lock is not regular"):
+            resume.partial_rollout(str(self.active), 3)
 
     def test_partial_rejects_missing_lock_symlink(self):
         self.partial(lock=False)
