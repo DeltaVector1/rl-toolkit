@@ -1,7 +1,6 @@
 # Hugging Face revision: 6412c1ad1588c664977b0f830b80a20273173318
 
 enable_lora = true
-enable_auto_tool_choice = true
 router = "None"
 max_loras = 1
 max_cpu_loras = 2
@@ -38,7 +37,6 @@ dtype = "bfloat16"
 max_model_len = 65536
 enforce_eager = false
 reasoning_parser = "deepseek_r1"
-tool_call_parser = "qwen3_coder"
 
 [parallel]
 tp = 8
