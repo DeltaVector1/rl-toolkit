@@ -81,6 +81,7 @@ adapter_container = containers["adapter"]
 adapter_relay_container = containers["adapter_relay"]
 glm_inference_container = containers["glm52_inference"]
 glm_model = models["glm52"]
+profile_models = {name: value for name, value in models.items() if isinstance(value, str)}
 adapter_archive_bucket = paths.get("adapter_bucket")
 
 minimum_trend_steps = 10
@@ -121,10 +122,12 @@ for inference_host in inference_hosts:
         )
 
 
-def _inference_config(host: str) -> dict:
-    settings = inference_settings.get(host, {}).get("glm52")
+def _inference_config(host: str, kind: str = "glm52") -> dict:
+    settings = inference_settings.get(host, {}).get(kind)
+    if settings is None and kind != "glm52":
+        settings = inference_settings.get(host, {}).get("glm52")
     if not isinstance(settings, dict):
-        raise RuntimeError(f"inference settings for {host} and glm52 are missing")
+        raise RuntimeError(f"inference settings for {host} and {kind} are missing")
     return settings
 
 
@@ -148,7 +151,8 @@ def _config_dir(
     orchestrator = path / "orchestrator.toml"
     if not (repo_root / trainer).is_file():
         raise Refused(f"run config directory has no trainer.toml: {config_dir}")
-    selected = {"kind": "glm52", "trainer": trainer.as_posix()}
+    kind = "trinity" if any("trinity" in part for part in path.parts) else "glm52"
+    selected = {"kind": kind, "trainer": trainer.as_posix()}
     inference = path / "inference.toml"
     if (repo_root / inference).is_file():
         selected["inference"] = inference.as_posix()
@@ -1092,8 +1096,9 @@ def _inference_script(
     policy_lora_name: str = "",
     run: str = "",
     policy_identity: dict | None = None,
+    kind: str = "glm52",
 ) -> str:
-    settings = _inference_config(host)
+    settings = _inference_config(host, kind)
     gpu_count = settings.get("gpu_count")
     if not isinstance(gpu_count, int) or gpu_count < 1:
         raise RuntimeError(f"GPU count for {host} is invalid")
@@ -1895,7 +1900,8 @@ def _acceptance_from_text(
     rollout_rows, _, _ = _select_active_metric_rows(
         rollout_rows, run, rollout_active_run, rollout_start_epoch
     )
-    rep = AcceptanceReport(run=run, profile="glm52", reward_verdict=reward_verdict)
+    profile = "trinity" if "/data/trinity-thinking-fp8" in trainer_config else "glm52"
+    rep = AcceptanceReport(run=run, profile=profile, reward_verdict=reward_verdict)
     expected_batch = _expected_value(orch_values, ("batch_size",))
     expected_group = _expected_value(orch_values, ("group_size",))
     expected_context = _expected_value(trainer_values, ("model.seq_len",))
@@ -2087,7 +2093,7 @@ def _acceptance_from_text(
         rep.alarms.append(f"{category} failure evidence is present ({count})")
     if reward_verdict == "falling":
         rep.alarms.append("effective reward verdict is falling")
-    if not rep.large_batch_evidence:
+    if rep.profile == "glm52" and not rep.large_batch_evidence:
         rep.alarms.append("no measured batch-2048 validation evidence")
     if rep.completed_steps < final_validation_steps:
         rep.alarms.append(
@@ -2449,6 +2455,9 @@ fi
 def status(run: str = "", quiet: bool = False) -> Status:
     """Probe every part of the run once and return the whole picture."""
     run = run or current_run()
+    selected_profile = _config_for_run(run, required=False)
+    profile_kind = selected_profile.get("kind", "glm52") if selected_profile else "glm52"
+    profile_model = profile_models.get(profile_kind, glm_model)
     s = Status(
         when=_dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), run=run
     )
@@ -2473,12 +2482,13 @@ def status(run: str = "", quiet: bool = False) -> Status:
             h,
             _inference_script(
                 h,
-                glm_model,
+                profile_model,
                 glm_inference_container,
                 policy_broadcast_dir,
                 policy_lora_name,
                 run,
                 policy_identity,
+                profile_kind,
             ),
             timeout=90,
         )
@@ -2800,6 +2810,9 @@ def current_run() -> str:
 def engines(run: str = "") -> dict[str, EngineState]:
     """Probe every configured inference host with a real completion."""
     run = run or current_run()
+    selected_profile = _config_for_run(run, required=False)
+    profile_kind = selected_profile.get("kind", "glm52") if selected_profile else "glm52"
+    profile_model = profile_models.get(profile_kind, glm_model)
     policy_probe = _active_policy_probe_config(run)
     policy_broadcast_dir = policy_probe[0] if policy_probe is not None else ""
     policy_lora_name = policy_probe[1] if policy_probe is not None else ""
@@ -2813,12 +2826,13 @@ def engines(run: str = "") -> dict[str, EngineState]:
             h,
             _inference_script(
                 h,
-                glm_model,
+                profile_model,
                 glm_inference_container,
                 policy_broadcast_dir,
                 policy_lora_name,
                 run,
                 policy_identity,
+                profile_kind,
             ),
             timeout=90,
         ),
@@ -4036,7 +4050,7 @@ def _adapter_update_config(run: str) -> dict:
             raise Refused(f"inference ports for {host} are invalid")
         ports_by_host[host] = list(configured_ports)
     return {
-        "kind": "glm52",
+        "kind": selected.get("kind", "glm52"),
         "engine_container": glm_inference_container,
         "output_dir": output_dir,
         "service_name": service_name,
@@ -5335,11 +5349,13 @@ def _engine_watchdog_identity_script(
     *,
     ensure_running: bool,
     inference_config: str | None = None,
+    engine_kind: str = "glm52",
 ) -> str:
     """Stop stale watchdogs for one configured engine identity."""
     values = {
         "ENGINE_HOST": host,
         "ENGINE_CONTAINER": engine_container,
+        "ENGINE_KIND": engine_kind,
     }
     lines = [
         "set -euo pipefail",
@@ -5490,7 +5506,8 @@ def _repair_engine(host: str, config_dir: str | None = None) -> str:
         selected = _config_dir(config_dir, require_inference=True)
     inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     engine_container = glm_inference_container
-    engine_model = glm_model
+    engine_kind = selected.get("kind", "glm52")
+    engine_model = profile_models.get(engine_kind, glm_model)
     start_script = f"{runtime_root}/h200/start_inference.sh"
     for path in ("configs/nodes.toml", "training_ops/runtime/h200/start_inference.sh", _selected_inference_config(selected)):
         if not deploy(path, nodes=[host]):
@@ -5511,6 +5528,7 @@ def _repair_engine(host: str, config_dir: str | None = None) -> str:
             startup_grace,
             ensure_running=False,
             inference_config=inference_config,
+            engine_kind=engine_kind,
         ),
     )
     if stop_code:
@@ -5518,7 +5536,7 @@ def _repair_engine(host: str, config_dir: str | None = None) -> str:
     rc, out = _ssh(
         host,
         f"sudo docker rm -f {engine_container} >/dev/null 2>&1; "
-        f"nohup setsid env ENGINE_HOST={shlex.quote(host)} "
+        f"nohup setsid env ENGINE_HOST={shlex.quote(host)} ENGINE_KIND={shlex.quote(engine_kind)} "
         f"inference_config={shlex.quote(inference_config)} bash {start_script} "
         ">/root/start_inference.log 2>&1 </dev/null & "
         "sleep 3; echo issued",
@@ -5537,6 +5555,7 @@ def _repair_engine(host: str, config_dir: str | None = None) -> str:
             startup_grace,
             ensure_running=True,
             inference_config=inference_config,
+            engine_kind=engine_kind,
         ),
     )
     if watchdog_code:
@@ -5701,13 +5720,14 @@ def _repair_engine_watchdog(
     if selected is None:
         selected = _config_for_run(run)
     inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
-    settings = _inference_config(host)
+    engine_kind = selected.get("kind", "glm52")
+    settings = _inference_config(host, engine_kind)
     configured_ports = settings.get("ports")
     if not isinstance(configured_ports, list) or not configured_ports:
         raise Refused(f"inference ports for {host} are missing")
     if not all(isinstance(port, int) and 1 <= port <= 65535 for port in configured_ports):
         raise Refused(f"inference ports for {host} are invalid")
-    model = glm_model
+    model = profile_models.get(engine_kind, glm_model)
     container = glm_inference_container
     start_script = f"{runtime_root}/h200/start_inference.sh"
     startup_grace = 600
@@ -5719,6 +5739,7 @@ def _repair_engine_watchdog(
             "MODEL": model,
             "START": start_script,
             "ENGINE_CONTAINER": container,
+            "ENGINE_KIND": engine_kind,
             "inference_config": inference_config,
             "PORT": str(port),
             "WATCHDOG_IDENTITY": f"engine-watchdog:{host}:{run}:{port}",
@@ -5743,6 +5764,7 @@ def _repair_engine_watchdog(
             startup_grace,
             ensure_running=False,
             inference_config=inference_config,
+            engine_kind=engine_kind,
         ),
         timeout=180,
     )

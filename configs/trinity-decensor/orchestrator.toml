@@ -1,6 +1,6 @@
 # Hugging Face revision: 6412c1ad1588c664977b0f830b80a20273173318
 
-output_dir = "/data/glm52-rl/runs/trinity-decensor/run_trinity-decensor"
+output_dir = "/data/glm52-rl/runs/trinity-decensor-1/run_trinity-decensor-1"
 max_steps = 50
 seq_len = 32768
 batch_size = 1024
@@ -17,24 +17,24 @@ level = "info"
 
 [swanlab]
 project = "trinity-runs"
-name = "orchestrator-trinity-decensor"
-group = "trinity-decensor"
+name = "orchestrator-trinity-decensor-1"
+group = "trinity-decensor-1"
 tags = ["trinity-large-thinking", "decensor", "grpo", "lora-r32", "50-step"]
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"
 
 [model]
-name = "arcee-ai/Trinity-Large-Thinking-FP8-Block"
+name = "/data/trinity-thinking-fp8"
 
 [model.lora]
-name = "trinity-decensor-r32-node-local"
+name = "trinity-decensor-1-r32-node-local"
 rank = 32
 alpha = 64
 
 [model.client]
-base_url = ["http://127.0.0.1:8000/v1", "http://127.0.0.1:18049/v1"]
-admin_base_url = ["http://127.0.0.1:8000/v1", "http://127.0.0.1:18049/v1"]
+base_url = ["http://127.0.0.1:8000/v1"]
+admin_base_url = ["http://127.0.0.1:8000/v1"]
 adapter_origin_base_urls = ["http://127.0.0.1:8000/v1"]
 wait_for_ready_timeout = 7200
 skip_model_check = true
@@ -81,8 +81,8 @@ max_concurrent_requests = 48
 
 [weight_broadcast]
 type = "filesystem"
-source_url = "http://127.0.0.1:18100/trinity-decensor"
-source_dir = "/data/glm52-rl/runs/trinity-decensor"
+source_url = "http://127.0.0.1:18100/trinity-decensor-1"
+source_dir = "/data/glm52-rl/runs/trinity-decensor-1"
 
 [rollout_transport]
 type = "filesystem"

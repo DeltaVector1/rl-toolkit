@@ -60,6 +60,7 @@ glm52_inference = "glm52-decensor-h200"
 
 [models]
 glm52 = "/models/glm52-fp8"
+trinity = "/data/trinity-thinking-fp8"
 
 [rollout_transfer]
 direction = "trainer_pull"
@@ -95,4 +96,11 @@ gpu_count = 8
 tensor_parallel_size = 8
 data_parallel_size = 1
 mtp_tokens = 1
+ports = [8000]
+
+[inference.h200b.trinity]
+gpu_count = 8
+tensor_parallel_size = 8
+data_parallel_size = 1
+mtp_tokens = 0
 ports = [8000]

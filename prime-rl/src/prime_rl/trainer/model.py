@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import cast
 
@@ -108,6 +109,78 @@ def iter_layers(layers):
     import torch.nn as _nn
 
     return layers.values() if isinstance(layers, _nn.ModuleDict) else layers
+
+
+def _config_mapping(value) -> Mapping:
+    if isinstance(value, Mapping):
+        return value
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        converted = to_dict()
+        if isinstance(converted, Mapping):
+            return converted
+    values = getattr(value, "__dict__", None)
+    return values if isinstance(values, Mapping) else {}
+
+
+def _config_value(value):
+    return getattr(value, "value", value)
+
+
+def _is_compressed_tensors_fp8_block(qconfig: Mapping) -> bool:
+    if (
+        str(_config_value(qconfig.get("quant_method", ""))).lower() != "compressed-tensors"
+        or str(_config_value(qconfig.get("format", ""))).lower() != "float-quantized"
+    ):
+        return False
+    groups = _config_mapping(qconfig.get("config_groups"))
+    if len(groups) != 1:
+        return False
+    for group in groups.values():
+        group = _config_mapping(group)
+        weights = _config_mapping(group.get("weights"))
+        activations = _config_mapping(group.get("input_activations"))
+        targets = group.get("targets")
+        if (
+            str(_config_value(group.get("format", qconfig.get("format", "")))).lower()
+            != "float-quantized"
+            or targets != ["Linear"]
+            or _config_value(weights.get("num_bits")) != 8
+            or str(_config_value(weights.get("type", ""))).lower() != "float"
+            or str(_config_value(weights.get("strategy", ""))).lower() != "block"
+            or list(weights.get("block_structure") or ()) != [128, 128]
+            or _config_value(weights.get("dynamic")) is not False
+            or _config_value(weights.get("symmetric")) is not True
+            or _config_value(activations.get("num_bits")) != 8
+            or str(_config_value(activations.get("type", ""))).lower() != "float"
+            or str(_config_value(activations.get("strategy", ""))).lower() != "group"
+            or _config_value(activations.get("dynamic")) is not True
+            or _config_value(activations.get("group_size")) != 128
+            or _config_value(activations.get("symmetric")) is not True
+            or group.get("output_activations") is not None
+        ):
+            return False
+    return True
+
+
+def _normalize_compressed_tensors_ignore(model_config, qconfig):
+    if isinstance(qconfig, Mapping):
+        normalized = qconfig
+    else:
+        normalized = dict(_config_mapping(qconfig))
+        model_config.quantization_config = normalized
+    ignored = normalized.get("ignore", [])
+    if ignored is None:
+        ignored = []
+    if not isinstance(ignored, (list, tuple)):
+        raise ValueError("compressed-tensors quantization ignore must be a list")
+    existing = normalized.get("modules_to_not_convert", [])
+    if existing is None:
+        existing = []
+    if not isinstance(existing, (list, tuple)):
+        raise ValueError("compressed-tensors modules_to_not_convert must be a list")
+    normalized["modules_to_not_convert"] = list(dict.fromkeys([*existing, *ignored]))
+    return normalized
 
 
 def _virtual_stage_blocks(language_model: nn.Module) -> list[list[nn.Module]]:
@@ -982,9 +1055,28 @@ def get_model(
     model_config.pp_boundary_plan = config.pp_boundary_plan
     model_config.pp_layer_boundaries = config.pp_layer_boundaries
     checkpoint_quantization = getattr(model_config, "quantization_config", {})
+    checkpoint_quantization_map = _config_mapping(checkpoint_quantization)
+    quant_method = str(_config_value(checkpoint_quantization_map.get("quant_method", ""))).lower()
+    compressed_tensors_fp8_block = _is_compressed_tensors_fp8_block(checkpoint_quantization_map)
+    if (
+        isinstance(config.quantization, FP8Config)
+        and quant_method == "compressed-tensors"
+        and not compressed_tensors_fp8_block
+    ):
+        raise ValueError(
+            "unsupported compressed-tensors checkpoint: expected float8 block weights "
+            "[128, 128] and dynamic group activations of size 128"
+        )
+    if compressed_tensors_fp8_block:
+        checkpoint_quantization_map = _normalize_compressed_tensors_ignore(
+            model_config, checkpoint_quantization
+        )
     model_config.fp8_source_checkpoint = isinstance(config.quantization, FP8Config) and (
-        checkpoint_quantization.get("quant_method") == "fp8"
-        and checkpoint_quantization.get("weight_block_size") == [128, 128]
+        (
+            quant_method == "fp8"
+            and list(checkpoint_quantization_map.get("weight_block_size") or ()) == [128, 128]
+        )
+        or compressed_tensors_fp8_block
     )
     model_config.fp8_checkpoint = model_config.fp8_source_checkpoint and not config.quantization.dequantize_checkpoint
     model_config.fp8_checkpoint_linears = model_config.fp8_checkpoint

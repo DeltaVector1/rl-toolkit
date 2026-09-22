@@ -3,6 +3,7 @@ set -euo pipefail
 
 deployment=/data/glm52-rl/deployment
 engine_host=${ENGINE_HOST:?ENGINE_HOST must name this host in nodes.toml}
+engine_kind=${ENGINE_KIND:-glm52}
 inference_config=${inference_config:?set inference_config to the selected run config}
 test -f "$inference_config" || {
   echo "inference config is missing: $inference_config" >&2
@@ -37,6 +38,7 @@ runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<'PY
 import sys
 import tomllib
 import json
+import os
 
 with open(sys.argv[1], "rb") as stream:
     config = tomllib.load(stream)
@@ -65,15 +67,18 @@ disable_nccl_shm = inference[host].get("disable_nccl_shm", False)
 if not isinstance(disable_nccl_shm, bool):
     raise SystemExit(f"disable_nccl_shm for {host} must be true or false")
 print("1" if disable_nccl_shm else "0")
-glm = inference[host]["glm52"]
-tp = glm.get("tensor_parallel_size")
-dp = glm.get("data_parallel_size", 1)
-gpu_count = glm.get("gpu_count")
+kind = os.environ.get("ENGINE_KIND", "glm52")
+profile = inference[host].get(kind)
+if not isinstance(profile, dict):
+    raise SystemExit(f"inference settings for {host} and {kind} are missing")
+tp = profile.get("tensor_parallel_size")
+dp = profile.get("data_parallel_size", 1)
+gpu_count = profile.get("gpu_count")
 if not all(isinstance(value, int) and value > 0 for value in (tp, dp, gpu_count)):
-    raise SystemExit(f"invalid GLM parallel sizes for {host}")
+    raise SystemExit(f"invalid {kind} parallel sizes for {host}")
 if tp * dp != gpu_count:
-    raise SystemExit(f"GLM TP times DP must equal gpu_count for {host}")
-mtp_tokens = glm.get("mtp_tokens")
+    raise SystemExit(f"{kind} TP times DP must equal gpu_count for {host}")
+mtp_tokens = profile.get("mtp_tokens")
 if type(mtp_tokens) is not int or mtp_tokens < 0:
     raise SystemExit(f"mtp_tokens for {host} must be a non-negative integer")
 max_num_seqs = 128

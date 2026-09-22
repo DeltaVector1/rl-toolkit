@@ -11,7 +11,7 @@ from torch.futures import Future
 
 
 _EXPERT = re.compile(
-    r"^(model\.layers\.\d+\.mlp)\.experts\.(\d+)\.(gate|down|up)_proj\.(weight|weight_scale_inv)$"
+    r"^(model\.layers\.\d+\.mlp)\.experts\.(\d+)\.(gate|down|up)_proj\.(weight|weight_scale|weight_scale_inv)$"
 )
 _PROJECTIONS = {"gate": "w1", "down": "w2", "up": "w3"}
 _GLM_QKV_A = re.compile(
@@ -23,10 +23,72 @@ _GLM_QKV_A = re.compile(
 @dataclasses.dataclass
 class _FP8StorageInfo(_HFStorageInfo):
     source_key: str = ""
+    scale_source_key: str = ""
     stacked: bool = False
     quantized: bool = False
     dequantize: bool = False
     bitcast: bool = False
+
+
+def _scale_source_for_weight(weight_key: str, source_keys: set[str]) -> str | None:
+    for suffix in (".weight_scale_inv", ".weight_scale"):
+        scale_key = weight_key.removesuffix(".weight") + suffix
+        if scale_key in source_keys:
+            return scale_key
+    return None
+
+
+def _canonical_scale_key(source_key: str) -> str:
+    return source_key.removesuffix(".weight_scale") + ".weight_scale_inv"
+
+
+def _validate_fp8_scale_metadata(metadata) -> None:
+    state = metadata.state_dict_metadata
+    keys = set(state)
+    fp8_dtypes = {
+        dtype
+        for dtype in (
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e4m3fnuz", None),
+            getattr(torch, "float8_e5m2", None),
+            getattr(torch, "float8_e5m2fnuz", None),
+        )
+        if dtype is not None
+    }
+    for weight in (key for key in keys if key.endswith(".weight")):
+        scale_keys = [
+            key
+            for key in (
+                weight.removesuffix(".weight") + ".weight_scale",
+                weight.removesuffix(".weight") + ".weight_scale_inv",
+            )
+            if key in keys
+        ]
+        if len(scale_keys) > 1:
+            raise ValueError(f"checkpoint has duplicate FP8 scales for {weight}")
+        if state[weight].properties.dtype not in fp8_dtypes:
+            continue
+        if not scale_keys:
+            raise ValueError(f"FP8 weight has no scale tensor: {weight}")
+        scale = scale_keys[0]
+        scale_meta = state[scale]
+        if scale_meta.properties.dtype not in {torch.bfloat16, torch.float32}:
+            raise TypeError(f"FP8 scale has unsupported dtype: {scale}")
+        if scale.endswith(".weight_scale") and scale_meta.properties.dtype != torch.bfloat16:
+            raise TypeError(f"compressed-tensors FP8 scale must be bfloat16: {scale}")
+        if len(weight_meta := state[weight].size) != 2 or len(scale_meta.size) != 2:
+            raise ValueError(f"FP8 weight and scale must be rank 2: {weight}")
+        rows, cols = map(int, weight_meta)
+        expected = ((rows + 127) // 128, (cols + 127) // 128)
+        if tuple(map(int, scale_meta.size)) != expected:
+            raise ValueError(f"FP8 scale shape does not match {weight}: expected {expected}")
+        if scale.endswith(".weight_scale") and (rows % 128 or cols % 128):
+            raise ValueError(f"compressed-tensors FP8 weight has a partial block: {weight}")
+
+    for scale in (key for key in keys if key.endswith((".weight_scale", ".weight_scale_inv"))):
+        weight = scale.rsplit(".weight_scale", 1)[0] + ".weight"
+        if weight not in keys:
+            raise ValueError(f"FP8 scale has no weight tensor: {scale}")
 
 
 class FP8CheckpointStorageReader(HuggingFaceStorageReader):
@@ -134,14 +196,18 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
 
     def read_metadata(self):
         metadata = super().read_metadata()
+        _validate_fp8_scale_metadata(metadata)
         storage_by_fqn = {}
         for index in metadata.storage_data:
             storage_by_fqn.setdefault(index.fqn, []).append(index)
-        quantized_weights = {
-            key
-            for key in storage_by_fqn
-            if key.endswith(".weight") and key.removesuffix(".weight") + ".weight_scale_inv" in storage_by_fqn
+        source_keys = set(storage_by_fqn)
+        scale_source_by_weight = {
+            key: scale_source
+            for key in source_keys
+            if key.endswith(".weight")
+            if (scale_source := _scale_source_for_weight(key, source_keys)) is not None
         }
+        quantized_weights = set(scale_source_by_weight)
 
         groups = {}
         for key in list(metadata.state_dict_metadata):
@@ -150,7 +216,7 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                 groups.setdefault((prefix, projection, kind), []).append((int(expert), key))
 
         for (prefix, projection, kind), sources in groups.items():
-            suffix = "_scale_inv" if kind == "weight_scale_inv" else ""
+            suffix = "_scale_inv" if kind in {"weight_scale", "weight_scale_inv"} else ""
             target = f"{prefix}.experts.{_PROJECTIONS[projection]}{suffix}"
             chunks = []
             properties = None
@@ -176,6 +242,7 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                     stacked=True,
                     quantized=source in quantized_weights,
                     dequantize=self.dequantize_all and source in quantized_weights,
+                    scale_source_key=scale_source_by_weight.get(source),
                 )
             metadata.state_dict_metadata[target] = TensorStorageMetadata(
                 properties=properties,
@@ -183,14 +250,35 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                 chunks=chunks,
             )
 
+        for source in list(metadata.state_dict_metadata):
+            if not source.endswith(".weight_scale"):
+                continue
+            target = _canonical_scale_key(source)
+            if target in metadata.state_dict_metadata:
+                metadata.state_dict_metadata.pop(source)
+                for index in storage_by_fqn.pop(source, ()):
+                    metadata.storage_data.pop(index, None)
+                continue
+            metadata.state_dict_metadata[target] = metadata.state_dict_metadata.pop(source)
+            self._move_storage(
+                metadata,
+                storage_by_fqn,
+                source,
+                target,
+                torch.Size([0] * len(metadata.state_dict_metadata[target].size)),
+            )
+
         renames = {
             ".mlp.gate.weight": ".mlp.router.gate.weight",
             ".mlp.gate.e_score_correction_bias": ".mlp.expert_bias",
             ".mlp.shared_experts.gate_proj.weight": ".mlp.shared_expert.w1",
+            ".mlp.shared_experts.gate_proj.weight_scale": ".mlp.shared_expert.w1_scale_inv",
             ".mlp.shared_experts.gate_proj.weight_scale_inv": ".mlp.shared_expert.w1_scale_inv",
             ".mlp.shared_experts.down_proj.weight": ".mlp.shared_expert.w2",
+            ".mlp.shared_experts.down_proj.weight_scale": ".mlp.shared_expert.w2_scale_inv",
             ".mlp.shared_experts.down_proj.weight_scale_inv": ".mlp.shared_expert.w2_scale_inv",
             ".mlp.shared_experts.up_proj.weight": ".mlp.shared_expert.w3",
+            ".mlp.shared_experts.up_proj.weight_scale": ".mlp.shared_expert.w3_scale_inv",
             ".mlp.shared_experts.up_proj.weight_scale_inv": ".mlp.shared_expert.w3_scale_inv",
         }
         for source in list(metadata.state_dict_metadata):
@@ -206,6 +294,7 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                         torch.Size([0] * len(metadata.state_dict_metadata[target].size)),
                         quantized=source in quantized_weights,
                         dequantize=self.dequantize_all and source in quantized_weights,
+                        scale_source_key=scale_source_by_weight.get(source),
                     )
                     break
 
@@ -223,6 +312,7 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                         shape=info.shape,
                         dtype=info.dtype,
                         source_key=source,
+                        scale_source_key=scale_source_by_weight.get(source, ""),
                         quantized=quantized,
                         dequantize=dequantize,
                         bitcast=bitcast,
@@ -241,6 +331,7 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
         stacked=False,
         quantized=False,
         dequantize=False,
+        scale_source_key=None,
     ):
         for index in storage_by_fqn.pop(source, ()):
             info = metadata.storage_data.pop(index)
@@ -249,6 +340,7 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
                 shape=info.shape,
                 dtype=info.dtype,
                 source_key=source,
+                scale_source_key=scale_source_key or "",
                 stacked=stacked,
                 quantized=quantized,
                 dequantize=dequantize,
@@ -271,9 +363,8 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
         # model by orders of magnitude (GLM kv_a is [576, 6144]).
         dequantize = info.dequantize or (info.quantized and target.dtype != tensor.dtype)
         if dequantize:
-            scale = file.get_tensor(
-                info.source_key.removesuffix(".weight") + ".weight_scale_inv"
-            )
+            scale_key = info.scale_source_key or info.source_key.removesuffix(".weight") + ".weight_scale_inv"
+            scale = file.get_tensor(scale_key)
             row_slice = slices[1] if info.stacked else slices[0]
             col_slice = slices[2] if info.stacked else slices[1]
             rows = torch.arange(row_slice.start, row_slice.stop) // 128

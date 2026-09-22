@@ -33,7 +33,7 @@ liveness_timeout_seconds = 120.0
 level = "info"
 
 [model]
-name = "arcee-ai/Trinity-Large-Thinking-FP8-Block"
+name = "/data/trinity-thinking-fp8"
 dtype = "bfloat16"
 max_model_len = 65536
 enforce_eager = false
