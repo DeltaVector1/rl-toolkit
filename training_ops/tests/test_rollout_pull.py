@@ -33,6 +33,7 @@ class RolloutPullTest(unittest.TestCase):
             "[ -n \"${SSH_FAIL:-}\" ] && exit 1 || true\n"
             "if [ -n \"${SSH_LISTING_DELAY:-}\" ] && [[ \"$last\" == *receivers-ready.json* ]]; then sleep \"$SSH_LISTING_DELAY\"; fi\n"
             "if [ \"${SSH_FAIL_STABLE:-0}\" = 1 ] && [[ \"$last\" == */STABLE* ]]; then exit 1; fi\n"
+            "if [ \"${SSH_READ_STDIN:-0}\" = 1 ] && [[ \" $* \" != *\" -n \"* ]]; then cat >/dev/null; fi\n"
             "if [ \"${SSH_FAIL_STABLE_ATTEMPTS:-0}\" -gt 0 ] && [[ \"$last\" == */STABLE* ]]; then state=${SSH_FAIL_STABLE_STATE:?}; count=0; [ -f \"$state\" ] && count=$(cat \"$state\"); if [ \"$count\" -lt \"$SSH_FAIL_STABLE_ATTEMPTS\" ]; then printf '%s' $((count + 1)) >\"$state\"; exit 1; fi; fi\n"
             "if [ -n \"${SSH_MISSING_TRAINER:-}\" ] && [[ \" $* \" == *\" $SSH_MISSING_TRAINER \"* ]] && [[ \"$last\" == *\"docker ps\"* ]]; then printf '%s\\n' missing; exit 0; fi\n"
             "if [ \"${SSH_FAIL_LISTING:-0}\" = 1 ] && [[ \"$last\" == *receivers-ready.json* ]]; then exit 1; fi\n"
@@ -579,6 +580,34 @@ class RolloutPullTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((source / "broadcasts/step_4/STABLE").exists())
             self.assertFalse((destination / "rollouts/step_1/train_rollouts.bin").exists())
+
+    def test_remote_does_not_consume_stable_marker_stream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            (source / "broadcasts").mkdir(parents=True)
+            for step in range(1, 7):
+                stable = destination / f"broadcasts/step_{step}/STABLE"
+                stable.parent.mkdir(parents=True)
+                stable.write_bytes(b"stable")
+            environment = self.environment(source, destination, self.tools(directory))
+            environment.update(ONCE="1", SSH_READ_STDIN="1")
+
+            result = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for step in range(1, 7):
+                self.assertEqual(
+                    (source / f"broadcasts/step_{step}/STABLE").read_bytes(),
+                    b"stable",
+                )
 
 
 if __name__ == "__main__":

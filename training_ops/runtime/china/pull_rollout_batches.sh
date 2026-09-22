@@ -39,7 +39,7 @@ health_lease_pid=
 health_probe_pids=()
 
 remote() {
-  ssh "${ssh_opts[@]}" "$source_target" "$1"
+  ssh -n "${ssh_opts[@]}" "$source_target" "$1"
 }
 
 local_path_safe() {
