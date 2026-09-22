@@ -7174,7 +7174,7 @@ def _trinity_trainer_preflight(nodes: list[str]) -> None:
             'image_id=$(sudo docker image inspect --format \'{{.Id}}\' "$image" 2>/dev/null) || { echo "missing trainer image: $image" >&2; exit 13; }',
             'case "$image_id" in sha256:*) ;; *) echo "trainer image has invalid immutable id: $image_id" >&2; exit 14;; esac',
             'image_digest=${image_id#sha256:}; [ "${#image_digest}" -eq 64 ] && [[ "$image_digest" =~ ^[0-9a-f]+$ ]] || { echo "trainer image has invalid immutable id: $image_id" >&2; exit 14; }',
-            f"base_result=$(sudo docker run --rm --pull=never --network none --entrypoint /bin/sh \"$image\" -c {shlex.quote(base_script)}) || {{ echo \"trainer image AFMoE base preflight failed\" >&2; exit 23; }}",
+            f"base_result=$(sudo docker run --rm --pull=never --network none --entrypoint /bin/bash \"$image\" -c {shlex.quote(base_script)}) || {{ echo \"trainer image AFMoE base preflight failed\" >&2; exit 23; }}",
             'test "$base_result" = AFMOE_BASE_OK || { echo "unexpected trainer image AFMoE preflight output: $base_result" >&2; exit 24; }',
             'printf \'%s\\n\' "TRINITY_AFMOE_OK image=$image_id"',
         ]
