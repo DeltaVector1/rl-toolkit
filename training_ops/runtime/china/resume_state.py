@@ -291,8 +291,25 @@ def quarantine_partial(root: Path, target: Path, observed: dict) -> str:
                 os.close(moved)
             def identity(value):
                 return value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns
-            if {name: identity(value) for name, value in current.items()} != {name: identity(value) for name, value in observed.items()}:
-                raise ValueError("partial rollout changed during quarantine")
+            actual = {name: identity(value) for name, value in current.items()}
+            expected = {name: identity(value) for name, value in observed.items()}
+            if actual != expected:
+                fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
+                changes = {}
+                for name in sorted(actual.keys() | expected.keys()):
+                    if name not in actual:
+                        changes[name] = {"entry": "missing"}
+                    elif name not in expected:
+                        changes[name] = {"entry": "added"}
+                    else:
+                        changed = {
+                            field: {"observed": before, "current": after}
+                            for field, before, after in zip(fields, expected[name], actual[name])
+                            if before != after
+                        }
+                        if changed:
+                            changes[name] = changed
+                raise ValueError(f"partial rollout changed during quarantine: {json.dumps(changes, sort_keys=True)}")
             linked = os.stat(destination.name, dir_fd=directory, follow_symlinks=False)
             if (linked.st_dev, linked.st_ino) != (info.st_dev, info.st_ino):
                 raise ValueError("private quarantine directory moved")

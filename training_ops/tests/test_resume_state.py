@@ -209,6 +209,64 @@ class ResumeStateTest(unittest.TestCase):
         self.assertTrue(trace.is_symlink())
         self.assertEqual(self.weight.read_bytes(), b"adapter-three")
 
+    def test_quarantine_reports_each_changed_identity_field_and_restores(self):
+        trace = self.partial()
+        target = self.active / "rollouts/step_4"
+        original_tree = resume.partial_tree
+        fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
+        for field in fields:
+            with self.subTest(field=field):
+                observed = {p.relative_to(target).as_posix(): p.lstat() for p in (target, *target.rglob("*"))}
+                before = getattr(observed["train/all/traces.jsonl"], field)
+                def changed_tree(descriptor, prefix="."):
+                    current = original_tree(descriptor, prefix)
+                    if prefix != ".":
+                        return current
+                    value = current["train/all/traces.jsonl"]
+                    attributes = {key: getattr(value, key) for key in fields}
+                    attributes[field] = before + 1
+                    current["train/all/traces.jsonl"] = types.SimpleNamespace(**attributes)
+                    return current
+                with mock.patch.object(resume, "partial_tree", side_effect=changed_tree):
+                    with self.assertRaisesRegex(ValueError, "validation failed; restored") as caught:
+                        resume.quarantine_partial(target.parent, target, observed)
+                details = str(caught.exception).split("partial rollout changed during quarantine: ", 1)[1]
+                self.assertEqual(json.loads(details), {"train/all/traces.jsonl": {field: {"observed": before, "current": before + 1}}})
+                self.assertEqual(trace.read_text(), "partial trace")
+
+    def test_quarantine_reports_entry_changes_and_restores(self):
+        self.partial()
+        target = self.active / "rollouts/step_4"
+        observed = {p.relative_to(target).as_posix(): p.lstat() for p in (target, *target.rglob("*"))}
+        current = dict(observed)
+        current["added"] = current.pop("train/all/traces.jsonl")
+        with mock.patch.object(resume, "partial_tree", return_value=current):
+            with self.assertRaisesRegex(ValueError, "validation failed; restored") as caught:
+                resume.quarantine_partial(target.parent, target, observed)
+        details = str(caught.exception).split("partial rollout changed during quarantine: ", 1)[1]
+        self.assertEqual(json.loads(details), {"added": {"entry": "added"}, "train/all/traces.jsonl": {"entry": "missing"}})
+        self.assertTrue(target.is_dir())
+
+    def test_quarantine_reports_real_trace_write_at_rename_and_restores(self):
+        trace = self.partial()
+        target = self.active / "rollouts/step_4"
+        observed = {p.relative_to(target).as_posix(): p.lstat() for p in (target, *target.rglob("*"))}
+        original_rename = resume.move_no_replace
+        calls = 0
+        def rename(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                trace.write_text("changed partial trace")
+            return original_rename(*args, **kwargs)
+        with mock.patch.object(resume, "move_no_replace", side_effect=rename):
+            with self.assertRaisesRegex(ValueError, "validation failed; restored") as caught:
+                resume.quarantine_partial(target.parent, target, observed)
+        details = str(caught.exception).split("partial rollout changed during quarantine: ", 1)[1]
+        self.assertEqual(json.loads(details)["train/all/traces.jsonl"]["st_size"], {"observed": 13, "current": 21})
+        self.assertEqual(trace.stat().st_ino, observed["train/all/traces.jsonl"].st_ino)
+        self.assertEqual(trace.read_text(), "changed partial trace")
+
     def test_quarantine_never_overwrites_destination_created_at_rename(self):
         self.partial()
         original_iter = Path.iterdir
