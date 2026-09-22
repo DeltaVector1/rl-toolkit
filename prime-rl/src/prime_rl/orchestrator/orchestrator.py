@@ -523,7 +523,7 @@ def _stale_resume_source_urls(
     if final_sync_version < 4:
         return set()
     stale_source_urls = set()
-    for step in range(1, final_sync_version - 2):
+    for step in range(1, final_sync_version - 1):
         if step % 2 != final_sync_version % 2:
             continue
         source_url = inference_weight_path(

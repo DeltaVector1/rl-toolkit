@@ -1725,24 +1725,28 @@ class ResumeRecoveryTest(unittest.TestCase):
         broadcast_dir = Path("/unused/broadcast")
         self.assertEqual(
             selector(config, broadcast_dir, "adapter", 25),
-            {f"http://source/step_{step}" for step in range(1, 23, 2)},
+            {f"http://source/step_{step}" for step in range(1, 24, 2)},
         )
         self.assertEqual(
             selector(config, broadcast_dir, "adapter", 24),
-            {f"http://source/step_{step}" for step in range(2, 22, 2)},
+            {f"http://source/step_{step}" for step in range(2, 23, 2)},
+        )
+        self.assertEqual(
+            selector(config, broadcast_dir, "adapter", 20),
+            {f"http://source/step_{step}" for step in range(2, 19, 2)},
         )
         self.assertEqual(selector(config, broadcast_dir, "adapter", 3), set())
         full_history = selector(config, broadcast_dir, "adapter", 25)
         pruned_history = selector(config, broadcast_dir, "adapter", 25)
         self.assertEqual(full_history, pruned_history)
         self.assertNotIn("http://source/step_22", full_history)
-        self.assertNotIn("http://source/step_23", full_history)
+        self.assertIn("http://source/step_23", full_history)
         self.assertNotIn("http://source/step_25", full_history)
 
     def test_final_resume_slot_removes_exact_stale_receipt_before_stage(self):
-        stale_url = "http://source/step_19"
+        stale_url = "http://source/step_18"
         receipt = {
-            "lora_name": "adapter-slot1",
+            "lora_name": "adapter-slot0",
             "source_url": stale_url,
             "target_size": 8,
             "target_sha256": "9" * 64,
@@ -1764,7 +1768,7 @@ class ResumeRecoveryTest(unittest.TestCase):
                 self.state = {
                     "status": "ready",
                     "loaded_receipts": {
-                        "adapter-slot1": {**receipt, "server_instance": instance}
+                        "adapter-slot0": {**receipt, "server_instance": instance}
                     },
                 }
 
@@ -1785,14 +1789,14 @@ class ResumeRecoveryTest(unittest.TestCase):
             prepare(
                 clients,
                 "adapter",
-                25,
-                "adapter-slot0",
-                {stale_url, "http://source/step_21"},
+                20,
+                "adapter-slot1",
+                {stale_url, "http://source/step_16"},
             )
         )
 
         self.assertEqual(result, stale_url)
-        removed.assert_awaited_once_with(clients, "adapter-slot1")
+        removed.assert_awaited_once_with(clients, "adapter-slot0")
         self.assertEqual([client.timeout for client in clients], [10.0, 10.0])
         self.assertEqual(
             [client.state["loaded_receipts"] for client in clients], [{}, {}]
@@ -1843,6 +1847,51 @@ class ResumeRecoveryTest(unittest.TestCase):
                     )
                 removed.assert_not_awaited()
 
+    def test_final_resume_slot_rejects_foreign_or_wrong_parity_receipt_at_final20(self):
+        cases = (
+            (
+                {"lora_name": "adapter-slot0", "source_url": "http://source/step_17"},
+                {"http://source/step_17"},
+            ),
+            (
+                {"lora_name": "adapter-slot0", "source_url": "http://source/step_20"},
+                {"http://source/step_18"},
+            ),
+            (
+                {"lora_name": "adapter-slot1", "source_url": "http://source/step_18"},
+                {"http://source/step_18"},
+            ),
+        )
+        for bad_receipt, stale_sources in cases:
+            with self.subTest(receipt=bad_receipt):
+                class Response:
+                    def raise_for_status(self):
+                        return None
+
+                    def json(self):
+                        return {
+                            "status": "ready",
+                            "loaded_receipts": {"adapter-slot0": bad_receipt},
+                        }
+
+                class Client:
+                    async def get(self, _path, timeout):
+                        return Response()
+
+                removed = mock.AsyncMock()
+                prepare = load_final_resume_slot_preparer(removed)
+                with self.assertRaisesRegex(RuntimeError, "wrong|exact stale"):
+                    asyncio.run(
+                        prepare(
+                            [Client()],
+                            "adapter",
+                            20,
+                            "adapter-slot1",
+                            stale_sources,
+                        )
+                    )
+                removed.assert_not_awaited()
+
     def test_final_resume_slot_rejects_current_serving_slot_or_active_requests(self):
         removed = mock.AsyncMock()
         prepare = load_final_resume_slot_preparer(removed)
@@ -1871,7 +1920,7 @@ class ResumeRecoveryTest(unittest.TestCase):
                 prepare(
                     [CurrentClient()],
                     "adapter",
-                    24,
+                    20,
                     "adapter-slot0",
                     {"http://source/step_18"},
                 )
