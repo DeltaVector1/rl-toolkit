@@ -23,6 +23,7 @@ inference_peer = 18049
 lora_source_first = 18100
 lora_source_last = 18227
 adapter_relay = 18228
+model_seed = 18229
 refusal_classifier = 18250
 adapter = 8100
 
