@@ -13,7 +13,7 @@ ranks_filter = [0]
 project = "trinity-runs"
 name = "trainer-trinity-decensor-1"
 group = "trinity-decensor-1"
-tags = ["trinity-large-thinking", "decensor", "grpo", "lora-r32", "50-step"]
+tags = ["trinity-thinking", "decensor", "grpo", "lora-r32", "50-step"]
 mode = "online"
 
 [file_monitor]
