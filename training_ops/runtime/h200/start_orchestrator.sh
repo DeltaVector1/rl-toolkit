@@ -4294,9 +4294,40 @@ remove_failed_orchestrator() {
   fi
 }
 
+orchestrator_trinity_model_path_exists() {
+  [ -d /data/trinity-thinking-fp8 ]
+}
+
+orchestrator_model_mount_required() {
+  local model_name
+  if ! model_name=$(python3 - "$config_file" <<'PY'
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as stream:
+        config = tomllib.load(stream)
+except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+    raise SystemExit(1)
+
+model = config.get("model")
+name = model.get("name") if isinstance(model, dict) else None
+if isinstance(name, str):
+    print(name)
+PY
+  ); then
+    return 1
+  fi
+  [ "$model_name" = /data/trinity-thinking-fp8 ] && orchestrator_trinity_model_path_exists
+}
+
 start_orchestrator_container() {
   local container_id container_name running state launch_output launch_status launch_label launch_nonce
   local startup_checks=0 running_checks=0
+  local model_mount_args=()
+  if orchestrator_model_mount_required; then
+    model_mount_args=(-v /data/trinity-thinking-fp8:/data/trinity-thinking-fp8:ro)
+  fi
   launch_nonce=$(< /proc/sys/kernel/random/uuid)
   if [[ ! "$launch_nonce" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
     echo "ERROR: could not create an orchestrator launch nonce" >&2
@@ -4313,6 +4344,7 @@ start_orchestrator_container() {
     -e PYTHONPATH="$deployment/environments/decensor/src:$deployment/environments/general-agent:/app/src" \
     -e HF_HOME="/data/glm52-rl/runs/$RUN/$RUN_NAME/hf-cache" \
     -v /data/glm52-rl:/data/glm52-rl \
+    "${model_mount_args[@]}" \
     -v glm52-fp8-model:/models/glm52-fp8:ro \
     -v "$deployment/prime-rl/deps/renderers/renderers/base.py":/app/deps/renderers/renderers/base.py:ro \
     -v "$deployment/prime-rl/deps/renderers/renderers/client.py":/app/deps/renderers/renderers/client.py:ro \

@@ -150,6 +150,8 @@ source <(sed -n '/^resolve_orchestrator_image_for_launch() {/,/^}$/p' "$launcher
 source <(sed -n '/^check_swanlab_secret() {/,/^}$/p' "$launcher")
 source <(sed -n '/^check_training_env_identity() {/,/^}$/p' "$launcher")
 source <(sed -n '/^remove_failed_orchestrator() {/,/^}$/p' "$launcher")
+source <(sed -n '/^orchestrator_trinity_model_path_exists() {/,/^}$/p' "$launcher")
+source <(sed -n '/^orchestrator_model_mount_required() {/,/^}$/p' "$launcher")
 source <(sed -n '/^start_orchestrator_container() {/,/^}$/p' "$launcher")
 source <(sed -n '/^adapter_relay_start() {/,/^}$/p' "$launcher")
 
@@ -167,6 +169,10 @@ export EXPECTED_ORCHESTRATOR_IMAGE=sha256:cccccccccccccccccccccccccccccccccccccc
 
 config_file="$tmp/orchestrator.toml"
 training_env_file="$tmp/training.env"
+orchestrator_trinity_model_path_exists() {
+  [ "${TEST_TRINITY_MODEL_PATH_EXISTS:-0}" = 1 ]
+}
+
 tunnels_only=0
 printf '%s\n' '[swanlab]' 'mode = "online"' >"$config_file"
 for contents in \
@@ -374,6 +380,31 @@ export DOCKER_MODE=stable
 start_orchestrator_container
 test "$sleep_calls" -eq 20
 grep -F -- "$EXPECTED_ORCHESTRATOR_IMAGE" "$CALL_LOG"
+
+config_file="$tmp/orchestrator.toml"
+TEST_TRINITY_MODEL_PATH_EXISTS=1
+printf '%s\n' '[model]' "name = '/data/trinity-thinking-fp8'" >"$config_file"
+sleep_calls=0
+: >"$CALL_LOG"
+start_orchestrator_container
+test "$sleep_calls" -eq 20
+grep -F -- '-v /data/trinity-thinking-fp8:/data/trinity-thinking-fp8:ro' "$CALL_LOG"
+
+TEST_TRINITY_MODEL_PATH_EXISTS=1
+printf '%s\n' '[model]' 'name = "/models/glm52-fp8"' >"$config_file"
+sleep_calls=0
+: >"$CALL_LOG"
+start_orchestrator_container
+test "$sleep_calls" -eq 20
+! grep -F -- '-v /data/trinity-thinking-fp8:/data/trinity-thinking-fp8:ro' "$CALL_LOG"
+
+TEST_TRINITY_MODEL_PATH_EXISTS=0
+printf '%s\n' '[model]' 'name = "/data/trinity-thinking-fp8"' >"$config_file"
+sleep_calls=0
+: >"$CALL_LOG"
+start_orchestrator_container
+test "$sleep_calls" -eq 20
+! grep -F -- '-v /data/trinity-thinking-fp8:/data/trinity-thinking-fp8:ro' "$CALL_LOG"
 
 peer_enabled=1
 tunnels_only=0
