@@ -260,6 +260,24 @@ only after measured learning.
   Confirm no policy mixing, no rollout errors, and no stop-gate events before
   accepting the timing repair.
 
+## Current Trinity reward diagnosis and controlled idea
+
+- Steps 1-24 have mean reward 0.0319, fitted change -0.0110, and noise
+  threshold 0.0229. The fitted change is inside noise. Steps 19-24 rewards
+  were 0.0330, 0.0318, 0.0195, 0.0214, 0.0221, and 0.0188.
+- Recent component ranges are refusal mean 6.82-7.53, reasoning
+  safety-policy turn rate 84.1%-89.7%, reasoning multiplier mean
+  0.180-0.222, and no-reasoning zero-rejection about 6.9%-11.9%.
+  Judge parse failures were about 0.11%-0.45% in the reported snapshots.
+- The measured pattern is reward compression with high refusal. It is not
+  evidence of a judge outage. The historical audit removed zero-advantage
+  effective groups, but it did not prove a learning gain.
+- Controlled idea: test an opt-in fully scored strong-refusal group filter at
+  refusal threshold >=7. Preserve errored, unscored, and mixed groups, and do
+  not change reward multipliers. Do not enable it during the current run
+  without explicit acceptance. Compare a clean baseline and experiment for
+  40-50 steps using per-difficulty reward and zero-advantage group rate.
+
 ## Acceptance
 
 - Actual ratios change by stage.
