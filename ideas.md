@@ -247,6 +247,19 @@ only after measured learning.
   caution in an otherwise fulfilled answer. Do not deploy it mid-run; compare
   it only in a clean 40-50-step run.
 
+## Fixed-size rollout timing repair
+
+- Step 23 took 45m53. Policy v22 became ready at 16/1,024 rollouts, then the
+  batch-boundary wait reached its 1,200s limit, followed by 60s grace. The
+  restart discarded 166 live and 186 completed rollouts across 22 groups.
+- For fixed-size batches, an immediate strict restart at the policy boundary
+  preserves GRPO policy purity and the existing limits. Token batches keep the
+  bounded batch-boundary deferral. Source fix commit `14c49e1f` was not yet
+  deployed at the time of this note.
+- Evaluate the next three completed rollout batches against steps 19-24.
+  Confirm no policy mixing, no rollout errors, and no stop-gate events before
+  accepting the timing repair.
+
 ## Acceptance
 
 - Actual ratios change by stage.
