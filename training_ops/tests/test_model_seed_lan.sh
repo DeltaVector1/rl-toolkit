@@ -3,8 +3,17 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 script=$root/training_ops/runtime/model_seed_lan.sh
+real_rsync=$(command -v rsync)
 tmp=$(mktemp -d)
-trap 'rm -rf -- "$tmp"' EXIT
+real_pid=
+cleanup() {
+  if [ -n "$real_pid" ]; then
+    kill "$real_pid" 2>/dev/null || true
+    wait "$real_pid" 2>/dev/null || true
+  fi
+  rm -rf -- "$tmp"
+}
+trap cleanup EXIT
 
 source_model=$tmp/source-model
 target_model=$tmp/target-model
@@ -120,7 +129,7 @@ printf 'partial\n' >"$partial/stale"
 "$script" target-pull >"$tmp/pull.out"
 grep -F -- '--checksum' "$FAKE_RSYNC_LOG" >/dev/null
 grep -F -- '--partial' "$FAKE_RSYNC_LOG" >/dev/null
-grep -F -- '--append-verify' "$FAKE_RSYNC_LOG" >/dev/null
+! grep -F -- '--append-verify' "$FAKE_RSYNC_LOG"
 grep -F -- '--partial-dir='"$partial" "$FAKE_RSYNC_LOG" >/dev/null
 grep -F -- '--protect-args' "$FAKE_RSYNC_LOG" >/dev/null
 grep -F -- '--timeout=600' "$FAKE_RSYNC_LOG" >/dev/null
@@ -129,5 +138,39 @@ grep -F -- '--contimeout=30' "$FAKE_RSYNC_LOG" >/dev/null
 test ! -e "$target_model/model-00001-of-00081.safetensors_range"
 test ! -e "$partial"
 "$script" verify >/dev/null
+
+real_source=$tmp/real-source
+real_target=$tmp/real-target
+real_partial=$tmp/.trinity-thinking-fp8.partial
+real_config=$tmp/real-rsyncd.conf
+real_log=$tmp/real-rsyncd.log
+real_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+mkdir -p "$real_source" "$real_target"
+printf 'local rsync smoke\n' >"$real_source/model.bin"
+cat >"$real_config" <<EOF
+port = $real_port
+address = 127.0.0.1
+use chroot = no
+read only = yes
+
+[model]
+path = $real_source
+read only = yes
+hosts allow = 127.0.0.1
+hosts deny = *
+EOF
+"$real_rsync" --daemon --no-detach --config "$real_config" >"$real_log" 2>&1 &
+real_pid=$!
+for _ in {1..20}; do
+  if "$real_rsync" --list-only "rsync://127.0.0.1:$real_port/model/" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.05
+done
+mkdir -p "$real_partial"
+"$real_rsync" -a --checksum --partial --partial-dir="$real_partial" \
+  --protect-args --timeout=10 --contimeout=3 \
+  "rsync://127.0.0.1:$real_port/model/" "$real_target/"
+cmp "$real_source/model.bin" "$real_target/model.bin"
 
 printf 'model seed LAN checks pass\n'

@@ -238,10 +238,10 @@ target_pull() {
   mkdir -p -- "$model_dir"
   mkdir -p -- "$partial_dir"
   target_manifest=$state_dir/$manifest_name
-  rsync -a --checksum --partial --append-verify \
+  rsync -a --checksum --partial \
     --partial-dir="$partial_dir" --protect-args --timeout=600 --contimeout=30 \
     "rsync://$source_ip:$source_port/model/" "$model_dir/"
-  rsync -a --checksum --partial --append-verify \
+  rsync -a --checksum --partial \
     --protect-args --timeout=600 --contimeout=30 \
     "rsync://$source_ip:$source_port/manifest/$manifest_name" "$target_manifest"
   verify_manifest "$target_manifest"
