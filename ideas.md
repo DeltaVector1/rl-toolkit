@@ -312,3 +312,21 @@ only after measured learning.
   samples per optimizer step; do not call it batch 1024.
 - Keep 32K context, 16K output, native FP8, rank-32 LoRA, and the existing
   prefill. Judge reward and refusal rates over the full run, not one step.
+
+## Trinity parser and flat-reward hypothesis
+
+- Steps 15-24 rejected 1,006 of 10,240 effective records (9.8%) for no
+  reasoning. There were 66 first-turn failures and 940 later-turn failures.
+- Reward can be lower for multi-turn records. At step 18, the one-turn reward
+  was 0.0581, the two-turn reward was 0.0208, the three-turn reward was
+  0.0474, and the four-turn reward was 0.0196. This is a measured pattern,
+  not proof of cause.
+- The orchestrator renderer uses `reasoning_parser='think'`. The H200
+  inference configuration uses `reasoning_parser='deepseek_r1'`. A parser
+  mismatch may explain some missing-reasoning records, but this is not proven.
+- Controlled test: in an isolated test, send matched prompts through both
+  parser settings and compare returned reasoning, visible content, and
+  rendered traces. If the mismatch is confirmed, align the parsers in a new
+  controlled run. Do not change the active run or reward limits for this test.
+- Add per-turn no-reasoning metrics, separated by first and later turn, before
+  judging a parser change.
