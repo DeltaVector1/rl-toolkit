@@ -126,6 +126,7 @@ def _lora_mm_config(
     return configs["wide_output"]
 
 
+@torch.compiler.disable
 def _lora_mm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     """BF16/FP16 GEMM with FP32 tensor-core accumulation and no cuBLAS handle.
 
