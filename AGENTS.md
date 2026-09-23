@@ -45,6 +45,8 @@ conclusions. Keep reports short.
 - Use native FP8 weights. Do not use QLoRA or INT4 model weights, cached
   rollout batches, or a full rollout batch to debug trainer execution. Do not
   change a measurement limit to make a run pass.
+- Do not download or copy model weights through SSH when a direct Hugging Face
+  or ModelScope download is available.
 - Follow the skill's task-specific approval and measurement rules for live
   work. Do not silently replace a requested method, setting, or metric;
   report the code and metric source.
