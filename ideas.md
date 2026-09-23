@@ -278,6 +278,33 @@ only after measured learning.
   without explicit acceptance. Compare a clean baseline and experiment for
   40-50 steps using per-difficulty reward and zero-advantage group rate.
 
+## Large-model reward-ordering audit
+
+- **Measured Astra audit:** Steps 15-24 covered 10,240 records in 640 groups.
+  There were zero uniform groups, 114/640 winner reversals, and 3,667/16,742
+  reversals among unequal-refusal pairs.
+- All 171 fully scored strong-refusal groups had reward spread. This corrects
+  the earlier strong-refusal and zero-advantage assumption: a broad
+  strong-refusal filter would discard useful refusal variation. Do not apply
+  that filter from the current evidence.
+- **Offline calculations, not causal results:** removing the word factor gave
+  79 winner reversals, removing Markdown gave 85, and removing reasoning gave
+  123. Multi-turn reward means for 1, 2, 3, 4, 5, and 6 turns were
+  0.0374, 0.0215, 0.00766, 0.0110, 0.00533, and 0.00174. Prompt mix
+  confounds these means. The run 1-27 trend stayed inside noise.
+- No active-run change is allowed before step 50. After step 50, run these
+  ideas in order:
+  1. Attribute normalized advantages to each reward component offline.
+  2. Replay parser decisions on saved outputs and measure changed winners.
+  3. Run a blind judge audit on a fixed holdout.
+  4. Run one controlled fixed-holdout comparison with refusal as the primary
+     reward and quality as the tie-break.
+  5. If reward stays flat, audit whether the update changes the measured
+     policy before changing the reward.
+- These tests can show association and implementation errors. They do not
+  prove that a reward change causes learning until a clean controlled run is
+  outside noise.
+
 ## Acceptance
 
 - Actual ratios change by stage.
