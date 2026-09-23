@@ -879,7 +879,8 @@ def combine_expert_outputs(
 
     output = shared_output
     for slot in range(top_k):
-        rows = sorted_row_for_token_slot[:, slot]
+        # Keep the saved index layout stable when activation offload is enabled.
+        rows = sorted_row_for_token_slot[:, slot].contiguous()
         contribution = routed_output.index_select(0, rows)
         output = output + contribution
     return output
