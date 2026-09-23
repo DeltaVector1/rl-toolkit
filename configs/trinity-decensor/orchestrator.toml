@@ -20,6 +20,7 @@ project = "trinity-runs"
 name = "orchestrator-trinity-decensor-1"
 group = "trinity-decensor-1"
 tags = ["trinity-large-thinking", "decensor", "grpo", "lora-r32", "50-step"]
+mode = "online"
 
 [file_monitor]
 filename = "rollout-metrics.jsonl"

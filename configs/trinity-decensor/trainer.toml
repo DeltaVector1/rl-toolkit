@@ -14,6 +14,7 @@ project = "trinity-runs"
 name = "trainer-trinity-decensor-1"
 group = "trinity-decensor-1"
 tags = ["trinity-large-thinking", "decensor", "grpo", "lora-r32", "50-step"]
+mode = "online"
 
 [file_monitor]
 filename = "run_trinity-decensor-1/trainer-metrics.jsonl"
