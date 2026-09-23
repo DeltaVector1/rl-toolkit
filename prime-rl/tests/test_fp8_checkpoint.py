@@ -1,5 +1,6 @@
 import ast
 import copy
+import dataclasses
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
@@ -21,6 +22,23 @@ def _load_functions(path, names, namespace):
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
 
 
+def _load_class(path, name, namespace):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    node = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+
+
+def _load_method(path, class_name, method_name, namespace):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    class_node = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method = next(node for node in class_node.body if isinstance(node, ast.FunctionDef) and node.name == method_name)
+    method = copy.deepcopy(method)
+    method.decorator_list = []
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+
+
 @unittest.skipIf(torch is None, "Torch is required")
 class FP8CheckpointTest(unittest.TestCase):
     @classmethod
@@ -40,6 +58,18 @@ class FP8CheckpointTest(unittest.TestCase):
             },
             cls.namespace,
         )
+        from torch.distributed.checkpoint._hf_utils import _HFStorageInfo
+        from torch.distributed.checkpoint.metadata import MetadataIndex
+
+        cls.namespace.update(
+            {
+                "dataclasses": dataclasses,
+                "_HFStorageInfo": _HFStorageInfo,
+                "MetadataIndex": MetadataIndex,
+            }
+        )
+        _load_class(READER_PATH, "_FP8StorageInfo", cls.namespace)
+        _load_method(READER_PATH, "FP8CheckpointStorageReader", "_move_storage", cls.namespace)
 
     def test_compressed_tensors_schema_is_exact(self):
         config = {
@@ -167,6 +197,68 @@ class FP8CheckpointTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             validate(self._metadata({"x.weight_scale": (torch.bfloat16, (2, 3))}))
+
+    def test_shared_scale_rename_keeps_physical_source_and_storage_mapping(self):
+        source = "model.layers.1.mlp.shared_experts.gate_proj.weight_scale"
+        intermediate = "model.layers.1.mlp.shared_experts.gate_proj.weight_scale_inv"
+        target = "model.layers.1.mlp.shared_expert.w1_scale_inv"
+        offset = torch.Size((0, 0))
+        source_index = self.namespace["MetadataIndex"](source, offset)
+        metadata = SimpleNamespace(
+            state_dict_metadata={source: SimpleNamespace(size=torch.Size((2, 3)))},
+            storage_data={
+                source_index: SimpleNamespace(
+                    relative_path="model.safetensors",
+                    shape=torch.Size((2, 3)),
+                    dtype=torch.bfloat16,
+                )
+            },
+        )
+        storage_by_fqn = {source: [source_index]}
+        move = self.namespace["_move_storage"]
+
+        metadata.state_dict_metadata[intermediate] = metadata.state_dict_metadata.pop(source)
+        move(metadata, storage_by_fqn, source, intermediate, offset)
+        metadata.state_dict_metadata[target] = metadata.state_dict_metadata.pop(intermediate)
+        move(metadata, storage_by_fqn, intermediate, target, offset)
+
+        target_index = self.namespace["MetadataIndex"](target, offset)
+        self.assertEqual(set(metadata.state_dict_metadata), {target})
+        self.assertEqual(storage_by_fqn, {target: [target_index]})
+        self.assertEqual(set(metadata.storage_data), {target_index})
+        info = metadata.storage_data[target_index]
+        self.assertIsInstance(info, self.namespace["_FP8StorageInfo"])
+        self.assertEqual(info.source_key, source)
+
+    def test_move_storage_keeps_multi_chunk_offsets_in_mapping(self):
+        target = "model.layers.2.mlp.experts.w1_scale_inv"
+        metadata = SimpleNamespace(storage_data={})
+        storage_by_fqn = {}
+        move = self.namespace["_move_storage"]
+        for expert, offset in enumerate((torch.Size((0, 0)), torch.Size((1, 0)))):
+            source = f"model.layers.2.mlp.experts.{expert}.gate_proj.weight_scale"
+            source_index = self.namespace["MetadataIndex"](source, offset)
+            metadata.storage_data[source_index] = SimpleNamespace(
+                relative_path="model.safetensors",
+                shape=torch.Size((1, 3)),
+                dtype=torch.bfloat16,
+            )
+            storage_by_fqn[source] = [source_index]
+            move(metadata, storage_by_fqn, source, target, offset, stacked=True)
+
+        target_indices = [
+            self.namespace["MetadataIndex"](target, torch.Size((0, 0))),
+            self.namespace["MetadataIndex"](target, torch.Size((1, 0))),
+        ]
+        self.assertEqual(storage_by_fqn[target], target_indices)
+        self.assertEqual(set(metadata.storage_data), set(target_indices))
+        self.assertEqual(
+            {metadata.storage_data[index].source_key for index in target_indices},
+            {
+                "model.layers.2.mlp.experts.0.gate_proj.weight_scale",
+                "model.layers.2.mlp.experts.1.gate_proj.weight_scale",
+            },
+        )
 
 
 if __name__ == "__main__":

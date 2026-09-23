@@ -338,16 +338,31 @@ class FP8CheckpointStorageReader(HuggingFaceStorageReader):
     ):
         for index in storage_by_fqn.pop(source, ()):
             info = metadata.storage_data.pop(index)
-            metadata.storage_data[MetadataIndex(target, target_offset)] = _FP8StorageInfo(
-                relative_path=info.relative_path,
-                shape=info.shape,
-                dtype=info.dtype,
-                source_key=source,
-                scale_source_key=scale_source_key or "",
-                stacked=stacked,
-                quantized=quantized,
-                dequantize=dequantize,
-            )
+            target_index = MetadataIndex(target, target_offset)
+            if isinstance(info, _FP8StorageInfo):
+                moved_info = dataclasses.replace(
+                    info,
+                    source_key=info.source_key or source,
+                    scale_source_key=scale_source_key or info.scale_source_key,
+                    stacked=info.stacked or stacked,
+                    quantized=info.quantized or quantized,
+                    dequantize=info.dequantize or dequantize,
+                )
+            else:
+                moved_info = _FP8StorageInfo(
+                    relative_path=info.relative_path,
+                    shape=info.shape,
+                    dtype=info.dtype,
+                    source_key=source,
+                    scale_source_key=scale_source_key or "",
+                    stacked=stacked,
+                    quantized=quantized,
+                    dequantize=dequantize,
+                )
+            metadata.storage_data[target_index] = moved_info
+            target_indices = storage_by_fqn.setdefault(target, [])
+            if target_index not in target_indices:
+                target_indices.append(target_index)
 
     @staticmethod
     def _process_request(file, request: ReadItem, planner: LoadPlanner, info: _FP8StorageInfo):
