@@ -88,9 +88,11 @@ test "$(stat -c '%a' "$state/rsyncd.conf")" -eq 444
 grep -Fx 'hosts allow = 10.92.20.76, 10.92.20.77, 10.92.20.78, 10.92.20.80, 10.92.20.83, 10.92.20.84, 10.92.20.85' "$state/rsyncd.conf" >/dev/null
 grep -Fx 'hosts deny = *' "$state/rsyncd.conf" >/dev/null
 grep -Fx 'exclude = /*/' "$state/rsyncd.conf" >/dev/null
+grep -Fx "lock file = $state/rsyncd.lock" "$state/rsyncd.conf" >/dev/null
 ! grep -F '10.92.20.79' "$state/rsyncd.conf"
 cp "$state/manifest.sha256" "$FAKE_MANIFEST"
 recorded_pid=$(sed -n '1p' "$state/rsyncd.pid")
+: >"$state/rsyncd.lock"
 chmod u+w "$state/rsyncd.pid"
 printf '%s\n' "$$" >"$state/rsyncd.pid"
 if "$script" source-stop >"$tmp/wrong-pid.out" 2>"$tmp/wrong-pid.err"; then
@@ -144,12 +146,15 @@ real_target=$tmp/real-target
 real_partial=$tmp/.trinity-thinking-fp8.partial
 real_config=$tmp/real-rsyncd.conf
 real_log=$tmp/real-rsyncd.log
+real_lock=$tmp/real-rsyncd.lock
 real_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 mkdir -p "$real_source" "$real_target"
 printf 'local rsync smoke\n' >"$real_source/model.bin"
 cat >"$real_config" <<EOF
 port = $real_port
 address = 127.0.0.1
+lock file = $real_lock
+max connections = 16
 use chroot = no
 read only = yes
 
@@ -167,10 +172,14 @@ for _ in {1..20}; do
   fi
   sleep 0.05
 done
+test -e "$real_lock"
 mkdir -p "$real_partial"
 "$real_rsync" -a --checksum --partial --partial-dir="$real_partial" \
   --protect-args --timeout=10 --contimeout=3 \
   "rsync://127.0.0.1:$real_port/model/" "$real_target/"
 cmp "$real_source/model.bin" "$real_target/model.bin"
+kill "$real_pid" 2>/dev/null || true
+wait "$real_pid" 2>/dev/null || true
+real_pid=
 
 printf 'model seed LAN checks pass\n'
