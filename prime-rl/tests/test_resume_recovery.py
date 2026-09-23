@@ -599,19 +599,13 @@ class PolicyUpdateBoundaryTest(unittest.TestCase):
 
         state.dispatcher.mark_batch_boundary_complete.assert_not_called()
 
-    def test_fixed_batch_boundary_behavior_is_unchanged(self):
+    def test_fixed_batch_boundary_applies_policy_update_immediately(self):
         boundary = load_policy_update_boundary()
         state = boundary_state(batch_size=1024, current=100, target=1024)
 
-        async def exercise():
-            task = asyncio.create_task(boundary(state, 1))
-            await asyncio.sleep(0)
-            self.assertFalse(task.done())
-            state.batch_completed.set()
-            await task
+        asyncio.run(boundary(state, 1))
 
-        asyncio.run(exercise())
-        state.dispatcher.mark_batch_boundary_complete.assert_called_once_with(1)
+        state.dispatcher.mark_batch_boundary_complete.assert_not_called()
 
     def test_policy_update_boundary_timeout_is_bounded(self):
         boundary = load_policy_update_boundary()

@@ -2027,7 +2027,7 @@ class Orchestrator:
         to schedule old-policy groups during this wait. Otherwise the batch
         could wait for the same update and deadlock.
         """
-        if self.config.max_off_policy_steps < 1:
+        if self.config.batch_size is not None or self.config.max_off_policy_steps < 1:
             return
         current, target, _ = self.train_sink.batch_progress()
         # There is no accepted batch work to preserve at zero progress. Apply
