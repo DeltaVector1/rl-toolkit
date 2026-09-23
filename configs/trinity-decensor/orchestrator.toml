@@ -45,7 +45,7 @@ lr = 8e-6
 
 [renderer]
 name = "default"
-tool_parser = "qwen3_coder"
+tool_parser = "qwen3"
 reasoning_parser = "deepseek_r1"
 enable_thinking = true
 clear_thinking = true
