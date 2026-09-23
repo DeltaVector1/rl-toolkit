@@ -4738,6 +4738,10 @@ def _orchestrator_resume_step(run: str, *, latest: bool = False) -> int | None:
     if latest:
         candidate = _resume_repair_state(trainer_head, "latest", service_dir, step)
         chosen = candidate.get("step")
+        if candidate == {"step": None}:
+            if cold_latest:
+                return None
+            raise Refused("no stable policy is valid only for a cold launch")
         if type(chosen) is not int or chosen < step:
             raise Refused("latest stable policy precedes trainer launch")
         if chosen > step:

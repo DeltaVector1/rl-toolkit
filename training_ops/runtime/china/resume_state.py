@@ -169,11 +169,17 @@ def latest_policy(service_dir: str, launch_step: int) -> dict:
             continue
         if path.is_symlink():
             raise ValueError("policy directory is a symlink")
+        if not path.is_dir():
+            raise ValueError("policy directory is not a directory")
         stable = path / "STABLE"
         if stable.exists() or stable.is_symlink():
             regular(stable)
             steps.append(int(path.name[5:]))
-    if not steps or max(steps) < launch_step:
+    if not steps:
+        if launch_step == 0:
+            return {"step": None}
+        raise ValueError("stable policy precedes trainer launch")
+    if max(steps) < launch_step:
         raise ValueError("stable policy precedes trainer launch")
     step = max(steps)
     result = {"step": step}

@@ -78,6 +78,19 @@ class ResumeStateTest(unittest.TestCase):
         with self.assertRaises(OSError):
             resume.latest_policy(str(self.active), 1)
 
+    def test_latest_policy_allows_empty_stable_set_only_for_cold_launch(self):
+        (self.target / "STABLE").unlink()
+        self.assertEqual(resume.latest_policy(str(self.active), 0), {"step": None})
+        with self.assertRaisesRegex(ValueError, "stable policy"):
+            resume.latest_policy(str(self.active), 1)
+
+    def test_latest_policy_rejects_malformed_policy_entry_without_stable(self):
+        malformed = self.active / "broadcasts/step_0"
+        malformed.unlink(missing_ok=True)
+        malformed.write_text("not a directory")
+        with self.assertRaisesRegex(ValueError, "not a directory"):
+            resume.latest_policy(str(self.active), 0)
+
     def test_partial_quarantine_preserves_trace_without_reuse(self):
         trace = self.partial()
         original = Path.iterdir

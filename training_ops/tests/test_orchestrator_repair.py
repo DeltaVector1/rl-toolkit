@@ -932,6 +932,32 @@ class OrchestratorResumeStateTest(unittest.TestCase):
                 training_ops._orchestrator_resume_step(self.run, latest=True)
         self.assertEqual(check.call_count, 2)
 
+    def test_cold_latest_without_stable_policy_recreates_base_orchestrator(self):
+        self.repair_state.return_value = {"step": None}
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, self.state())), mock.patch.object(
+            training_ops, "_check_adapter_restart"
+        ) as check, mock.patch.object(training_ops, "_trainer_addresses", return_value="trainer-address"):
+            step = training_ops._orchestrator_resume_step(self.run, latest=True)
+            script = training_ops._recreate_orchestrator_script(
+                self.run,
+                {"orchestrator": "configs/general-agent/orchestrator.toml"},
+                False,
+                resume_step=step,
+            )
+        self.assertIsNone(step)
+        self.assertNotIn("adapter_resume_step=", script)
+        check.assert_not_called()
+
+    def test_explicit_resume_without_stable_policy_is_refused(self):
+        self.repair_state.return_value = {"step": None}
+        state = self.state(
+            f"PRIME_RL_RESUME_ADAPTER={self.adapter}",
+            "PRIME_RL_RESUME_ADAPTER_STEP=1",
+        )
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, state)):
+            with self.assertRaisesRegex(training_ops.Refused, "cold launch"):
+                training_ops._orchestrator_resume_step(self.run, latest=True)
+
     def state(self, *environment, **changes):
         value = {"name": f"/{training_ops.trainer_container}", "running": True, "environment": [f"RUN={self.run}", *environment]}
         value.update(changes)
