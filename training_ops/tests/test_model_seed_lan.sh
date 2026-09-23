@@ -9,7 +9,7 @@ trap 'rm -rf -- "$tmp"' EXIT
 source_model=$tmp/source-model
 target_model=$tmp/target-model
 state=$tmp/state
-partial=$tmp/partial
+partial=$tmp/.trinity-thinking-fp8.partial
 fake_bin=$tmp/bin
 mkdir -p "$source_model" "$target_model" "$fake_bin"
 
@@ -97,6 +97,24 @@ test ! -e "$state"
 export MODEL_SEED_MODEL_DIR=$target_model
 : >"$FAKE_RSYNC_LOG"
 printf 'stale\n' >"$target_model/model-00001-of-00081.safetensors_range"
+export MODEL_SEED_PARTIAL_DIR=/tmp
+if "$script" target-pull >"$tmp/unsafe-partial.out" 2>"$tmp/unsafe-partial.err"; then
+  echo 'unsafe partial directory must be refused' >&2
+  exit 1
+fi
+grep -F 'partial directory is not dedicated' "$tmp/unsafe-partial.err" >/dev/null
+test -d /tmp
+symlink_partial=$tmp/symlink-parent/.trinity-thinking-fp8.partial
+mkdir -p "$(dirname "$symlink_partial")"
+ln -s "$tmp/sink" "$symlink_partial"
+export MODEL_SEED_PARTIAL_DIR=$symlink_partial
+if "$script" target-pull >"$tmp/symlink-partial.out" 2>"$tmp/symlink-partial.err"; then
+  echo 'symlink partial directory must be refused' >&2
+  exit 1
+fi
+grep -F 'partial directory is a symlink' "$tmp/symlink-partial.err" >/dev/null
+test -L "$symlink_partial"
+export MODEL_SEED_PARTIAL_DIR=$partial
 mkdir -p "$partial"
 printf 'partial\n' >"$partial/stale"
 "$script" target-pull >"$tmp/pull.out"

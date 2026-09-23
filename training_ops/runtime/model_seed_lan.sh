@@ -47,6 +47,25 @@ require_tools() {
   done
 }
 
+validate_partial_dir() {
+  case "$partial_dir" in
+    /*) ;;
+    *) die "partial directory must be an absolute path: $partial_dir" ;;
+  esac
+  case "$partial_dir" in
+    /|/data|/tmp|"$model_dir"|"$state_dir")
+      die "partial directory is not dedicated: $partial_dir"
+      ;;
+  esac
+  [ "${partial_dir##*/}" = .trinity-thinking-fp8.partial ] || {
+    die "partial directory has an unsafe name: $partial_dir"
+  }
+  [ ! -L "$partial_dir" ] || die "partial directory is a symlink: $partial_dir"
+  if [ -e "$partial_dir" ] && [ ! -d "$partial_dir" ]; then
+    die "partial directory is not a directory: $partial_dir"
+  fi
+}
+
 check_incomplete_names() {
   local path name lower
   while IFS= read -r -d '' path; do
@@ -214,6 +233,7 @@ verify_manifest() {
 target_pull() {
   local target_manifest path
   require_tools
+  validate_partial_dir
   mkdir -p -- "$state_dir"
   mkdir -p -- "$model_dir"
   mkdir -p -- "$partial_dir"
@@ -229,7 +249,8 @@ target_pull() {
     rm -f -- "$path"
   done < <(find "$model_dir" -maxdepth 1 -type f -name 'model-*.safetensors_*' -print0)
   if [ -d "$partial_dir" ] && [ ! -L "$partial_dir" ]; then
-    rm -rf -- "$partial_dir"
+    find "$partial_dir" -mindepth 1 -delete
+    rmdir -- "$partial_dir"
   fi
   echo "model seed pull verified: $model_dir"
 }
