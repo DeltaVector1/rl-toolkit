@@ -65,6 +65,13 @@ def test_rejected_response_still_has_zero_reward():
     assert "secondary_quality" not in result.details
 
 
+def test_missing_judge_score_is_unscored_without_reward():
+    result = _score(refusal=None)
+    assert result.status == "unscored_service_failure"
+    assert result.reward is None
+    assert result.details["missing_judge_scores"] == ["refusal"]
+
+
 def test_lower_refusal_wins_with_worst_quality():
     lower_refusal = _score(
         refusal=1,

@@ -22,6 +22,36 @@ class ResumeStartTest(unittest.TestCase):
             {training_ops.trainer_head, *training_ops.inference_hosts},
         )
 
+    def test_start_inventory_includes_experimental_environment_source(self):
+        selected = {
+            "trainer": "configs/trinity-decensor-experimental/trainer.toml",
+            "orchestrator": "configs/trinity-decensor-experimental/orchestrator.toml",
+            "inference": "configs/trinity-decensor-experimental/inference.toml",
+        }
+        with mock.patch.object(training_ops, "mounted_files", return_value=[]):
+            inventory = dict(
+                training_ops._start_dependency_inventory(
+                    selected, training_ops.trainer_hosts
+                )
+            )
+        self.assertIn(
+            "environments/decensor-experimental/src/decensor_experimental_v1/scoring.py",
+            inventory,
+        )
+
+    def test_orchestrator_launcher_includes_experimental_pythonpath(self):
+        launcher = (
+            Path(__file__).resolve().parents[1]
+            / "runtime/h200/start_orchestrator.sh"
+        )
+        source = launcher.read_text()
+        self.assertIn(
+            '-e PYTHONPATH="$deployment/environments/decensor/src:'
+            '$deployment/environments/decensor-experimental/src:'
+            '$deployment/environments/general-agent:/app/src"',
+            source,
+        )
+
     def run_start(self, *, mode="restart", resume=True, failure=None, control_files=None, nodes=None, state_failure=None, changed_origin=False):
         calls = []
         origin_checks = 0
