@@ -6569,6 +6569,9 @@ def _start_dependency_inventory(
     environment_sources = {
         "general-agent": ("environments/general-agent/general_agent",),
         "decensor-v1": ("environments/decensor/src/decensor_v1",),
+        "decensor-experimental-v1": (
+            "environments/decensor-experimental/src/decensor_experimental_v1",
+        ),
     }
     if not isinstance(train_envs, list):
         raise Refused("orchestrator train.env must be a list")
