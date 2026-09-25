@@ -1041,6 +1041,17 @@ class AdapterUpdateTest(unittest.TestCase):
                 for call in calls
             )
         )
+        watchdog_launch = calls[-1]
+        for setting in (
+            f"ENGINE_HOST={host}",
+            "ENGINE_CONTAINER=glm52-decensor-h200",
+            "ENGINE_KIND=glm52",
+            "PORT=8000",
+            f"WATCHDOG_IDENTITY=engine-watchdog:{host}:glm-perf-3:8000",
+            "START=/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh",
+            "MODEL=/models/glm52-fp8",
+        ):
+            self.assertIn(setting, watchdog_launch)
 
     def test_watchdog_cleanup_uses_engine_identity_not_script_path(self):
         script = training_ops._engine_watchdog_identity_script(
@@ -1051,6 +1062,8 @@ class AdapterUpdateTest(unittest.TestCase):
             "/models/glm52-fp8",
             600,
             ensure_running=True,
+            port=8000,
+            watchdog_identity="engine-watchdog:h200a:glm-perf-3:8000",
         )
 
         self.assertIn(
@@ -1059,6 +1072,8 @@ class AdapterUpdateTest(unittest.TestCase):
         )
         self.assertIn("grep -Fxq ENGINE_HOST=h200a", script)
         self.assertIn("grep -Fxq ENGINE_CONTAINER=glm52-decensor-h200", script)
+        self.assertIn("grep -Fxq PORT=8000", script)
+        self.assertIn("grep -Fxq WATCHDOG_IDENTITY=engine-watchdog:h200a:glm-perf-3:8000", script)
         self.assertIn("STARTUP_GRACE=600", script)
         self.assertIn(
             "START=/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh",
@@ -1068,6 +1083,131 @@ class AdapterUpdateTest(unittest.TestCase):
         self.assertIn("kill -TERM -- \"-$pid\"", script)
         self.assertNotIn("pkill", script)
         self.assertNotIn("pgrep", script)
+
+    def run_watchdog_identity_script(self, entries, *, ensure_running=False):
+        watchdog = "/data/glm52-rl/deployment/training_ops/runtime/h200/engine_watchdog.sh"
+        script = training_ops._engine_watchdog_identity_script(
+            "h200a",
+            "glm52-decensor-h200",
+            watchdog,
+            "/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh",
+            "/models/glm52-fp8",
+            600,
+            ensure_running=ensure_running,
+            inference_config="/data/glm52-rl/deployment/configs/current/inference.toml",
+            engine_kind="glm52",
+            port=8000,
+            watchdog_identity="engine-watchdog:h200a:glm-perf-3:8000",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            proc_root = root / "proc"
+            script = script.replace(
+                "for proc_dir in /proc/[0-9]*; do",
+                f"for proc_dir in {proc_root}/[0-9]*; do",
+            ).replace('"/proc/$pid/', f'"{proc_root}/$pid/')
+            script = script.replace(
+                'kill -TERM -- "-$pid" 2>/dev/null || true',
+                f'rm -rf "{proc_root}/$pid"',
+            ).replace(
+                'kill -KILL -- "-$pid" 2>/dev/null || true',
+                f'rm -rf "{proc_root}/$pid"',
+            )
+            for pid, argv, environment in entries:
+                process = proc_root / str(pid)
+                process.mkdir(parents=True)
+                (process / "cmdline").write_bytes(b"\0".join(value.encode() for value in argv) + b"\0")
+                (process / "environ").write_bytes(b"\0".join(value.encode() for value in environment) + b"\0")
+                (process / "stat").write_text(
+                    f"{pid} (bash) S 1 {pid} 1 0 0 0 0 0\n",
+                    encoding="ascii",
+                )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result, sorted(path.name for path in proc_root.iterdir())
+
+    def test_watchdog_migration_cleans_one_known_parent_version_process(self):
+        environment = [
+            "ENGINE_HOST=h200a",
+            "ENGINE_CONTAINER=glm52-decensor-h200",
+            "ENGINE_KIND=glm52",
+            "STARTUP_GRACE=600",
+            "MODEL=/models/glm52-fp8",
+            "START=/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh",
+            "inference_config=/data/glm52-rl/deployment/configs/current/inference.toml",
+        ]
+        _result, remaining = self.run_watchdog_identity_script([
+            (101, ["bash", "/data/glm52-rl/deployment/training_ops/runtime/h200/engine_watchdog.sh"], environment),
+        ])
+        self.assertEqual(remaining, [])
+
+    def test_watchdog_migration_preserves_mismatched_parent_version_processes(self):
+        base = [
+            "ENGINE_HOST=h200a",
+            "ENGINE_CONTAINER=glm52-decensor-h200",
+            "ENGINE_KIND=glm52",
+            "STARTUP_GRACE=600",
+            "MODEL=/models/glm52-fp8",
+            "START=/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh",
+            "inference_config=/data/glm52-rl/deployment/configs/current/inference.toml",
+        ]
+        for key, wrong in (
+            ("ENGINE_HOST", "h200b"),
+            ("ENGINE_CONTAINER", "other-engine"),
+            ("ENGINE_KIND", "trinity"),
+            ("MODEL", "/models/other"),
+            ("START", "/data/other/start_inference.sh"),
+        ):
+            with self.subTest(key=key):
+                environment = [wrong if item.startswith(f"{key}=") else item for item in base]
+                _result, remaining = self.run_watchdog_identity_script([
+                    (101, ["bash", "/data/glm52-rl/deployment/training_ops/runtime/h200/engine_watchdog.sh"], environment),
+                ])
+                self.assertEqual(remaining, ["101"])
+
+    def test_current_exact_watchdog_is_kept_without_migration_restart(self):
+        environment = [
+            "ENGINE_HOST=h200a",
+            "ENGINE_CONTAINER=glm52-decensor-h200",
+            "ENGINE_KIND=glm52",
+            "PORT=8000",
+            "WATCHDOG_IDENTITY=engine-watchdog:h200a:glm-perf-3:8000",
+            "STARTUP_GRACE=600",
+            "MODEL=/models/glm52-fp8",
+            "START=/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh",
+            "inference_config=/data/glm52-rl/deployment/configs/current/inference.toml",
+        ]
+        result, remaining = self.run_watchdog_identity_script([
+            (101, ["bash", "/data/glm52-rl/deployment/training_ops/runtime/h200/engine_watchdog.sh"], environment),
+        ], ensure_running=True)
+        self.assertEqual(remaining, ["101"])
+        self.assertIn("canonical engine watchdog already running", result.stdout)
+
+    def test_unrelated_and_ambiguous_legacy_watchdogs_are_preserved(self):
+        environment = [
+            "ENGINE_HOST=h200a",
+            "ENGINE_CONTAINER=glm52-decensor-h200",
+            "ENGINE_KIND=glm52",
+            "STARTUP_GRACE=600",
+            "MODEL=/models/glm52-fp8",
+            "START=/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh",
+            "inference_config=/data/glm52-rl/deployment/configs/current/inference.toml",
+        ]
+        unrelated = [
+            "ENGINE_HOST=h200a",
+            "ENGINE_CONTAINER=glm52-decensor-h200",
+        ]
+        _result, remaining = self.run_watchdog_identity_script([
+            (101, ["bash", "/data/old/engine_watchdog.sh"], unrelated),
+            (102, ["bash", "/data/glm52-rl/deployment/training_ops/runtime/h200/engine_watchdog.sh"], environment),
+            (103, ["bash", "/data/glm52-rl/deployment/training_ops/runtime/h200/engine_watchdog.sh"], environment),
+        ])
+        self.assertEqual(remaining, ["101", "102", "103"])
 
     def test_supervisor_repair_reconciles_stale_watchdogs(self):
         calls = []
@@ -1117,7 +1257,10 @@ class AdapterUpdateTest(unittest.TestCase):
             self.assertIn(f"grep -Fxq ENGINE_HOST={host}", cleanup_script)
             self.assertIn("grep -Fxq ENGINE_CONTAINER=glm52-decensor-h200", cleanup_script)
             self.assertIn('for pid in "${matches[@]}"; do stop_watchdog "$pid"; done', cleanup_script)
-            self.assertNotIn("WATCHDOG_IDENTITY=engine-watchdog:", cleanup_script)
+            self.assertIn(
+                f"grep -Fxq WATCHDOG_IDENTITY=engine-watchdog:{host}:glm-decensor-difficulty-8:8000",
+                cleanup_script,
+            )
             self.assertIn("PORT=8000", repair_script)
             self.assertIn(
                 f"WATCHDOG_IDENTITY=engine-watchdog:{host}:glm-decensor-difficulty-8:8000",

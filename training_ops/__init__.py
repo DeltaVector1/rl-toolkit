@@ -5362,12 +5362,20 @@ def _engine_watchdog_identity_script(
     ensure_running: bool,
     inference_config: str | None = None,
     engine_kind: str = "glm52",
+    port: int,
+    watchdog_identity: str,
 ) -> str:
     """Stop stale watchdogs for one configured engine identity."""
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise Refused("engine watchdog port is invalid")
+    if not isinstance(watchdog_identity, str) or not watchdog_identity:
+        raise Refused("engine watchdog identity is invalid")
     values = {
         "ENGINE_HOST": host,
         "ENGINE_CONTAINER": engine_container,
         "ENGINE_KIND": engine_kind,
+        "PORT": str(port),
+        "WATCHDOG_IDENTITY": watchdog_identity,
     }
     lines = [
         "set -euo pipefail",
@@ -5405,6 +5413,31 @@ def _engine_watchdog_identity_script(
         [
             "  return 0",
             "}",
+            "watchdog_migration_matches() {",
+            "  local pid=$1 environment",
+            "  watchdog_command_matches \"$pid\" || return 1",
+            "  environment=$(watchdog_environment \"$pid\" || true)",
+        ]
+    )
+    migration_environment = {
+        **values,
+        "STARTUP_GRACE": str(startup_grace),
+        "MODEL": model,
+        "START": start_script,
+    }
+    if inference_config is not None:
+        migration_environment["inference_config"] = inference_config
+    for key, value in migration_environment.items():
+        if key in {"PORT", "WATCHDOG_IDENTITY"}:
+            continue
+        lines.append(
+            f"  printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'{key}={value}')} || return 1"
+        )
+    lines.extend(
+        [
+            "  printf '%s\\n' \"$environment\" | grep -Eq '^(PORT|WATCHDOG_IDENTITY)=' && return 1",
+            "  return 0",
+            "}",
             "canonical_watchdog_matches() {",
             "  local pid=$1 command_line environment",
             "  watchdog_matches \"$pid\" || return 1",
@@ -5430,22 +5463,24 @@ def _engine_watchdog_identity_script(
             "}",
             "stop_watchdog() {",
             "  local pid=$1 pgid",
-            "  watchdog_matches \"$pid\" || return 0",
+            "  (watchdog_matches \"$pid\" || watchdog_migration_matches \"$pid\") || return 0",
             "  pgid=$(awk '{print $5}' \"/proc/$pid/stat\" 2>/dev/null || true)",
             '  [ "$pgid" = "$pid" ] || { echo "watchdog identity is not its own process group: pid=$pid pgid=$pgid" >&2; return 1; }',
             '  kill -TERM -- "-$pid" 2>/dev/null || true',
-            '  for _ in $(seq 1 50); do watchdog_matches "$pid" || break; sleep 0.1; done',
-            '  if watchdog_matches "$pid"; then kill -KILL -- "-$pid" 2>/dev/null || true; fi',
-            '  for _ in $(seq 1 20); do watchdog_matches "$pid" || break; sleep 0.1; done',
-            '  if watchdog_matches "$pid"; then echo "watchdog did not exit: pid=$pid" >&2; return 1; fi',
+            '  for _ in $(seq 1 50); do (watchdog_matches "$pid" || watchdog_migration_matches "$pid") || break; sleep 0.1; done',
+            '  if watchdog_matches "$pid" || watchdog_migration_matches "$pid"; then kill -KILL -- "-$pid" 2>/dev/null || true; fi',
+            '  for _ in $(seq 1 20); do (watchdog_matches "$pid" || watchdog_migration_matches "$pid") || break; sleep 0.1; done',
+            '  if watchdog_matches "$pid" || watchdog_migration_matches "$pid"; then echo "watchdog did not exit: pid=$pid" >&2; return 1; fi',
             "  return 0",
             "}",
             "matches=()",
             "canonical_matches=()",
+            "migration_matches=()",
             "for proc_dir in /proc/[0-9]*; do",
             "  pid=${proc_dir##*/}",
             "  watchdog_matches \"$pid\" && matches+=(\"$pid\")",
             "  canonical_watchdog_matches \"$pid\" && canonical_matches+=(\"$pid\")",
+            "  watchdog_migration_matches \"$pid\" && migration_matches+=(\"$pid\")",
             "done",
         ]
     )
@@ -5453,6 +5488,7 @@ def _engine_watchdog_identity_script(
         lines.extend(
             [
                 'if [ "${#matches[@]}" = 1 ] && [ "${#canonical_matches[@]}" = 1 ]; then',
+                '  if [ "${#migration_matches[@]}" = 1 ]; then stop_watchdog "${migration_matches[0]}"; fi',
                 '  echo "canonical engine watchdog already running"',
                 "  exit 0",
                 "fi",
@@ -5461,6 +5497,7 @@ def _engine_watchdog_identity_script(
     lines.extend(
         [
             'for pid in "${matches[@]}"; do stop_watchdog "$pid"; done',
+            'if [ "${#migration_matches[@]}" = 1 ]; then stop_watchdog "${migration_matches[0]}"; fi',
             "matches=()",
             "for proc_dir in /proc/[0-9]*; do",
             "  pid=${proc_dir##*/}",
@@ -5512,19 +5549,28 @@ def _repair_engine(host: str, config_dir: str | None = None) -> str:
     _check_host(host)
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
+    run = current_run()
     if config_dir is None:
-        selected = _config_for_run(current_run())
+        selected = _config_for_run(run)
     else:
         selected = _config_dir(config_dir, require_inference=True)
     inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     engine_container = glm_inference_container
     engine_kind = selected.get("kind", "glm52")
     engine_model = profile_models.get(engine_kind, glm_model)
+    settings = _inference_config(host, engine_kind)
+    configured_ports = settings.get("ports")
+    if not isinstance(configured_ports, list) or not configured_ports:
+        raise Refused(f"inference ports for {host} are missing")
+    if not all(isinstance(port, int) and 1 <= port <= 65535 for port in configured_ports):
+        raise Refused(f"inference ports for {host} are invalid")
     start_script = f"{runtime_root}/h200/start_inference.sh"
     for path in ("configs/nodes.toml", "training_ops/runtime/h200/start_inference.sh", _selected_inference_config(selected)):
         if not deploy(path, nodes=[host]):
             raise RuntimeError(f"inference configuration deployment failed on {host}: {path}")
     startup_grace = 600
+    port = configured_ports[0]
+    watchdog_identity = f"engine-watchdog:{host}:{run}:{port}"
     print(
         f"{host}: removing and restarting {engine_container}. The model load needs 5 to 10 minutes."
     )
@@ -5541,6 +5587,8 @@ def _repair_engine(host: str, config_dir: str | None = None) -> str:
             ensure_running=False,
             inference_config=inference_config,
             engine_kind=engine_kind,
+            port=port,
+            watchdog_identity=watchdog_identity,
         ),
     )
     if stop_code:
@@ -5568,6 +5616,8 @@ def _repair_engine(host: str, config_dir: str | None = None) -> str:
             ensure_running=True,
             inference_config=inference_config,
             engine_kind=engine_kind,
+            port=port,
+            watchdog_identity=watchdog_identity,
         ),
     )
     if watchdog_code:
@@ -5765,6 +5815,7 @@ def _repair_engine_watchdog(
     watchdog_path = f"{runtime_root}/h200/engine_watchdog.sh"
     if not deploy("training_ops/runtime/h200/engine_watchdog.sh", [host]):
         raise RuntimeError(f"watchdog deployment failed on {host}")
+    first_environment = specs[0]["environment"]
     stop_code, stop_output = _ssh(
         host,
         _engine_watchdog_identity_script(
@@ -5777,6 +5828,8 @@ def _repair_engine_watchdog(
             ensure_running=False,
             inference_config=inference_config,
             engine_kind=engine_kind,
+            port=int(first_environment["PORT"]),
+            watchdog_identity=first_environment["WATCHDOG_IDENTITY"],
         ),
         timeout=180,
     )
