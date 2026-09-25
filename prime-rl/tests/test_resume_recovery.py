@@ -204,6 +204,7 @@ def load_resume_staging(
     final_slot_cleanup=None,
     stale_source_urls=None,
     serving_slot="adapter-slot0",
+    loaded_step=None,
 ):
     """Run the startup staging loop and its real final identity validator."""
     source = ORCHESTRATOR_PATH.read_text(encoding="utf-8")
@@ -272,6 +273,7 @@ def load_resume_staging(
         "stage_lora_adapter": stage_mock,
         "_prepare_final_resume_adapter_slot": final_slot_cleanup or mock.AsyncMock(),
         "stale_source_urls": stale_source_urls or set(),
+        "loaded_step": final_sync_version - 1 if loaded_step is None else loaded_step,
         "loaded_slot": serving_slot,
         "_read_remote_adapter_manifest": read_manifest,
         "validate_adapter_manifest": lambda *_args, **_kwargs: None,
@@ -1606,6 +1608,32 @@ class ResumeRecoveryTest(unittest.TestCase):
             {2: startup_identity(2, "2", "a")}, (3, 4), results,
         )
         asyncio.run(run())
+        self.assertEqual([call.kwargs["policy_step"] for call in stage.await_args_list], [3, 4])
+        inference.update_weights.assert_awaited_once_with(
+            "http://source/step_4", lora_name="adapter-slot0", step=4,
+            require_delta=True, prefetched=True,
+            expected_adapter_identity=results[4]["adapter_identity"],
+        )
+        self.assertEqual(state.policy.version, 4)
+
+    def test_loaded_final_resume_skips_stale_slot_cleanup(self):
+        results = {
+            3: {"cache_hit": False, "adapter_identity": startup_identity(3, "3", "b")},
+            4: {"cache_hit": False, "adapter_identity": startup_identity(4, "4", "c")},
+        }
+        cleanup = mock.AsyncMock(side_effect=AssertionError("final policy cleanup must be skipped"))
+        run, inference, stage, state = load_resume_staging(
+            {2: startup_identity(2, "2", "a")},
+            (3, 4),
+            results,
+            final_slot_cleanup=cleanup,
+            stale_source_urls={"http://source/step_2"},
+            loaded_step=4,
+        )
+
+        asyncio.run(run())
+
+        cleanup.assert_not_awaited()
         self.assertEqual([call.kwargs["policy_step"] for call in stage.await_args_list], [3, 4])
         inference.update_weights.assert_awaited_once_with(
             "http://source/step_4", lora_name="adapter-slot0", step=4,

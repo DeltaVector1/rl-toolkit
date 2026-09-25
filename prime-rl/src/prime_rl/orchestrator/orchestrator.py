@@ -1188,6 +1188,7 @@ class Orchestrator:
                     and sync_version == final_sync_version
                     and using_pruned_resume_tail
                     and stale_source_urls
+                    and loaded_step != final_sync_version
                 ):
                     await _prepare_final_resume_adapter_slot(
                         self.policy_inference.admin_clients,
