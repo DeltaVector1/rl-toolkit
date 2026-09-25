@@ -484,5 +484,142 @@ class InitialLoraRetirementTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(unload.await_count, 1)
 
 
+class ReconcileReceiptRecoveryTest(unittest.IsolatedAsyncioTestCase):
+    def fixture(self, post_load_receipt):
+        path = ROOT / "src/prime_rl/orchestrator/watcher.py"
+        nodes = [
+            node for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+            if (
+                isinstance(node, ast.AsyncFunctionDef)
+                and node.name == "reconcile_current_policy"
+            ) or (
+                isinstance(node, ast.FunctionDef)
+                and node.name == "_validate_receipt_against_ack"
+            )
+        ]
+        source_url = "https://source.example/step_1"
+        identity = {
+            "source_url": source_url,
+            "target_sha256": "a" * 64,
+            "target_size": 12,
+            "config_sha256": "b" * 64,
+            "config_size": 2,
+        }
+        receipt = dict(identity, lora_name="policy-slot0", server_instance="engine-1")
+        if post_load_receipt == "valid":
+            post_load_receipt = receipt
+        ack = dict(identity, slot="policy-slot0")
+        visible = {"healthy": True, "restarted": False}
+        events = []
+        receipts = [post_load_receipt]
+        logger = _Logger()
+
+        async def is_visible(client, _model_name):
+            events.append(("visible", client))
+            return visible[client]
+
+        async def common(_clients, _name):
+            events.append("receipt")
+            return receipts[0]
+
+        async def stage(clients, _weights_path, **kwargs):
+            events.append(("stage", clients))
+            self.assertEqual(kwargs, {"require_delta": True, "policy_step": 1})
+            return {
+                "policy_step": 1,
+                "stage_limit_seconds": 600.0,
+                "adapter_identity": identity,
+            }
+
+        async def load(clients, _name, _weights_path, **kwargs):
+            events.append(("load", clients))
+            self.assertTrue(kwargs["require_delta"])
+            self.assertTrue(kwargs["prefetched"])
+            self.assertEqual(kwargs["expected_identity"], identity)
+            visible["restarted"] = True
+
+        temporary_directory = TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name)
+        step_path = root / "step_1"
+        step_path.mkdir()
+        (step_path / "STABLE").touch()
+        namespace = {
+                "asyncio": asyncio,
+                "time": time,
+                "get_broadcast_dir": lambda value: value,
+                "get_step_path": lambda value, step: value / f"step_{step}",
+                "inference_weight_path": lambda _config, _path, _name: source_url,
+                "model_is_visible": is_visible,
+                "common_loaded_lora_receipt": common,
+                "stage_lora_adapter": stage,
+                "load_lora_adapter": load,
+                "_read_receivers_ready": lambda *_args, **_kwargs: ack,
+                "_validate_receipt_against_ack": None,
+                "get_logger": lambda: logger,
+                "format_time": str,
+        }
+        validate = next(node for node in nodes if getattr(node, "name", None) == "_validate_receipt_against_ack")
+        reconcile = next(node for node in nodes if getattr(node, "name", None) == "reconcile_current_policy")
+        exec(compile(ast.Module(body=[validate, reconcile], type_ignores=[]), str(path), "exec"), namespace)
+        watcher = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                model=types.SimpleNamespace(name="base-model"),
+                weight_broadcast=types.SimpleNamespace(type="filesystem", source_url="https://source.example"),
+                output_dir=root,
+            ),
+            policy=types.SimpleNamespace(model_name="policy-slot0"),
+            inference=types.SimpleNamespace(admin_clients=["healthy", "restarted"]),
+            lora_name="policy",
+            ckpt_step=1,
+            current_weights_path=source_url,
+            verified_adapter_step=1,
+            verified_adapter_url=source_url,
+            update_lock=asyncio.Lock(),
+            model_express=None,
+            last_reconcile_time=0.0,
+            reconcile_count=0,
+            last_adapter_policy_step=0,
+            last_adapter_stage_limit_seconds=0.0,
+        )
+        watcher.reconcile_current_policy = types.MethodType(
+            namespace["reconcile_current_policy"], watcher
+        )
+        return watcher, events, receipt
+
+    async def test_invisible_endpoint_with_absent_receipt_is_reloaded_and_rechecked(self):
+        watcher, events, _receipt = self.fixture("valid")
+        await watcher.reconcile_current_policy()
+        self.assertEqual(events, [
+            ("visible", "healthy"),
+            ("visible", "restarted"),
+            ("stage", ["restarted"]),
+            ("load", ["restarted"]),
+            ("visible", "healthy"),
+            ("visible", "restarted"),
+            "receipt",
+        ])
+        self.assertEqual(watcher.reconcile_count, 1)
+
+    async def test_post_load_absent_or_invalid_receipt_stays_terminal(self):
+        for post_load_receipt in (None, dict(
+            source_url="https://source.example/step_1",
+            target_sha256="c" * 64,
+            target_size=12,
+            config_sha256="b" * 64,
+            config_size=2,
+            lora_name="policy-slot0",
+            server_instance="engine-1",
+        )):
+            with self.subTest(post_load_receipt=post_load_receipt):
+                watcher, events, _receipt = self.fixture(post_load_receipt)
+                with self.assertRaisesRegex(RuntimeError, "cannot reconcile policy v1"):
+                    await watcher.reconcile_current_policy()
+                self.assertEqual([item[0] if isinstance(item, tuple) else item for item in events], [
+                    "visible", "visible", "stage", "load", "visible", "visible", "receipt",
+                ])
+                self.assertEqual(watcher.reconcile_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

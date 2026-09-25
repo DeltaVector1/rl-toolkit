@@ -1159,17 +1159,18 @@ class WeightWatcher:
                     slot=self.policy.model_name,
                     admin_clients=self.inference.admin_clients,
                 )
-                loaded_receipt = await common_loaded_lora_receipt(
-                    self.inference.admin_clients,
-                    self.policy.model_name,
-                )
-                _validate_receipt_against_ack(loaded_receipt, receiver_ack, step=self.ckpt_step)
 
             checks = await asyncio.gather(
                 *(model_is_visible(client, self.policy.model_name) for client in self.inference.admin_clients)
             )
             missing = [client for client, visible in zip(self.inference.admin_clients, checks) if not visible]
             if not missing:
+                if remote_filesystem:
+                    loaded_receipt = await common_loaded_lora_receipt(
+                        self.inference.admin_clients,
+                        self.policy.model_name,
+                    )
+                    _validate_receipt_against_ack(loaded_receipt, receiver_ack, step=self.ckpt_step)
                 return
 
             get_logger().warning(
