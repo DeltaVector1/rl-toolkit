@@ -1,5 +1,6 @@
 import contextlib
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -9,6 +10,52 @@ import training_ops.tests  # Install the local-only test guard before any test r
 
 
 class ResumeStartTest(unittest.TestCase):
+    def test_trinity_parity_config_is_new_and_fail_closed(self):
+        config_dir = (
+            Path(__file__).resolve().parents[2]
+            / "configs/trinity-decensor-experimental-parity"
+        )
+        with (config_dir / "trainer.toml").open("rb") as stream:
+            trainer = tomllib.load(stream)
+        with (config_dir / "orchestrator.toml").open("rb") as stream:
+            orchestrator = tomllib.load(stream)
+        with (config_dir / "inference.toml").open("rb") as stream:
+            inference = tomllib.load(stream)
+
+        self.assertEqual(trainer["max_steps"], 50)
+        self.assertEqual(
+            trainer["parity_guard"],
+            {
+                "max_unmasked_mismatch_kl": 0.1,
+                "max_masked_mismatch_kl": 0.5,
+                "max_masked_fraction": 0.06,
+            },
+        )
+        self.assertTrue(trainer["enable_router_replay"])
+        self.assertTrue(inference["enable_return_routed_experts"])
+        self.assertEqual(orchestrator["max_steps"], 50)
+        self.assertEqual(orchestrator["renderer"]["reasoning_parser"], "think")
+        self.assertEqual(
+            trainer["output_dir"],
+            "/data/glm52-rl/runs/trinity-decensor-experimental-parity",
+        )
+        self.assertTrue(
+            orchestrator["weight_broadcast"]["source_url"].endswith("-parity")
+        )
+        self.assertTrue(
+            orchestrator["weight_broadcast"]["source_dir"].endswith("-parity")
+        )
+
+        launcher = (
+            Path(__file__).resolve().parents[1]
+            / "runtime/h200/start_inference.sh"
+        )
+        source = launcher.read_text()
+        self.assertIn(
+            '"kv_cache_dtype": "bfloat16" if kind == "trinity" else "fp8"',
+            source,
+        )
+
     def test_start_inventory_deploys_shared_drain_to_trainer_head(self):
         selected = {
             "trainer": "configs/general-agent/trainer.toml",

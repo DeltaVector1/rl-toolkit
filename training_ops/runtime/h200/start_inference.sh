@@ -88,7 +88,9 @@ vllm_extra = {
     "tensor_parallel_size": tp,
     "data_parallel_size": dp,
     "gpu_memory_utilization": 0.920,
-    "kv_cache_dtype": "fp8",
+    # GLM keeps the existing FP8 cache. Trinity's H200 path uses BF16 KV
+    # cache because its native FP8 cache path is not parity-qualified.
+    "kv_cache_dtype": "bfloat16" if kind == "trinity" else "fp8",
     "max_num_seqs": max_num_seqs,
     "max_num_batched_tokens": max_num_batched_tokens,
     "compilation_config": {
