@@ -357,3 +357,17 @@ only after measured learning.
   controlled run. Do not change the active run or reward limits for this test.
 - Add per-turn no-reasoning metrics, separated by first and later turn, before
   judging a parser change.
+
+## Controlled Trinity H200 to trainer parity qualification
+
+- Measured in the retained Trinity trainer metrics: mean masked fraction was
+  0.2585, mean unmasked mismatch KL was 1.9495, and mean masked mismatch KL
+  was 2.8736. Step 1 was 0.3742 masked, with 2.8270 unmasked mismatch KL.
+- Run one deterministic reference batch from H200's serialized
+  `/inference/v1/generate` endpoint. Preserve native FP8 weights, use BF16 KV
+  cache, request routed experts, and enable trainer router replay. Use the
+  existing reference schema and no cached or full rollout batch.
+- Pass only when routes, token IDs, positions, masks, and logprobs validate and
+  the fail-closed gates pass: unmasked KL <= 0.1, masked KL <= 0.5, and masked
+  fraction <= 0.06. Do not start production training until this qualification
+  passes. The live operator must capture the serialized response first.
