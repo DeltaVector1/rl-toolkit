@@ -295,10 +295,13 @@ def quarantine_partial(root: Path, target: Path, observed: dict) -> str:
                 current = partial_tree(moved)
             finally:
                 os.close(moved)
-            def identity(value):
-                return value.st_dev, value.st_ino, value.st_mode, value.st_size, value.st_mtime_ns
-            actual = {name: identity(value) for name, value in current.items()}
-            expected = {name: identity(value) for name, value in observed.items()}
+            def identity(name, value):
+                # The moved root can change directory metadata during rename.
+                # Keep nested directory and regular-file sizes strict.
+                size = None if name == "." and stat.S_ISDIR(value.st_mode) else value.st_size
+                return value.st_dev, value.st_ino, value.st_mode, size, value.st_mtime_ns
+            actual = {name: identity(name, value) for name, value in current.items()}
+            expected = {name: identity(name, value) for name, value in observed.items()}
             if actual != expected:
                 fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")
                 changes = {}

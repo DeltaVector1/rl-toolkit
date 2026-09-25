@@ -247,6 +247,52 @@ class ResumeStateTest(unittest.TestCase):
                 self.assertEqual(json.loads(details), {"train/all/traces.jsonl": {field: {"observed": before, "current": before + 1}}})
                 self.assertEqual(trace.read_text(), "partial trace")
 
+    def test_quarantine_ignores_moved_directory_size_change(self):
+        trace = self.partial()
+        target = self.active / "rollouts/step_4"
+        original_tree = resume.partial_tree
+
+        def changed_tree(descriptor, prefix="."):
+            current = original_tree(descriptor, prefix)
+            if prefix == ".":
+                value = current["."]
+                attributes = {key: getattr(value, key) for key in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")}
+                attributes["st_size"] += 1
+                current["."] = types.SimpleNamespace(**attributes)
+            return current
+
+        with mock.patch.object(resume, "partial_tree", side_effect=changed_tree):
+            moved = resume.quarantine_partial(target.parent, target, {
+                p.relative_to(target).as_posix(): p.lstat() for p in (target, *target.rglob("*"))
+            })
+        self.assertFalse(target.exists())
+        self.assertEqual((Path(moved) / "train/all/traces.jsonl").read_text(), "partial trace")
+
+    def test_quarantine_rejects_nested_directory_size_changes_and_restores(self):
+        self.partial()
+        target = self.active / "rollouts/step_4"
+        original_tree = resume.partial_tree
+        observed = {p.relative_to(target).as_posix(): p.lstat() for p in (target, *target.rglob("*"))}
+
+        for name in ("train", "train/all"):
+            with self.subTest(name=name):
+                def changed_tree(descriptor, prefix="."):
+                    current = original_tree(descriptor, prefix)
+                    if prefix == name:
+                        value = current[name]
+                        attributes = {key: getattr(value, key) for key in ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns")}
+                        attributes["st_size"] += 1
+                        current[name] = types.SimpleNamespace(**attributes)
+                    return current
+
+                with mock.patch.object(resume, "partial_tree", side_effect=changed_tree):
+                    with self.assertRaisesRegex(ValueError, "validation failed; restored") as caught:
+                        resume.quarantine_partial(target.parent, target, observed)
+                details = str(caught.exception).split("partial rollout changed during quarantine: ", 1)[1]
+                self.assertEqual(json.loads(details), {name: {"st_size": {"observed": observed[name].st_size, "current": observed[name].st_size + 1}}})
+                self.assertTrue(target.is_dir())
+                self.assertEqual((target / "train/all/traces.jsonl").read_text(), "partial trace")
+
     def test_quarantine_reports_entry_changes_and_restores(self):
         self.partial()
         target = self.active / "rollouts/step_4"
