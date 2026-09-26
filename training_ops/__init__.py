@@ -7053,13 +7053,13 @@ def _policy0_transfer_reference_script(
     if type(source_size) is not int or source_size < 0:
         raise Refused("reference source size is invalid")
     if (expected_old_sha256 is None) != (expected_old_size is None):
-        raise Refused("expected existing reference SHA256 and size are both required")
+        raise Refused("expected old reference SHA256 and size are both required")
     if expected_old_sha256 is not None and not re.fullmatch(
         r"[0-9a-f]{64}", expected_old_sha256
     ):
-        raise Refused("expected existing reference SHA256 is invalid")
+        raise Refused("expected old reference SHA256 is invalid")
     if expected_old_size is not None and (type(expected_old_size) is not int or expected_old_size < 0):
-        raise Refused("expected existing reference size is invalid")
+        raise Refused("expected old reference size is invalid")
     partial = shlex.quote(partial_path)
     final = shlex.quote(target_path)
     archive = shlex.quote(
@@ -7119,6 +7119,38 @@ fsync_file_and_directory() {{
   fsync_directory "$2"
 }}
 
+read_regular_identity() {{
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(sys.argv[1], flags)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise SystemExit("not a regular file")
+    digest = hashlib.sha256()
+    while True:
+        block = os.read(fd, 1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    print(digest.hexdigest(), info.st_size)
+finally:
+    os.close(fd)
+PY
+}}
+
+verify_final_regular() {{
+  if [ -L "$final" ] || {{ [ -e "$final" ] && [ ! -f "$final" ]; }}; then
+    echo "reference destination is not a regular file: $final" >&2
+    return 65
+  fi
+}}
+
 verify_new_partial() {{
   test -f "$partial" && test ! -L "$partial" || {{
     echo "reference partial is not a regular file" >&2
@@ -7135,18 +7167,24 @@ verify_new_partial() {{
 }}
 
 verify_archive() {{
-    if [ -L "$archive" ] || {{ [ -e "$archive" ] && [ ! -f "$archive" ]; }}; then
+  if [ -L "$archive" ] || {{ [ -e "$archive" ] && [ ! -f "$archive" ]; }}; then
     echo "reference preservation archive is not a regular file" >&2
     return 57
   fi
   test -f "$archive" || {{ echo "reference preservation archive is missing" >&2; return 58; }}
-  test "$(sha256sum -- "$archive" | cut -d' ' -f1)" = "$expected_old_sha" || {{
-    echo "reference preservation archive conflicts" >&2
+  archive_identity=$(read_regular_identity "$archive") || {{
+    echo "reference preservation archive cannot be read" >&2
     return 59
   }}
-  test "$(stat -c '%s' -- "$archive")" = "$expected_old_size" || {{
-    echo "reference preservation archive size conflicts" >&2
+  archive_sha=${{archive_identity%% *}}
+  archive_size=${{archive_identity#* }}
+  test "$archive_sha" = "$expected_old_sha" || {{
+    echo "reference preservation archive conflicts" >&2
     return 60
+  }}
+  test "$archive_size" = "$expected_old_size" || {{
+    echo "reference preservation archive size conflicts" >&2
+    return 61
   }}
 }}
 
@@ -7168,18 +7206,32 @@ flock -n 9 || {{ echo "reference target is locked: $final" >&2; exit 64; }}
 verify_new_partial
 fsync_file "$partial"
 
-if [ -L "$final" ] || {{ [ -e "$final" ] && [ ! -f "$final" ]; }}; then
-  echo "reference destination is not a regular file: $final" >&2
-  exit 65
-fi
+verify_final_regular
 if [ -f "$final" ]; then
-  current_sha=$(sha256sum -- "$final" | cut -d' ' -f1)
-  current_size=$(stat -c '%s' -- "$final")
+  final_identity=$(read_regular_identity "$final")
+  current_sha=${{final_identity%% *}}
+  current_size=${{final_identity#* }}
   if [ "$current_sha" = "$new_sha" ] && [ "$current_size" = "$new_size" ]; then
+    if [ -n "$expected_old_sha" ]; then
+      verify_final_regular
+      if [ -L "$archive" ] || {{ [ -e "$archive" ] && [ ! -f "$archive" ]; }}; then
+        echo "reference preservation archive is not a regular file" >&2
+        exit 77
+      fi
+      if [ -f "$archive" ]; then
+        verify_archive
+        fsync_file_and_directory "$archive" "$directory"
+        preserved=$archive
+      else
+        echo "reference already-new final has no preserved old archive; old reference is not recoverable" >&2
+        exit 78
+      fi
+    fi
     rm -f -- "$partial"
     fsync_directory "$directory"
     completed=1
-    printf 'REFERENCE_INSTALL status=idempotent old_sha=none old_size=none preserved=none new_sha=%s new_size=%s\\n' "$new_sha" "$new_size"
+    printf 'REFERENCE_INSTALL status=idempotent old_sha=%s old_size=%s preserved=%s new_sha=%s new_size=%s\\n' \\
+      "${{expected_old_sha:-none}}" "${{expected_old_size:-none}}" "$preserved" "$new_sha" "$new_size"
     exit 0
   fi
   if [ -z "$expected_old_sha" ] || [ "$current_sha" != "$expected_old_sha" ] || [ "$current_size" != "$expected_old_size" ]; then
@@ -7221,11 +7273,23 @@ if [ -f "$final" ]; then
     verify_archive
     preserved=$archive
   fi
-  current_sha=$(sha256sum -- "$final" | cut -d' ' -f1)
-  current_size=$(stat -c '%s' -- "$final")
+  verify_final_regular
+  verify_archive
+  final_identity=$(read_regular_identity "$final")
+  current_sha=${{final_identity%% *}}
+  current_size=${{final_identity#* }}
   if [ "$current_sha" != "$expected_old_sha" ] || [ "$current_size" != "$expected_old_size" ]; then
     echo "reference destination changed during preservation" >&2
     exit 71
+  fi
+  verify_final_regular
+  verify_archive
+  final_identity=$(read_regular_identity "$final")
+  current_sha=${{final_identity%% *}}
+  current_size=${{final_identity#* }}
+  if [ "$current_sha" != "$expected_old_sha" ] || [ "$current_size" != "$expected_old_size" ]; then
+    echo "reference destination changed before replacement" >&2
+    exit 79
   fi
   verify_new_partial
   mv -- "$partial" "$final"
@@ -7245,8 +7309,9 @@ else
     old_sha=none
     old_size=none
   elif [ -f "$final" ] && [ ! -L "$final" ]; then
-    current_sha=$(sha256sum -- "$final" | cut -d' ' -f1)
-    current_size=$(stat -c '%s' -- "$final")
+    final_identity=$(read_regular_identity "$final")
+    current_sha=${{final_identity%% *}}
+    current_size=${{final_identity#* }}
     if [ "$current_sha" = "$new_sha" ] && [ "$current_size" = "$new_size" ]; then
       rm -f -- "$partial"
       partial=
@@ -7262,11 +7327,15 @@ else
     exit 74
   fi
 fi
-test "$(sha256sum -- "$final" | cut -d' ' -f1)" = "$new_sha" || {{
+verify_final_regular
+final_identity=$(read_regular_identity "$final")
+final_sha=${{final_identity%% *}}
+final_size=${{final_identity#* }}
+test "$final_sha" = "$new_sha" || {{
   echo "reference final SHA256 differs after install" >&2
   exit 75
 }}
-test "$(stat -c '%s' -- "$final")" = "$new_size" || {{
+test "$final_size" = "$new_size" || {{
   echo "reference final size differs after install" >&2
   exit 76
 }}
@@ -7285,6 +7354,35 @@ def _policy0_local_file_identity(path: Path) -> dict[str, int | str]:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return {"sha256": digest.hexdigest(), "size": path.stat().st_size}
+
+
+class _Policy0ReferenceTransferError(RuntimeError):
+    """Carry every per-host result when one reference install fails."""
+
+    def __init__(self, results: dict[str, dict[str, object]]):
+        self.results = results
+        self.failures = {
+            host: result for host, result in results.items() if not result.get("ok")
+        }
+        super().__init__(
+            "reference staging failed: "
+            f"results={results!r}; failures={self.failures!r}"
+        )
+
+
+def _policy0_reference_install_record(output: str) -> dict[str, str]:
+    """Parse one structured remote reference install report."""
+    report = output.strip()
+    line = next(
+        (item for item in reversed(report.splitlines()) if item.startswith("REFERENCE_INSTALL ")),
+        "",
+    )
+    record: dict[str, str] = {"report": report}
+    for field in line.split()[1:]:
+        key, separator, value = field.partition("=")
+        if separator:
+            record[key] = value
+    return record
 
 
 def _policy0_controller_transfer_reference(
@@ -7345,10 +7443,28 @@ fi
             return True, ""
 
         def install_one(host: str) -> dict[str, object]:
-            _, target_scp_options, target_destination = _ssh_destination(host)
             partial_path = (
                 f"{target_path}.partial.policy0.{os.getpid()}.{uuid.uuid4().hex}"
             )
+            archive_path = (
+                f"{target_path}.preserved.{expected_old_sha256}"
+                if expected_old_sha256 is not None
+                else None
+            )
+            try:
+                _, target_scp_options, target_destination = _ssh_destination(host)
+            except Exception as error:
+                cleaned, cleanup_output = cleanup_partial(host, partial_path)
+                detail = f"target route exception: {error}"
+                if not cleaned:
+                    detail += f"; cleanup failed: {cleanup_output}"
+                return {
+                    "ok": False,
+                    "phase": "target-route",
+                    "message": detail,
+                    "partial_path": partial_path,
+                    "preserved_path": archive_path,
+                }
             target_directory = str(PurePosixPath(target_path).parent)
             parent_script = f"""set -euo pipefail
 directory={shlex.quote(target_directory)}
@@ -7373,6 +7489,7 @@ test -d "$directory" && test ! -L "$directory"
                     "phase": "parent",
                     "message": detail,
                     "partial_path": partial_path,
+                    "preserved_path": archive_path,
                 }
             upload = scp_command + target_scp_options + [
                 str(local_reference),
@@ -7403,6 +7520,7 @@ test -d "$directory" && test ! -L "$directory"
                     "phase": "upload",
                     "message": detail,
                     "partial_path": partial_path,
+                    "preserved_path": archive_path,
                 }
             install_script = _policy0_transfer_reference_script(
                 partial_path,
@@ -7426,18 +7544,21 @@ test -d "$directory" && test ! -L "$directory"
                     "phase": "install",
                     "message": detail[-500:],
                     "partial_path": partial_path,
+                    "preserved_path": archive_path,
                 }
-            return {
+            result = _policy0_reference_install_record(output)
+            result.update({
                 "ok": True,
                 "phase": "install",
-                "message": output.strip() or "reference installed",
                 "partial_path": partial_path,
-            }
+                "preserved_path": result.get("preserved", "none"),
+            })
+            return result
 
         results = _fan(selected_nodes, install_one)
         failures = {host: result for host, result in results.items() if not result.get("ok")}
         if failures:
-            raise RuntimeError(f"reference staging failed: {failures}")
+            raise _Policy0ReferenceTransferError(results)
         return results
 
 
@@ -7450,36 +7571,10 @@ def prepare_policy0_qualification(
     source_reference_path: str | None = None,
     source_adapter_host: str = trainer_head,
     source_reference_host: str = orchestrator_host,
-    expected_existing_reference_sha256: str | None = None,
-    expected_existing_reference_size: int | None = None,
     expected_old_reference_sha256: str | None = None,
     expected_old_reference_size: int | None = None,
-    expected_old_sha256: str | None = None,
-    expected_old_size: int | None = None,
 ) -> dict[str, object]:
     """Preflight or stage exact policy-0 files on every configured trainer."""
-    if expected_old_sha256 is not None:
-        if expected_old_reference_sha256 is not None and (
-            expected_old_reference_sha256 != expected_old_sha256
-        ):
-            raise Refused("expected old reference SHA256 was provided twice with different values")
-        expected_old_reference_sha256 = expected_old_sha256
-    if expected_old_size is not None:
-        if expected_old_reference_size is not None and expected_old_reference_size != expected_old_size:
-            raise Refused("expected old reference size was provided twice with different values")
-        expected_old_reference_size = expected_old_size
-    if expected_old_reference_sha256 is not None:
-        if expected_existing_reference_sha256 is not None and (
-            expected_existing_reference_sha256 != expected_old_reference_sha256
-        ):
-            raise Refused("expected old reference SHA256 was provided twice with different values")
-        expected_existing_reference_sha256 = expected_old_reference_sha256
-    if expected_old_reference_size is not None:
-        if expected_existing_reference_size is not None and (
-            expected_existing_reference_size != expected_old_reference_size
-        ):
-            raise Refused("expected old reference size was provided twice with different values")
-        expected_existing_reference_size = expected_old_reference_size
     selected = _config_dir(config_dir)
     if "orchestrator" in selected:
         raise Refused("policy-0 qualification staging accepts a trainer-only config")
@@ -7533,22 +7628,22 @@ def prepare_policy0_qualification(
         raise Refused(f"source adapter host must be configured trainer head {trainer_head}")
     if source_reference_host != orchestrator_host:
         raise Refused(f"source reference host must be configured H200 {orchestrator_host}")
-    if (expected_existing_reference_sha256 is None) != (
-        expected_existing_reference_size is None
+    if (expected_old_reference_sha256 is None) != (
+        expected_old_reference_size is None
     ):
         raise Refused(
-            "expected existing reference SHA256 and size are both required"
+            "expected old reference SHA256 and size are both required"
         )
-    if expected_existing_reference_sha256 is not None and not re.fullmatch(
-        r"[0-9a-f]{64}", expected_existing_reference_sha256
+    if expected_old_reference_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", expected_old_reference_sha256
     ):
-        raise Refused("expected existing reference SHA256 is invalid")
-    if expected_existing_reference_size is not None and (
-        not isinstance(expected_existing_reference_size, int)
-        or isinstance(expected_existing_reference_size, bool)
-        or expected_existing_reference_size < 0
+        raise Refused("expected old reference SHA256 is invalid")
+    if expected_old_reference_size is not None and (
+        not isinstance(expected_old_reference_size, int)
+        or isinstance(expected_old_reference_size, bool)
+        or expected_old_reference_size < 0
     ):
-        raise Refused("expected existing reference size is invalid")
+        raise Refused("expected old reference size is invalid")
     _check_host(source_adapter_host)
     _check_host(source_reference_host)
     storage_prefix = f"{storage_root.rstrip('/')}/"
@@ -7581,8 +7676,8 @@ def prepare_policy0_qualification(
         reference_path,
         "0" * 64,
         0,
-        expected_existing_reference_sha256,
-        expected_existing_reference_size,
+        expected_old_reference_sha256,
+        expected_old_reference_size,
     )
     stage_adapter_script = _policy0_stage_head_file_script(source_adapter_path, adapter_path)
     stage_config_script = _policy0_stage_head_file_script(source_config_path, config_path)
@@ -7596,12 +7691,8 @@ def prepare_policy0_qualification(
         "source_adapter_dir": source_adapter_dir,
         "source_reference_host": source_reference_host,
         "source_reference_path": source_reference_path,
-        "expected_existing_reference_sha256": expected_existing_reference_sha256,
-        "expected_existing_reference_size": expected_existing_reference_size,
-        "expected_old_reference_sha256": expected_existing_reference_sha256,
-        "expected_old_reference_size": expected_existing_reference_size,
-        "expected_old_sha256": expected_existing_reference_sha256,
-        "expected_old_size": expected_existing_reference_size,
+        "expected_old_reference_sha256": expected_old_reference_sha256,
+        "expected_old_reference_size": expected_old_reference_size,
         "source_adapter_path": source_adapter_path,
         "source_config_path": source_config_path,
         "verify_script": verify_script,
@@ -7653,8 +7744,8 @@ def prepare_policy0_qualification(
         reference_path,
         selected_nodes,
         reference_manifest["reference.json"],
-        expected_existing_reference_sha256,
-        expected_existing_reference_size,
+        expected_old_reference_sha256,
+        expected_old_reference_size,
     )
     plan["transfer_results"] = transfer_results
     for source, target in (
@@ -9279,8 +9370,8 @@ def _prepare_policy0_action(arguments: list[str]):
     source_reference_path = None
     source_adapter_host = trainer_head
     source_reference_host = orchestrator_host
-    expected_existing_reference_sha256 = None
-    expected_existing_reference_size = None
+    expected_old_reference_sha256 = None
+    expected_old_reference_size = None
     positional = []
     index = 0
     options = {
@@ -9290,8 +9381,6 @@ def _prepare_policy0_action(arguments: list[str]):
         "--source-reference-host": "reference_host",
         "--expected-old-reference-sha256": "expected_old_sha256",
         "--expected-old-reference-size": "expected_old_size",
-        "--expected-existing-reference-sha256": "expected_old_sha256",
-        "--expected-existing-reference-size": "expected_old_size",
     }
     while index < len(arguments):
         argument = arguments[index]
@@ -9309,10 +9398,10 @@ def _prepare_policy0_action(arguments: list[str]):
             elif options[argument] == "reference_host":
                 source_reference_host = value
             elif options[argument] == "expected_old_sha256":
-                expected_existing_reference_sha256 = value
+                expected_old_reference_sha256 = value
             else:
                 try:
-                    expected_existing_reference_size = int(value)
+                    expected_old_reference_size = int(value)
                 except ValueError as error:
                     raise Refused(f"{argument} must be an integer") from error
         elif argument.startswith("--"):
@@ -9335,8 +9424,8 @@ def _prepare_policy0_action(arguments: list[str]):
         source_reference_path=source_reference_path,
         source_adapter_host=source_adapter_host,
         source_reference_host=source_reference_host,
-        expected_existing_reference_sha256=expected_existing_reference_sha256,
-        expected_existing_reference_size=expected_existing_reference_size,
+        expected_old_reference_sha256=expected_old_reference_sha256,
+        expected_old_reference_size=expected_old_reference_size,
     )
     if mode == "plan":
         print(json.dumps({

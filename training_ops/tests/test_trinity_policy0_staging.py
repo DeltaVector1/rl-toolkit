@@ -1,4 +1,6 @@
 import hashlib
+import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -56,7 +58,17 @@ def _identity_bytes(value: bytes) -> tuple[str, int]:
 
 
 class TrinityPolicy0StagingTest(unittest.TestCase):
-    def run_install(self, *, final=None, partial=b"new", archive=None, old_sha=OLD_SHA256, old_size=OLD_SIZE):
+    def run_install(
+        self,
+        *,
+        final=None,
+        partial=b"new",
+        archive=None,
+        old_sha=OLD_SHA256,
+        old_size=OLD_SIZE,
+        expected_new_sha=None,
+        expected_new_size=None,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             destination = root / "qualification" / "reference.json"
@@ -68,8 +80,11 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             if archive is not None:
                 destination.with_name(destination.name + ".preserved." + old_sha).write_bytes(archive)
             new_sha, new_size = _identity_bytes(partial)
+            expected_new_sha = expected_new_sha or new_sha
+            expected_new_size = new_size if expected_new_size is None else expected_new_size
             script = _policy0_transfer_reference_script(
-                str(partial_path), str(destination), new_sha, new_size, old_sha, old_size
+                str(partial_path), str(destination), expected_new_sha, expected_new_size,
+                old_sha, old_size
             )
             result = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
             archive_path = destination.with_name(destination.name + ".preserved." + old_sha)
@@ -89,6 +104,14 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         changed = reference_payload()
         changed["source_kind"] = "rollout_batch"
         with self.assertRaisesRegex(QualificationError, "cached rollout"):
+            validate_reference(changed)
+        changed = reference_payload()
+        changed["routed_experts"] = {"shape": [4, 60, 4]}
+        with self.assertRaisesRegex(QualificationError, "routes"):
+            validate_reference(changed)
+        changed = reference_payload()
+        changed["inference_logprobs"][1] = -0.1
+        with self.assertRaisesRegex(QualificationError, "prompt inference logprobs"):
             validate_reference(changed)
 
     def test_plan_uses_controller_route_and_expected_old_options(self):
@@ -130,6 +153,26 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 **kwargs,
             )
 
+    def test_rejects_wrong_source_host_and_incomplete_source_identity(self):
+        kwargs = {
+            "source_adapter_dir": "/data/glm52-rl/preserved-step0",
+            "source_reference_path": "/data/glm52-rl/fresh-h200/reference.json",
+            "expected_old_reference_sha256": OLD_SHA256,
+            "expected_old_reference_size": OLD_SIZE,
+        }
+        with self.assertRaisesRegex(Refused, "source adapter host"):
+            prepare_policy0_qualification(
+                "configs/trinity-h200-parity-production",
+                source_adapter_host="n80",
+                **kwargs,
+            )
+        incomplete = "QUAL_FILE adapter_model.safetensors " + "a" * 64 + " 10"
+        with patch("training_ops._ssh", return_value=(0, incomplete)) as ssh:
+            with self.assertRaisesRegex(RuntimeError, "source step-0 adapter identity"):
+                prepare_policy0_qualification(
+                    "configs/trinity-h200-parity-production", apply=True, **kwargs
+                )
+        self.assertEqual(ssh.call_count, 1)
     def test_stage_keeps_adapter_and_config_staging_separate(self):
         source_manifest = "\n".join([
             "QUAL_FILE adapter_model.safetensors " + "a" * 64 + " 10",
@@ -176,12 +219,39 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertIn(".preserved.", result.stdout)
         self.assertIn(f"new_sha={hashlib.sha256(b'new-reference').hexdigest()}", result.stdout)
 
-    def test_reference_script_already_new_is_idempotent(self):
-        result, state = self.run_install(final=b"new-reference", partial=b"new-reference")
+    def test_reference_script_already_new_reports_valid_preserved_archive(self):
+        old = b"old-reference"
+        old_sha, old_size = _identity_bytes(old)
+        result, state = self.run_install(
+            final=b"new-reference", partial=b"new-reference", archive=old,
+            old_sha=old_sha, old_size=old_size,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(state["final"], b"new-reference")
+        self.assertEqual(state["archive"], old)
         self.assertFalse(state["partial_exists"])
         self.assertIn("status=idempotent", result.stdout)
+        self.assertIn(f"preserved=", result.stdout)
+        self.assertIn(f".preserved.{old_sha}", result.stdout)
+
+    def test_reference_script_already_new_without_archive_is_not_recoverable(self):
+        result, state = self.run_install(final=b"new-reference", partial=b"new-reference")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not recoverable", result.stderr)
+        self.assertEqual(state["final"], b"new-reference")
+        self.assertFalse(state["partial_exists"])
+
+    def test_reference_script_already_new_rejects_corrupt_archive(self):
+        old = b"old-reference"
+        old_sha, old_size = _identity_bytes(old)
+        result, state = self.run_install(
+            final=b"new-reference", partial=b"new-reference", archive=b"corrupt",
+            old_sha=old_sha, old_size=old_size,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("archive conflicts", result.stderr)
+        self.assertEqual(state["final"], b"new-reference")
+        self.assertFalse(state["partial_exists"])
 
     def test_reference_script_missing_installs_without_archive(self):
         result, state = self.run_install(final=None, partial=b"new-reference")
@@ -233,11 +303,64 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(state["final"], old)
         self.assertFalse(state["partial_exists"])
-        result, state = self.run_install(final=old, partial=b"corrupt")
+        expected_sha, expected_size = _identity_bytes(b"new-reference")
+        result, state = self.run_install(
+            final=old,
+            partial=b"corrupt",
+            expected_new_sha=expected_sha,
+            expected_new_size=expected_size,
+            old_sha=old_sha,
+            old_size=old_size,
+        )
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(state["final"], old)
         self.assertFalse(state["partial_exists"])
 
+    def test_reference_script_rejects_nonregular_archive(self):
+        old = b"old-reference"
+        old_sha, old_size = _identity_bytes(old)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "reference.json"
+            target.write_bytes(b"new-reference")
+            partial = root / "reference.partial"
+            partial.write_bytes(b"new-reference")
+            archive = root / (target.name + ".preserved." + old_sha)
+            archive.mkdir()
+            new_sha, new_size = _identity_bytes(b"new-reference")
+            result = subprocess.run(
+                ["bash", "-c", _policy0_transfer_reference_script(
+                    str(partial), str(target), new_sha, new_size, old_sha, old_size
+                )],
+                text=True,
+                capture_output=True,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a regular file", result.stderr)
+
+    def test_reference_script_interrupted_upload_can_retry_cleanly(self):
+        old = b"old-reference"
+        new = b"new-reference"
+        old_sha, old_size = _identity_bytes(old)
+        new_sha, new_size = _identity_bytes(new)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "reference.json"
+            target.write_bytes(old)
+            partial = root / "reference.partial"
+            partial.write_bytes(b"corrupt-upload")
+            script = _policy0_transfer_reference_script(
+                str(partial), str(target), new_sha, new_size, old_sha, old_size
+            )
+            interrupted = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
+            self.assertNotEqual(interrupted.returncode, 0)
+            self.assertFalse(partial.exists())
+            partial.write_bytes(new)
+            retried = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
+            self.assertEqual(retried.returncode, 0, retried.stderr)
+            archive = target.with_name(target.name + ".preserved." + old_sha)
+            self.assertEqual(target.read_bytes(), new)
+            self.assertEqual(archive.read_bytes(), old)
     def test_reference_script_race_lock_refuses_second_writer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -258,6 +381,44 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(target.exists())
             self.assertFalse(partial.exists())
+
+    def test_reference_script_rejects_equal_size_relative_symlink_race(self):
+        old = b"old-reference"
+        old_sha, old_size = _identity_bytes(old)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "reference.json"
+            relative_target = root / "same-size-target"
+            relative_target.write_bytes(old)
+            target.write_bytes(old)
+            partial = root / "reference.partial"
+            partial.write_bytes(b"new-reference")
+            wrapper_dir = root / "bin"
+            wrapper_dir.mkdir()
+            wrapper = wrapper_dir / "python3"
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$2\" = {str(target)!r} ]; then\n"
+                f"  rm -f -- {str(target)!r}\n"
+                f"  ln -s -- same-size-target {str(target)!r}\n"
+                "fi\n"
+                "exec /usr/bin/python3 \"$@\"\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            new_sha, new_size = _identity_bytes(b"new-reference")
+            environment = dict(os.environ)
+            environment["PATH"] = str(wrapper_dir) + os.pathsep + environment["PATH"]
+            result = subprocess.run(
+                ["bash", "-c", _policy0_transfer_reference_script(
+                    str(partial), str(target), new_sha, new_size, old_sha, old_size
+                )],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertTrue(target.is_symlink(), result.stderr)
+        self.assertNotEqual(result.returncode, 0)
 
     def test_controller_downloads_once_and_uploads_all_trainers(self):
         source_bytes = b"verified-reference"
@@ -350,6 +511,36 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             self.assertEqual(ssh.call_count, 2)
             self.assertIn("partial", ssh.call_args_list[-1].args[1])
 
+    def test_controller_failure_retains_complete_multi_host_results(self):
+        source_bytes = b"verified"
+        source_sha, source_size = _identity_bytes(source_bytes)
+        all_results = {
+            "n76": {
+                "ok": True, "phase": "install", "preserved_path": "/ref.preserved.old",
+            },
+            "n77": {
+                "ok": False, "phase": "upload", "message": "exit 9",
+            },
+        }
+        def fetch(command, *, stdin, timeout):
+            Path(command[-1]).write_bytes(source_bytes)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.json"
+            source.write_bytes(source_bytes)
+            with patch("training_ops._run_process", side_effect=fetch), patch(
+                "training_ops._fan", return_value=all_results
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    _policy0_controller_transfer_reference(
+                        "h200b", str(source), str(Path(directory) / "reference.json"),
+                        list(all_results), {"sha256": source_sha, "size": source_size},
+                        OLD_SHA256, OLD_SIZE,
+                    )
+        self.assertEqual(raised.exception.results, all_results)
+        self.assertEqual(raised.exception.failures, {"n77": all_results["n77"]})
+
     def test_final_manifest_verification_checks_exact_hash_and_size(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -357,8 +548,22 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             config = root / "adapter_config.json"
             reference = root / "reference.json"
             adapter.write_bytes(b"adapter")
-            config.write_text('{"r":32,"lora_alpha":64,"lora_dropout":0.0,"target_modules":[]}', encoding="utf-8")
-            reference.write_text('{"policy":"policy-0"}', encoding="utf-8")
+            config.write_text(json.dumps({
+                "r": 32,
+                "lora_alpha": 64,
+                "lora_dropout": 0.0,
+                "target_modules": EXPECTED_LORA["target_modules"],
+            }), encoding="utf-8")
+            reference_data = reference_payload()
+            reference_data["policy_identity_before"] = {
+                "server_instance": "h200",
+                "target_sha256": hashlib.sha256(b"adapter").hexdigest(),
+                "target_size": 7,
+                "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+                "config_size": config.stat().st_size,
+            }
+            reference_data["policy_identity_after"] = dict(reference_data["policy_identity_before"])
+            reference.write_text(json.dumps(reference_data), encoding="utf-8")
             script = _policy0_qualification_verify_script(
                 str(adapter), str(config), str(reference), EXPECTED_LORA,
                 {
@@ -367,8 +572,11 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                     "reference.json": {"sha256": hashlib.sha256(reference.read_bytes()).hexdigest(), "size": reference.stat().st_size},
                 },
             )
-            self.assertIn("sha256sum", script)
-            self.assertIn("adapter_model.safetensors", script)
+            result = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            adapter.write_bytes(b"changed")
+            failed = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
+            self.assertNotEqual(failed.returncode, 0)
 
     def test_cli_options_parse_size_and_help(self):
         from training_ops import _prepare_policy0_action, usage
