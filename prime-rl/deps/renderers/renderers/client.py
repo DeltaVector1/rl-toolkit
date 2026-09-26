@@ -66,6 +66,14 @@ class MalformedGenerateResponseError(ValueError):
     """The generate endpoint returned unusable sampled-token evidence."""
 
 
+def _validate_cache_salt(value: Any, *, allow_none: bool) -> str | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("cache_salt must be a non-empty string")
+    return value
+
+
 # Per-process cache of resolved engine context-length caps, keyed by
 # ``(base_url, model)``. ``None`` is the "we asked the engine and it didn't
 # tell us" sentinel — distinct from "key missing" (haven't asked yet). The
@@ -231,7 +239,9 @@ async def generate(
 
     ``sampling_params`` is forwarded to vLLM verbatim. Two fields are always
     set by us and override caller values: ``stop_token_ids`` (from the
-    renderer) and ``logprobs=1`` (we always emit completion_logprobs). Pass
+    renderer) and ``logprobs=1`` (we always emit completion_logprobs). A
+    compatibility ``sampling_params["cache_salt"]`` is promoted to the
+    top-level request field when the explicit argument is absent. Pass
     ``prompt_ids`` to skip rendering and use a prebuilt token sequence —
     pair it with ``multi_modal_data`` when the prebuilt prompt has image /
     video placeholders that need engine-side mm payload, and with
@@ -309,6 +319,12 @@ async def generate(
         )
 
     sp: dict[str, Any] = dict(sampling_params or {})
+    explicit_cache_salt = _validate_cache_salt(cache_salt, allow_none=True)
+    nested_value = sp.pop("cache_salt", None)
+    if explicit_cache_salt is None and "cache_salt" in (sampling_params or {}):
+        cache_salt = _validate_cache_salt(nested_value, allow_none=False)
+    else:
+        cache_salt = explicit_cache_salt
     sp["stop_token_ids"] = stop_token_ids
     sp["logprobs"] = 1
     sp.setdefault("skip_special_tokens", False)
