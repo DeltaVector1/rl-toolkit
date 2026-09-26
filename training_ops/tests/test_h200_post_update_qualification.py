@@ -10,7 +10,6 @@ from training_ops.runtime.h200.post_update_qualification import (
     POST_UPDATE_LOAD_SLOT,
     POST_UPDATE_STEP,
     PostUpdateQualificationError,
-    loss_sensitivity_signal,
     post_update_adapter_path,
     post_update_load_target,
     validate_forward_backward_seconds,
@@ -191,19 +190,6 @@ class H200PostUpdateQualificationTest(unittest.TestCase):
         rescore["request_mode"] = "serialized_generate_decode256_prefill_rescore"
         with self.assertRaisesRegex(PostUpdateQualificationError, "rescore"):
             validate_post_update_reference(rescore)
-
-    def test_changed_inference_logprobs_change_loss_and_signal_update(self):
-        result = loss_sensitivity_signal(
-            self.reference()["inference_logprobs"],
-            self.reference()["advantages"],
-            self.reference()["loss_mask"],
-        )
-        self.assertNotEqual(result["loss_before"], result["loss_after"])
-        self.assertTrue(math.isfinite(result["loss_before"]))
-        self.assertTrue(math.isfinite(result["loss_after"]))
-        self.assertTrue(math.isfinite(result["gradient_l1"]))
-        self.assertGreater(result["gradient_l1"], 0.0)
-        self.assertGreater(result["update_l1"], 0.0)
 
     def test_export_and_load_evidence_requires_fresh_changed_adapter(self):
         with self.subTest("missing evidence"):

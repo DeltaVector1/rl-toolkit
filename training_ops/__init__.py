@@ -136,6 +136,12 @@ _TRINITY_AFMOE_BASE_HASHES = {
     "prime_rl/trainer/models/afmoe/converting_afmoe.py": "2743fc844d285b29ade3089e18216044492d392f0d9d1c017ee35fe0e5fcf41b",
 }
 
+trinity_trainer_loss_module = "/app/src/prime_rl/trainer/rl/loss.py"
+trinity_trainer_loss_sha256 = (
+    "102b14539a2aa7e4b807967f9c9caeaaa974373391a21602ce45b24414fb7863"
+)
+trinity_trainer_loss_identity_env = "PRIME_RL_TRAINER_LOSS_IDENTITY"
+
 
 def _adapter_stage_limit_seconds(policy_step: int) -> int:
     if type(policy_step) is not int or policy_step <= 0:
@@ -9369,6 +9375,126 @@ def _validate_trinity_afmoe_overlay() -> None:
         )
 
 
+def _validate_trinity_trainer_loss_identity(value: object) -> dict[str, str | int]:
+    if not isinstance(value, dict):
+        raise Refused("Trinity trainer loss identity must be an object")
+    digest = value.get("sha256")
+    size = value.get("size")
+    mode = value.get("mode")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise Refused("Trinity trainer loss identity has an invalid SHA-256")
+    if digest != trinity_trainer_loss_sha256:
+        raise Refused("Trinity trainer loss identity SHA-256 is not approved")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise Refused("Trinity trainer loss identity size is not configured")
+    if not isinstance(mode, str) or not re.fullmatch(r"[0-7]{3,4}", mode):
+        raise Refused("Trinity trainer loss identity mode is not configured")
+    return {"sha256": digest, "size": size, "mode": mode}
+
+
+def _trinity_trainer_loss_identity() -> dict[str, str | int]:
+    raw = os.environ.get(trinity_trainer_loss_identity_env, "")
+    if not raw:
+        raise Refused(
+            "Trinity trainer loss identity is not configured; provide measured size and mode"
+        )
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise Refused("Trinity trainer loss identity is not valid JSON") from error
+    return _validate_trinity_trainer_loss_identity(value)
+
+
+def _trinity_trainer_loss_inspection_script(
+    image: str, expected_identity: dict[str, str | int]
+) -> str:
+    if not isinstance(image, str) or not image or "\n" in image or "\r" in image:
+        raise Refused("Trinity trainer image name is invalid")
+    identity = _validate_trinity_trainer_loss_identity(expected_identity)
+    inspection = f"""set -euo pipefail
+module={shlex.quote(trinity_trainer_loss_module)}
+expected_sha256={shlex.quote(str(identity['sha256']))}
+expected_size={shlex.quote(str(identity['size']))}
+expected_mode={shlex.quote(str(identity['mode']))}
+test -f "$module"
+test ! -L "$module"
+test "$(readlink -f -- "$module")" = "$module"
+test "$(sha256sum -- "$module" | awk '{{print $1}}')" = "$expected_sha256"
+test "$(stat -c '%s' -- "$module")" = "$expected_size"
+test "$(stat -c '%a' -- "$module")" = "$expected_mode"
+python3 - <<'PY'
+import importlib
+import importlib.metadata
+import inspect
+import pathlib
+import sys
+
+assert sys.version_info[:3] == (3, 12, 3), sys.version
+import torch
+assert torch.__version__ == "2.11.0+cu128", torch.__version__
+assert importlib.metadata.version("prime-rl") == "0.7.0"
+loss = importlib.import_module("prime_rl.trainer.rl.loss")
+assert pathlib.Path(loss.__file__).resolve() == pathlib.Path("/app/src/prime_rl/trainer/rl/loss.py")
+required = {{
+    "selective_log_softmax": ("logits", "index"),
+    "compute_entropy": ("shifted_logits",),
+    "shift_tensor_left": ("t",),
+    "shift_tensor_right": ("t",),
+    "compute_importance_ratio_and_mismatch_kl": ("trainer_logprobs", "inference_logprobs"),
+    "setup_rl_loss_fn": ("loss_config",),
+    "compute_loss": ("trainer_logprobs", "inference_logprobs", "advantages", "loss_mask", "rl_loss_fn"),
+}}
+for name, parameters in required.items():
+    function = getattr(loss, name, None)
+    assert function is not None, name
+    signature = inspect.signature(function)
+    assert all(parameter in signature.parameters for parameter in parameters), (name, signature)
+PY
+printf '%s\\n' "TRINITY_TRAINER_LOSS_INSPECTION_OK sha256=$expected_sha256 size=$expected_size mode=$expected_mode"
+"""
+    container_name = f"training-ops-loss-preflight-{uuid.uuid4().hex}"
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            f"image={shlex.quote(image)}",
+            f"container_name={shlex.quote(container_name)}",
+            'image_id=$(sudo docker image inspect --format \'{{.Id}}\' "$image" 2>/dev/null) || { echo "configured trainer image is missing: $image" >&2; exit 21; }',
+            'case "$image_id" in sha256:*) ;; *) echo "configured trainer image has invalid immutable id: $image_id" >&2; exit 22;; esac',
+            'image_digest=${image_id#sha256:}; [ "${#image_digest}" -eq 64 ] && [[ "$image_digest" =~ ^[0-9a-f]+$ ]] || { echo "configured trainer image has invalid immutable id: $image_id" >&2; exit 22; }',
+            'set +e',
+            f"result=$(sudo docker run --rm --pull=never --network none --gpus none --name \"$container_name\" --entrypoint /bin/bash \"$image\" -c {shlex.quote(inspection)})",
+            "run_code=$?",
+            "set -e",
+            'leftover=$(sudo docker ps -aq --filter "name=^/${container_name}$")',
+            'test -z "$leftover" || { echo "trainer loss preflight container was not cleaned up" >&2; exit 23; }',
+            'test "$run_code" -eq 0 || { printf "%s\\n" "$result" >&2; exit "$run_code"; }',
+            'printf "%s\\n" "TRINITY_TRAINER_LOSS_PREFLIGHT_OK image=$image_id $result"',
+        ]
+    )
+
+
+def _trinity_trainer_loss_preflight(
+    nodes: list[str], *, expected_identity: dict[str, str | int] | None = None
+) -> None:
+    identity = (
+        _trinity_trainer_loss_identity()
+        if expected_identity is None
+        else _validate_trinity_trainer_loss_identity(expected_identity)
+    )
+    selected = [host for host in nodes if host not in blocked_hosts]
+    if not selected:
+        raise Refused("Trinity trainer loss preflight has no permitted trainer hosts")
+    script = _trinity_trainer_loss_inspection_script(trainer_image, identity)
+    results = _fan(selected, lambda host: _ssh(host, script, timeout=180))
+    failures = {
+        host: output.strip() or f"exit {code}"
+        for host, (code, output) in results.items()
+        if code or "TRINITY_TRAINER_LOSS_PREFLIGHT_OK" not in output
+    }
+    if failures:
+        raise Refused(f"Trinity trainer loss preflight failed: {failures}")
+
+
 def _trinity_trainer_preflight(nodes: list[str]) -> None:
     base_script = "set -euo pipefail\n"
     for path, digest in _TRINITY_AFMOE_BASE_HASHES.items():
@@ -9458,6 +9584,7 @@ def start(
         _check_adapter_restart(orchestrator_host, service_run_dir, resume_step, "orchestrator", resume_adapter)
     if selected.get("kind") == "trinity":
         _validate_trinity_afmoe_overlay()
+        _trinity_trainer_loss_preflight(nodes)
     required_files = _start_dependency_inventory(selected, nodes)
     _deploy_dependencies(required_files)
     if selected.get("kind") == "trinity":
@@ -9823,6 +9950,8 @@ def qualify(
         raise Refused(
             f"{relative_config} has no [data.fake]; use start() for an RL run"
         )
+    if selected.get("kind") == "trinity":
+        _trinity_trainer_loss_preflight(nodes)
     rc, out = _ssh(
         orchestrator_host,
         f"sudo docker ps --filter name=^{orchestrator_container}$ --format '{{{{.Names}}}}'",

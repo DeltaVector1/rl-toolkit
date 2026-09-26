@@ -132,68 +132,6 @@ def validate_post_update_reference(value: Mapping[str, Any]) -> dict[str, Any]:
     return dict(validated)
 
 
-def loss_sensitivity_signal(
-    inference_logprobs: list[Any],
-    advantages: list[Any],
-    loss_mask: list[Any],
-    *,
-    perturbation: float = 0.125,
-) -> dict[str, float]:
-    """Prove that inference logprobs affect loss and produce an update signal."""
-    if not isinstance(perturbation, (int, float)) or not math.isfinite(float(perturbation)):
-        raise PostUpdateQualificationError("loss sensitivity perturbation is invalid")
-    if not inference_logprobs or len(inference_logprobs) != len(advantages) or len(advantages) != len(loss_mask):
-        raise PostUpdateQualificationError("loss sensitivity fields do not align")
-    selected: list[tuple[float, float]] = []
-    for index, (logprob, advantage, keep) in enumerate(
-        zip(inference_logprobs, advantages, loss_mask)
-    ):
-        if not isinstance(keep, bool):
-            raise PostUpdateQualificationError("loss sensitivity mask is invalid")
-        if (
-            isinstance(logprob, bool)
-            or not isinstance(logprob, (int, float))
-            or not math.isfinite(float(logprob))
-            or isinstance(advantage, bool)
-            or not isinstance(advantage, (int, float))
-            or not math.isfinite(float(advantage))
-        ):
-            raise PostUpdateQualificationError(
-                f"loss sensitivity value {index} is not finite"
-            )
-        if keep:
-            selected.append((float(logprob), float(advantage)))
-    if not selected or not any(advantage != 0.0 for _, advantage in selected):
-        raise PostUpdateQualificationError("loss sensitivity has no nonzero advantage")
-    denominator = float(len(selected))
-    loss_before = -sum(logprob * advantage for logprob, advantage in selected) / denominator
-    changed = list(selected)
-    changed_index = next(index for index, (_, advantage) in enumerate(changed) if advantage != 0.0)
-    changed[changed_index] = (
-        changed[changed_index][0] + float(perturbation),
-        changed[changed_index][1],
-    )
-    loss_after = -sum(logprob * advantage for logprob, advantage in changed) / denominator
-    gradient_l1 = sum(abs(advantage) / denominator for _, advantage in selected)
-    update_l1 = gradient_l1 * 8e-6
-    values = {
-        "loss_before": loss_before,
-        "loss_after": loss_after,
-        "gradient_l1": gradient_l1,
-        "update_l1": update_l1,
-    }
-    if (
-        not all(math.isfinite(item) for item in values.values())
-        or loss_before == loss_after
-        or gradient_l1 <= 0.0
-        or update_l1 <= 0.0
-    ):
-        raise PostUpdateQualificationError(
-            "loss sensitivity did not produce a finite nonzero update signal"
-        )
-    return values
-
-
 def _regular(path: Path, label: str) -> None:
     if path.is_symlink() or not path.is_file():
         raise PostUpdateQualificationError(f"{label} is missing or not regular: {path}")
