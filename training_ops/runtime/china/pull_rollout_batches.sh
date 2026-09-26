@@ -18,6 +18,9 @@ parallel_threshold=${PARALLEL_THRESHOLD:-16777216}
 parallel_streams=${PARALLEL_STREAMS:-16}
 case "$parallel_streams" in ''|*[!0-9]*|0) echo "PARALLEL_STREAMS must be a positive integer" >&2; exit 2 ;; esac
 [ "$parallel_streams" -le 16 ] || { echo "PARALLEL_STREAMS must not exceed 16" >&2; exit 2; }
+pull_part_timeout=${PULL_PART_TIMEOUT:-300}
+case "$pull_part_timeout" in ''|*[!0-9]*|0) echo "PULL_PART_TIMEOUT must be a positive integer" >&2; exit 2 ;; esac
+[ "$pull_part_timeout" -le 3600 ] || { echo "PULL_PART_TIMEOUT must not exceed 3600 seconds" >&2; exit 2; }
 script=$(readlink -f "$0")
 pid_file="$dest_dir/.rollout-pull.pid"
 lock_file="$dest_dir/.rollout-pull.lock"
@@ -37,6 +40,10 @@ rsync_ssh_wrapper=
 pid_owned=0
 health_lease_pid=
 health_probe_pids=()
+
+pull_rsync() {
+  timeout --signal=TERM --kill-after=10s "$pull_part_timeout" rsync "$@"
+}
 
 remote() {
   ssh -n "${ssh_opts[@]}" "$source_target" "$1"
@@ -240,7 +247,7 @@ pull_bytes() {
   local -a pids=()
   size=$(remote "stat -c %s -- '$source'") || return 1
   if [ "$size" -lt "$parallel_threshold" ]; then
-    rsync -az --partial --append-verify --timeout=60 -e "$rsync_ssh" \
+    pull_rsync -az --partial --append-verify --timeout=60 -e "$rsync_ssh" \
       "$source_target:$source" "$partial"
     return
   fi
@@ -261,7 +268,7 @@ pull_bytes() {
       wait "${pids[0]}" || status=1
       pids=("${pids[@]:1}")
     done
-    rsync -az --partial --append-verify --timeout=60 -e "$rsync_ssh" \
+    pull_rsync -az --partial --append-verify --timeout=60 -e "$rsync_ssh" \
       "$source_target:$remote_parts/$name" "$part" &
     pids+=("$!")
   done <<<"$listing"

@@ -443,3 +443,18 @@ only after measured learning.
   600-second limit. Keep warnings for down or non-exact systems, zero running
   requests, throughput below 5 tok/s, trainer-only mode, and inactive transfer
   or rollouts.
+
+## Rollout puller per-part timeout
+
+- Observed failure: source size was 397,167,733 bytes across 16 parts; the
+  destination was about 310 MB with 8 complete parts, 7 partial parts, and
+  `part007` absent. Transfer rate was only 25-31 KiB/s. Rsync children stayed
+  held by SSH keepalive while the parent waited for all children, so no retry
+  occurred. Stopping and starting the exact puller preserved complete files
+  and resumed partial files with `--append-verify`; the direct adapter route
+  was not involved.
+- Repair plan: wrap each pull-side rsync child in a bounded configurable outer
+  timeout, default 300 seconds based on about 90 KiB/s for 24.8 MB parts, with
+  TERM then KILL grace. Keep rsync `--timeout=60`, `--partial`, and
+  `--append-verify`; let timeout failures return to the existing scan retry
+  loop without deleting partials.

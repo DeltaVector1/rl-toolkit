@@ -45,7 +45,11 @@ class RolloutPullTest(unittest.TestCase):
                 "#!/usr/bin/env bash\nset -eu\na=(\"$@\"); "
                 "src=${a[${#a[@]}-2]}; dst=${a[${#a[@]}-1]}; "
                 "[[ $src = *:* ]] && src=${src#*:}; [[ $dst = *:* ]] && dst=${dst#*:}; "
-                "mkdir -p \"$(dirname \"$dst\")\"; cp -- \"$src\" \"$dst\"\n"
+                "mkdir -p \"$(dirname \"$dst\")\"; "
+                "if [ -n \"${RSYNC_SLEEP_ONCE_MARKER:-}\" ] && [ ! -e \"$RSYNC_SLEEP_ONCE_MARKER\" ]; then "
+                "(set -C; : >\"$RSYNC_SLEEP_ONCE_MARKER\") 2>/dev/null || true; "
+                "sleep \"${RSYNC_SLEEP:-0}\"; fi; "
+                "cp -- \"$src\" \"$dst\"\n"
             )
         for path in tools.iterdir():
             path.chmod(0o755)
@@ -328,6 +332,76 @@ class RolloutPullTest(unittest.TestCase):
                 ).returncode,
                 0,
             )
+
+    def test_pull_part_timeout_is_bounded_and_retry_resumes_partial_parts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            rollout = source / "rollouts/step_1/train_rollouts.bin"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_bytes(bytes(range(256)))
+            environment = self.environment(source, destination, self.tools(directory))
+            environment.update(
+                ONCE="1",
+                PARALLEL_THRESHOLD="1",
+                PARALLEL_STREAMS="2",
+                PULL_PART_TIMEOUT="1",
+                RSYNC_SLEEP="3",
+                RSYNC_SLEEP_ONCE_MARKER=str(base / "rsync-sleep-once"),
+            )
+
+            started = time.monotonic()
+            failed = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            elapsed = time.monotonic() - started
+            self.assertNotEqual(failed.returncode, 0, failed.stderr)
+            self.assertLess(elapsed, 5)
+            partial_parts = destination / ".incoming/rollouts/step_1/train_rollouts.bin.parallel"
+            self.assertTrue(partial_parts.is_dir())
+
+            resumed = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertEqual((destination / "rollouts/step_1/train_rollouts.bin").read_bytes(), rollout.read_bytes())
+
+    def test_pull_part_timeout_validation_and_resume_flags(self):
+        source = puller.read_text()
+        self.assertIn("pull_part_timeout=${PULL_PART_TIMEOUT:-300}", source)
+        self.assertIn(
+            'timeout --signal=TERM --kill-after=10s "$pull_part_timeout" rsync "$@"',
+            source,
+        )
+        self.assertEqual(
+            source.count("pull_rsync -az --partial --append-verify --timeout=60"),
+            2,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source_dir = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            environment = self.environment(source_dir, destination, self.tools(directory))
+            for value in ("0", "-1", "not-an-integer", "3601"):
+                environment["PULL_PART_TIMEOUT"] = value
+                result = subprocess.run(
+                    ["bash", str(puller), "run"],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertEqual(result.returncode, 2, value)
+                self.assertIn("PULL_PART_TIMEOUT", result.stderr)
 
     def test_pull_is_checksummed_resumable_and_no_replace(self):
         with tempfile.TemporaryDirectory() as directory:
