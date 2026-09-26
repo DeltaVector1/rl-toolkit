@@ -59,7 +59,10 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
 
     def test_plan_uses_all_configured_trainers_without_live_action(self):
         plan = prepare_policy0_qualification(
-            "configs/trinity-h200-parity-production", apply=False
+            "configs/trinity-h200-parity-production",
+            apply=False,
+            source_adapter_dir="/data/glm52-rl/preserved-step0",
+            source_reference_path="/data/glm52-rl/fresh-h200/reference.json",
         )
         self.assertEqual(
             plan["nodes"], ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
@@ -67,16 +70,30 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertNotIn("n79", plan["nodes"])
         self.assertTrue(plan["adapter_path"].endswith("/policy-0/adapter_model.safetensors"))
         self.assertTrue(plan["reference_path"].endswith("/trinity-h200-parity-production/reference.json"))
+        self.assertEqual(plan["source_adapter_host"], "n82")
+        self.assertEqual(plan["source_reference_host"], "h200b")
+        self.assertIn("preserved-step0/adapter_model.safetensors", plan["source_adapter_script"])
+        self.assertIn("fresh-h200/reference.json", plan["transfer_reference_script"])
         self.assertIn("serialized_generate_completion_prompt_logprobs", plan["verify_script"])
         self.assertIn("sha256sum", plan["verify_script"])
+        self.assertIn("read(1024 * 1024)", plan["verify_script"])
+        self.assertNotIn('open(path, "rb").read()', plan["verify_script"])
+        self.assertIn("destination conflicts", plan["stage_adapter_script"])
+        self.assertIn("trap 'rm -f -- \"$tmp\"' EXIT", plan["stage_adapter_script"])
+        self.assertIn("tmp.policy0", plan["transfer_reference_script"])
+        self.assertIn("china-trainer", plan["transfer_reference_script"])
+        self.assertIn("scp -q", plan["transfer_reference_script"])
 
     def test_stage_accepts_all_verified_hosts_and_refuses_one_bad_hash(self):
-        manifest = "\n".join([
+        source_manifest = "\n".join([
             "QUAL_FILE adapter_model.safetensors " + "a" * 64 + " 10",
             "QUAL_FILE adapter_config.json " + "b" * 64 + " 20",
-            "QUAL_FILE reference.json " + "c" * 64 + " 30",
         ])
-        with patch("training_ops._ssh", side_effect=[(0, "verified"), (0, manifest)]) as ssh:
+        reference_manifest = "QUAL_FILE reference.json " + "c" * 64 + " 30"
+        with patch("training_ops._ssh", side_effect=[
+            (0, source_manifest), (0, reference_manifest), (0, "transferred"),
+            (0, "staged"), (0, "staged"),
+        ]) as ssh:
             with patch("training_ops._copy_resume_adapter") as copy:
                 with patch(
                     "training_ops._fan",
@@ -85,10 +102,13 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                     ]},
                 ) as fan:
                     result = prepare_policy0_qualification(
-                        "configs/trinity-h200-parity-production", apply=True
+                        "configs/trinity-h200-parity-production",
+                        apply=True,
+                        source_adapter_dir="/data/glm52-rl/preserved-step0",
+                        source_reference_path="/data/glm52-rl/fresh-h200/reference.json",
                     )
         self.assertTrue(result["staged"])
-        self.assertEqual(copy.call_count, 3)
+        self.assertEqual(copy.call_count, 2)
         self.assertEqual(fan.call_count, 1)
         self.assertGreaterEqual(ssh.call_count, 1)
 
@@ -96,13 +116,40 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             host: (0 if host != "n83" else 1, "bad" if host == "n83" else "verified")
             for host in ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
         }
-        with patch("training_ops._ssh", side_effect=[(0, "verified"), (0, manifest)]):
+        with patch("training_ops._ssh", side_effect=[
+            (0, source_manifest), (0, reference_manifest), (0, "transferred"),
+            (0, "staged"), (0, "staged"),
+        ]):
             with patch("training_ops._copy_resume_adapter"):
                 with patch("training_ops._fan", return_value=bad_results):
                     with self.assertRaisesRegex(RuntimeError, "verification failed"):
                         prepare_policy0_qualification(
-                            "configs/trinity-h200-parity-production", apply=True
+                            "configs/trinity-h200-parity-production",
+                            apply=True,
+                            source_adapter_dir="/data/glm52-rl/preserved-step0",
+                            source_reference_path="/data/glm52-rl/fresh-h200/reference.json",
                         )
+
+    def test_stage_refuses_wrong_source_identity(self):
+        with self.assertRaisesRegex(RuntimeError, "source adapter host"):
+            prepare_policy0_qualification(
+                "configs/trinity-h200-parity-production",
+                source_adapter_dir="/data/glm52-rl/preserved-step0",
+                source_reference_path="/data/glm52-rl/fresh-h200/reference.json",
+                source_adapter_host="n80",
+            )
+
+    def test_stage_refuses_missing_source_identity_before_transfer(self):
+        incomplete = "QUAL_FILE adapter_model.safetensors " + "a" * 64 + " 10"
+        with patch("training_ops._ssh", return_value=(0, incomplete)) as ssh:
+            with self.assertRaisesRegex(RuntimeError, "source step-0 adapter identity"):
+                prepare_policy0_qualification(
+                    "configs/trinity-h200-parity-production",
+                    apply=True,
+                    source_adapter_dir="/data/glm52-rl/preserved-step0",
+                    source_reference_path="/data/glm52-rl/fresh-h200/reference.json",
+                )
+        self.assertEqual(ssh.call_count, 1)
 
 
 if __name__ == "__main__":

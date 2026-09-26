@@ -6717,13 +6717,20 @@ def _copy_resume_adapter(
     nodes: list[str],
     *,
     allow_qualification: bool = False,
+    target_path: str | None = None,
 ) -> None:
     """Copy one adapter or explicitly staged qualification file to peers."""
     allowed = (f"{run_root}/",)
     if allow_qualification:
         allowed += (f"{storage_root.rstrip('/')}/qualifications/",)
-    if not path.startswith(allowed):
+    if target_path is None and not path.startswith(allowed):
         raise Refused(f"staged file is outside an allowed training path: {path}")
+    if target_path is not None:
+        storage_prefix = f"{storage_root.rstrip('/')}/"
+        if not path.startswith(storage_prefix) or not target_path.startswith(
+            f"{storage_root.rstrip('/')}/qualifications/"
+        ):
+            raise Refused("qualification source and destination must be below configured storage")
     targets = [host for host in nodes if host != trainer_head]
     if not targets:
         return
@@ -6732,11 +6739,15 @@ def _copy_resume_adapter(
     script = f"""
 set -euo pipefail
 source_file={quoted_path}
-test -f "$source_file"
+test -f "$source_file" && test ! -L "$source_file"
 digest=$(sha256sum "$source_file" | cut -d' ' -f1)
 copy_one() {{
   target=$1
-  final=$source_file
+  final={shlex.quote(target_path or path)}
+  if [ -L "$final" ]; then
+    echo "$target has a symlink at $final" >&2
+    return 1
+  fi
   directory=$(dirname "$final")
   partial="$directory/.adapter_model.$digest.partial"
   remote_digest=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
@@ -6766,7 +6777,10 @@ copy_one() {{
         "sha256sum '$partial' | cut -d' ' -f1")
       if [ "$remote_digest" = "$digest" ]; then
         ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$target" \
-          "mv '$partial' '$final'"
+          "set -e; if [ -L '$final' ]; then exit 44; fi; \\
+           if [ -f '$final' ]; then existing=\\$(sha256sum '$final' | cut -d' ' -f1); \\
+             [ \\\"\\$existing\\\" = \\\"$digest\\\" ] || exit 45; rm -f -- '$partial'; \\
+           else mv -- '$partial' '$final'; fi"
         return 0
       fi
     fi
@@ -6853,6 +6867,13 @@ if (not isinstance(generated_ids, list)
         or len(generated_ids) != sum(mask)):
     raise SystemExit("reference generated token metadata is not aligned")
 if expected_files:
+    identity = reference.get("policy_identity_after")
+    if (not isinstance(identity, dict)
+            or identity.get("target_sha256") != expected_files["adapter_model.safetensors"]["sha256"]
+            or identity.get("target_size") != expected_files["adapter_model.safetensors"]["size"]
+            or identity.get("config_sha256") != expected_files["adapter_config.json"]["sha256"]
+            or identity.get("config_size") != expected_files["adapter_config.json"]["size"]):
+        raise SystemExit("reference receipt does not match staged adapter/config")
     paths = {{
         "adapter_model.safetensors": {adapter_path!r},
         "adapter_config.json": {config_path!r},
@@ -6862,7 +6883,11 @@ if expected_files:
         record = expected_files.get(name)
         if not isinstance(record, dict):
             raise SystemExit("missing expected artifact identity: " + name)
-        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        digest = digest.hexdigest()
         size = __import__("os").stat(path).st_size
         if digest != record.get("sha256") or size != record.get("size"):
             raise SystemExit("artifact identity differs: " + name)
@@ -6890,17 +6915,196 @@ done
 """
 
 
+def _policy0_adapter_source_manifest_script(
+    adapter_path: str,
+    config_path: str,
+    expected_lora: dict,
+) -> str:
+    expected_json = json.dumps(expected_lora, separators=(",", ":"))
+    return f"""set -euo pipefail
+adapter={shlex.quote(adapter_path)}
+config_file={shlex.quote(config_path)}
+test -f "$adapter" && test ! -L "$adapter"
+test -f "$config_file" && test ! -L "$config_file"
+python3 - "$config_file" {shlex.quote(expected_json)} <<'PY'
+import json
+import sys
+
+config = json.loads(open(sys.argv[1], encoding="utf-8").read())
+expected = json.loads(sys.argv[2])
+for key in ("r", "lora_alpha", "lora_dropout"):
+    if config.get(key) != expected[key]:
+        raise SystemExit("adapter configuration differs in " + key)
+targets = config.get("target_modules")
+if (not isinstance(targets, list) or set(targets) != set(expected["target_modules"])
+        or len(targets) != len(expected["target_modules"])):
+    raise SystemExit("adapter target_modules differ")
+PY
+printf 'QUAL_FILE adapter_model.safetensors %s %s\\n' \\
+  "$(sha256sum -- "$adapter" | cut -d' ' -f1)" "$(stat -c '%s' -- "$adapter")"
+printf 'QUAL_FILE adapter_config.json %s %s\\n' \\
+  "$(sha256sum -- "$config_file" | cut -d' ' -f1)" "$(stat -c '%s' -- "$config_file")"
+"""
+
+
+def _policy0_reference_source_verify_script(
+    reference_path: str,
+    adapter_identity: dict[str, int | str],
+    config_identity: dict[str, int | str],
+) -> str:
+    identity_json = json.dumps(
+        {"adapter": adapter_identity, "config": config_identity},
+        separators=(",", ":"),
+    )
+    return f"""set -euo pipefail
+reference={shlex.quote(reference_path)}
+test -f "$reference" && test ! -L "$reference"
+python3 - "$reference" {shlex.quote(identity_json)} <<'PY'
+import json
+import sys
+
+reference = json.loads(open(sys.argv[1], encoding="utf-8").read())
+expected = json.loads(sys.argv[2])
+if reference.get("policy") != "policy-0":
+    raise SystemExit("reference is not policy-0")
+if reference.get("request_mode") != "serialized_generate_completion_prompt_logprobs":
+    raise SystemExit("reference is not a completion qualification")
+if reference.get("source_kind") in {"rollout_batch", "cached_rollout_batch"}:
+    raise SystemExit("cached rollout reference is not allowed")
+before = reference.get("policy_identity_before")
+after = reference.get("policy_identity_after")
+if not isinstance(before, dict) or before != after:
+    raise SystemExit("reference policy identity changed")
+for prefix, identity in (("target", expected["adapter"]), ("config", expected["config"])):
+    if before.get(prefix + "_sha256") != identity["sha256"]:
+        raise SystemExit("reference receipt SHA differs for " + prefix)
+    if before.get(prefix + "_size") != identity["size"]:
+        raise SystemExit("reference receipt size differs for " + prefix)
+if not reference.get("cache_salt"):
+    raise SystemExit("reference has no cache salt")
+PY
+printf 'QUAL_FILE reference.json %s %s\\n' \\
+  "$(sha256sum -- "$reference" | cut -d' ' -f1)" "$(stat -c '%s' -- "$reference")"
+"""
+
+
+def _policy0_stage_head_file_script(source_path: str, target_path: str) -> str:
+    return f"""set -euo pipefail
+source={shlex.quote(source_path)}
+final={shlex.quote(target_path)}
+test -f "$source" && test ! -L "$source"
+source_sha=$(sha256sum -- "$source" | cut -d' ' -f1)
+source_size=$(stat -c '%s' -- "$source")
+if [ -L "$final" ]; then echo "destination is a symlink: $final" >&2; exit 41; fi
+if [ -f "$final" ]; then
+  [ "$(sha256sum -- "$final" | cut -d' ' -f1)" = "$source_sha" ] || {{ echo "destination conflicts: $final" >&2; exit 42; }}
+  [ "$(stat -c '%s' -- "$final")" = "$source_size" ] || exit 43
+  exit 0
+fi
+mkdir -p -- "$(dirname -- "$final")"
+tmp="$final.tmp.policy0.$$"
+trap 'rm -f -- "$tmp"' EXIT
+cp -- "$source" "$tmp"
+[ "$(sha256sum -- "$tmp" | cut -d' ' -f1)" = "$source_sha" ]
+[ "$(stat -c '%s' -- "$tmp")" = "$source_size" ]
+if [ -e "$final" ]; then
+  if [ -L "$final" ] || [ "$(sha256sum -- "$final" | cut -d' ' -f1)" != "$source_sha" ] \
+      || [ "$(stat -c '%s' -- "$final")" != "$source_size" ]; then
+    echo "destination appeared with a conflicting identity: $final" >&2
+    exit 44
+  fi
+  rm -f -- "$tmp"
+  trap - EXIT
+  exit 0
+fi
+mv -- "$tmp" "$final"
+trap - EXIT
+"""
+
+
+def _policy0_transfer_reference_script(
+    source_path: str,
+    target_path: str,
+    trainer_ssh_target: str,
+) -> str:
+    source = shlex.quote(source_path)
+    target = shlex.quote(target_path)
+    remote_target = shlex.quote(trainer_ssh_target)
+    remote_dir = shlex.quote(str(PurePosixPath(target_path).parent))
+    remote_tmp = shlex.quote(target_path + ".tmp.policy0.reference")
+    return f"""set -euo pipefail
+source={source}
+final={target}
+trainer_target={remote_target}
+test -f "$source" && test ! -L "$source"
+source_sha=$(sha256sum -- "$source" | cut -d' ' -f1)
+source_size=$(stat -c '%s' -- "$source")
+remote_state=$(ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
+  bash -s -- "$final" <<'REMOTE_STATE'
+set -e
+final=$1
+if [ -L "$final" ]; then
+  echo SYMLINK
+elif [ -f "$final" ]; then
+  printf 'FILE %s %s\\n' "$(sha256sum -- "$final" | cut -d' ' -f1)" "$(stat -c '%s' -- "$final")"
+else
+  echo MISSING
+fi
+REMOTE_STATE
+)
+case "$remote_state" in
+  "FILE $source_sha $source_size") exit 0 ;;
+  MISSING) ;;
+  *) echo "reference destination conflicts: $remote_state" >&2; exit 44 ;;
+esac
+tmp={remote_tmp}
+cleanup() {{ ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
+  "rm -f -- {remote_tmp}" >/dev/null 2>&1 || true; }}
+trap cleanup EXIT
+ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
+  "mkdir -p -- {remote_dir}"
+scp -q -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 \
+  -- "$source" "$trainer_target:$tmp"
+ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
+  bash -s -- "$source_sha" "$source_size" "$tmp" "$final" <<'REMOTE_MOVE'
+set -e
+source_sha=$1
+source_size=$2
+tmp=$3
+final=$4
+test ! -L "$tmp"
+test "$(sha256sum -- "$tmp" | cut -d' ' -f1)" = "$source_sha"
+test "$(stat -c '%s' -- "$tmp")" = "$source_size"
+if [ -L "$final" ]; then
+  echo "reference destination became a symlink" >&2
+  exit 45
+fi
+if [ -f "$final" ]; then
+  if [ "$(sha256sum -- "$final" | cut -d' ' -f1)" = "$source_sha" ] \
+      && [ "$(stat -c '%s' -- "$final")" = "$source_size" ]; then
+    rm -f -- "$tmp"
+    exit 0
+  fi
+  echo "reference destination appeared with a conflicting identity" >&2
+  exit 46
+fi
+mv -- "$tmp" "$final"
+REMOTE_MOVE
+trap - EXIT
+"""
+
+
 def prepare_policy0_qualification(
     config_dir: str = "configs/trinity-h200-parity-production",
     nodes: list[str] | None = None,
     *,
     apply: bool = False,
+    source_adapter_dir: str | None = None,
+    source_reference_path: str | None = None,
+    source_adapter_host: str = trainer_head,
+    source_reference_host: str = orchestrator_host,
 ) -> dict[str, object]:
-    """Preflight or stage policy-0 files on every configured trainer.
-
-    The default is a local plan only.  ``apply=True`` uses the existing
-    trainer-head fan-out and verifies the exact files on every selected host.
-    """
+    """Preflight or stage exact policy-0 files on every configured trainer."""
     selected = _config_dir(config_dir)
     if "orchestrator" in selected:
         raise Refused("policy-0 qualification staging accepts a trainer-only config")
@@ -6935,6 +7139,36 @@ def prepare_policy0_qualification(
         validate_lora_config(expected_lora, expected_lora)
     except QualificationError as error:
         raise Refused(f"qualification LoRA settings are invalid: {error}") from error
+    if not isinstance(source_adapter_dir, str) or not source_adapter_dir:
+        raise Refused("source_adapter_dir is required; it must name the preserved step-0 adapter directory")
+    if not isinstance(source_reference_path, str) or not source_reference_path:
+        raise Refused("source_reference_path is required; it must name the fresh H200 reference")
+    for label, path in (
+        ("source adapter directory", source_adapter_dir),
+        ("source reference path", source_reference_path),
+    ):
+        parsed = PurePosixPath(path)
+        if (
+            not parsed.is_absolute()
+            or any(part in {"", ".", ".."} for part in parsed.parts)
+            or parsed.as_posix() != path
+        ):
+            raise Refused(f"{label} must be one canonical absolute path")
+    if source_adapter_host != trainer_head:
+        raise Refused(f"source adapter host must be configured trainer head {trainer_head}")
+    if source_reference_host != orchestrator_host:
+        raise Refused(f"source reference host must be configured H200 {orchestrator_host}")
+    _check_host(source_adapter_host)
+    _check_host(source_reference_host)
+    storage_prefix = f"{storage_root.rstrip('/')}/"
+    if not source_adapter_dir.startswith(storage_prefix):
+        raise Refused("source adapter directory must be below configured storage")
+    if not source_reference_path.startswith(storage_prefix):
+        raise Refused("source reference path must be below configured storage")
+    source_adapter_path = f"{source_adapter_dir.rstrip('/')}/adapter_model.safetensors"
+    source_config_path = f"{source_adapter_dir.rstrip('/')}/adapter_config.json"
+    if source_adapter_dir.rstrip("/") == adapter_dir:
+        raise Refused("source adapter directory must be distinct from qualification destination")
     selected_nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
     selected_nodes = list(dict.fromkeys(selected_nodes))
     verify_script = _policy0_qualification_verify_script(
@@ -6943,42 +7177,107 @@ def prepare_policy0_qualification(
     manifest_script = _policy0_qualification_manifest_script(
         adapter_path, config_path, reference_path
     )
+    source_adapter_script = _policy0_adapter_source_manifest_script(
+        source_adapter_path, source_config_path, expected_lora
+    )
+    source_reference_script = _policy0_reference_source_verify_script(
+        source_reference_path,
+        {"sha256": "expected-after-source-check", "size": 0},
+        {"sha256": "expected-after-source-check", "size": 0},
+    )
+    transfer_reference_script = _policy0_transfer_reference_script(
+        source_reference_path,
+        reference_path,
+        hosts["trainer_ssh"],
+    )
+    stage_adapter_script = _policy0_stage_head_file_script(source_adapter_path, adapter_path)
+    stage_config_script = _policy0_stage_head_file_script(source_config_path, config_path)
     plan = {
         "config": selected["trainer"],
         "nodes": selected_nodes,
         "adapter_path": adapter_path,
         "config_path": config_path,
         "reference_path": reference_path,
+        "source_adapter_host": source_adapter_host,
+        "source_adapter_dir": source_adapter_dir,
+        "source_reference_host": source_reference_host,
+        "source_reference_path": source_reference_path,
+        "source_adapter_path": source_adapter_path,
+        "source_config_path": source_config_path,
         "verify_script": verify_script,
         "manifest_script": manifest_script,
+        "source_adapter_script": source_adapter_script,
+        "source_reference_script": source_reference_script,
+        "transfer_reference_script": transfer_reference_script,
+        "stage_adapter_script": stage_adapter_script,
+        "stage_config_script": stage_config_script,
         "apply": apply,
     }
     if not apply:
         return plan
-    code, output = _ssh(trainer_head, verify_script, timeout=180)
+    code, output = _ssh(source_adapter_host, source_adapter_script, timeout=180)
     if code:
         detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
-        raise Refused(f"trainer-head qualification artifacts failed validation: {detail}")
-    code, output = _ssh(trainer_head, manifest_script, timeout=180)
-    if code:
-        detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
-        raise Refused(f"trainer-head qualification identities failed validation: {detail}")
-    manifest: dict[str, dict[str, int | str]] = {}
+        raise Refused(f"source step-0 adapter failed validation: {detail}")
+    source_manifest: dict[str, dict[str, int | str]] = {}
     for line in output.splitlines():
         parts = line.split()
         if len(parts) == 4 and parts[0] == "QUAL_FILE":
             name, digest, size_text = parts[1:]
             if re.fullmatch(r"[0-9a-f]{64}", digest) and size_text.isdigit():
-                manifest[name] = {"sha256": digest, "size": int(size_text)}
-    if set(manifest) != {"adapter_model.safetensors", "adapter_config.json", "reference.json"}:
-        raise Refused("trainer-head qualification identity output is incomplete")
+                source_manifest[name] = {"sha256": digest, "size": int(size_text)}
+    if set(source_manifest) != {"adapter_model.safetensors", "adapter_config.json"}:
+        raise Refused("source step-0 adapter identity output is incomplete")
+    reference_verify = _policy0_reference_source_verify_script(
+        source_reference_path,
+        source_manifest["adapter_model.safetensors"],
+        source_manifest["adapter_config.json"],
+    )
+    plan["source_reference_script"] = reference_verify
+    code, output = _ssh(source_reference_host, reference_verify, timeout=180)
+    if code:
+        detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
+        raise Refused(f"fresh H200 reference failed validation: {detail}")
+    reference_manifest: dict[str, dict[str, int | str]] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[0] == "QUAL_FILE":
+            name, digest, size_text = parts[1:]
+            if re.fullmatch(r"[0-9a-f]{64}", digest) and size_text.isdigit():
+                reference_manifest[name] = {"sha256": digest, "size": int(size_text)}
+    if set(reference_manifest) != {"reference.json"}:
+        raise Refused("fresh H200 reference identity output is incomplete")
+    code, output = _ssh(source_reference_host, transfer_reference_script, timeout=600)
+    if code:
+        detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
+        raise Refused(f"fresh H200 reference staging failed: {detail}")
+    for source, target in (
+        (source_adapter_path, adapter_path),
+        (source_config_path, config_path),
+    ):
+        code, output = _ssh(
+            trainer_head,
+            stage_adapter_script if target == adapter_path else stage_config_script,
+            timeout=600,
+        )
+        if code:
+            detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
+            raise Refused(f"step-0 adapter staging on {trainer_head} failed: {detail}")
+    for source, target in (
+        (source_adapter_path, adapter_path),
+        (source_config_path, config_path),
+    ):
+        _copy_resume_adapter(source, selected_nodes, target_path=target)
+    manifest = {
+        "adapter_model.safetensors": source_manifest["adapter_model.safetensors"],
+        "adapter_config.json": source_manifest["adapter_config.json"],
+        "reference.json": reference_manifest["reference.json"],
+    }
     verify_script = _policy0_qualification_verify_script(
         adapter_path, config_path, reference_path, expected_lora, manifest
     )
     plan["verify_script"] = verify_script
     plan["manifest"] = manifest
-    for path in (adapter_path, config_path, reference_path):
-        _copy_resume_adapter(path, selected_nodes, allow_qualification=True)
     results = _fan(selected_nodes, lambda host: _ssh(host, verify_script, timeout=180))
     failed = {
         host: " | ".join(output.strip().splitlines()[-3:]) if output.strip() else f"exit {code}"
@@ -8108,13 +8407,62 @@ def _qualify_action(arguments: list[str]):
 
 
 def _prepare_policy0_action(arguments: list[str]):
-    config_dir = arguments[0] if arguments else "configs/trinity-h200-parity-production"
-    mode = arguments[1] if len(arguments) > 1 else "plan"
+    config_dir = "configs/trinity-h200-parity-production"
+    mode = "plan"
+    source_adapter_dir = None
+    source_reference_path = None
+    source_adapter_host = trainer_head
+    source_reference_host = orchestrator_host
+    positional = []
+    index = 0
+    options = {
+        "--source-adapter-dir": "adapter",
+        "--source-reference-path": "reference",
+        "--source-adapter-host": "adapter_host",
+        "--source-reference-host": "reference_host",
+    }
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in options:
+            index += 1
+            if index >= len(arguments):
+                raise Refused(f"{argument} requires a value")
+            value = arguments[index]
+            if options[argument] == "adapter":
+                source_adapter_dir = value
+            elif options[argument] == "reference":
+                source_reference_path = value
+            elif options[argument] == "adapter_host":
+                source_adapter_host = value
+            else:
+                source_reference_host = value
+        elif argument.startswith("--"):
+            raise Refused(f"unknown prepare-policy0 option {argument}")
+        else:
+            positional.append(argument)
+        index += 1
+    if positional:
+        config_dir = positional[0]
+    if len(positional) > 1:
+        mode = positional[1]
+    if len(positional) > 2:
+        raise Refused("prepare-policy0 accepts one config directory and one mode")
     if mode not in {"plan", "stage"}:
         raise Refused("prepare-policy0 mode must be plan or stage")
-    result = prepare_policy0_qualification(config_dir, apply=mode == "stage")
+    result = prepare_policy0_qualification(
+        config_dir,
+        apply=mode == "stage",
+        source_adapter_dir=source_adapter_dir,
+        source_reference_path=source_reference_path,
+        source_adapter_host=source_adapter_host,
+        source_reference_host=source_reference_host,
+    )
     if mode == "plan":
-        print(json.dumps({key: value for key, value in result.items() if key != "verify_script"}, indent=2))
+        print(json.dumps({
+            key: value
+            for key, value in result.items()
+            if not key.endswith("_script") and key != "verify_script"
+        }, indent=2))
     else:
         print("staged and verified policy-0 qualification artifacts on all selected trainers")
     return result
@@ -8193,7 +8541,8 @@ usage = f"""training-ops <action> [args]
   archive <run> [step ...]      upload stable old LoRA adapters
                                 add --finished after another run is active
   qualify <name> [mode] [config-dir]  start a trainer-only config directory
-  prepare-policy0 [config-dir] [plan|stage]  preflight or stage policy-0 qualification files
+  prepare-policy0 [config-dir] [plan|stage] \
+    --source-adapter-dir DIR --source-reference-path FILE  preflight or stage policy-0 files
   mounts                        list live-mounted source files
   stop                          stop the run but keep inference loaded
 

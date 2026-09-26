@@ -654,3 +654,8 @@ only after measured learning.
 
 - Reviewer measured that the prior policy-0 reference requested `max_tokens=1` and prompt logprobs, then discarded generated token IDs and scores. It did not qualify the decode path and compared only a caller-supplied receipt.
 - The corrected experiment requests a fresh deterministic completion with exact prompt and completion IDs/logprobs, a zero prompt loss mask and completion-token loss mask, and routed experts aligned to every token. It fetches an explicit readiness receipt immediately before and after generation and requires the active endpoint identity to remain unchanged. A verified step-0 adapter, config, and reference are staged to every configured trainer with existing `training_ops` APIs before an operator invokes qualification. No cached rollout data or live action is part of this change.
+
+## Policy-0 staging review corrections
+
+- Review measured that remote verification read the full 16.5 GB adapter into one Python buffer. The verifier must hash in bounded blocks. Review also found that `prepare-policy0 stage` only checked files already present on n82; it did not stage the preserved step-0 adapter/config or the fresh H200 reference.
+- The corrected local-only plan adds explicit source paths and host identities, refuses missing, symlinked, conflicting, or digest-mismatched sources/destinations, stages the small reference through the configured H200 connection, stages adapter/config only from n82 over the trainer LAN, and atomically verifies every destination. It must preserve source files and bind the reference receipt to the staged adapter/config SHA and size. No model-weight transfer is allowed.
