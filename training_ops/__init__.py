@@ -147,6 +147,7 @@ trinity_trainer_loss_sha256 = (
 trinity_trainer_loss_size = 16446
 trinity_trainer_loss_mode = "644"
 trinity_trainer_loss_identity_env = "PRIME_RL_TRAINER_LOSS_IDENTITY"
+trinity_post_update_reference_identity_env = "PRIME_RL_POST_UPDATE_REFERENCE_IDENTITY"
 
 
 def _adapter_stage_limit_seconds(policy_step: int) -> int:
@@ -6034,8 +6035,48 @@ def _qualification_launch_env(profile: dict) -> dict[str, str]:
     return validated
 
 
+def _validate_post_update_reference_identity(value: object) -> dict[str, str | int]:
+    if not isinstance(value, dict):
+        raise Refused("post-update reference identity must be an object")
+    fields = (
+        "final_reference_sha256",
+        "final_reference_size",
+        "server_instance",
+        "adapter_sha256",
+        "adapter_size",
+        "config_sha256",
+        "config_size",
+    )
+    if set(value) != set(fields):
+        raise Refused("post-update reference identity fields are incomplete")
+    for field in ("final_reference_sha256", "adapter_sha256", "config_sha256"):
+        if not isinstance(value[field], str) or re.fullmatch(r"[0-9a-f]{64}", value[field]) is None:
+            raise Refused(f"post-update reference identity {field} is invalid")
+    for field in ("final_reference_size", "adapter_size", "config_size"):
+        if type(value[field]) is not int or value[field] <= 0:
+            raise Refused(f"post-update reference identity {field} is invalid")
+    if not isinstance(value["server_instance"], str) or not value["server_instance"]:
+        raise Refused("post-update reference identity server_instance is invalid")
+    return value
+
+
+def _post_update_reference_identity() -> dict[str, str | int]:
+    raw = os.environ.get(trinity_post_update_reference_identity_env, "")
+    if not raw:
+        raise Refused(
+            "post-update reference identity is not configured; provide the measured final artifact receipt"
+        )
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise Refused("post-update reference identity is not valid JSON") from error
+    return _validate_post_update_reference_identity(value)
+
+
 def _validate_post_update_qualification_reference(
-    trainer_config: dict, reference_path: Path
+    trainer_config: dict,
+    reference_path: Path,
+    expected_identity: dict[str, str | int] | None = None,
 ) -> dict:
     """Validate the local eight-reference post-update input before any SSH."""
     fake = trainer_config.get("data", {}).get("fake", {})
@@ -6044,12 +6085,27 @@ def _validate_post_update_qualification_reference(
         raise Refused("post-update qualification requires batch_size=8 and seq_len=8192")
     if reference_path.is_symlink() or not reference_path.is_file():
         raise Refused(f"missing local post-update reference {reference_path}")
+    if expected_identity is None:
+        expected_identity = _post_update_reference_identity()
     try:
         reference = json.loads(reference_path.read_text(encoding="utf-8"))
         validate_post_update_references(
             reference,
             expected_seq_len=model["seq_len"],
         )
+        digest = hashlib.sha256(reference_path.read_bytes()).hexdigest()
+        if digest != expected_identity["final_reference_sha256"] or reference_path.stat().st_size != expected_identity["final_reference_size"]:
+            raise PostUpdateQualificationError("post-update final reference identity differs")
+        for item in reference["microbatches"]:
+            binding = item["qualification_binding"]
+            if (
+                binding.get("server_instance") != expected_identity["server_instance"]
+                or binding.get("adapter_sha256") != expected_identity["adapter_sha256"]
+                or binding.get("adapter_size") != expected_identity["adapter_size"]
+                or binding.get("config_sha256") != expected_identity["config_sha256"]
+                or binding.get("config_size") != expected_identity["config_size"]
+            ):
+                raise PostUpdateQualificationError("post-update reference receipt identity differs")
     except (
         OSError,
         json.JSONDecodeError,

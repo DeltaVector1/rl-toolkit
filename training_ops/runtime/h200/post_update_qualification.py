@@ -12,7 +12,9 @@ import json
 import math
 import base64
 import binascii
+import os
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -31,6 +33,13 @@ POST_UPDATE_COMPLETION_TOKENS = 32
 POST_UPDATE_ROUTE_SHAPE = [8191, 60, 4]
 POST_UPDATE_ADVANTAGE_VALUE = 1.0
 FORWARD_BACKWARD_GATE_SECONDS = 600.0
+_POST_UPDATE_SAMPLING_PARAMS = {
+    "max_tokens": POST_UPDATE_COMPLETION_TOKENS,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "logprobs": 1,
+    "min_tokens": POST_UPDATE_COMPLETION_TOKENS,
+}
 
 _EXPECTED_TARGETS = {
     "q_proj",
@@ -65,6 +74,33 @@ def _json_sha256(value: Any) -> str:
     ).hexdigest()
 
 
+def _atomic_no_clobber_write(path: Path, payload: str) -> None:
+    """Publish one final artifact without replacing an existing artifact."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.partial.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError as error:
+            raise PostUpdateQualificationError(
+                f"refusing to clobber existing qualification output: {path}"
+            ) from error
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _post_update_binding(
     reference: Mapping[str, Any],
     *,
@@ -82,6 +118,9 @@ def _post_update_binding(
     response = responses.get("decode")
     if not isinstance(request, Mapping) or not isinstance(response, Mapping):
         raise PostUpdateQualificationError("post-update reference decode evidence is missing")
+    request_id = request.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise PostUpdateQualificationError("post-update request ID is missing")
     server_instance = receipt.get("server_instance")
     target_sha = receipt.get("target_sha256")
     config_sha = receipt.get("config_sha256")
@@ -113,6 +152,9 @@ def _post_update_binding(
         "full_input_sha256": _json_sha256(input_ids),
         "request_sha256": _json_sha256(request),
         "response_sha256": _json_sha256(response),
+        "request_id": request_id,
+        "adapter_size": receipt.get("target_size"),
+        "config_size": receipt.get("config_size"),
         "route_shape": list(route["shape"]),
         "route_sha256": route.get("sha256"),
         "advantage_value": advantage_value,
@@ -136,49 +178,73 @@ def build_post_update_reference(
     advantage_value: float = POST_UPDATE_ADVANTAGE_VALUE,
 ) -> dict[str, Any]:
     """Build one strict reference from one fresh serialized completion decode."""
+    if output_path.exists() or output_path.is_symlink():
+        raise PostUpdateQualificationError(
+            f"refusing to clobber existing qualification output: {output_path}"
+        )
     if isinstance(advantage_value, bool) or not math.isfinite(float(advantage_value)) or float(advantage_value) == 0.0:
         raise PostUpdateQualificationError("post-update advantage value must be finite and nonzero")
+    from . import build_trinity_parity_reference as reference_builder
     from .build_trinity_parity_reference import build_reference
 
     kwargs: dict[str, Any] = {}
-    if post_json is not None:
-        kwargs["post_json"] = post_json
     if get_json is not None:
         kwargs["get_json"] = get_json
-    try:
-        result = build_reference(
-            endpoint=endpoint,
-            input_record=input_record,
-            output_path=output_path,
-            base_model=base_model,
-            policy="policy-0",
-            policy_model=policy_model,
-            policy_receipt=policy_receipt,
-            expected_policy_identity=expected_policy_identity,
-            cache_salt=cache_salt,
-            prefill_rescore=False,
-            readiness_endpoint=readiness_endpoint,
-            completion_tokens=POST_UPDATE_COMPLETION_TOKENS,
-            minimum_completion_tokens=POST_UPDATE_COMPLETION_TOKENS,
-            trainer_seq_len=POST_UPDATE_SEQ_LEN,
-            minimum_tokens=POST_UPDATE_PROMPT_TOKENS,
-            expected_route_shape=POST_UPDATE_ROUTE_SHAPE,
-            timeout=timeout,
-            **kwargs,
+    actual_post_json = post_json or reference_builder._post_json
+
+    def request_with_identity(url: str, body: Mapping[str, Any], request_timeout: float) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise PostUpdateQualificationError("post-update request body is not mutable")
+        request_id = _json_sha256(body)
+        body["request_id"] = request_id
+        response = actual_post_json(url, body, request_timeout)
+        if not isinstance(response, Mapping):
+            raise PostUpdateQualificationError("post-update response is not an object")
+        returned_id = response.get("request_id")
+        if returned_id is not None and returned_id != request_id:
+            raise PostUpdateQualificationError("post-update response request ID differs")
+        return dict(response)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output_path.parent, prefix=f".{output_path.name}.build.") as directory:
+        temporary_output = Path(directory) / output_path.name
+        try:
+            result = build_reference(
+                endpoint=endpoint,
+                input_record=input_record,
+                output_path=temporary_output,
+                base_model=base_model,
+                policy="policy-0",
+                policy_model=policy_model,
+                policy_receipt=policy_receipt,
+                expected_policy_identity=expected_policy_identity,
+                cache_salt=cache_salt,
+                prefill_rescore=False,
+                readiness_endpoint=readiness_endpoint,
+                completion_tokens=POST_UPDATE_COMPLETION_TOKENS,
+                minimum_completion_tokens=POST_UPDATE_COMPLETION_TOKENS,
+                trainer_seq_len=POST_UPDATE_SEQ_LEN,
+                minimum_tokens=POST_UPDATE_PROMPT_TOKENS,
+                expected_route_shape=POST_UPDATE_ROUTE_SHAPE,
+                timeout=timeout,
+                post_json=request_with_identity,
+                **kwargs,
+            )
+        except Exception as error:
+            if error.__class__.__name__ == "ReferenceError":
+                raise PostUpdateQualificationError(str(error)) from error
+            raise
+        if result.get("request_mode") != POST_UPDATE_REQUEST_MODE or "prefill_rescore_comparison" in result:
+            raise PostUpdateQualificationError("post-update reference must use one completion decode")
+        if len(result.get("input_ids", [])) != POST_UPDATE_SEQ_LEN:
+            raise PostUpdateQualificationError("post-update reference length is not 8192")
+        result["advantages"] = [0.0] * POST_UPDATE_PROMPT_TOKENS + [float(advantage_value)] * POST_UPDATE_COMPLETION_TOKENS
+        result["qualification_binding"] = _post_update_binding(
+            result, advantage_value=float(advantage_value)
         )
-    except Exception as error:
-        if error.__class__.__name__ == "ReferenceError":
-            raise PostUpdateQualificationError(str(error)) from error
-        raise
-    if result.get("request_mode") != POST_UPDATE_REQUEST_MODE or "prefill_rescore_comparison" in result:
-        raise PostUpdateQualificationError("post-update reference must use one completion decode")
-    if len(result.get("input_ids", [])) != POST_UPDATE_SEQ_LEN:
-        raise PostUpdateQualificationError("post-update reference length is not 8192")
-    result["advantages"] = [0.0] * POST_UPDATE_PROMPT_TOKENS + [float(advantage_value)] * POST_UPDATE_COMPLETION_TOKENS
-    result["qualification_binding"] = _post_update_binding(
-        result, advantage_value=float(advantage_value)
-    )
-    output_path.write_text(json.dumps(result, separators=(",", ":")) + "\n")
+        # The builder's temporary file is discarded; only this final link is public.
+        temporary_output.write_text(json.dumps(result, separators=(",", ":")) + "\n", encoding="utf-8")
+        _atomic_no_clobber_write(output_path, temporary_output.read_text(encoding="utf-8"))
     return result
 
 
@@ -197,6 +263,26 @@ def build_post_update_references(
     cache_salt = kwargs.pop("cache_salt", None)
     if not isinstance(cache_salt, str) or not cache_salt:
         raise PostUpdateQualificationError("post-update qualification requires a fresh cache salt")
+    if output_path.exists() or output_path.is_symlink():
+        raise PostUpdateQualificationError(
+            f"refusing to clobber existing qualification output: {output_path}"
+        )
+    prompt_hashes: list[str] = []
+    for record in input_records:
+        if isinstance(record, Path):
+            try:
+                loaded = json.loads(record.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise PostUpdateQualificationError("post-update input record is invalid") from error
+        else:
+            loaded = record
+        if not isinstance(loaded, Mapping) or not isinstance(loaded.get("input_ids"), list):
+            raise PostUpdateQualificationError("post-update input record must contain input_ids")
+        if len(loaded["input_ids"]) != POST_UPDATE_PROMPT_TOKENS:
+            raise PostUpdateQualificationError("post-update input records must contain 8160 prompt tokens")
+        prompt_hashes.append(_json_sha256(loaded["input_ids"]))
+    if len(set(prompt_hashes)) != 8:
+        raise PostUpdateQualificationError("post-update input records must be eight distinct prompts")
     built: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(dir=output_path.parent) as directory:
         for index, record in enumerate(input_records):
@@ -215,7 +301,7 @@ def build_post_update_references(
     if len(set(input_hashes)) != 8 or len(set(response_hashes)) != 8:
         raise PostUpdateQualificationError("post-update references must have unique input and response hashes")
     result = {"schema_version": 1, "microbatches": built}
-    output_path.write_text(json.dumps(result, separators=(",", ":")) + "\n")
+    _atomic_no_clobber_write(output_path, json.dumps(result, separators=(",", ":")) + "\n")
     return result
 
 
@@ -351,6 +437,51 @@ def validate_post_update_reference(
     if validated.get("routed_experts", {}).get("shape") != POST_UPDATE_ROUTE_SHAPE:
         raise PostUpdateQualificationError("post-update reference route shape must be [8191,60,4]")
     _validate_post_update_route(validated["routed_experts"])
+    request_bodies = validated.get("request_bodies")
+    responses = validated.get("responses")
+    stored_request_hashes = validated.get("request_sha256")
+    stored_response_hashes = validated.get("response_sha256")
+    if (
+        not isinstance(request_bodies, Mapping)
+        or not isinstance(responses, Mapping)
+        or not isinstance(stored_request_hashes, Mapping)
+        or not isinstance(stored_response_hashes, Mapping)
+        or not isinstance(request_bodies.get("decode"), Mapping)
+        or not isinstance(responses.get("decode"), Mapping)
+        or stored_request_hashes.get("decode") != _json_sha256(request_bodies["decode"])
+        or stored_response_hashes.get("decode") != _json_sha256(responses["decode"])
+    ):
+        raise PostUpdateQualificationError("post-update request or response hash differs")
+    request = request_bodies["decode"]
+    if request.get("sampling_params") != _POST_UPDATE_SAMPLING_PARAMS:
+        raise PostUpdateQualificationError("post-update sampling parameters are not deterministic")
+    if request.get("token_ids") != input_ids[:POST_UPDATE_PROMPT_TOKENS]:
+        raise PostUpdateQualificationError("post-update request tokens differ from the reference prompt")
+    if request.get("cache_salt") != validated.get("cache_salt"):
+        raise PostUpdateQualificationError("post-update request cache salt differs")
+    request_id = request.get("request_id")
+    if not isinstance(request_id, str) or not request_id:
+        raise PostUpdateQualificationError("post-update request ID is missing")
+    response = responses["decode"]
+    choices = response.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], Mapping):
+        raise PostUpdateQualificationError("post-update response choice is missing")
+    choice = choices[0]
+    if choice.get("token_ids") != validated.get("generated_token_ids"):
+        raise PostUpdateQualificationError("post-update response token IDs differ")
+    try:
+        from .build_trinity_parity_reference import _flatten_completion_logprobs, _normalise_route
+
+        response_logprobs = _flatten_completion_logprobs(
+            choice.get("logprobs"), list(validated.get("generated_token_ids", []))
+        )
+        response_route = _normalise_route(choice.get("routed_experts"), POST_UPDATE_SEQ_LEN - 1)
+    except Exception as error:
+        raise PostUpdateQualificationError("post-update response token evidence is invalid") from error
+    if response_logprobs != validated["inference_logprobs"][POST_UPDATE_PROMPT_TOKENS:]:
+        raise PostUpdateQualificationError("post-update response logprobs differ")
+    if response_route != validated.get("routed_experts"):
+        raise PostUpdateQualificationError("post-update response route differs")
     before = validated.get("policy_identity_before")
     after = validated.get("policy_identity_after")
     policy = validated.get("policy_identity")
@@ -397,7 +528,15 @@ def validate_post_update_references(
     ]
     input_hashes = [item["qualification_binding"]["input_sha256"] for item in validated]
     response_hashes = [item["qualification_binding"]["response_sha256"] for item in validated]
-    if len(set(input_hashes)) != 8 or len(set(response_hashes)) != 8:
+    salts = [item.get("cache_salt") for item in validated]
+    request_ids = [item["qualification_binding"]["request_id"] for item in validated]
+    if (
+        len(set(input_hashes)) != 8
+        or len(set(response_hashes)) != 8
+        or len(set(salts)) != 8
+        or any(not isinstance(salt, str) or not salt for salt in salts)
+        or len(set(request_ids)) != 8
+    ):
         raise PostUpdateQualificationError("post-update microbatch input or response hashes are reused")
     return {"schema_version": 1, "microbatches": validated}
 
@@ -620,3 +759,47 @@ def validate_post_update_evidence(
         "config_sha256": identity["config_sha256"],
         "config_size": identity["config_size"],
     }
+
+
+def _post_update_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--endpoint", required=True)
+    parser.add_argument("--input-record", action="append", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--base-model", required=True)
+    parser.add_argument("--policy-model", required=True)
+    parser.add_argument("--expected-policy-identity", required=True, type=Path)
+    parser.add_argument("--policy-receipt", required=True, type=Path)
+    parser.add_argument("--cache-salt", required=True)
+    parser.add_argument("--readiness-endpoint", required=True)
+    parser.add_argument("--timeout", type=float, default=120.0)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _post_update_parser()
+    args = parser.parse_args(argv)
+    if len(args.input_record) != 8:
+        parser.error("exactly eight --input-record values are required")
+    try:
+        build_post_update_references(
+            endpoint=args.endpoint,
+            input_records=args.input_record,
+            output_path=args.output,
+            base_model=args.base_model,
+            policy_model=args.policy_model,
+            expected_policy_identity=args.expected_policy_identity,
+            policy_receipt=args.policy_receipt,
+            cache_salt=args.cache_salt,
+            readiness_endpoint=args.readiness_endpoint,
+            timeout=args.timeout,
+        )
+    except PostUpdateQualificationError as error:
+        parser.error(str(error))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -190,6 +190,10 @@ class FakeDataLoader:
             self.references = reference_payload.get("microbatches", [reference_payload])
             if not self.references:
                 raise ValueError("fake reference contains no microbatches")
+            if config.export_final_adapter and len(self.references) != self.num_micro_batches:
+                raise ValueError(
+                    "export_final_adapter requires one distinct reference per microbatch"
+                )
             if len(self.references) not in (1, self.num_micro_batches):
                 raise ValueError(
                     "fake reference must contain one microbatch or exactly "

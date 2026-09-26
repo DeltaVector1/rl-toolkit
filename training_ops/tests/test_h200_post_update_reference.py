@@ -3,6 +3,7 @@ import ast
 import copy
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import training_ops
+import training_ops.runtime.h200.post_update_qualification as post_update
 from training_ops.runtime.h200.post_update_qualification import (
     PostUpdateQualificationError,
     build_post_update_reference,
@@ -148,6 +150,169 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
                     expected_seq_len=SEQ_LEN,
                     expected_policy_identity=self.receipt(),
                 )
+
+    def test_validator_recomputes_stored_request_and_response_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.build(Path(directory) / "reference.json")
+        for field in ("request_sha256", "response_sha256"):
+            changed = copy.deepcopy(result)
+            changed[field]["decode"] = "0" * 64
+            with self.subTest(field=field), self.assertRaises(PostUpdateQualificationError):
+                validate_post_update_reference(
+                    changed,
+                    expected_seq_len=SEQ_LEN,
+                    expected_policy_identity=self.receipt(),
+                )
+
+    def test_builder_adds_distinct_request_ids_and_binds_response_fields(self):
+        records = []
+        responses = []
+        for index in range(8):
+            record = self.input_record()
+            record["input_ids"] = [token + index * 10000 for token in record["input_ids"]]
+            records.append(record)
+            response = self.response()
+            response["choices"][0]["token_ids"] = [10000 + index * 100 + token for token in range(32)]
+            response["choices"][0]["logprobs"]["content"] = [
+                {"token": f"token_id:{token}", "logprob": -0.25}
+                for token in response["choices"][0]["token_ids"]
+            ]
+            responses.append(response)
+        with tempfile.TemporaryDirectory() as directory:
+            result = build_post_update_references(
+                endpoint="http://h200b:18100/inference/v1/generate",
+                input_records=records,
+                output_path=Path(directory) / "reference.json",
+                base_model="/data/trinity-thinking-fp8",
+                policy_model="policy-0-slot0",
+                expected_policy_identity=self.receipt(),
+                policy_receipt=self.receipt(),
+                cache_salt="fresh-post-update-decode",
+                readiness_endpoint="http://h200b:18100/inference/v1/staging-status",
+                post_json=lambda *_: responses.pop(0),
+                get_json=lambda *_: self.receipt(),
+            )
+        ids = [item["request_bodies"]["decode"].get("request_id") for item in result["microbatches"]]
+        self.assertEqual(len(ids), 8)
+        self.assertEqual(len(set(ids)), 8)
+        self.assertTrue(all(isinstance(value, str) and value for value in ids))
+        for item in result["microbatches"]:
+            self.assertEqual(
+                item["qualification_binding"]["request_sha256"],
+                item["request_sha256"]["decode"],
+            )
+
+    def test_validator_rejects_reused_salts_and_unbound_response_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.build(Path(directory) / "reference.json")
+        changed = copy.deepcopy(result)
+        changed["cache_salt"] = "same-salt"
+        changed["request_bodies"]["decode"]["cache_salt"] = "same-salt"
+        changed["qualification_binding"] = post_update._post_update_binding(changed)
+        with self.assertRaises(PostUpdateQualificationError):
+            validate_post_update_reference(
+                changed,
+                expected_seq_len=SEQ_LEN,
+                expected_policy_identity=self.receipt(),
+            )
+        changed = copy.deepcopy(result)
+        changed["request_bodies"]["decode"]["sampling_params"]["temperature"] = 0.2
+        changed["qualification_binding"] = post_update._post_update_binding(changed)
+        with self.assertRaises(PostUpdateQualificationError):
+            validate_post_update_reference(
+                changed,
+                expected_seq_len=SEQ_LEN,
+                expected_policy_identity=self.receipt(),
+            )
+        changed = copy.deepcopy(result)
+        changed["responses"]["decode"]["choices"][0]["routed_experts"]["data"] = base64.b64encode(b"bad").decode()
+        changed["qualification_binding"] = post_update._post_update_binding(changed)
+        with self.assertRaises(PostUpdateQualificationError):
+            validate_post_update_reference(
+                changed,
+                expected_seq_len=SEQ_LEN,
+                expected_policy_identity=self.receipt(),
+            )
+        changed = copy.deepcopy(result)
+        changed["generated_token_ids"][0] += 1
+        changed["qualification_binding"] = post_update._post_update_binding(changed)
+        with self.assertRaises(PostUpdateQualificationError):
+            validate_post_update_reference(
+                changed,
+                expected_seq_len=SEQ_LEN,
+                expected_policy_identity=self.receipt(),
+            )
+        changed = copy.deepcopy(result)
+        changed["inference_logprobs"][-1] = -0.5
+        changed["qualification_binding"] = post_update._post_update_binding(changed)
+        with self.assertRaises(PostUpdateQualificationError):
+            validate_post_update_reference(
+                changed,
+                expected_seq_len=SEQ_LEN,
+                expected_policy_identity=self.receipt(),
+            )
+
+    def test_builder_rejects_duplicate_inputs_before_requests(self):
+        calls = []
+        records = [self.input_record() for _ in range(8)]
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(PostUpdateQualificationError):
+            build_post_update_references(
+                endpoint="http://h200b:18100/inference/v1/generate",
+                input_records=records,
+                output_path=Path(directory) / "reference.json",
+                base_model="/data/trinity-thinking-fp8",
+                policy_model="policy-0-slot0",
+                expected_policy_identity=self.receipt(),
+                policy_receipt=self.receipt(),
+                cache_salt="fresh-post-update-decode",
+                readiness_endpoint="http://h200b:18100/inference/v1/staging-status",
+                post_json=lambda *_: calls.append(True) or self.response(),
+                get_json=lambda *_: self.receipt(),
+            )
+        self.assertEqual(calls, [])
+
+    def test_final_reference_publication_is_no_clobber(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "reference.json"
+            self.build(output)
+            original = output.read_bytes()
+            with self.assertRaises(PostUpdateQualificationError):
+                self.build(output)
+            self.assertEqual(output.read_bytes(), original)
+
+    def test_qualify_requires_caller_supplied_reference_identity(self):
+        config = {
+            "data": {"fake": {"batch_size": 8}},
+            "model": {"seq_len": 8192},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "reference.json"
+            path.write_text(json.dumps({"schema_version": 1, "microbatches": []}))
+            with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(training_ops.Refused):
+                training_ops._validate_post_update_qualification_reference(config, path)
+
+    def test_export_mode_rejects_singleton_reference_cycling(self):
+        source = (ROOT / "prime-rl/src/prime_rl/trainer/rl/data.py").read_text()
+        self.assertIn(
+            "config.export_final_adapter and len(self.references) != self.num_micro_batches",
+            source,
+        )
+
+    def test_builder_cli_requires_exactly_eight_records(self):
+        arguments = [
+            "--endpoint", "http://h200b:18100/inference/v1/generate",
+            "--output", "/tmp/post-update-reference.json",
+            "--base-model", "/data/trinity-thinking-fp8",
+            "--policy-model", "policy-0-slot0",
+            "--expected-policy-identity", "/tmp/expected.json",
+            "--policy-receipt", "/tmp/receipt.json",
+            "--cache-salt", "fresh-post-update-decode",
+            "--readiness-endpoint", "http://h200b:18100/inference/v1/staging-status",
+        ]
+        for index in range(7):
+            arguments.extend(["--input-record", f"/tmp/input-{index}.json"])
+        with self.assertRaises(SystemExit):
+            post_update.main(arguments)
 
     def test_eight_microbatches_are_distinct_actual_decode_references(self):
         records = []
