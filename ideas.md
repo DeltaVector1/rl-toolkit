@@ -610,3 +610,16 @@ only after measured learning.
   FP8, topology, reward, rollout, and strict parity settings. The guard must
   fail closed before optimizer or weight broadcast when parity mismatches.
   Preserve the completed parity run and do not change production settings.
+
+## Reconcile validated stale watchdog identities
+
+- Measured state: two own-process-group watchdogs served the same h200b
+  container, model, start script, and port. Their identities were
+  parity-production and experimental-parity. Trainers were idle, the
+  orchestrator was down, and the engine was healthy, but cold start refused
+  the ambiguous watchdog set.
+- Plan: accept multiple candidates only when every one has the exact static
+  host, container, kind, model, start script, startup grace, and port. Stop
+  each validated process with the existing process-group checks, then start
+  and verify one desired watchdog. Keep refusal for mismatched, unreadable,
+  shared-group, or otherwise unverified candidates.

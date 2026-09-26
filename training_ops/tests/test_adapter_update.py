@@ -1226,16 +1226,19 @@ class AdapterUpdateTest(unittest.TestCase):
             result.stdout,
         )
 
-    def test_repair_rejects_ambiguous_stale_watchdogs(self):
+    def test_repair_replaces_multiple_validated_stale_watchdogs(self):
         result = self.run_watchdog_repair_script(
             [
-                (self.watchdog_environment(identity="engine-watchdog:h200a:old-1:8000"), True),
-                (self.watchdog_environment(identity="engine-watchdog:h200a:old-2:8000"), True),
+                (self.watchdog_environment(identity="engine-watchdog:h200a:parity-production:8000"), True),
+                (self.watchdog_environment(identity="engine-watchdog:h200a:experimental-parity:8000"), True),
             ]
         )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("ambiguous", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "reloaded exact engine watchdog(s) without restarting an engine",
+            result.stdout,
+        )
 
     def test_repair_rejects_watchdog_with_shared_process_group(self):
         result = self.run_watchdog_repair_script(
