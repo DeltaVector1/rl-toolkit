@@ -65,6 +65,20 @@ class FixedConfigTest(unittest.TestCase):
             f"/data/glm52-rl/runs/{run}/run_{run}",
         )
         self.assertEqual(
+            Path(trainer["output_dir"]) / trainer["file_monitor"]["filename"],
+            Path(f"/data/glm52-rl/runs/{run}/run_{run}")
+            / "trainer-metrics.jsonl",
+        )
+        self.assertEqual(
+            Path(orchestrator["output_dir"]) / orchestrator["file_monitor"]["filename"],
+            Path(f"/data/glm52-rl/runs/{run}/run_{run}")
+            / "rollout-metrics.jsonl",
+        )
+        self.assertNotIn(
+            f"run_{run}/run_{run}",
+            str(Path(orchestrator["output_dir"]) / orchestrator["file_monitor"]["filename"]),
+        )
+        self.assertEqual(
             orchestrator["weight_broadcast"]["source_url"],
             f"http://127.0.0.1:18100/{run}",
         )

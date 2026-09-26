@@ -23,7 +23,7 @@ tags = ["trinity-thinking", "decensor", "grpo", "lora-r32", "50-step", "refusal-
 mode = "online"
 
 [file_monitor]
-filename = "run_trinity-decensor-experimental-fixed/rollout-metrics.jsonl"
+filename = "rollout-metrics.jsonl"
 
 [model]
 name = "/data/trinity-thinking-fp8"

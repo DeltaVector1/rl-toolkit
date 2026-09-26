@@ -623,3 +623,14 @@ only after measured learning.
   each validated process with the existing process-group checks, then start
   and verify one desired watchdog. Keep refusal for mismatched, unreadable,
   shared-group, or otherwise unverified candidates.
+
+## Fix fixed-run orchestrator metric path
+
+- Measured failure: the fixed orchestrator output directory is
+  `/data/glm52-rl/runs/trinity-decensor-experimental-fixed/run_trinity-decensor-experimental-fixed`,
+  but its file monitor filename also starts with
+  `run_trinity-decensor-experimental-fixed/`. The effective path is therefore
+  duplicated and missing, which causes `FileNotFoundError`.
+- Plan: follow the existing orchestrator path contract and use the bare
+  `rollout-metrics.jsonl` filename. Keep the trainer's nested filename because
+  its output directory is the run root. Add a test for both effective paths.
