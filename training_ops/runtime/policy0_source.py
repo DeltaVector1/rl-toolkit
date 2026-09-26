@@ -116,6 +116,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -159,6 +160,38 @@ def regular(path, label):
     return identity(path)
 
 
+def read_regular_bytes(path, label):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        fail(f"{label} cannot be opened without following a symlink: {error}")
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            fail(f"{label} is not a regular file")
+        data = bytearray()
+        while block := os.read(fd, 1024 * 1024):
+            data.extend(block)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+    ):
+        fail(f"{label} changed during the pinned read")
+    value = bytes(data)
+    return value, {
+        "size": len(value),
+        "sha256": hashlib.sha256(value).hexdigest(),
+        "inode": before.st_ino,
+        "mtime_ns": before.st_mtime_ns,
+    }
+
+
 def no_symlink_path(root, path, label):
     try:
         parts = path.relative_to(root).parts
@@ -187,8 +220,9 @@ def load_json(path, label):
     return value
 
 
-def validate_legacy_config(path):
-    value = load_json(path, "source adapter_config.json")
+def validate_legacy_config(value):
+    if not isinstance(value, dict):
+        fail("source adapter_config.json is not an object")
     allowed = {
         "peft_type", "task_type", "base_model_name_or_path", "r",
         "lora_alpha", "lora_dropout", "bias", "target_modules",
@@ -280,8 +314,12 @@ def validate_source():
             fail("source adapter has an active writer marker")
     if any(path.is_file() for path in source_dir.glob("*.partial")):
         fail("source adapter has a partial writer artifact")
-    config_value = validate_legacy_config(source_config)
-    config_identity = regular(source_config, "source adapter_config.json")
+    config_bytes, config_identity = read_regular_bytes(source_config, "source adapter_config.json")
+    try:
+        config_value = json.loads(config_bytes.decode("utf-8"))
+    except (UnicodeError, ValueError) as error:
+        fail(f"source adapter_config.json is invalid: {error}")
+    config_value = validate_legacy_config(config_value)
     weight_identity = regular(source_adapter, "source adapter_model.safetensors")
     sidecar_path = source_dir / "adapter_model.safetensors.sha256"
     sidecar_identity = regular(sidecar_path, "source adapter checksum sidecar")
@@ -290,7 +328,7 @@ def validate_source():
     manifest_path = source_dir / "adapter_manifest.json"
     manifest_identity = regular(manifest_path, "source adapter manifest")
     manifest = load_json(manifest_path, "source adapter manifest")
-    if manifest.get("version") not in (1, 2) or manifest.get("kind") != "lora-adapter" or manifest.get("mode") != "full" or manifest.get("target_step") != 0 or manifest.get("base_step") is not None:
+    if type(manifest.get("version")) is not int or manifest.get("version") != 1 or manifest.get("kind") != "lora-adapter" or manifest.get("mode") != "full" or type(manifest.get("target_step")) is not int or manifest.get("target_step") != 0 or manifest.get("base_step") is not None:
         fail("source adapter manifest is not a full step-0 manifest")
     if manifest.get("full_size") != weight_identity["size"] or manifest.get("full_sha256") != weight_identity["sha256"] or manifest.get("target_size") != weight_identity["size"] or manifest.get("target_sha256") != weight_identity["sha256"]:
         fail("source adapter manifest weight identity differs")

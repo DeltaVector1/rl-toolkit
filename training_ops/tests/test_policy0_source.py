@@ -207,6 +207,17 @@ def test_script_refuses_unexpected_legacy_config(tmp_path):
     assert "unexpected fields" in result.stderr
 
 
+def test_script_refuses_version_two_full_manifest(tmp_path):
+    plan, source, _ = local_plan(tmp_path)
+    manifest_path = source / "adapter_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = 2
+    manifest_path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n")
+    result = run_script(build_apply_script(plan))
+    assert result.returncode != 0
+    assert "full step-0 manifest" in result.stderr
+
+
 @pytest.mark.parametrize(("field", "value", "message"), [
     ("r", 16, "rank is not 32"),
     ("lora_dropout", 0.1, "dropout is not zero"),
@@ -229,6 +240,9 @@ def test_script_has_source_change_and_no_replace_race_guards(tmp_path):
     assert "RENAME_NOREPLACE" in script
     assert "destination appeared during atomic publish" in script
     assert "mv --" not in script
+    assert "getattr(os, \"O_NOFOLLOW\"" in script
+    assert "config_bytes.decode(\"utf-8\")" in script
+    assert "read_regular_bytes(source_config" in script
 
 
 def test_parse_result_requires_full_identities():
