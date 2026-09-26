@@ -502,3 +502,13 @@ only after measured learning.
   `sampling_params`, while `GenerateRequest` expects it at the top level. A
   same-name policy reload may therefore reuse stale prefix KV or routes. This
   commit records the risk only; it does not change the client.
+
+## H200 long-context prompt-logprob OOM
+
+- Measured failure: the 8,192-token prompt-logprobs request OOMed in
+  `_patched_get_logits` during TP all-gather. It requested 6.11 GiB with
+  2.18 GiB free at 0.92 GPU memory utilization. No trainer or optimizer ran.
+- Bounded experiment: retain the exact 8,192-token input and strict gates,
+  temporarily reduce engine KV allocation only enough to leave at least 8 GiB
+  free, rerun the same reference, then restore the setting. Prefer a
+  source-supported chunked prompt-logit computation if a small repair exists.
