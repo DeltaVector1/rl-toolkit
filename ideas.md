@@ -430,3 +430,16 @@ only after measured learning.
   existing 5 tok/s health threshold. Keep the warning for idle queues,
   non-exact policy, stalled throughput, orchestrator-down, and trainer-only
   states.
+
+## Orchestrator silence during active rollouts
+
+- Observed result: orchestrator Step 1 succeeded at 02:42:51, then wrote no
+  log for more than 10 minutes while the exact policy v0 served 128 running
+  requests at about 2,173 tok/s. Step 1 batch transfer was progressing:
+  397,167,733 bytes at source, 187,432,960 bytes received, and +45,875,200
+  bytes in about two minutes. The orchestrator silence warning was false.
+- Repair plan: when the existing active-rollout condition is true, suppress
+  log-age warnings for both trainer and orchestrator without changing the
+  600-second limit. Keep warnings for down or non-exact systems, zero running
+  requests, throughput below 5 tok/s, trainer-only mode, and inactive transfer
+  or rollouts.

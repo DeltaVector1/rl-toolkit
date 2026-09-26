@@ -2782,14 +2782,13 @@ def _warnings(s: Status) -> list[str]:
             for e in s.engines
         )
     )
-    trainer_busy = trainer_gpu_busy or active_rollouts
     ages = (("trainer", s.trainer_log_age),) if trainer_only else (
         ("trainer", s.trainer_log_age),
         ("orchestrator", s.orch_log_age),
     )
     for name, age in (() if s.trainer_finished else ages):
         if age is not None and age > stall_seconds:
-            if name == "trainer" and trainer_busy:
+            if active_rollouts or (name == "trainer" and trainer_gpu_busy):
                 continue
             w.append(
                 f"{name} has written nothing for {_hms(age)}; the limit is {stall_seconds // 60} minutes"

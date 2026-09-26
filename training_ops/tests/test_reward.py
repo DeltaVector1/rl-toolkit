@@ -224,8 +224,11 @@ class TrainerComputeProbeTest(unittest.TestCase):
 
 
 class TrainerLogAgeWarningTest(unittest.TestCase):
+    def _has_log_age_warning(self, warnings, name):
+        return any(message.startswith(f"{name} has written nothing") for message in warnings)
+
     def _has_trainer_stall_warning(self, warnings):
-        return any(message.startswith("trainer has written nothing") for message in warnings)
+        return self._has_log_age_warning(warnings, "trainer")
 
     def _status(self, **engine):
         return training_ops.Status(
@@ -241,10 +244,11 @@ class TrainerLogAgeWarningTest(unittest.TestCase):
             running=1,
             throughput=5.0,
         )
+        status.orch_log_age = training_ops.stall_seconds + 1
+        warnings = training_ops._warnings(status)
 
-        self.assertFalse(
-            self._has_trainer_stall_warning(training_ops._warnings(status))
-        )
+        self.assertFalse(self._has_trainer_stall_warning(warnings))
+        self.assertFalse(self._has_log_age_warning(warnings, "orchestrator"))
 
     def test_negative_rollout_states_keep_trainer_log_age_warning(self):
         cases = (
@@ -255,18 +259,21 @@ class TrainerLogAgeWarningTest(unittest.TestCase):
         )
         for name, engine in cases:
             with self.subTest(name=name):
+                status = self._status(**engine)
+                status.orch_log_age = training_ops.stall_seconds + 1
+                warnings = training_ops._warnings(status)
                 self.assertTrue(
-                    self._has_trainer_stall_warning(
-                        training_ops._warnings(self._status(**engine))
-                    )
+                    self._has_trainer_stall_warning(warnings)
                 )
+                self.assertTrue(self._has_log_age_warning(warnings, "orchestrator"))
 
         with self.subTest(name="orchestrator-down"):
             status = self._status(policy_state="ready", running=1, throughput=20.0)
             status.orch_up = False
-            self.assertTrue(
-                self._has_trainer_stall_warning(training_ops._warnings(status))
-            )
+            status.orch_log_age = training_ops.stall_seconds + 1
+            warnings = training_ops._warnings(status)
+            self.assertTrue(self._has_trainer_stall_warning(warnings))
+            self.assertTrue(self._has_log_age_warning(warnings, "orchestrator"))
 
         with self.subTest(name="trainer-only"):
             status = self._status(policy_state="ready", running=1, throughput=20.0)
