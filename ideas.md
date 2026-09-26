@@ -557,3 +557,9 @@ only after measured learning.
   the qualifier. No model transfer is involved.
 - Cleanup result: the owned processes were stopped at about 4m35s, all
   matching local PIDs were confirmed gone, and partial files were preserved.
+- Username correction: the n82 seed completed in 5 seconds with the exact
+  size and SHA256, but `root@10.92.20.76` was rejected with `publickey`.
+  Existing deployment fanout in `training_ops/__init__.py` uses `scp ...
+  peer:` without a username, while the n82 session uses `ubuntu`. The next
+  bounded probe and fanout must inherit or explicitly use `ubuntu`, not root;
+  the exact SHA256 gate remains required.
