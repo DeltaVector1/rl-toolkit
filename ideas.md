@@ -540,11 +540,16 @@ only after measured learning.
   reference stayed live for more than 3m22s with only n76, n78, and n82
   children, remote rsync servers, and no completion. A separate eight-host
   hash probe ran for more than 1m11s.
-- Bounded plan: after five minutes without progress, stop only the owned
-  transfer and probe processes and preserve partial files. Seed n82 directly
-  from h200b using the configured peer identity and trainer LAN
-  `10.92.20.82`, then use n82 LAN access to fan out the same small JSON to
-  n76, n77, n78, n80, n83, n84, and n85. Verify all eight SHA256 values match
+- Measured topology failure: direct H200 access to `root@10.92.20.82:22`
+  timed out, and the configured peer identity path was unavailable in the
+  H200 host shell. No remote change was made.
+- Corrected plan: after five minutes without progress, stop only the owned
+  transfer and probe processes and preserve partial files. Use
+  `hosts.trainer_ssh = china-trainer`, the bounded H200-to-trainer-head route
+  already used by `start_orchestrator.sh`, for a read-only probe and seed to
+  n82. Only after that use n82's existing `trainer_lan` access to fan out the
+  same small JSON to n76, n77, n78, n80, n83, n84, and n85. Verify all eight
+  SHA256 values match
   `df7d7b0baf5aa646751fc1762fb7882e4266afda3df2017f92ba44a3758af589` before
   the qualifier. No model transfer is involved.
 - Cleanup result: the owned processes were stopped at about 4m35s, all
