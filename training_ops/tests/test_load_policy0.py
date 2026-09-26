@@ -1,5 +1,6 @@
 import copy
 import io
+import inspect
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -8,12 +9,14 @@ from training_ops import (
     _load_policy0_action,
     _policy0_load_engine_state_script,
     _policy0_load_service_state_script,
+    _policy0_remote_client_op,
 )
 from training_ops.runtime.h200.load_policy0 import (
     EXPECTED_LORA,
     Policy0LoadError,
     build_plan,
     execute_policy0_load,
+    validate_metric_samples,
 )
 
 
@@ -82,7 +85,12 @@ class Policy0LoadTest(unittest.TestCase):
     def test_success_uses_stage_without_delta_and_prefetched_load(self):
         before = state()
         final = state()
-        final["engine"]["loaded_receipts"] = {"qualification-policy-0": receipt()}
+        other = receipt("instance-b")
+        other["lora_name"] = "other-slot"
+        final["engine"]["loaded_receipts"] = {
+            "qualification-policy-0": receipt(),
+            "other-slot": other,
+        }
         calls = []
 
         def stage(url, **kwargs):
@@ -186,6 +194,25 @@ class Policy0LoadTest(unittest.TestCase):
                 engine_container="engine",
             )
 
+    def test_mixed_metric_samples_refuse_even_if_last_sample_is_zero(self):
+        with self.assertRaisesRegex(Policy0LoadError, "running samples"):
+            validate_metric_samples({"running": [1, 0], "waiting": [0, 0]})
+        validate_metric_samples({"running": [0, 0], "waiting": [0]})
+
+    def test_occupied_target_refuses_before_stage(self):
+        occupied = state()
+        occupied["engine"]["loaded_receipts"] = {
+            "qualification-policy-0": receipt()
+        }
+        calls = []
+        with self.assertRaisesRegex(Policy0LoadError, "already occupied"):
+            execute_policy0_load(
+                plan(), read_state=lambda: occupied, read_source=source,
+                stage=lambda *a, **k: calls.append("stage"),
+                load=lambda *a, **k: calls.append("load"),
+            )
+        self.assertEqual(calls, [])
+
     def test_plan_action_makes_no_live_call(self):
         args = [
             "configs/trinity-decensor-experimental-fixed", "plan",
@@ -207,10 +234,27 @@ class Policy0LoadTest(unittest.TestCase):
         self.assertNotIn("docker start", service)
         self.assertIn(".Id", engine)
         self.assertIn(".State.StartedAt", engine)
-        self.assertIn(".State.Pid", engine)
+        self.assertIn("ss -H -ltnp", engine)
+        self.assertIn("/proc/$api_pid/cmdline", engine)
         self.assertIn("num_requests_(running|waiting)", engine)
         self.assertIn("staging_status", engine)
         self.assertNotIn("docker restart", engine)
+
+    def test_remote_client_call_is_h200_local_and_controller_has_no_client_import(self):
+        response = '{"ok":true,"result":{"adapter_identity":{}}}'
+        with patch("training_ops._ssh", return_value=(0, response)) as ssh:
+            result = _policy0_remote_client_op(plan(), "stage")
+        self.assertEqual(result["adapter_identity"], {})
+        script = ssh.call_args.args[1]
+        self.assertIn("docker exec -i", script)
+        self.assertIn("/app/.venv/bin/python", script)
+        self.assertIn("127.0.0.1:8000", script)
+        self.assertNotIn("from prime_rl", inspect.getsource(__import__("training_ops")._policy0_load_apply))
+
+    def test_remote_client_error_category_is_preserved(self):
+        with patch("training_ops._ssh", return_value=(1, "{\"ok\":false,\"category\":\"identity\",\"error\":\"receipt mismatch\"}")):
+            with self.assertRaisesRegex(RuntimeError, r"\[identity\].*receipt mismatch"):
+                _policy0_remote_client_op(plan(), "load", IDENTITY)
 
 
 if __name__ == "__main__":

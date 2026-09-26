@@ -8574,20 +8574,30 @@ def _policy0_load_engine_state_script(container: str, ports_for_host: list[int])
     ports_text = " ".join(str(port) for port in ports_for_host)
     return f"""set -euo pipefail
 container={shlex.quote(container)}
-inspect=$(sudo docker inspect --format '{{{{.Name}}}}\\t{{{{.Id}}}}\\t{{{{.State.StartedAt}}}}\\t{{{{.State.Pid}}}}\\t{{{{.State.Running}}}}' "$container" 2>/dev/null) || {{ echo unknown >&2; exit 81; }}
-IFS=$'\\t' read -r name container_id container_started_at api_pid running <<< "$inspect"
+inspect=$(sudo docker inspect --format '{{{{.Name}}}}\\t{{{{.Id}}}}\\t{{{{.State.StartedAt}}}}\\t{{{{.State.Running}}}}' "$container" 2>/dev/null) || {{ echo unknown >&2; exit 81; }}
+IFS=$'\\t' read -r name container_id container_started_at running <<< "$inspect"
 [ "$name" = "/$container" ] || {{ echo identity-mismatch >&2; exit 82; }}
 [ "$running" = true ] || {{ echo engine-stopped >&2; exit 83; }}
-case "$api_pid" in ''|*[!0-9]*) echo invalid-api-pid >&2; exit 84;; esac
-api_start_time=$(sudo awk '{{print $22}}' "/proc/$api_pid/stat" 2>/dev/null || true)
-[ -n "$api_start_time" ] || {{ echo invalid-api-start >&2; exit 85; }}
+listener_identity=""
 tmp=$(mktemp -d /tmp/training-ops-policy0-load.XXXXXX)
 trap 'rm -rf -- "$tmp"' EXIT
 for port in {ports_text}; do
+  owner=$(sudo ss -H -ltnp "sport = :$port" 2>/dev/null || true)
+  pids=$(printf '%s\\n' "$owner" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+  [ "$(printf '%s\\n' "$pids" | sed '/^$/d' | wc -l)" = 1 ] || {{ echo "listener identity is not unique on $port" >&2; exit 84; }}
+  api_pid=$(printf '%s\\n' "$pids" | sed -n '1p')
+  api_command=$(sudo cat "/proc/$api_pid/cmdline" 2>/dev/null | tr '\\0' ' ' || true)
+  case "$api_command" in *python*|*vllm*|*inference*) ;; *) echo "listener command is not the inference API on $port" >&2; exit 85;; esac
+  api_start_time=$(sudo awk '{{print $22}}' "/proc/$api_pid/stat" 2>/dev/null || true)
+  [ -n "$api_start_time" ] || {{ echo "listener start identity is unreadable on $port" >&2; exit 86; }}
+  current_identity="$api_pid:$api_start_time"
+  if [ -z "$listener_identity" ]; then listener_identity="$current_identity"; else [ "$listener_identity" = "$current_identity" ] || {{ echo "inference listener identity differs by port" >&2; exit 87; }}; fi
   curl -fsS -m 30 "http://127.0.0.1:$port/health" > "$tmp/health.$port" || exit 86
   curl -fsS -m 30 "http://127.0.0.1:$port/metrics" > "$tmp/metrics.$port" || exit 87
   curl -fsS -m 30 "http://127.0.0.1:$port/staging_status" > "$tmp/status.$port" || exit 88
 done
+api_pid=${{listener_identity%%:*}}
+api_start_time=${{listener_identity#*:}}
 python3 - "$tmp" "$container_id" "$container_started_at" "$api_pid" "$api_start_time" {shlex.quote(ports_text)} <<'PY'
 import json
 import pathlib
@@ -8600,12 +8610,12 @@ ports = [int(value) for value in sys.argv[6:]]
 records = []
 for port in ports:
     metrics = (root / f"metrics.{{port}}").read_text()
-    values = {{"running": None, "waiting": None}}
+    values = {{"running": [], "waiting": []}}
     for line in metrics.splitlines():
         match = re.match(r"^vllm:num_requests_(running|waiting)(?:\\{{[^}}]*\\}})?\\s+([0-9]+(?:\\.[0-9]+)?)$", line)
         if match:
-            values[match.group(1)] = float(match.group(2))
-    if any(value is None or value != 0 for value in values.values()):
+            values[match.group(1)].append(float(match.group(2)))
+    if any(not samples or any(sample != 0 for sample in samples) for samples in values.values()):
         raise SystemExit("engine has active or unreadable requests")
     status = json.loads((root / f"status.{{port}}").read_text())
     if not isinstance(status, dict) or not isinstance(status.get("loaded_receipts"), dict):
@@ -8632,6 +8642,60 @@ print(json.dumps({{
 }}))
 PY
 """
+
+
+def _policy0_remote_client_op(plan: dict[str, object], operation: str, expected_identity=None):
+    """Run the existing client primitives in the exact H200 venv/container."""
+    if operation not in {"stage", "load"}:
+        raise Refused("policy-0 remote client operation is invalid")
+    helper = (repo_root / "training_ops/runtime/h200/load_policy0_remote.py").read_text(
+        encoding="utf-8"
+    )
+    request = {
+        "operation": operation,
+        "admin_urls": list(plan["admin_urls"]),
+        "origin_urls": list(plan["origin_urls"]),
+        "source_url": plan["source_url"],
+        "qualification_slot": plan["qualification_slot"],
+    }
+    if expected_identity is not None:
+        request["expected_identity"] = dict(expected_identity)
+    payload = json.dumps(request, separators=(",", ":"))
+    script = (
+        "set -euo pipefail\n"
+        f"container={shlex.quote(str(plan['engine_container']))}\n"
+        "name=$(sudo docker inspect --format '{{.Name}}' \"$container\" 2>/dev/null || true)\n"
+        "[ \"$name\" = \"/$container\" ] || { echo 'identity: exact inference container is not running' >&2; exit 91; }\n"
+        "state=$(sudo docker inspect --format '{{.State.Running}}' \"$container\" 2>/dev/null || true)\n"
+        "[ \"$state\" = true ] || { echo 'identity: exact inference container is not running' >&2; exit 92; }\n"
+        "  sudo docker exec -i \\\n"
+        f"    -e POLICY0_REQUEST_JSON={shlex.quote(payload)} \\\n"
+        "    -e PYTHONPATH=/app/src:/app/packages/prime-rl-configs/src \\\n"
+        "    \"$container\" /app/.venv/bin/python - <<'PY'\n"
+        + helper
+        + "\nPY\n"
+    )
+    code, output = _ssh(str(plan["inference_hosts"][0]), script, timeout=900)
+    response = None
+    try:
+        response = json.loads(output.strip().splitlines()[-1])
+    except (TypeError, ValueError, IndexError):
+        pass
+    if isinstance(response, dict) and response.get("ok") is not True:
+        category = response.get("category", "config")
+        message = response.get("error", "remote helper failed")
+        raise Refused(f"policy-0 remote {operation} failed [{category}]: {message}")
+    if code:
+        detail = output.strip() or f"exit {code}"
+        if detail.startswith(("tunnel:", "http:", "identity:", "config:")):
+            category, _, message = detail.partition(":")
+            raise Refused(f"policy-0 remote {operation} failed [{category}]: {message.strip()}")
+        raise Refused(f"policy-0 remote {operation} failed [tunnel]: {detail}")
+    if response is None:
+        raise Refused(f"policy-0 remote {operation} returned no structured result [config]")
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        raise Refused(f"policy-0 remote {operation} returned an invalid structured result [config]")
+    return response.get("result")
 
 
 def _policy0_load_live_state(plan: dict[str, object]) -> dict[str, object]:
@@ -8677,83 +8741,24 @@ def _policy0_load_live_state(plan: dict[str, object]) -> dict[str, object]:
 
 
 def _policy0_load_apply(plan: dict[str, object]) -> dict[str, object]:
-    try:
-        from prime_rl.configs.shared import ClientConfig
-        from prime_rl.utils.client import load_lora_adapter, setup_admin_clients, stage_lora_adapter
-    except Exception as error:
-        raise Refused(f"policy-0 load client primitives are unavailable: {error}") from error
     code, output = _ssh(
         str(plan["source_adapter_host"]), _policy0_load_source_script(plan), timeout=180
     )
     if code:
+        category = "tunnel" if code == 124 or output.strip() == "TIMEOUT" else "identity"
         raise Refused(
-            "source step-0 adapter or tunnel validation failed: "
-            f"{output.strip()}; run {plan['repair_command']} if the configured tunnel is missing"
+            f"source step-0 adapter validation failed [{category}]: {output.strip()}; "
+            f"run {plan['repair_command']} if the configured tunnel is missing"
         )
     source = _policy0_parse_source_manifest(output, plan)
-    import asyncio
-
-    def clients():
-        config = ClientConfig(
-            base_url=list(plan["admin_urls"]),
-            admin_base_url=list(plan["admin_urls"]),
-            adapter_origin_base_urls=list(plan["origin_urls"]),
-        )
-        return setup_admin_clients(config)
-
-    def stage(source_url: str, **kwargs):
-        async def operation():
-            admin_clients = clients()
-            try:
-                return await stage_lora_adapter(
-                    admin_clients,
-                    source_url,
-                    require_delta=False,
-                    policy_step=None,
-                    origin_base_urls=list(plan["origin_urls"]),
-                )
-            finally:
-                await asyncio.gather(
-                    *(client.aclose() for client in admin_clients), return_exceptions=True
-                )
-
-        try:
-            return asyncio.run(operation())
-        except Exception as error:
-            raise Refused(
-                f"source or adapter tunnel is unreachable; run {plan['repair_command']}: {error}"
-            ) from error
-
-    def load(slot: str, source_url: str, *, expected_identity, **kwargs):
-        async def operation():
-            admin_clients = clients()
-            try:
-                return await load_lora_adapter(
-                    admin_clients,
-                    slot,
-                    source_url,
-                    require_delta=False,
-                    prefetched=True,
-                    expected_identity=expected_identity,
-                )
-            finally:
-                await asyncio.gather(
-                    *(client.aclose() for client in admin_clients), return_exceptions=True
-                )
-
-        try:
-            return asyncio.run(operation())
-        except Exception as error:
-            raise Refused(
-                f"source or adapter tunnel is unreachable; run {plan['repair_command']}: {error}"
-            ) from error
-
     return execute_policy0_load(
         plan,
         read_state=lambda: _policy0_load_live_state(plan),
         read_source=lambda: source,
-        stage=stage,
-        load=load,
+        stage=lambda source_url, **kwargs: _policy0_remote_client_op(plan, "stage"),
+        load=lambda slot, source_url, **kwargs: _policy0_remote_client_op(
+            plan, "load", kwargs.get("expected_identity")
+        ),
     )
 
 

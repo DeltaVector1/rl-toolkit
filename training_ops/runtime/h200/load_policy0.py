@@ -32,6 +32,18 @@ EXPECTED_LORA = {
 }
 
 
+def validate_metric_samples(samples: Mapping[str, object]) -> None:
+    """Reject any non-zero or missing running/waiting metric sample."""
+    for name in ("running", "waiting"):
+        values = samples.get(name)
+        if (
+            not isinstance(values, (list, tuple))
+            or not values
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) or value != 0 for value in values)
+        ):
+            _fail(f"inference engine has active or unreadable {name} samples")
+
+
 def build_plan(
     *,
     config_dir: str,
@@ -194,6 +206,15 @@ def _check_engine(plan: Mapping[str, object], state: Mapping[str, object]) -> Ma
     return engine
 
 
+def _check_target_slot_free(plan: Mapping[str, object], engine: Mapping[str, object]) -> None:
+    receipts = engine.get("loaded_receipts")
+    if not isinstance(receipts, Mapping):
+        _fail("inference engine loaded receipt map is missing")
+    slot = plan.get("qualification_slot")
+    if slot in receipts:
+        _fail("qualification slot is already occupied; refusing before adapter stage")
+
+
 def _check_engine_identity(before: Mapping[str, object], after: Mapping[str, object]) -> None:
     for key in ("container_id", "container_started_at", "api_pid", "api_start_time"):
         if before.get(key) != after.get(key):
@@ -270,6 +291,7 @@ def execute_policy0_load(
     before = read_state()
     _check_services(plan, before)
     before_engine = _check_engine(plan, before)
+    _check_target_slot_free(plan, before_engine)
     source = _check_source(plan, read_source())
     staged = stage(plan["source_url"], require_delta=False, policy_step=None)
     staged_identity = _identity(staged.get("adapter_identity"), "staged adapter")
@@ -280,6 +302,7 @@ def execute_policy0_load(
     _check_services(plan, middle)
     middle_engine = _check_engine(plan, middle)
     _check_engine_identity(before_engine, middle_engine)
+    _check_target_slot_free(plan, middle_engine)
     loaded = load(
         plan["qualification_slot"],
         plan["source_url"],
@@ -292,7 +315,8 @@ def execute_policy0_load(
     _check_engine_identity(before_engine, after_engine)
     loaded_status = after_engine.get("loaded_receipts")
     if isinstance(loaded_status, Mapping):
-        loaded_status = list(loaded_status.values())
+        target = loaded_status.get(plan["qualification_slot"])
+        loaded_status = [target] if target is not None else []
     _check_receipts(plan, loaded, source, loaded_status)
     return {
         "status": "loaded",
