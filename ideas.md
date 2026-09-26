@@ -668,3 +668,5 @@ only after measured learning.
 
 - Deployed MTP0/default serialized `generate` with prompt length 8160 and 32 generated tokens returned 8191 routed-expert rows (`P+G-1`). Token IDs, logprobs, and the loss mask remain length 8192.
 - Production rollout packing keeps the full token sequence and zero-pads one missing final route row before the trainer model consumes it. The qualification artifact must keep the raw 8191 rows; the trainer fake loader must apply the same one-row tail handling. It must not fabricate a route in the serialized reference.
+
+- Reviewer found the fake-loader route validator used bitwise inversion on a boolean tensor and rejected a valid sparse row whose selected expert IDs were all zero. The repair must use type-safe boolean masks, validate every real row for range and top-k uniqueness, and allow only the explicit final zero padding row.

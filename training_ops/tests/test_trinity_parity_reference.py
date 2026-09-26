@@ -234,6 +234,19 @@ class TrinityParityReferenceTest(unittest.TestCase):
         data_source = (ROOT / "prime-rl/src/prime_rl/trainer/rl/data.py").read_text()
         self.assertIn("shape[0] in {token_count - 1, token_count}", data_source)
         self.assertIn("routed.new_zeros((1, routed.shape[1], routed.shape[2]))", data_source)
+        self.assertIn("torch.count_nonzero(sparse[-1]).item()", data_source)
+        self.assertNotIn("~sparse_nonzero", data_source)
+
+    def test_route_normalizer_allows_expert_zero_when_topk_is_one(self):
+        raw = bytes((0,) * (8 * 1 * 4))
+        route = {
+            "data": base64.b64encode(raw).decode(),
+            "dtype": "uint8",
+            "shape": [4, 8, 1],
+            "start": 0,
+        }
+        normalised = reference._normalise_route(route, 4)
+        self.assertEqual(normalised["shape"], [4, 8, 1])
 
     def test_policy_zero_requires_active_receipt_to_stay_stable(self):
         changed = self.policy_receipt()
