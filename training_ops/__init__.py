@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import datetime as _dt
+import gzip
 import hashlib
 import ipaddress
 import json
@@ -7487,6 +7488,247 @@ def _policy0_reference_install_record(output: str) -> dict[str, str]:
     return record
 
 
+def _policy0_reference_seed_prepare_script(
+    compressed_path: str,
+    raw_partial_path: str,
+    compressed_sha256: str,
+    compressed_size: int,
+    raw_sha256: str,
+    raw_size: int,
+) -> str:
+    """Verify one compressed seed and make one durable raw partial on n82."""
+    compressed = shlex.quote(compressed_path)
+    raw_partial = shlex.quote(raw_partial_path)
+    directory = shlex.quote(str(PurePosixPath(raw_partial_path).parent))
+    return f"""set -euo pipefail
+compressed={compressed}
+raw_partial={raw_partial}
+directory={directory}
+completed=0
+raw_owned=0
+cleanup() {{
+  if [ "$completed" -ne 1 ]; then
+    if [ "$raw_owned" -eq 1 ] && ([ -L "$raw_partial" ] || [ -f "$raw_partial" ]); then
+      rm -f -- "$raw_partial"
+    fi
+    if [ -L "$compressed" ] || [ -f "$compressed" ]; then
+      rm -f -- "$compressed"
+    fi
+  fi
+}}
+trap cleanup EXIT
+
+read_regular_identity() {{
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(sys.argv[1], flags)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise SystemExit("not a regular file")
+    digest = hashlib.sha256()
+    while True:
+        block = os.read(fd, 1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    print(digest.hexdigest(), info.st_size)
+finally:
+    os.close(fd)
+PY
+}}
+
+fsync_file_and_directory() {{
+  python3 - "$1" "$2" <<'PY'
+import os
+import sys
+
+file_fd = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    os.fsync(file_fd)
+finally:
+    os.close(file_fd)
+directory_fd = os.open(sys.argv[2], os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
+}}
+
+compressed_identity=$(read_regular_identity "$compressed") || {{
+  echo "reference compressed seed is not readable" >&2
+  exit 91
+}}
+test "${{compressed_identity%% *}}" = {shlex.quote(compressed_sha256)}
+test "${{compressed_identity#* }}" = {compressed_size}
+if [ -e "$raw_partial" ] || [ -L "$raw_partial" ]; then
+  echo "reference seed raw partial already exists" >&2
+  exit 92
+fi
+raw_owned=1
+python3 - "$compressed" "$raw_partial" <<'PY'
+import gzip
+import os
+import stat
+import sys
+
+source_fd = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+destination_fd = None
+try:
+    if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+        raise SystemExit("compressed seed is not a regular file")
+    destination_fd = os.open(
+        sys.argv[2],
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    with os.fdopen(source_fd, "rb") as source:
+        source_fd = None
+        with gzip.GzipFile(fileobj=source, mode="rb") as stream:
+            with os.fdopen(destination_fd, "wb") as destination:
+                destination_fd = None
+                while True:
+                    block = stream.read(1024 * 1024)
+                    if not block:
+                        break
+                    destination.write(block)
+                destination.flush()
+                os.fsync(destination.fileno())
+finally:
+    if source_fd is not None:
+        os.close(source_fd)
+    if destination_fd is not None:
+        os.close(destination_fd)
+PY
+raw_identity=$(read_regular_identity "$raw_partial") || {{
+  echo "reference seed raw partial is not readable" >&2
+  exit 93
+}}
+test "${{raw_identity%% *}}" = {shlex.quote(raw_sha256)}
+test "${{raw_identity#* }}" = {raw_size}
+fsync_file_and_directory "$raw_partial" "$directory"
+raw_identity=$(read_regular_identity "$raw_partial") || exit 94
+test "${{raw_identity%% *}}" = {shlex.quote(raw_sha256)}
+test "${{raw_identity#* }}" = {raw_size}
+completed=1
+printf 'REFERENCE_SEED status=prepared compressed_sha=%s compressed_size=%s compressed_path=%s raw_sha=%s raw_size=%s raw_path=%s\\n' \\
+  {shlex.quote(compressed_sha256)} {compressed_size} "$compressed" {shlex.quote(raw_sha256)} {raw_size} "$raw_partial"
+"""
+
+
+def _policy0_reference_lan_fanout_script(
+    source_path: str,
+    target_path: str,
+    peer_address: str,
+    expected_sha256: str,
+    expected_size: int,
+) -> str:
+    """Copy one verified raw partial from n82 to one China-LAN peer."""
+    source = shlex.quote(source_path)
+    target = shlex.quote(target_path)
+    peer = shlex.quote(peer_address)
+    target_directory = shlex.quote(str(PurePosixPath(target_path).parent))
+    remote_cleanup = shlex.quote(
+        f"if [ -L {target} ] || [ -f {target} ]; then rm -f -- {target}; fi"
+    )
+    remote_setup = shlex.quote(f"""set -euo pipefail
+directory={target_directory}
+if [ -L \"$directory\" ] || {{ [ -e \"$directory\" ] && [ ! -d \"$directory\" ]; }}; then
+  exit 81
+fi
+mkdir -p -- \"$directory\"
+test -d \"$directory\" && test ! -L \"$directory\"
+partial={target}
+if [ -e \"$partial\" ] || [ -L \"$partial\" ]; then
+  echo \"reference peer raw partial already exists\" >&2
+  exit 82
+fi
+""")
+    remote_verify = shlex.quote(f"""set -euo pipefail
+partial={target}
+test -f \"$partial\" && test ! -L \"$partial\"
+test \"$(sha256sum -- \"$partial\" | cut -d' ' -f1)\" = {shlex.quote(expected_sha256)}
+test \"$(stat -c '%s' -- \"$partial\")\" = {expected_size}
+""")
+    return f"""set -euo pipefail
+source={source}
+peer={peer}
+partial={target}
+copied=0
+read_regular_identity() {{
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise SystemExit("source is not a regular file")
+    digest = hashlib.sha256()
+    while True:
+        block = os.read(fd, 1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    print(digest.hexdigest(), info.st_size)
+finally:
+    os.close(fd)
+PY
+}}
+cleanup() {{
+  if [ "$copied" -eq 1 ]; then
+    ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \\
+      "$peer" {remote_cleanup} || true
+  fi
+}}
+trap cleanup EXIT
+source_identity=$(read_regular_identity "$source")
+test "${{source_identity%% *}}" = {shlex.quote(expected_sha256)}
+test "${{source_identity#* }}" = {expected_size}
+ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \\
+  \"$peer\" {remote_setup}
+copied=1
+scp -q -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -- \\
+  \"$source\" \"$peer:$partial\"
+ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \\
+  \"$peer\" {remote_verify}
+"""
+
+
+def _policy0_reference_stage_cleanup_script(
+    compressed_path: str,
+    raw_seed_path: str | None,
+    peer_partials: dict[str, str],
+) -> str:
+    """Remove only unique pre-install reference staging paths via n82."""
+    lines = [
+        "set -euo pipefail",
+        f"if [ -L {shlex.quote(compressed_path)} ] || [ -f {shlex.quote(compressed_path)} ]; then rm -f -- {shlex.quote(compressed_path)}; fi",
+    ]
+    if raw_seed_path is not None:
+        lines.append(
+            f"if [ -L {shlex.quote(raw_seed_path)} ] || [ -f {shlex.quote(raw_seed_path)} ]; then rm -f -- {shlex.quote(raw_seed_path)}; fi"
+        )
+    for peer, path in peer_partials.items():
+        remote = shlex.quote(
+            f"if [ -L {shlex.quote(path)} ] || [ -f {shlex.quote(path)} ]; then rm -f -- {shlex.quote(path)}; fi"
+        )
+        lines.append(
+            "ssh -n -o BatchMode=yes -o ConnectTimeout=10 "
+            f"-o StrictHostKeyChecking=accept-new {shlex.quote(peer)} {remote}"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _policy0_controller_transfer_reference(
     source_reference_host: str,
     source_reference_path: str,
@@ -7529,106 +7771,266 @@ def _policy0_controller_transfer_reference(
         ):
             raise Refused("reference source manifest is invalid")
 
-        def cleanup_partial(host: str, partial_path: str) -> tuple[bool, str]:
-            cleanup_script = f"""set -euo pipefail
-partial={shlex.quote(partial_path)}
-if [ -e "$partial" ] || [ -L "$partial" ]; then
-  rm -f -- "$partial"
-fi
-"""
+        raw_sha256 = str(expected_manifest["sha256"])
+        raw_size = int(expected_manifest["size"])
+        compressed_reference = Path(directory) / "reference.json.gz"
+        try:
+            with compressed_reference.open("wb") as compressed_stream:
+                with gzip.GzipFile(
+                    fileobj=compressed_stream, mode="wb", filename="", mtime=0
+                ) as compressor:
+                    with local_reference.open("rb") as source_stream:
+                        for block in iter(lambda: source_stream.read(1024 * 1024), b""):
+                            compressor.write(block)
+        except OSError as error:
+            raise Refused(f"reference compression failed: {error}") from error
+        compressed_identity = _policy0_local_file_identity(compressed_reference)
+        compressed_sha256 = str(compressed_identity["sha256"])
+        compressed_size = int(compressed_identity["size"])
+        transfer_id = f"{os.getpid()}.{uuid.uuid4().hex}"
+        compressed_path = f"{target_path}.partial.policy0.{transfer_id}.seed.json.gz"
+        seed_partial_path = f"{target_path}.partial.policy0.{transfer_id}.{trainer_head}"
+        peers = [host for host in selected_nodes if host != trainer_head]
+        trainer_lan = hosts.get("trainer_lan")
+        if not isinstance(trainer_lan, dict):
+            raise Refused("trainer LAN addresses are missing")
+        peer_addresses: dict[str, str] = {}
+        for host in peers:
+            address = trainer_lan.get(host)
+            if not isinstance(address, str):
+                raise Refused(f"trainer LAN address is missing for {host}")
             try:
-                code, output = _ssh(host, cleanup_script, timeout=120)
-            except Exception as error:
-                return False, f"cleanup exception: {error}"
-            if code:
-                return False, output.strip() or f"exit {code}"
-            return True, ""
-
-        def install_one(host: str) -> dict[str, object]:
-            partial_path = (
-                f"{target_path}.partial.policy0.{os.getpid()}.{uuid.uuid4().hex}"
-            )
-            archive_path = (
+                ipaddress.ip_address(address)
+            except ValueError as error:
+                raise Refused(f"trainer LAN address is invalid for {host}") from error
+            peer_addresses[host] = address
+        peer_partials = {
+            host: f"{target_path}.partial.policy0.{transfer_id}.{host}"
+            for host in peers
+        }
+        partial_paths = {trainer_head: seed_partial_path, **peer_partials}
+        archive_paths = {
+            host: (
                 f"{target_path}.preserved.{expected_old_sha256}"
                 if expected_old_sha256 is not None
                 else None
             )
+            for host in selected_nodes
+        }
+        evidence = {
+            "seed_compressed_path": compressed_path,
+            "seed_compressed_sha256": compressed_sha256,
+            "seed_compressed_size": compressed_size,
+            "seed_partial_path": seed_partial_path,
+        }
+
+        def base_record(host: str) -> dict[str, object]:
+            return {
+                **evidence,
+                "partial_path": partial_paths.get(host),
+                "preserved_path": archive_paths.get(host),
+            }
+
+        def cleanup_preinstall(
+            *, include_seed_raw: bool = True, peer_subset: dict[str, str] | None = None
+        ) -> str:
+            cleanup_peers = peer_partials if peer_subset is None else peer_subset
+            stage_cleanup = _policy0_reference_stage_cleanup_script(
+                compressed_path,
+                seed_partial_path if include_seed_raw else None,
+                {peer_addresses[host]: path for host, path in cleanup_peers.items()},
+            )
             try:
-                _, target_scp_options, target_destination = _ssh_destination(host)
+                code, output = _ssh(trainer_head, stage_cleanup, timeout=120)
             except Exception as error:
-                cleaned, cleanup_output = cleanup_partial(host, partial_path)
-                detail = f"target route exception: {error}"
-                if not cleaned:
-                    detail += f"; cleanup failed: {cleanup_output}"
-                return {
-                    "ok": False,
-                    "phase": "target-route",
-                    "message": detail,
-                    "partial_path": partial_path,
-                    "preserved_path": archive_path,
-                }
+                return f"cleanup exception: {error}"
+            if code:
+                return output.strip() or f"cleanup exit {code}"
+            return ""
+
+        def raise_preinstall_failure(
+            phase: str,
+            detail: str,
+            *,
+            include_seed_raw: bool = True,
+            cleanup: bool = True,
+        ) -> None:
+            cleanup_error = cleanup_preinstall(include_seed_raw=include_seed_raw) if cleanup else ""
+            if cleanup_error:
+                detail = f"{detail}; cleanup failed: {cleanup_error}"
+            results = {}
+            for host in selected_nodes:
+                record = base_record(host)
+                record.update({"ok": False, "phase": phase, "message": detail})
+                results[host] = record
+            raise _Policy0ReferenceTransferError(results)
+
+        seed_guard_script = f"""set -euo pipefail
+compressed={shlex.quote(compressed_path)}
+directory={shlex.quote(str(PurePosixPath(compressed_path).parent))}
+if [ -L \"$directory\" ] || {{ [ -e \"$directory\" ] && [ ! -d \"$directory\" ]; }}; then
+  echo \"reference seed parent is not a directory: $directory\" >&2
+  exit 89
+fi
+mkdir -p -- \"$directory\"
+test -d \"$directory\" && test ! -L \"$directory\"
+if [ -e \"$compressed\" ] || [ -L \"$compressed\" ]; then
+  echo \"reference compressed seed path already exists\" >&2
+  exit 88
+fi
+"""
+        try:
+            guard_code, guard_output = _ssh(trainer_head, seed_guard_script, timeout=120)
+        except Exception as error:
+            raise_preinstall_failure(
+                "seed-guard", f"seed guard exception: {error}", cleanup=False
+            )
+        if guard_code:
+            raise_preinstall_failure(
+                "seed-guard",
+                guard_output.strip() or f"seed guard exit {guard_code}",
+                cleanup=False,
+            )
+        try:
+            _, seed_scp_options, seed_destination = _ssh_destination(trainer_head)
+            seed_upload = scp_command + seed_scp_options + [
+                str(compressed_reference),
+                f"{seed_destination}:{compressed_path}",
+            ]
+            uploaded = _run_process(
+                seed_upload,
+                stdin=subprocess.DEVNULL,
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            raise_preinstall_failure("seed-upload", "seed upload timed out")
+        except OSError as error:
+            raise_preinstall_failure("seed-upload", f"seed upload failed: {error}")
+        except Exception as error:
+            raise_preinstall_failure("seed-upload", f"seed upload exception: {error}")
+        if uploaded.returncode:
+            detail = ((uploaded.stdout or "") + (uploaded.stderr or "")).strip()
+            raise_preinstall_failure(
+                "seed-upload", detail or f"seed upload exit {uploaded.returncode}"
+            )
+
+        seed_script = _policy0_reference_seed_prepare_script(
+            compressed_path,
+            seed_partial_path,
+            compressed_sha256,
+            compressed_size,
+            raw_sha256,
+            raw_size,
+        )
+        try:
+            seed_code, seed_output = _ssh(trainer_head, seed_script, timeout=600)
+        except Exception as error:
+            raise_preinstall_failure(
+                "seed-prepare", f"seed prepare exception: {error}", include_seed_raw=False
+            )
+        if seed_code:
+            detail = seed_output.strip() or f"seed prepare exit {seed_code}"
+            raise_preinstall_failure("seed-prepare", detail, include_seed_raw=False)
+
+        def fanout_one(host: str) -> dict[str, object]:
+            script = _policy0_reference_lan_fanout_script(
+                seed_partial_path,
+                peer_partials[host],
+                peer_addresses[host],
+                raw_sha256,
+                raw_size,
+            )
+            try:
+                code, output = _ssh(trainer_head, script, timeout=600)
+            except Exception as error:
+                code, output = 1, f"LAN fanout exception: {error}"
+            detail = output if isinstance(output, str) else str(output)
+            record = base_record(host)
+            record.update({
+                "ok": code == 0,
+                "phase": "fanout",
+                "message": detail.strip() or ("verified" if code == 0 else f"exit {code}"),
+                "fanout_output": detail,
+            })
+            return record
+
+        fanout_results = _fan(peers, fanout_one, workers=min(4, len(peers))) if peers else {}
+        fanout_failures = {
+            host: result for host, result in fanout_results.items() if not result.get("ok")
+        }
+        if fanout_failures:
+            completed_peer_partials = {
+                host: peer_partials[host]
+                for host, result in fanout_results.items()
+                if result.get("ok")
+            }
+            cleanup_error = cleanup_preinstall(peer_subset=completed_peer_partials)
+            results = {}
+            for host in selected_nodes:
+                record = base_record(host)
+                fanout = fanout_results.get(host)
+                if fanout is not None:
+                    record.update(fanout)
+                    if fanout.get("ok"):
+                        message = "raw partial verified; installer not started because LAN fanout failed"
+                    else:
+                        message = str(fanout.get("message", "LAN fanout failed"))
+                else:
+                    message = "installer not started because LAN fanout failed"
+                if cleanup_error:
+                    message = f"{message}; cleanup failed: {cleanup_error}"
+                record.update({
+                    "phase": "fanout",
+                    "message": message,
+                    "installer_started": False,
+                })
+                results[host] = record
+            raise _Policy0ReferenceTransferError(results)
+
+        def cleanup_host_partial(host: str, partial_path: str) -> str:
+            script = f"""set -euo pipefail
+partial={shlex.quote(partial_path)}
+if [ -L \"$partial\" ] || [ -f \"$partial\" ]; then
+  rm -f -- \"$partial\"
+fi
+"""
+            try:
+                code, output = _ssh(host, script, timeout=120)
+            except Exception as error:
+                return f"cleanup exception: {error}"
+            if code:
+                return output.strip() or f"cleanup exit {code}"
+            return ""
+
+        def install_one(host: str) -> dict[str, object]:
+            partial_path = partial_paths[host]
+            record = base_record(host)
             target_directory = str(PurePosixPath(target_path).parent)
             parent_script = f"""set -euo pipefail
 directory={shlex.quote(target_directory)}
-if [ -L "$directory" ] || {{ [ -e "$directory" ] && [ ! -d "$directory" ]; }}; then
-  echo "reference parent is not a directory: $directory" >&2
+if [ -L \"$directory\" ] || {{ [ -e \"$directory\" ] && [ ! -d \"$directory\" ]; }}; then
+  echo \"reference parent is not a directory: $directory\" >&2
   exit 81
 fi
-mkdir -p -- "$directory"
-test -d "$directory" && test ! -L "$directory"
+mkdir -p -- \"$directory\"
+test -d \"$directory\" && test ! -L \"$directory\"
 """
             try:
                 parent_code, parent_output = _ssh(host, parent_script, timeout=120)
             except Exception as error:
                 parent_code, parent_output = 1, f"parent exception: {error}"
             if parent_code:
-                cleaned, cleanup_output = cleanup_partial(host, partial_path)
                 detail = parent_output.strip() or f"exit {parent_code}"
-                if not cleaned:
-                    detail += f"; cleanup failed: {cleanup_output}"
-                return {
-                    "ok": False,
-                    "phase": "parent",
-                    "message": detail,
-                    "partial_path": partial_path,
-                    "preserved_path": archive_path,
-                }
-            upload = scp_command + target_scp_options + [
-                str(local_reference),
-                f"{target_destination}:{partial_path}",
-            ]
-            try:
-                uploaded = _run_process(
-                    upload,
-                    stdin=subprocess.DEVNULL,
-                    timeout=600,
-                )
-            except subprocess.TimeoutExpired:
-                upload_code, upload_output = 124, "timeout"
-            except OSError as error:
-                upload_code, upload_output = 1, str(error)
-            except Exception as error:
-                upload_code, upload_output = 1, f"upload exception: {error}"
-            else:
-                upload_code = uploaded.returncode
-                upload_output = ((uploaded.stdout or "") + (uploaded.stderr or "")).strip()
-            if upload_code:
-                cleaned, cleanup_output = cleanup_partial(host, partial_path)
-                detail = upload_output[:200] or f"exit {upload_code}"
-                if not cleaned:
-                    detail += f"; cleanup failed: {cleanup_output}"
-                return {
-                    "ok": False,
-                    "phase": "upload",
-                    "message": detail,
-                    "partial_path": partial_path,
-                    "preserved_path": archive_path,
-                }
+                cleanup_error = cleanup_host_partial(host, partial_path)
+                if cleanup_error:
+                    detail = f"{detail}; cleanup failed: {cleanup_error}"
+                record.update({"ok": False, "phase": "parent", "message": detail})
+                return record
             install_script = _policy0_transfer_reference_script(
                 partial_path,
                 target_path,
-                str(expected_manifest["sha256"]),
-                int(expected_manifest["size"]),
+                raw_sha256,
+                raw_size,
                 expected_old_sha256,
                 expected_old_size,
             )
@@ -7638,27 +8040,41 @@ test -d "$directory" && test ! -L "$directory"
                 code, output = 1, f"install exception: {error}"
             if code:
                 remote_diagnostic = output if isinstance(output, str) else str(output)
-                detail = remote_diagnostic if remote_diagnostic.strip() else f"exit {code}"
-                return {
+                record.update({
                     "ok": False,
                     "phase": "install",
-                    "message": detail,
+                    "message": remote_diagnostic if remote_diagnostic.strip() else f"exit {code}",
                     "remote_diagnostic": remote_diagnostic,
                     "exit_code": code,
-                    "partial_path": partial_path,
-                    "preserved_path": archive_path,
-                }
+                })
+                return record
             result = _policy0_reference_install_record(output)
-            result.update({
+            record.update(result)
+            record.update({
                 "ok": True,
                 "phase": "install",
                 "partial_path": partial_path,
                 "preserved_path": result.get("preserved", "none"),
             })
-            return result
+            return record
 
         results = _fan(selected_nodes, install_one)
         failures = {host: result for host, result in results.items() if not result.get("ok")}
+        if not failures:
+            cleanup_code, cleanup_output = _ssh(
+                trainer_head,
+                _policy0_reference_stage_cleanup_script(
+                    compressed_path, seed_partial_path, {}
+                ),
+                timeout=120,
+            )
+            cleanup_status = (
+                cleanup_output.strip() or f"exit {cleanup_code}"
+                if cleanup_code
+                else "cleaned"
+            )
+            for result in results.values():
+                result["seed_cleanup"] = cleanup_status
         if failures:
             raise _Policy0ReferenceTransferError(results)
         return results

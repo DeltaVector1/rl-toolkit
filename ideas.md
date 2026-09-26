@@ -570,6 +570,14 @@ only after measured learning.
   bounded probe and fanout must inherit or explicitly use `ubuntu`, not root;
   the exact SHA256 gate remains required.
 
+## Qualification reference seed fanout
+
+- Measured failure: direct controller fanout exceeded 600 seconds and left
+  six unique partial reference files.
+- Bounded fix: compress the verified 2.7 MB H200 reference once, upload and
+  verify one seed on n82, then fan out unique partials over n82's China LAN
+  route before invoking the existing locked installer on all eight trainers.
+
 ## Trinity reference determinism split
 
 - Measured fresh qualifier: one masked token out of 8,192 at index 1,074

@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import json
 import os
@@ -11,6 +12,8 @@ from unittest.mock import patch
 from training_ops import (
     Refused,
     _policy0_controller_transfer_reference,
+    _policy0_reference_lan_fanout_script,
+    _policy0_reference_seed_prepare_script,
     _policy0_qualification_verify_script,
     _policy0_transfer_reference_script,
     prepare_policy0_qualification,
@@ -621,12 +624,15 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         source_sha, source_size = _identity_bytes(source_bytes)
         nodes = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
         process_commands = []
+        compressed_uploads = []
 
         def run_process(command, *, stdin, timeout):
             process_commands.append(command)
             if ":" in command[-1]:
                 source = Path(command[-2])
                 destination = Path(command[-1].split(":", 1)[1])
+                if len(process_commands) == 2:
+                    compressed_uploads.append(source.read_bytes())
             elif len(process_commands) == 1:
                 source = None
                 destination = Path(command[-1])
@@ -652,16 +658,207 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 )
         self.assertEqual(set(result), set(nodes))
         self.assertTrue(all(record["ok"] for record in result.values()))
-        self.assertEqual(len(process_commands), 1 + len(nodes))
-        self.assertEqual(ssh.call_count, 2 * len(nodes))
+        self.assertEqual(len(process_commands), 2)
+        self.assertEqual(gzip.decompress(compressed_uploads[0]), source_bytes)
+        self.assertGreaterEqual(ssh.call_count, 1 + 2 * len(nodes))
         self.assertTrue(process_commands[0][-2].startswith("root@38.255.28.19:"))
-        target_commands = process_commands[1:]
-        self.assertEqual(
-            {command[-1].split(":", 1)[0] for command in target_commands},
-            set(nodes),
-        )
+        self.assertTrue(process_commands[1][-1].split(":", 1)[0].endswith("n82"))
         self.assertTrue(all("adapter_model" not in " ".join(command) for command in process_commands))
         self.assertTrue(all("china-trainer" not in " ".join(command) for command in process_commands))
+        fanout_scripts = [call.args[1] for call in ssh.call_args_list if "scp -q" in call.args[1]]
+        self.assertEqual(len(fanout_scripts), len(nodes) - 1)
+        for host in nodes:
+            if host != "n82":
+                self.assertTrue(any(
+                    f"10.92.20.{host.removeprefix('n')}" in script
+                    for script in fanout_scripts
+                ))
+        self.assertTrue(all("reference.json.partial.policy0." in script for script in fanout_scripts))
+        self.assertTrue(all(call.args[0] != "h200b" for call in ssh.call_args_list))
+
+    def _write_compressed_seed(self, path, payload):
+        with path.open("wb") as stream:
+            with gzip.GzipFile(fileobj=stream, mode="wb", filename="", mtime=0) as compressed:
+                compressed.write(payload)
+
+    def test_seed_prepare_rejects_corrupt_uploaded_bytes(self):
+        payload = b"verified-reference"
+        raw_sha, raw_size = _identity_bytes(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compressed = root / "seed.json.gz"
+            self._write_compressed_seed(compressed, payload)
+            expected_sha, expected_size = _identity_bytes(compressed.read_bytes())
+            damaged = bytearray(compressed.read_bytes())
+            damaged[-1] ^= 1
+            compressed.write_bytes(damaged)
+            raw = root / "reference.partial"
+            result = subprocess.run(
+                ["bash", "-c", _policy0_reference_seed_prepare_script(
+                    str(compressed), str(raw), expected_sha, expected_size, raw_sha, raw_size
+                )],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(raw.exists())
+            self.assertFalse(compressed.exists())
+
+    def test_seed_prepare_rejects_raw_manifest_mismatch_and_cleans(self):
+        payload = b"verified-reference"
+        raw_sha, raw_size = _identity_bytes(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compressed = root / "seed.json.gz"
+            self._write_compressed_seed(compressed, payload)
+            compressed_sha, compressed_size = _identity_bytes(compressed.read_bytes())
+            raw = root / "reference.partial"
+            result = subprocess.run(
+                ["bash", "-c", _policy0_reference_seed_prepare_script(
+                    str(compressed), str(raw), compressed_sha, compressed_size,
+                    "0" * 64, raw_size + 1,
+                )],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(raw.exists())
+            self.assertFalse(compressed.exists())
+
+    def test_seed_prepare_preserves_conflicting_raw_partial(self):
+        payload = b"verified-reference"
+        raw_sha, raw_size = _identity_bytes(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compressed = root / "seed.json.gz"
+            self._write_compressed_seed(compressed, payload)
+            compressed_sha, compressed_size = _identity_bytes(compressed.read_bytes())
+            raw = root / "reference.partial"
+            raw.write_bytes(b"foreign")
+            result = subprocess.run(
+                ["bash", "-c", _policy0_reference_seed_prepare_script(
+                    str(compressed), str(raw), compressed_sha, compressed_size, raw_sha, raw_size
+                )],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(raw.read_bytes(), b"foreign")
+            self.assertFalse(compressed.exists())
+
+    def test_seed_prepare_retry_after_interrupted_upload(self):
+        payload = b"verified-reference"
+        raw_sha, raw_size = _identity_bytes(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compressed = root / "seed.json.gz"
+            compressed.write_bytes(b"interrupted")
+            raw = root / "reference.partial"
+            expected_sha, expected_size = _identity_bytes(gzip.compress(payload, mtime=0))
+            failed = subprocess.run(
+                ["bash", "-c", _policy0_reference_seed_prepare_script(
+                    str(compressed), str(raw), expected_sha, expected_size, raw_sha, raw_size
+                )],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertFalse(compressed.exists())
+            self._write_compressed_seed(compressed, payload)
+            expected_sha, expected_size = _identity_bytes(compressed.read_bytes())
+            succeeded = subprocess.run(
+                ["bash", "-c", _policy0_reference_seed_prepare_script(
+                    str(compressed), str(raw), expected_sha, expected_size, raw_sha, raw_size
+                )],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(succeeded.returncode, 0, succeeded.stderr)
+            self.assertEqual(raw.read_bytes(), payload)
+
+    def test_lan_fanout_refuses_peer_conflict_without_overwrite(self):
+        payload = b"verified-reference"
+        expected_sha, expected_size = _identity_bytes(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "seed.partial"
+            target = root / "peer.partial"
+            source.write_bytes(payload)
+            target.write_bytes(b"foreign")
+            wrapper_dir = root / "bin"
+            wrapper_dir.mkdir()
+            (wrapper_dir / "ssh").write_text(
+                "#!/bin/sh\n"
+                "last=\"\"\n"
+                "for value in \"$@\"; do last=\"$value\"; done\n"
+                "exec bash -c \"$last\"\n",
+                encoding="utf-8",
+            )
+            marker = root / "scp-called"
+            (wrapper_dir / "scp").write_text(
+                "#!/bin/sh\n"
+                f"touch -- {str(marker)!r}\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            for wrapper in (wrapper_dir / "ssh", wrapper_dir / "scp"):
+                wrapper.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = str(wrapper_dir) + os.pathsep + environment["PATH"]
+            result = subprocess.run(
+                ["bash", "-c", _policy0_reference_lan_fanout_script(
+                    str(source), str(target), "10.92.20.77", expected_sha, expected_size
+                )],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_bytes(), b"foreign")
+            self.assertFalse(marker.exists())
+
+    def test_lan_fanout_cleans_owned_partial_after_upload_failure(self):
+        payload = b"verified-reference"
+        expected_sha, expected_size = _identity_bytes(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "seed.partial"
+            target = root / "peer.partial"
+            source.write_bytes(payload)
+            wrapper_dir = root / "bin"
+            wrapper_dir.mkdir()
+            (wrapper_dir / "ssh").write_text(
+                "#!/bin/sh\n"
+                "last=\"\"\n"
+                "for value in \"$@\"; do last=\"$value\"; done\n"
+                "exec bash -c \"$last\"\n",
+                encoding="utf-8",
+            )
+            (wrapper_dir / "scp").write_text(
+                "#!/bin/sh\n"
+                "previous=\"\"\n"
+                "source=\"\"\n"
+                "destination=\"\"\n"
+                "for value in \"$@\"; do source=\"$previous\"; previous=\"$value\"; done\n"
+                "destination=\"${previous#*:}\"\n"
+                "cp -- \"$source\" \"$destination\"\n"
+                "exit 9\n",
+                encoding="utf-8",
+            )
+            for wrapper in (wrapper_dir / "ssh", wrapper_dir / "scp"):
+                wrapper.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = str(wrapper_dir) + os.pathsep + environment["PATH"]
+            result = subprocess.run(
+                ["bash", "-c", _policy0_reference_lan_fanout_script(
+                    str(source), str(target), "10.92.20.77", expected_sha, expected_size
+                )],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(target.exists())
 
     def test_controller_rejects_corrupt_download(self):
         def corrupt_download(command, *, stdin, timeout):
@@ -696,7 +893,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             source = Path(directory) / "source.json"
             source.write_bytes(b"verified")
             with patch("training_ops._run_process", side_effect=process), patch(
-                "training_ops._ssh", side_effect=[(0, "parent"), (0, "cleanup")]
+                "training_ops._ssh", side_effect=[(0, "cleanup")]
             ) as ssh:
                 with self.assertRaisesRegex(RuntimeError, "phase.*upload"):
                     _policy0_controller_transfer_reference(
@@ -705,7 +902,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                         OLD_SHA256, 2_838_023,
                     )
             self.assertEqual(ssh.call_count, 2)
-            self.assertIn("partial", ssh.call_args_list[-1].args[1])
+            self.assertIn("partial.policy0", ssh.call_args_list[-1].args[1])
 
     def test_controller_install_failure_keeps_rollback_foreign_path_and_full_results(self):
         old = b"old-reference"
@@ -754,6 +951,15 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             environment["PATH"] = str(wrapper_dir) + os.pathsep + environment["PATH"]
 
             def remote(host, script, timeout):
+                if "scp -q" in script and "partial=" in script:
+                    values = {}
+                    for line in script.splitlines():
+                        if line.startswith(("source=", "partial=")):
+                            values[line.split("=", 1)[0]] = line.split("=", 1)[1].strip("'")
+                    destination = Path(values["partial"])
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(values["source"], destination)
+                    return 0, "verified"
                 result = subprocess.run(
                     ["bash", "-c", script],
                     text=True,
@@ -791,30 +997,40 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         source_sha, source_size = _identity_bytes(source_bytes)
         all_results = {
             "n76": {
-                "ok": True, "phase": "install", "preserved_path": "/ref.preserved.old",
+                "ok": True, "phase": "fanout", "message": "verified",
             },
             "n77": {
-                "ok": False, "phase": "upload", "message": "exit 9",
+                "ok": False, "phase": "fanout", "message": "exit 9",
             },
         }
+        calls = []
         def fetch(command, *, stdin, timeout):
-            Path(command[-1]).write_bytes(source_bytes)
+            calls.append(command)
+            if len(calls) == 1:
+                Path(command[-1]).write_bytes(source_bytes)
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.json"
             source.write_bytes(source_bytes)
             with patch("training_ops._run_process", side_effect=fetch), patch(
-                "training_ops._fan", return_value=all_results
-            ):
+                "training_ops._ssh", side_effect=[(0, "seed"), (0, "cleanup")]
+            ) as ssh, patch("training_ops._fan", return_value=all_results):
                 with self.assertRaises(RuntimeError) as raised:
                     _policy0_controller_transfer_reference(
                         "h200b", str(source), str(Path(directory) / "reference.json"),
                         list(all_results), {"sha256": source_sha, "size": source_size},
                         OLD_SHA256, OLD_SIZE,
                     )
-        self.assertEqual(raised.exception.results, all_results)
-        self.assertEqual(raised.exception.failures, {"n77": all_results["n77"]})
+        results = raised.exception.results
+        self.assertEqual(set(results), set(all_results))
+        self.assertTrue(all(result["phase"] == "fanout" for result in results.values()))
+        self.assertTrue(results["n76"]["ok"])
+        self.assertFalse(results["n77"]["ok"])
+        self.assertIn("installer not started", results["n76"]["message"])
+        self.assertIn("partial.policy0", results["n76"]["partial_path"])
+        self.assertIn("seed_compressed_sha256", results["n76"])
+        self.assertEqual(ssh.call_count, 3)
 
     def test_final_manifest_verification_checks_exact_hash_and_size(self):
         with tempfile.TemporaryDirectory() as directory:
