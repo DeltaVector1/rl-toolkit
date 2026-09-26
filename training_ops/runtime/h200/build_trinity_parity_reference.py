@@ -123,6 +123,7 @@ def write_input_record(
     tokenizer_path: str,
     *,
     token_count: int = _DEFAULT_TOKEN_COUNT,
+    prefill_rescore: bool = False,
     encode: Callable[[str], list[int]] | None = None,
 ) -> dict[str, Any]:
     """Tokenize a fresh deterministic seed locally and write one sequence.
@@ -130,8 +131,13 @@ def write_input_record(
     ``local_files_only`` is used for the production tokenizer load. This mode
     never reads rollout files and never sends model data over SSH.
     """
-    if isinstance(token_count, bool) or token_count < 4097:
-        raise ReferenceError("input token_count must be at least 4097")
+    if not isinstance(prefill_rescore, bool):
+        raise ReferenceError("prefill_rescore must be a boolean")
+    minimum_token_count = _PREFILL_RESCORE_PROMPT_TOKENS if prefill_rescore else 4097
+    if isinstance(token_count, bool) or token_count < minimum_token_count:
+        raise ReferenceError(
+            f"input token_count must be at least {minimum_token_count}"
+        )
     if encode is None:
         try:
             from transformers import AutoTokenizer
@@ -800,6 +806,11 @@ def build_reference(
                 "prefill": response_hashes["prefill"],
                 "rescore": response_hashes["prefill"],
             },
+            "responses": {
+                "decode": decode_response,
+                "prefill": rescore_response,
+                "rescore": rescore_response,
+            },
             "route_sha256": {
                 "decode": decode_route["sha256"],
                 "prefill": rescore_route["sha256"],
@@ -909,7 +920,11 @@ def build_reference(
         if expected_digest is not None and route.get("sha256") != expected_digest:
             raise ReferenceError("routed expert digest differs from the preserved expectation")
 
-    sampling_params = request_bodies["decode"]["sampling_params"]
+    primary_request = "prefill" if prefill_rescore else "decode"
+    sampling_params = request_bodies[primary_request]["sampling_params"]
+    primary_cache_salt = (
+        rescore_cache_salt if prefill_rescore else cache_salt
+    )
     result = {
         "schema_version": 1,
         "source_kind": record["source_kind"],
@@ -923,7 +938,7 @@ def build_reference(
         "policy": policy,
         "model": model,
         "policy_identity": policy_identity,
-        "cache_salt": cache_salt,
+        "cache_salt": primary_cache_salt,
         "request_mode": (
             _PREFILL_RESCORE_REQUEST_MODE
             if prefill_rescore
@@ -953,6 +968,7 @@ def build_reference(
             assert policy_identity_between is not None
             result["policy_identity_between"] = policy_identity_between
             result["rescore_cache_salt"] = rescore_cache_salt
+            result["decode_cache_salt"] = cache_salt
             result["decode_route_sha256"] = prefill_comparison["route_sha256"]["decode"]
             result["rescore_route_sha256"] = prefill_comparison["route_sha256"]["prefill"]
             result["response_sha256"] = prefill_comparison["response_sha256"]
@@ -973,7 +989,18 @@ def build_reference(
                 stream.write(serialized)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary_path, output_path)
+            try:
+                os.link(temporary_path, output_path, follow_symlinks=False)
+            except FileExistsError as error:
+                raise ReferenceError(
+                    f"refusing to clobber existing qualification output: {output_path}"
+                ) from error
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_fd = os.open(output_path.parent, directory_flags)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             try:
                 temporary_path.unlink()
@@ -1028,6 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.make_input_record,
                 args.tokenizer,
                 token_count=args.token_count,
+                prefill_rescore=args.prefill_rescore,
             )
             return 0
         if not all((args.endpoint, args.input_record, args.output, args.base_model, args.policy)):

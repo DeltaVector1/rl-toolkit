@@ -84,6 +84,38 @@ def _validate_route_payload(
                 raise QualificationError(f"{label} sparse route IDs are invalid")
 
 
+def _json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _route_prediction_differences(
+    decode_route: Mapping[str, Any],
+    prefill_route: Mapping[str, Any],
+) -> dict[str, Any]:
+    decode_shape = decode_route["shape"]
+    prefill_shape = prefill_route["shape"]
+    decode_raw = base64.b64decode(decode_route["data"], validate=True)
+    prefill_raw = base64.b64decode(prefill_route["data"], validate=True)
+    row_width = decode_shape[1] * decode_shape[2]
+    if prefill_shape[1:] != decode_shape[1:] or row_width != prefill_shape[1] * prefill_shape[2]:
+        raise QualificationError("prefill-rescore route row schemas differ")
+    differences = []
+    for row in range(255, 511):
+        decode_ids = list(decode_raw[row * row_width : (row + 1) * row_width])
+        prefill_ids = list(prefill_raw[row * row_width : (row + 1) * row_width])
+        if decode_ids != prefill_ids:
+            differences.append({"row": row, "decode": decode_ids, "prefill": prefill_ids})
+    return {
+        "first_predicting_row": 255,
+        "last_predicting_row_exclusive": 511,
+        "compared_rows": 256,
+        "different_rows": differences,
+        "different_row_count": len(differences),
+    }
+
+
 def _validate_prefill_rescore_comparison(
     value: Mapping[str, Any],
     input_ids: list[int],
@@ -96,6 +128,7 @@ def _validate_prefill_rescore_comparison(
     for key in (
         "decode_request",
         "prefill_request",
+        "rescore_request",
         "request_parameters",
         "response_sha256",
         "route_sha256",
@@ -108,6 +141,8 @@ def _validate_prefill_rescore_comparison(
         raise QualificationError("decode request prompt IDs do not align")
     if prefill_request.get("token_ids") != input_ids:
         raise QualificationError("prefill request token IDs do not align")
+    if comparison["rescore_request"] != prefill_request:
+        raise QualificationError("prefill-rescore request aliases differ")
     decode_salt = decode_request.get("cache_salt")
     prefill_salt = prefill_request.get("cache_salt")
     if (
@@ -118,18 +153,34 @@ def _validate_prefill_rescore_comparison(
         or decode_salt == prefill_salt
     ):
         raise QualificationError("prefill-rescore cache salts are missing or not distinct")
-    if value.get("cache_salt") != decode_salt or value.get("rescore_cache_salt") != prefill_salt:
-        raise QualificationError("prefill-rescore cache salts do not match the reference")
+    prefill_params = prefill_request.get("sampling_params")
+    if not isinstance(prefill_params, Mapping):
+        raise QualificationError("prefill-rescore sampling parameters are missing")
+    if (
+        value.get("cache_salt") != prefill_salt
+        or value.get("rescore_cache_salt") != prefill_salt
+        or value.get("decode_cache_salt") != decode_salt
+        or value.get("sampling_params") != prefill_params
+        or value.get("temperature") != prefill_params.get("temperature")
+    ):
+        raise QualificationError("prefill-rescore primary request fields do not match the reference")
     salts = comparison.get("salts")
     if (
         not isinstance(salts, Mapping)
         or salts.get("decode") != decode_salt
         or salts.get("prefill") != prefill_salt
+        or salts.get("rescore") != prefill_salt
     ):
         raise QualificationError("prefill-rescore salt diagnostic differs")
+    request_parameters = comparison["request_parameters"]
+    if (
+        request_parameters.get("decode") != decode_request.get("sampling_params")
+        or request_parameters.get("prefill") != prefill_request.get("sampling_params")
+    ):
+        raise QualificationError("prefill-rescore request parameters differ")
     for hash_map_name in ("response_sha256", "route_sha256"):
         hashes = comparison[hash_map_name]
-        for phase in ("decode", "prefill"):
+        for phase in ("decode", "prefill", "rescore"):
             digest = hashes.get(phase)
             if (
                 not isinstance(digest, str)
@@ -137,7 +188,18 @@ def _validate_prefill_rescore_comparison(
                 or any(character not in "0123456789abcdef" for character in digest)
             ):
                 raise QualificationError(f"prefill-rescore {hash_map_name} is invalid")
-    if comparison["route_sha256"].get("prefill") != route.get("sha256"):
+    responses = comparison.get("responses")
+    if not isinstance(responses, Mapping):
+        raise QualificationError("prefill-rescore exact responses are missing")
+    for phase in ("decode", "prefill", "rescore"):
+        if phase not in responses:
+            raise QualificationError(f"prefill-rescore response is missing {phase}")
+        if _json_sha256(responses[phase]) != comparison["response_sha256"][phase]:
+            raise QualificationError(f"prefill-rescore {phase} response hash differs")
+    if (
+        comparison["route_sha256"].get("prefill") != route.get("sha256")
+        or comparison["route_sha256"].get("rescore") != route.get("sha256")
+    ):
         raise QualificationError("prefill-rescore route hash does not match reference route")
     decode_route = comparison.get("decode_route")
     if not isinstance(decode_route, Mapping):
@@ -146,6 +208,11 @@ def _validate_prefill_rescore_comparison(
     _validate_route_payload(route, 512, "prefill")
     if comparison["route_sha256"].get("decode") != decode_route.get("sha256"):
         raise QualificationError("prefill-rescore decode route hash does not match diagnostic route")
+    if (
+        comparison.get("prefill_route") != route
+        or comparison.get("rescore_route") != route
+    ):
+        raise QualificationError("prefill-rescore route aliases differ")
     deltas = comparison.get("completion_logprob_deltas")
     if (
         not isinstance(deltas, list)
@@ -170,13 +237,17 @@ def _validate_prefill_rescore_comparison(
             )
         ):
             raise QualificationError("prefill-rescore per-completion diagnostic is misaligned")
+        expected_delta = float(entry["prefill_logprob"]) - float(entry["decode_logprob"])
+        if not math.isclose(float(entry["delta"]), expected_delta, rel_tol=1e-12, abs_tol=1e-12):
+            raise QualificationError("prefill-rescore completion delta was not recomputed")
     route_differences = comparison.get("predicting_route_differences")
     if not isinstance(route_differences, Mapping):
         raise QualificationError("prefill-rescore route comparison is missing")
-    if route_differences.get("compared_rows") != 256 or not isinstance(
-        route_differences.get("different_rows"), list
-    ):
+    if route_differences.get("compared_rows") != 256 or not isinstance(route_differences.get("different_rows"), list):
         raise QualificationError("prefill-rescore predicting routes are not aligned")
+    recomputed_routes = _route_prediction_differences(decode_route, route)
+    if route_differences != recomputed_routes:
+        raise QualificationError("prefill-rescore predicting route differences are incorrect")
 
 
 def _sha256(path: Path) -> str:
@@ -267,7 +338,7 @@ def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
         raise QualificationError("reference routes have an invalid row count")
     required_fields = ["policy_identity_before", "policy_identity_after", "cache_salt"]
     if request_mode == _PREFILL_RESCORE_REQUEST_MODE:
-        required_fields.extend(("policy_identity_between", "rescore_cache_salt"))
+        required_fields.extend(("policy_identity_between", "rescore_cache_salt", "decode_cache_salt"))
     for field in required_fields:
         if field not in value or value[field] is None:
             raise QualificationError(f"reference is missing {field}")
@@ -295,7 +366,7 @@ def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
             raise QualificationError("prefill-rescore reference token alignment is invalid")
         if value["policy_identity_between"] != value["policy_identity_before"]:
             raise QualificationError("policy receipt changed between decode and prefill")
-        if value.get("rescore_cache_salt") == value.get("cache_salt"):
+        if value.get("decode_cache_salt") == value.get("cache_salt"):
             raise QualificationError("prefill-rescore cache salts must be distinct")
         if generated_ids != input_ids[256:]:
             raise QualificationError("prefill-rescore completion suffix does not align")

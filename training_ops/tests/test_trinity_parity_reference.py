@@ -1,4 +1,5 @@
 import base64
+import copy
 import hashlib
 import importlib.util
 import json
@@ -6,7 +7,11 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
-from training_ops.runtime.h200.prepare_trinity_policy0_qualification import validate_reference
+from unittest.mock import patch
+from training_ops.runtime.h200.prepare_trinity_policy0_qualification import (
+    QualificationError,
+    validate_reference,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -156,6 +161,10 @@ class TrinityParityReferenceTest(unittest.TestCase):
         self.assertEqual(len(calls[1]["token_ids"]), 512)
         self.assertEqual(calls[1]["sampling_params"]["prompt_logprobs"], 1)
         self.assertEqual(calls[1]["cache_salt"], "prefill-salt")
+        self.assertEqual(result["cache_salt"], "prefill-salt")
+        self.assertEqual(result["decode_cache_salt"], "decode-salt")
+        self.assertEqual(result["sampling_params"], calls[1]["sampling_params"])
+        self.assertEqual(result["temperature"], 1.0)
         self.assertEqual(result["request_mode"], "serialized_generate_decode256_prefill_rescore")
         self.assertEqual(result["loss_mask"], [False] * 256 + [True] * 256)
         self.assertEqual(result["routed_experts"]["shape"][0], 512)
@@ -166,6 +175,76 @@ class TrinityParityReferenceTest(unittest.TestCase):
         )
         self.assertEqual(result["policy_identity_between"], result["policy_identity_before"])
         self.assertEqual(validate_reference(result)["request_mode"], result["request_mode"])
+        changed = copy.deepcopy(result)
+        changed["prefill_rescore_comparison"]["per_completion"][0]["decode_logprob"] += 1.0
+        with self.assertRaisesRegex(QualificationError, "delta"):
+            validate_reference(changed)
+        changed = copy.deepcopy(result)
+        changed["prefill_rescore_comparison"]["predicting_route_differences"]["different_rows"] = [{"row": 255}]
+        with self.assertRaisesRegex(QualificationError, "route differences"):
+            validate_reference(changed)
+        changed = copy.deepcopy(result)
+        changed["prefill_rescore_comparison"]["responses"]["decode"]["choices"][0]["finish_reason"] = "stop"
+        with self.assertRaisesRegex(QualificationError, "response hash"):
+            validate_reference(changed)
+
+    def test_prefill_rescore_success_does_not_clobber_existing_output(self):
+        decode, prefill = self.prefill_responses()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "reference.json"
+
+            def build_once():
+                calls = []
+
+                def post(_url, _body, _timeout):
+                    calls.append(1)
+                    return decode if len(calls) == 1 else prefill
+
+                states = iter((self.readiness(), self.readiness(), self.readiness()))
+                return reference.build_reference(
+                    endpoint="http://engine:8000/inference/v1/generate",
+                    input_record=self.prefill_record(),
+                    output_path=output,
+                    base_model="base",
+                    policy="policy-0",
+                    policy_model="policy-0-slot0",
+                    expected_policy_identity=self.policy_receipt(),
+                    cache_salt="decode-salt",
+                    rescore_cache_salt="prefill-salt",
+                    prefill_rescore=True,
+                    readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                    minimum_tokens=1,
+                    post_json=post,
+                    get_json=lambda *_: next(states),
+                )
+
+            build_once()
+            original = output.read_bytes()
+            with self.assertRaisesRegex(reference.ReferenceError, "clobber"):
+                build_once()
+            self.assertEqual(output.read_bytes(), original)
+
+    def test_prefill_rescore_input_record_opt_in_and_cli_flag(self):
+        encode = lambda text: list(range(len(text.split())))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "input.json"
+            result = reference.write_input_record(
+                output, "tokenizer", token_count=256, prefill_rescore=True, encode=encode
+            )
+            self.assertEqual(len(result["input_ids"]), 256)
+            with self.assertRaisesRegex(reference.ReferenceError, "at least 4097"):
+                reference.write_input_record(
+                    output, "tokenizer", token_count=256, encode=encode
+                )
+            with patch.object(reference, "write_input_record") as writer:
+                self.assertEqual(
+                    reference.main([
+                        "--make-input-record", str(output), "--tokenizer", "tokenizer",
+                        "--token-count", "256", "--prefill-rescore",
+                    ]),
+                    0,
+                )
+                self.assertTrue(writer.call_args.kwargs["prefill_rescore"])
 
     def test_prefill_rescore_failure_does_not_clobber_output(self):
         decode, _ = self.prefill_responses()
