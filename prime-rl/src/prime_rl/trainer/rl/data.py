@@ -48,7 +48,7 @@ def _decode_reference_routed_experts(value: object, token_count: int) -> Tensor:
             not isinstance(item, bool) and isinstance(item, int) and item > 0
             for item in shape
         )
-        and shape[0] == token_count
+        and shape[0] in {token_count - 1, token_count}
     )
     if (
         value["schema_version"] != 1
@@ -91,12 +91,26 @@ def _decode_reference_routed_experts(value: object, token_count: int) -> Tensor:
     if dense.numel() and torch.count_nonzero(dense):
         raise ValueError("fake reference dense-layer router IDs must be zero")
     sparse = routed[:, dense_layers:, :]
+    sparse_nonzero = sparse.reshape(sparse.shape[0], -1).any(dim=1)
+    # vLLM omits the final forward position. Production rollout packing keeps
+    # the full token sequence and appends one zero route row before training.
+    # A reference may therefore contain exactly token_count-1 raw rows, but
+    # any zero row in the serialized rows is still invalid.
+    if shape[0] == token_count - 1 and not torch.all(sparse_nonzero):
+        raise ValueError("fake reference sparse router rows are incomplete")
+    if shape[0] == token_count and torch.any(~sparse_nonzero[:-1]):
+        raise ValueError("fake reference sparse router rows are incomplete")
+    sparse = sparse[sparse_nonzero]
     if sparse.numel() and (
         int(sparse.max()) >= experts
-        or not torch.count_nonzero(sparse)
         or torch.any(torch.diff(torch.sort(sparse, dim=-1).values, dim=-1) == 0)
     ):
         raise ValueError("fake reference sparse router IDs are invalid")
+    if shape[0] == token_count - 1:
+        routed = torch.cat(
+            (routed, routed.new_zeros((1, routed.shape[1], routed.shape[2]))),
+            dim=0,
+        )
     return routed
 
 

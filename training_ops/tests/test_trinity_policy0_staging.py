@@ -35,7 +35,7 @@ def reference_payload():
         "generated_token_ids": [12, 13],
         "generated_token_count": 2,
         "sequence_lengths": [4],
-        "routed_experts": {"shape": [4, 60, 4]},
+        "routed_experts": {"shape": [3, 60, 4]},
         "policy_identity_before": {"server_instance": "h200"},
         "policy_identity_after": {"server_instance": "h200"},
         "cache_salt": "fresh-policy-0",
@@ -57,7 +57,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         with self.assertRaisesRegex(QualificationError, "cached rollout"):
             validate_reference(changed)
         changed = reference_payload()
-        changed["routed_experts"] = {"shape": [3, 60, 4]}
+        changed["routed_experts"] = {"shape": [4, 60, 4]}
         with self.assertRaisesRegex(QualificationError, "routes"):
             validate_reference(changed)
 

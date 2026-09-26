@@ -6854,7 +6854,7 @@ route = reference.get("routed_experts")
 if (not isinstance(ids, list) or not ids or len(logs or []) != len(ids)
         or not isinstance(mask, list) or len(mask) != len(ids)
         or not isinstance(lengths, list) or sum(lengths) != len(ids)
-        or not isinstance(route, dict) or route.get("shape", [None])[0] != len(ids)
+        or not isinstance(route, dict) or route.get("shape", [None])[0] != len(ids) - 1
         or not any(mask) or all(mask)):
     raise SystemExit("reference token fields are not aligned")
 if reference.get("policy_identity_before") != reference.get("policy_identity_after"):

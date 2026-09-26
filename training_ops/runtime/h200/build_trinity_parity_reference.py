@@ -619,7 +619,12 @@ def build_reference(
     route = choice.get("routed_experts")
     if not isinstance(route, dict):
         raise ReferenceError("serialized generate response is missing routed experts")
-    route = _normalise_route(route, len(full_ids))
+    # vLLM emits one fewer route row than tokens for the default MTP0 path:
+    # the final generated token has no following-token forward position.  The
+    # trainer loader applies the same zero-tail padding as production rollout
+    # packing; keep the serialized qualification artifact raw.
+    route_token_count = len(full_ids) - 1 if policy == "policy-0" else len(full_ids)
+    route = _normalise_route(route, route_token_count)
     if expected_shape is not None and route.get("shape") != expected_shape:
         raise ReferenceError("routed expert shape differs from the preserved expectation")
     if expected_digest is not None and route.get("sha256") != expected_digest:

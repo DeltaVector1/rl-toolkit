@@ -95,8 +95,8 @@ def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
     if any(loss_mask[:first_generated]) or not all(loss_mask[first_generated:]):
         raise QualificationError("reference loss mask is not prompt-then-completion")
     route = value.get("routed_experts")
-    if not isinstance(route, Mapping) or route.get("shape", [None])[0] != len(input_ids):
-        raise QualificationError("reference routes do not cover prompt and completion tokens")
+    if not isinstance(route, Mapping) or route.get("shape", [None])[0] != len(input_ids) - 1:
+        raise QualificationError("reference routes must omit the final token row")
     for field in ("policy_identity_before", "policy_identity_after", "cache_salt"):
         if field not in value or value[field] is None:
             raise QualificationError(f"reference is missing {field}")

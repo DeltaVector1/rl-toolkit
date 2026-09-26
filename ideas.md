@@ -664,3 +664,7 @@ only after measured learning.
 
 - Review measured that `ssh -n` cannot consume the heredoc remote scripts, and that the fresh reference stopped at n82 instead of reaching all configured trainers. The corrected path must use stdin-capable SSH for remote bash, fan out the verified reference from n82, and verify every host.
 - Review also requires an exact trainer-length contract: policy-0 uses an 8160-token prompt plus exactly 32 generated tokens, requests `min_tokens=max_tokens=32`, refuses early stop or any total other than trainer `seq_len=8192`, and keeps the base qualifier unchanged. Route and logprob scaling remain pending deployed audit.
+## Policy-0 routed-expert final-token contract
+
+- Deployed MTP0/default serialized `generate` with prompt length 8160 and 32 generated tokens returned 8191 routed-expert rows (`P+G-1`). Token IDs, logprobs, and the loss mask remain length 8192.
+- Production rollout packing keeps the full token sequence and zero-pads one missing final route row before the trainer model consumes it. The qualification artifact must keep the raw 8191 rows; the trainer fake loader must apply the same one-row tail handling. It must not fabricate a route in the serialized reference.

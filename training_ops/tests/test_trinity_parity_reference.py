@@ -79,7 +79,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
                     ]
                 },
                 "finish_reason": "length",
-                "routed_experts": route_for(prompt_count + completion_count),
+                "routed_experts": route_for(prompt_count + completion_count - 1),
             }],
         }
 
@@ -140,7 +140,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
             self.assertEqual(result["routed_experts"]["experts"], 256)
             self.assertEqual(
                 result["routed_experts"]["sha256"],
-                hashlib.sha256(base64.b64decode(route_for(36)["data"])).hexdigest(),
+                hashlib.sha256(base64.b64decode(route_for(35)["data"])).hexdigest(),
             )
             self.assertEqual(result["policy_identity"], self.policy_receipt())
             self.assertEqual(result["cache_salt"], "qualifier-policy-0-fresh-1")
@@ -225,12 +225,15 @@ class TrinityParityReferenceTest(unittest.TestCase):
         self.assertEqual(len(result["input_ids"]), trainer_seq_len)
         self.assertEqual(result["sequence_lengths"], [trainer_seq_len])
         self.assertEqual(sum(result["loss_mask"]), 32)
-        self.assertEqual(result["routed_experts"]["shape"][0], trainer_seq_len)
+        self.assertEqual(result["routed_experts"]["shape"][0], trainer_seq_len - 1)
         self.assertEqual(len(result["inference_logprobs"]), trainer_seq_len)
         self.assertTrue(
             set(("input_ids", "inference_logprobs", "loss_mask", "sequence_lengths", "routed_experts"))
             <= result.keys()
         )
+        data_source = (ROOT / "prime-rl/src/prime_rl/trainer/rl/data.py").read_text()
+        self.assertIn("shape[0] in {token_count - 1, token_count}", data_source)
+        self.assertIn("routed.new_zeros((1, routed.shape[1], routed.shape[2]))", data_source)
 
     def test_policy_zero_requires_active_receipt_to_stay_stable(self):
         changed = self.policy_receipt()
