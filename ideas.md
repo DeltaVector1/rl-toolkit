@@ -469,3 +469,15 @@ only after measured learning.
   first failed rollout pull. The next loop must retry that same oldest
   undelivered rollout, while control and receiver files still run before
   rollouts and receipts, hashes, and partials remain unchanged.
+
+## Rollout puller lock orphan recovery
+
+- Observed failure: the general stop exited the parent and health loop, but 38
+  exact timeout/rsync/ssh step-2 children inherited fd 9 for
+  `.rollout-pull.lock`. There was no target parent or pid file, so the lock
+  stayed held and blocked the exact stop.
+- Recovery plan: close fd 9 for every background transfer job and health child
+  before fork or exec. A one-time cleanup may kill only processes with the
+  exact RUN/source/destination/identity environment and an fd pointing to the
+  exact lock inode, then must verify that the lock is free. Do not use broad
+  process matching or pkill.

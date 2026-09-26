@@ -52,6 +52,7 @@ class RolloutPullTest(unittest.TestCase):
                 "if [ -n \"${RSYNC_SLEEP_ONCE_MARKER:-}\" ] && [ ! -e \"$RSYNC_SLEEP_ONCE_MARKER\" ]; then "
                 "(set -C; : >\"$RSYNC_SLEEP_ONCE_MARKER\") 2>/dev/null || true; "
                 "sleep \"${RSYNC_SLEEP:-0}\"; fi; "
+                "while [ -n \"${RSYNC_BLOCK_FILE:-}\" ] && [ -e \"$RSYNC_BLOCK_FILE\" ]; do sleep 0.1; done; "
                 "cp -- \"$src\" \"$dst\"\n"
             )
         for path in tools.iterdir():
@@ -187,6 +188,95 @@ class RolloutPullTest(unittest.TestCase):
             finally:
                 subprocess.run(["bash", "-c", stop_command], env=environment, capture_output=True, timeout=10)
                 training_ops.rollout_pull_script = old_script
+
+    def test_background_jobs_do_not_hold_lock_after_parent_group_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            rollout = source / "rollouts/step_1/train_rollouts.bin"
+            rollout.parent.mkdir(parents=True)
+            rollout.write_bytes(bytes(range(256)))
+            block = base / "rsync-block"
+            block.touch()
+            attempts = base / "rsync-attempts"
+            environment = self.environment(source, destination, self.tools(directory))
+            environment.update(
+                PARALLEL_THRESHOLD="1",
+                PARALLEL_STREAMS="1",
+                PULL_PART_TIMEOUT="300",
+                RSYNC_BLOCK_FILE=str(block),
+                RSYNC_ATTEMPTS_LOG=str(attempts),
+            )
+            old_script = training_ops.rollout_pull_script
+            training_ops.rollout_pull_script = str(puller)
+            stop_command = training_ops._rollout_pull_command(str(destination), "stop")
+            start_command = training_ops._rollout_pull_command(str(destination), "start")
+            owner = subprocess.Popen(
+                ["setsid", "bash", str(puller), "run"],
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                for _ in range(100):
+                    if attempts.is_file() and attempts.read_text().strip():
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(attempts.is_file())
+                self.assertTrue(attempts.read_text().strip())
+                os.killpg(owner.pid, signal.SIGTERM)
+                owner.wait(timeout=10)
+
+                self.assertEqual(
+                    subprocess.run(
+                        ["flock", "-n", str(destination / ".rollout-pull.lock"), "-c", "true"],
+                        env=environment,
+                    ).returncode,
+                    0,
+                )
+                stopped = subprocess.run(
+                    ["bash", "-c", stop_command],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                started = subprocess.run(
+                    ["bash", "-c", start_command],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(started.returncode, 0, started.stderr)
+                stopped = subprocess.run(
+                    ["bash", "-c", stop_command],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            finally:
+                block.unlink(missing_ok=True)
+                if owner.poll() is None:
+                    os.killpg(owner.pid, signal.SIGKILL)
+                    owner.wait(timeout=10)
+                subprocess.run(
+                    ["bash", "-c", stop_command],
+                    env=environment,
+                    capture_output=True,
+                    timeout=10,
+                )
+                training_ops.rollout_pull_script = old_script
+
+    def test_background_jobs_close_lock_fd_at_the_fork_boundary(self):
+        source = puller.read_text()
+        self.assertIn('"$part" 9>&- &', source)
+        self.assertIn(") 9>&- &", source)
+        self.assertIn("health_lease_loop' 9>&- &", source)
 
     def test_health_lease_renews_during_blocked_scan(self):
         with tempfile.TemporaryDirectory() as directory:

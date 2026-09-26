@@ -269,7 +269,7 @@ pull_bytes() {
       pids=("${pids[@]:1}")
     done
     pull_rsync -az --partial --append-verify --timeout=60 -e "$rsync_ssh" \
-      "$source_target:$remote_parts/$name" "$part" &
+      "$source_target:$remote_parts/$name" "$part" 9>&- &
     pids+=("$!")
   done <<<"$listing"
   for part in "${pids[@]}"; do wait "$part" || status=1; done
@@ -398,7 +398,7 @@ refresh_health_lease() {
       else
         exit 2
       fi
-    ) &
+    ) 9>&- &
     health_probe_pids+=("$!")
   done
   for pid in "${health_probe_pids[@]}"; do
@@ -454,7 +454,7 @@ start_health_lease() {
   export source_dir source_host source_port source_user source_identity source_known_hosts
   export trainer_addresses trainer_container
   export -f health_remote health_publish_state refresh_health_lease health_lease_shutdown health_lease_loop
-  setsid bash -c 'exec -a rollout-pull-health bash -c health_lease_loop' &
+  setsid bash -c 'exec -a rollout-pull-health bash -c health_lease_loop' 9>&- &
   health_lease_pid=$!
 }
 
