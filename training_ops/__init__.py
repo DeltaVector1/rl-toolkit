@@ -2767,7 +2767,10 @@ def _warnings(s: Status) -> list[str]:
     if s.orch_up and not s.trainer_failure_watchdog:
         location = "edge lease" if s.rollout_transfer_direction == "trainer_pull" else "edge"
         w.append(f"{location} trainer-failure watchdog is not running; rollout production will not fail closed")
-    trainer_busy = (
+    trainer_gpu_busy = s.trainer_up and any(
+        node.reachable and node.gpu_util >= 50 for node in s.nodes
+    )
+    active_rollouts = (
         s.mode != "trainer-only"
         and s.trainer_up
         and s.orch_up
@@ -2779,6 +2782,7 @@ def _warnings(s: Status) -> list[str]:
             for e in s.engines
         )
     )
+    trainer_busy = trainer_gpu_busy or active_rollouts
     ages = (("trainer", s.trainer_log_age),) if trainer_only else (
         ("trainer", s.trainer_log_age),
         ("orchestrator", s.orch_log_age),

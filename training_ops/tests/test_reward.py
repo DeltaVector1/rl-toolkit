@@ -275,6 +275,31 @@ class TrainerLogAgeWarningTest(unittest.TestCase):
                 self._has_trainer_stall_warning(training_ops._warnings(status))
             )
 
+    def test_busy_trainer_gpu_still_suppresses_without_rollout_components(self):
+        for mode in ("rl", "trainer-only"):
+            with self.subTest(mode=mode):
+                status = training_ops.Status(
+                    mode=mode,
+                    trainer_up=True,
+                    trainer_log_age=training_ops.stall_seconds + 1,
+                    nodes=[training_ops.NodeState(host="x85", gpu_util=50)],
+                )
+
+                self.assertFalse(
+                    self._has_trainer_stall_warning(training_ops._warnings(status))
+                )
+
+    def test_idle_trainer_gpu_keeps_trainer_log_age_warning(self):
+        status = training_ops.Status(
+            trainer_up=True,
+            trainer_log_age=training_ops.stall_seconds + 1,
+            nodes=[training_ops.NodeState(host="x85", gpu_util=49)],
+        )
+
+        self.assertTrue(
+            self._has_trainer_stall_warning(training_ops._warnings(status))
+        )
+
 
 class ActiveRewardRowsTest(unittest.TestCase):
     def test_selects_rows_after_active_container_start(self):
