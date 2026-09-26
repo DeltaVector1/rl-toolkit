@@ -101,6 +101,35 @@ def _atomic_no_clobber_write(path: Path, payload: str) -> None:
             pass
 
 
+def _publish_post_failure(
+    output_path: Path,
+    *,
+    error: str,
+    request: Mapping[str, Any],
+    response: Any = None,
+    client_request_id: str | None = None,
+) -> None:
+    """Keep the first failed POST's raw evidence without overwriting it."""
+    diagnostic: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "post_update_post_failure",
+        "error": error,
+        "request": dict(request),
+        "request_sha256": _json_sha256(request),
+        "client_request_id": client_request_id,
+        "response": response if isinstance(response, Mapping) else None,
+    }
+    if isinstance(response, Mapping):
+        diagnostic["response_sha256"] = _json_sha256(response)
+        diagnostic["server_response_id"] = response.get("request_id")
+    else:
+        diagnostic["response_repr"] = repr(response)
+    _atomic_no_clobber_write(
+        output_path,
+        json.dumps(diagnostic, sort_keys=True, separators=(",", ":")) + "\n",
+    )
+
+
 def _post_update_binding(
     reference: Mapping[str, Any],
     *,
@@ -121,6 +150,13 @@ def _post_update_binding(
     request_id = request.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         raise PostUpdateQualificationError("post-update request ID is missing")
+    request_without_id = dict(request)
+    request_without_id.pop("request_id", None)
+    if request_id != _json_sha256(request_without_id):
+        raise PostUpdateQualificationError("post-update client request ID is not bound to the request body")
+    response_id = response.get("request_id")
+    if not isinstance(response_id, str) or not response_id.strip():
+        raise PostUpdateQualificationError("post-update response ID is missing")
     server_instance = receipt.get("server_instance")
     target_sha = receipt.get("target_sha256")
     config_sha = receipt.get("config_sha256")
@@ -152,7 +188,8 @@ def _post_update_binding(
         "full_input_sha256": _json_sha256(input_ids),
         "request_sha256": _json_sha256(request),
         "response_sha256": _json_sha256(response),
-        "request_id": request_id,
+        "client_request_id": request_id,
+        "server_response_id": response.get("request_id"),
         "adapter_size": receipt.get("target_size"),
         "config_size": receipt.get("config_size"),
         "route_shape": list(route["shape"]),
@@ -176,11 +213,18 @@ def build_post_update_reference(
     post_json: Any = None,
     get_json: Any = None,
     advantage_value: float = POST_UPDATE_ADVANTAGE_VALUE,
+    failure_output_path: Path | None = None,
 ) -> dict[str, Any]:
     """Build one strict reference from one fresh serialized completion decode."""
-    if output_path.exists() or output_path.is_symlink():
+    failure_path = Path(failure_output_path) if failure_output_path is not None else output_path
+    if (
+        output_path.exists()
+        or output_path.is_symlink()
+        or failure_path.exists()
+        or failure_path.is_symlink()
+    ):
         raise PostUpdateQualificationError(
-            f"refusing to clobber existing qualification output: {output_path}"
+            f"refusing to clobber existing qualification output: {failure_path}"
         )
     if isinstance(advantage_value, bool) or not math.isfinite(float(advantage_value)) or float(advantage_value) == 0.0:
         raise PostUpdateQualificationError("post-update advantage value must be finite and nonzero")
@@ -197,15 +241,44 @@ def build_post_update_reference(
             raise PostUpdateQualificationError("post-update request body is not mutable")
         request_id = _json_sha256(body)
         body["request_id"] = request_id
-        response = actual_post_json(url, body, request_timeout)
+        request_snapshot = dict(body)
+        try:
+            response = actual_post_json(url, body, request_timeout)
+        except Exception as error:
+            _publish_post_failure(
+                failure_path,
+                error=str(error),
+                request=request_snapshot,
+                client_request_id=request_id,
+            )
+            raise PostUpdateQualificationError(
+                "post-update POST failed; raw request diagnostic was published"
+            ) from error
         if not isinstance(response, Mapping):
-            raise PostUpdateQualificationError("post-update response is not an object")
+            error = "post-update response is not an object"
+            _publish_post_failure(
+                failure_path,
+                error=error,
+                request=request_snapshot,
+                response=response,
+                client_request_id=request_id,
+            )
+            raise PostUpdateQualificationError(error)
         returned_id = response.get("request_id")
-        if returned_id is not None and returned_id != request_id:
-            raise PostUpdateQualificationError("post-update response request ID differs")
+        if not isinstance(returned_id, str) or not returned_id.strip():
+            error = "post-update response request ID is missing"
+            _publish_post_failure(
+                failure_path,
+                error=error,
+                request=request_snapshot,
+                response=response,
+                client_request_id=request_id,
+            )
+            raise PostUpdateQualificationError(error)
         return dict(response)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    failure_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output_path.parent, prefix=f".{output_path.name}.build.") as directory:
         temporary_output = Path(directory) / output_path.name
         try:
@@ -239,6 +312,8 @@ def build_post_update_reference(
         if len(result.get("input_ids", [])) != POST_UPDATE_SEQ_LEN:
             raise PostUpdateQualificationError("post-update reference length is not 8192")
         result["advantages"] = [0.0] * POST_UPDATE_PROMPT_TOKENS + [float(advantage_value)] * POST_UPDATE_COMPLETION_TOKENS
+        result["client_request_id"] = result["request_bodies"]["decode"]["request_id"]
+        result["server_response_id"] = result["responses"]["decode"]["request_id"]
         result["qualification_binding"] = _post_update_binding(
             result, advantage_value=float(advantage_value)
         )
@@ -291,6 +366,7 @@ def build_post_update_references(
             current = build_post_update_reference(
                 input_record=record,
                 output_path=Path(directory) / f"reference-{index}.json",
+                failure_output_path=output_path,
                 post_json=post_json,
                 get_json=get_json,
                 **per_reference,
@@ -462,7 +538,21 @@ def validate_post_update_reference(
     request_id = request.get("request_id")
     if not isinstance(request_id, str) or not request_id:
         raise PostUpdateQualificationError("post-update request ID is missing")
+    request_without_id = dict(request)
+    request_without_id.pop("request_id", None)
+    if request_id != _json_sha256(request_without_id):
+        raise PostUpdateQualificationError("post-update client request ID is not bound to the request body")
     response = responses["decode"]
+    response_id = response.get("request_id")
+    if not isinstance(response_id, str) or not response_id.strip():
+        raise PostUpdateQualificationError("post-update response ID is missing")
+    if (
+        validated.get("client_request_id") != request_id
+        or validated.get("server_response_id") != response_id
+        or validated.get("client_request_id") != request.get("request_id")
+        or validated.get("server_response_id") != response.get("request_id")
+    ):
+        raise PostUpdateQualificationError("post-update request or response ID binding differs")
     choices = response.get("choices")
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], Mapping):
         raise PostUpdateQualificationError("post-update response choice is missing")
@@ -529,13 +619,15 @@ def validate_post_update_references(
     input_hashes = [item["qualification_binding"]["input_sha256"] for item in validated]
     response_hashes = [item["qualification_binding"]["response_sha256"] for item in validated]
     salts = [item.get("cache_salt") for item in validated]
-    request_ids = [item["qualification_binding"]["request_id"] for item in validated]
+    client_request_ids = [item["qualification_binding"]["client_request_id"] for item in validated]
+    server_response_ids = [item["qualification_binding"]["server_response_id"] for item in validated]
     if (
         len(set(input_hashes)) != 8
         or len(set(response_hashes)) != 8
         or len(set(salts)) != 8
         or any(not isinstance(salt, str) or not salt for salt in salts)
-        or len(set(request_ids)) != 8
+        or len(set(client_request_ids)) != 8
+        or len(set(server_response_ids)) != 8
     ):
         raise PostUpdateQualificationError("post-update microbatch input or response hashes are reused")
     return {"schema_version": 1, "microbatches": validated}

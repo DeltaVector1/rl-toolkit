@@ -65,6 +65,7 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
     def response(self):
         generated = list(range(10000, 10032))
         return {
+            "request_id": "server-response-default",
             "choices": [{
                 "token_ids": generated,
                 "finish_reason": "length",
@@ -172,6 +173,7 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
             record["input_ids"] = [token + index * 10000 for token in record["input_ids"]]
             records.append(record)
             response = self.response()
+            response["request_id"] = f"server-response-{index}"
             response["choices"][0]["token_ids"] = [10000 + index * 100 + token for token in range(32)]
             response["choices"][0]["logprobs"]["content"] = [
                 {"token": f"token_id:{token}", "logprob": -0.25}
@@ -196,11 +198,108 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
         self.assertEqual(len(ids), 8)
         self.assertEqual(len(set(ids)), 8)
         self.assertTrue(all(isinstance(value, str) and value for value in ids))
+        server_ids = [item["responses"]["decode"].get("request_id") for item in result["microbatches"]]
+        self.assertEqual(len(set(server_ids)), 8)
         for item in result["microbatches"]:
             self.assertEqual(
                 item["qualification_binding"]["request_sha256"],
                 item["request_sha256"]["decode"],
             )
+            self.assertEqual(
+                item["qualification_binding"]["client_request_id"],
+                item["request_bodies"]["decode"]["request_id"],
+            )
+            self.assertEqual(
+                item["qualification_binding"]["server_response_id"],
+                item["responses"]["decode"]["request_id"],
+            )
+
+        duplicate_server = copy.deepcopy(result)
+        duplicate_server["microbatches"][1]["responses"]["decode"]["request_id"] = server_ids[0]
+        duplicate_server["microbatches"][1]["server_response_id"] = server_ids[0]
+        duplicate_server["microbatches"][1]["qualification_binding"] = post_update._post_update_binding(
+            duplicate_server["microbatches"][1]
+        )
+        duplicate_server["microbatches"][1]["response_sha256"]["decode"] = duplicate_server["microbatches"][1]["qualification_binding"]["response_sha256"]
+        with self.assertRaises(PostUpdateQualificationError):
+            validate_post_update_references(
+                duplicate_server,
+                expected_seq_len=SEQ_LEN,
+                expected_policy_identity=self.receipt(),
+            )
+
+
+    def test_server_response_id_may_differ_from_client_request_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.build(Path(directory) / "reference.json")
+        client_id = result["qualification_binding"]["client_request_id"]
+        server_id = result["qualification_binding"]["server_response_id"]
+        self.assertNotEqual(client_id, server_id)
+        self.assertEqual(server_id, "server-response-default")
+
+    def test_failed_post_publishes_raw_id_diagnostic_without_clobbering(self):
+        output = None
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "reference.json"
+            with self.assertRaises(PostUpdateQualificationError):
+                build_post_update_reference(
+                    endpoint="http://h200b:18100/inference/v1/generate",
+                    input_record=self.input_record(),
+                    output_path=output,
+                    base_model="/data/trinity-thinking-fp8",
+                    policy_model="policy-0-slot0",
+                    expected_policy_identity=self.receipt(),
+                    policy_receipt=self.receipt(),
+                    cache_salt="fresh-post-update-decode",
+                    readiness_endpoint="http://h200b:18100/inference/v1/staging-status",
+                    post_json=lambda *_: {"unexpected": True},
+                    get_json=lambda *_: self.receipt(),
+                )
+            diagnostic = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["kind"], "post_update_post_failure")
+            self.assertNotIn("request_id", diagnostic["response"])
+            original = output.read_bytes()
+            with self.assertRaises(PostUpdateQualificationError):
+                build_post_update_reference(
+                    endpoint="http://h200b:18100/inference/v1/generate",
+                    input_record=self.input_record(),
+                    output_path=output,
+                    base_model="/data/trinity-thinking-fp8",
+                    policy_model="policy-0-slot0",
+                    expected_policy_identity=self.receipt(),
+                    policy_receipt=self.receipt(),
+                    cache_salt="fresh-post-update-decode",
+                    readiness_endpoint="http://h200b:18100/inference/v1/staging-status",
+                    post_json=lambda *_: {"request_id": "other-server-id"},
+                    get_json=lambda *_: self.receipt(),
+                )
+            self.assertEqual(output.read_bytes(), original)
+
+    def test_eight_reference_failure_keeps_diagnostic_at_final_path(self):
+        records = []
+        for index in range(8):
+            record = self.input_record()
+            record["input_ids"] = [token + index * 10000 for token in record["input_ids"]]
+            records.append(record)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "reference.json"
+            with self.assertRaises(PostUpdateQualificationError):
+                build_post_update_references(
+                    endpoint="http://h200b:18100/inference/v1/generate",
+                    input_records=records,
+                    output_path=output,
+                    base_model="/data/trinity-thinking-fp8",
+                    policy_model="policy-0-slot0",
+                    expected_policy_identity=self.receipt(),
+                    policy_receipt=self.receipt(),
+                    cache_salt="fresh-post-update-decode",
+                    readiness_endpoint="http://h200b:18100/inference/v1/staging-status",
+                    post_json=lambda *_: {"choices": []},
+                    get_json=lambda *_: self.receipt(),
+                )
+            diagnostic = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["kind"], "post_update_post_failure")
+            self.assertEqual(diagnostic["response"], {"choices": []})
 
     def test_validator_rejects_reused_salts_and_unbound_response_tokens(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -208,6 +307,10 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
         changed = copy.deepcopy(result)
         changed["cache_salt"] = "same-salt"
         changed["request_bodies"]["decode"]["cache_salt"] = "same-salt"
+        changed["request_bodies"]["decode"].pop("request_id")
+        changed["request_bodies"]["decode"]["request_id"] = post_update._json_sha256(
+            changed["request_bodies"]["decode"]
+        )
         changed["qualification_binding"] = post_update._post_update_binding(changed)
         with self.assertRaises(PostUpdateQualificationError):
             validate_post_update_reference(
@@ -217,6 +320,10 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
             )
         changed = copy.deepcopy(result)
         changed["request_bodies"]["decode"]["sampling_params"]["temperature"] = 0.2
+        changed["request_bodies"]["decode"].pop("request_id")
+        changed["request_bodies"]["decode"]["request_id"] = post_update._json_sha256(
+            changed["request_bodies"]["decode"]
+        )
         changed["qualification_binding"] = post_update._post_update_binding(changed)
         with self.assertRaises(PostUpdateQualificationError):
             validate_post_update_reference(
@@ -322,6 +429,7 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
             record["input_ids"] = [token + index * 10000 for token in record["input_ids"]]
             records.append(record)
             response = self.response()
+            response["request_id"] = f"server-response-{index}"
             response["choices"][0]["token_ids"] = [10000 + index * 100 + token for token in range(32)]
             response["choices"][0]["logprobs"]["content"] = [
                 {"token": f"token_id:{token}", "logprob": -0.25}
