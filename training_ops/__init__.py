@@ -6842,7 +6842,7 @@ if (not isinstance(config.get("target_modules"), list)
 reference = json.loads(open(reference_path, encoding="utf-8").read())
 if reference.get("policy") != "policy-0":
     raise SystemExit("reference is not policy-0")
-if reference.get("request_mode") != "serialized_generate_completion_prompt_logprobs":
+if reference.get("request_mode") != "serialized_generate_completion_logprobs":
     raise SystemExit("reference is not a completion qualification")
 if reference.get("source_kind") in {"rollout_batch", "cached_rollout_batch"}:
     raise SystemExit("cached rollout reference is not allowed")
@@ -6857,6 +6857,8 @@ if (not isinstance(ids, list) or not ids or len(logs or []) != len(ids)
         or not isinstance(route, dict) or route.get("shape", [None])[0] != len(ids) - 1
         or not any(mask) or all(mask)):
     raise SystemExit("reference token fields are not aligned")
+if any(logprob != 0.0 for logprob, trainable in zip(logs, mask) if not trainable):
+    raise SystemExit("reference prompt inference logprobs are not zero")
 if reference.get("policy_identity_before") != reference.get("policy_identity_after"):
     raise SystemExit("reference policy identity changed")
 if not reference.get("cache_salt"):
@@ -6967,7 +6969,7 @@ reference = json.loads(open(sys.argv[1], encoding="utf-8").read())
 expected = json.loads(sys.argv[2])
 if reference.get("policy") != "policy-0":
     raise SystemExit("reference is not policy-0")
-if reference.get("request_mode") != "serialized_generate_completion_prompt_logprobs":
+if reference.get("request_mode") != "serialized_generate_completion_logprobs":
     raise SystemExit("reference is not a completion qualification")
 if reference.get("source_kind") in {"rollout_batch", "cached_rollout_batch"}:
     raise SystemExit("cached rollout reference is not allowed")

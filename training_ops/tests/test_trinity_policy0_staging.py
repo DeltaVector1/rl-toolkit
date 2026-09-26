@@ -27,10 +27,10 @@ EXPECTED_LORA = {
 def reference_payload():
     return {
         "policy": "policy-0",
-        "request_mode": "serialized_generate_completion_prompt_logprobs",
+        "request_mode": "serialized_generate_completion_logprobs",
         "source_kind": "operator_non_rollout",
         "input_ids": [10, 11, 12, 13],
-        "inference_logprobs": [0.0, -1.0, -2.0, -3.0],
+        "inference_logprobs": [0.0, 0.0, -2.0, -3.0],
         "loss_mask": [False, False, True, True],
         "generated_token_ids": [12, 13],
         "generated_token_count": 2,
@@ -60,6 +60,10 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         changed["routed_experts"] = {"shape": [4, 60, 4]}
         with self.assertRaisesRegex(QualificationError, "routes"):
             validate_reference(changed)
+        changed = reference_payload()
+        changed["inference_logprobs"][1] = -0.1
+        with self.assertRaisesRegex(QualificationError, "prompt inference logprobs"):
+            validate_reference(changed)
 
     def test_plan_uses_all_configured_trainers_without_live_action(self):
         plan = prepare_policy0_qualification(
@@ -78,7 +82,8 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertEqual(plan["source_reference_host"], "h200b")
         self.assertIn("preserved-step0/adapter_model.safetensors", plan["source_adapter_script"])
         self.assertIn("fresh-h200/reference.json", plan["transfer_reference_script"])
-        self.assertIn("serialized_generate_completion_prompt_logprobs", plan["verify_script"])
+        self.assertIn("serialized_generate_completion_logprobs", plan["verify_script"])
+        self.assertIn("prompt inference logprobs are not zero", plan["verify_script"])
         self.assertIn("sha256sum", plan["verify_script"])
         self.assertIn("read(1024 * 1024)", plan["verify_script"])
         self.assertNotIn('open(path, "rb").read()', plan["verify_script"])

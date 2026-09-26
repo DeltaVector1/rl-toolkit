@@ -573,8 +573,9 @@ def build_reference(
         "max_tokens": completion_tokens if policy == "policy-0" else 1,
         "temperature": 0.0 if policy == "policy-0" else 1.0,
         "top_p": 1.0,
-        "prompt_logprobs": 1,
     }
+    if policy == "base":
+        sampling_params["prompt_logprobs"] = 1
     if policy == "policy-0":
         sampling_params["logprobs"] = 1
         sampling_params["min_tokens"] = completion_tokens
@@ -590,7 +591,11 @@ def build_reference(
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
         raise ReferenceError("serialized generate response must contain one choice")
     choice = choices[0]
-    prompt_logprobs = _flatten_prompt_logprobs(response.get("prompt_logprobs"), input_ids)
+    prompt_logprobs = (
+        [0.0] * token_count
+        if policy == "policy-0"
+        else _flatten_prompt_logprobs(response.get("prompt_logprobs"), input_ids)
+    )
     generated_ids: list[int] = []
     generated_logprobs: list[float] = []
     full_ids = input_ids
@@ -616,6 +621,12 @@ def build_reference(
         full_ids = input_ids + generated_ids
         full_logprobs = prompt_logprobs + generated_logprobs
         loss_mask = [False] * token_count + [True] * len(generated_ids)
+        if any(
+            logprob != 0.0
+            for logprob, trainable in zip(full_logprobs, loss_mask)
+            if not trainable
+        ):
+            raise ReferenceError("policy-0 prompt inference logprobs must be zero")
     route = choice.get("routed_experts")
     if not isinstance(route, dict):
         raise ReferenceError("serialized generate response is missing routed experts")
@@ -645,7 +656,7 @@ def build_reference(
         "policy_identity": policy_identity,
         "cache_salt": cache_salt,
         "request_mode": (
-            "serialized_generate_completion_prompt_logprobs"
+            "serialized_generate_completion_logprobs"
             if policy == "policy-0"
             else "serialized_generate_prompt_logprobs"
         ),

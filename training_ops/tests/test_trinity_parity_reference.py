@@ -69,7 +69,6 @@ class TrinityParityReferenceTest(unittest.TestCase):
     def policy_response(self, prompt_count=4, completion_count=32):
         generated_ids = list(range(900, 900 + completion_count))
         return {
-            "prompt_logprobs": self.response(prompt_count)["prompt_logprobs"],
             "choices": [{
                 "token_ids": generated_ids,
                 "logprobs": {
@@ -117,6 +116,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
             self.assertEqual(calls[0][1]["token_ids"], self.record()["input_ids"])
             self.assertEqual(calls[0][1]["cache_salt"], "qualifier-policy-0-fresh-1")
             self.assertNotIn("cache_salt", calls[0][1]["sampling_params"])
+            self.assertNotIn("prompt_logprobs", calls[0][1]["sampling_params"])
             self.assertEqual(
                 calls[0][1]["sampling_params"],
                 {
@@ -124,12 +124,11 @@ class TrinityParityReferenceTest(unittest.TestCase):
                     "min_tokens": 32,
                     "temperature": 0.0,
                     "top_p": 1.0,
-                    "prompt_logprobs": 1,
                     "logprobs": 1,
                 },
             )
             self.assertEqual(len(result["input_ids"]), 36)
-            self.assertEqual(result["inference_logprobs"][:4], [0.0, -1.0, -2.0, -3.0])
+            self.assertEqual(result["inference_logprobs"][:4], [0.0] * 4)
             self.assertEqual(result["loss_mask"], [False] * 4 + [True] * 32)
             self.assertEqual(result["sequence_lengths"], [36])
             self.assertEqual(
@@ -144,11 +143,19 @@ class TrinityParityReferenceTest(unittest.TestCase):
             )
             self.assertEqual(result["policy_identity"], self.policy_receipt())
             self.assertEqual(result["cache_salt"], "qualifier-policy-0-fresh-1")
-            self.assertEqual(result["request_mode"], "serialized_generate_completion_prompt_logprobs")
+            self.assertEqual(result["request_mode"], "serialized_generate_completion_logprobs")
             self.assertEqual(result["generated_token_count"], 32)
             self.assertEqual(result["policy_identity_before"], self.policy_receipt())
             self.assertEqual(result["policy_identity_after"], self.policy_receipt())
-            self.assertEqual(result["sampling_params"]["prompt_logprobs"], 1)
+            self.assertTrue(
+                all(
+                    logprob == 0.0
+                    for logprob, trainable in zip(
+                        result["inference_logprobs"], result["loss_mask"]
+                    )
+                    if not trainable
+                )
+            )
             self.assertEqual(json.loads(output.read_text()), result)
 
     def test_policy_zero_requires_matching_readiness_receipt(self):
@@ -357,6 +364,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
             )
         self.assertEqual(calls[0]["model"], "base-model")
         self.assertNotIn("cache_salt", calls[0])
+        self.assertEqual(calls[0]["sampling_params"]["prompt_logprobs"], 1)
         self.assertIsNone(result["policy_identity"])
         self.assertIsNone(result["cache_salt"])
         self.assertEqual(result["request_mode"], "serialized_generate_prompt_logprobs")

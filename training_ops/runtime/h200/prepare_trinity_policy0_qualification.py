@@ -67,7 +67,7 @@ def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
         raise QualificationError("reference must be an object")
     if value.get("policy") != "policy-0":
         raise QualificationError("reference is not a policy-0 reference")
-    if value.get("request_mode") != "serialized_generate_completion_prompt_logprobs":
+    if value.get("request_mode") != "serialized_generate_completion_logprobs":
         raise QualificationError("reference does not use completion qualification mode")
     if value.get("source_kind") in {"rollout_batch", "cached_rollout_batch"}:
         raise QualificationError("cached rollout reference is not allowed")
@@ -109,6 +109,8 @@ def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
         or len(generated_ids) != sum(loss_mask)
     ):
         raise QualificationError("reference generated token metadata is not aligned")
+    if any(logprob != 0.0 for logprob, trainable in zip(logprobs, loss_mask) if not trainable):
+        raise QualificationError("reference prompt inference logprobs must be zero")
     return dict(value)
 
 
