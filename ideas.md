@@ -378,3 +378,17 @@ only after measured learning.
   This improved from the prior step-1 unmasked KL of 2.8270 but still failed
   safely. Next test: change only the trainer router dtype to BF16 to align it
   with inference; keep the production config unchanged until this passes.
+
+- The BF16-router follow-up was worse: unmasked mismatch KL was
+  0.636548996, versus 0.609494925 with the FP32 trainer router. Revert the
+  experimental dtype to FP32 before the next test; do not change production.
+- The qualification reference also had a capture flaw. The current 32768-token
+  reference retained only one completion token from a temperature-0 request;
+  it did not use the full `prompt_logprobs` stream and was not
+  production-equivalent. Regenerate the same 32768-token reference through
+  serialized `/inference/v1/generate` with `max_tokens=1`,
+  `temperature=1.0`, `top_p=1.0`, and `prompt_logprobs=1`. Flatten one prompt
+  logprob per token, set the leading token to 0 and masked, retain all other
+  prompt tokens, and preserve the exact routed-expert payload. Use the
+  `prefill_logprobs` contract in
+  `prime-rl/src/prime_rl/utils/client.py`.
