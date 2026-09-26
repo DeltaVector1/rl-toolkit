@@ -1,5 +1,22 @@
 # Difficulty ideas
 
+## Isolated decode256 to prefill-rescore parity qualification
+
+- **Planned, opt-in only.** Keep the existing policy-0 qualification unchanged
+  by default. The new mode decodes exactly 256 completion tokens from a 256-token
+  prompt, then scores the exact prompt-plus-completion sequence with a separate
+  cache salt.
+- Require identical policy readiness receipts before decode, between decode and
+  rescore, and after rescore. Preserve exact token IDs, validate the decode
+  route (511 rows) and full rescore route (512 rows), and publish no artifact
+  when any request, response, route, token-key, finite-value, alignment, receipt,
+  or timeout check fails.
+- Keep a strict diagnostic comparison with both request bodies and salts,
+  response and route hashes, completion logprob deltas, and predicting-route
+  differences. Use the rescored completion logprobs with zero prompt values in
+  the trainer reference. This is a qualification parity check, not a training
+  result.
+
 ## Policy-0 reference staging repair
 
 - Route the small H200 reference file through the controller, verify its

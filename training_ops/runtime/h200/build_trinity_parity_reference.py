@@ -14,6 +14,7 @@ import binascii
 import hashlib
 import json
 import math
+import os
 import re
 import sys
 from collections import Counter
@@ -27,6 +28,10 @@ from urllib.request import Request, urlopen
 _RAW_ROUTE_FIELDS = {"data", "dtype", "shape", "start"}
 _MAX_ROUTE_BYTES = 512 * 1024 * 1024
 _POLICIES = {"base", "policy-0"}
+_PREFILL_RESCORE_REQUEST_MODE = "serialized_generate_decode256_prefill_rescore"
+_PREFILL_RESCORE_PROMPT_TOKENS = 256
+_PREFILL_RESCORE_COMPLETION_TOKENS = 256
+_PREFILL_RESCORE_SEQUENCE_TOKENS = 512
 _DEFAULT_TOKEN_COUNT = 8160
 # A two-percent excess limit rejects a periodic seed while allowing ordinary
 # syntax to recur in long natural-language input.
@@ -318,6 +323,66 @@ def _flatten_completion_logprobs(raw: Any, completion_ids: list[int]) -> list[fl
     return result
 
 
+def _json_sha256(value: Any) -> str:
+    """Hash one response or request without depending on object key order."""
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _route_prediction_comparison(
+    decode_route: Mapping[str, Any],
+    rescore_route: Mapping[str, Any],
+    *,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> dict[str, Any]:
+    """Compare the route rows that predict the generated suffix."""
+    try:
+        decode_raw = base64.b64decode(decode_route["data"], validate=True)
+        rescore_raw = base64.b64decode(rescore_route["data"], validate=True)
+    except (KeyError, binascii.Error, ValueError) as error:
+        raise ReferenceError("cannot compare serialized routed experts") from error
+    decode_shape = decode_route.get("shape")
+    rescore_shape = rescore_route.get("shape")
+    if (
+        not isinstance(decode_shape, list)
+        or not isinstance(rescore_shape, list)
+        or len(decode_shape) != 3
+        or len(rescore_shape) != 3
+        or decode_shape[1:] != rescore_shape[1:]
+    ):
+        raise ReferenceError("decode and prefill routes have different row schemas")
+    decode_width = decode_shape[1] * decode_shape[2]
+    rescore_width = rescore_shape[1] * rescore_shape[2]
+    if decode_width != rescore_width or len(decode_raw) != decode_shape[0] * decode_width:
+        raise ReferenceError("decode route rows are not aligned")
+    if len(rescore_raw) != rescore_shape[0] * rescore_width:
+        raise ReferenceError("prefill route rows are not aligned")
+    # The row immediately before each completion token predicts that token.
+    first_row = prompt_tokens - 1
+    last_row = first_row + completion_tokens
+    if decode_shape[0] < last_row or rescore_shape[0] < last_row:
+        raise ReferenceError("decode and prefill routes do not cover the completion")
+    differences = []
+    for row in range(first_row, last_row):
+        decode_ids = list(decode_raw[row * decode_width : (row + 1) * decode_width])
+        rescore_ids = list(rescore_raw[row * rescore_width : (row + 1) * rescore_width])
+        if decode_ids != rescore_ids:
+            differences.append({
+                "row": row,
+                "decode": decode_ids,
+                "prefill": rescore_ids,
+            })
+    return {
+        "first_predicting_row": first_row,
+        "last_predicting_row_exclusive": last_row,
+        "compared_rows": completion_tokens,
+        "different_rows": differences,
+        "different_row_count": len(differences),
+    }
+
+
 def _post_json(endpoint: str, body: Mapping[str, Any], timeout: float) -> dict[str, Any]:
     request = Request(
         endpoint,
@@ -479,10 +544,12 @@ def build_reference(
     policy_receipt: Path | Mapping[str, Any] | None = None,
     expected_policy_identity: Path | Mapping[str, Any] | None = None,
     cache_salt: str | None = None,
+    prefill_rescore: bool = False,
+    rescore_cache_salt: str | None = None,
     readiness_endpoint: str | None = None,
-    completion_tokens: int = 32,
-    minimum_completion_tokens: int = 32,
-    trainer_seq_len: int = 8192,
+    completion_tokens: int | None = None,
+    minimum_completion_tokens: int | None = None,
+    trainer_seq_len: int | None = None,
     minimum_tokens: int = 4097,
     expected_route_shape: list[int] | None = None,
     expected_route_sha256: str | None = None,
@@ -492,6 +559,22 @@ def build_reference(
 ) -> dict[str, Any]:
     if policy not in _POLICIES:
         raise ReferenceError(f"policy must be one of {sorted(_POLICIES)}")
+    if not isinstance(prefill_rescore, bool):
+        raise ReferenceError("prefill_rescore must be a boolean")
+    if not prefill_rescore and rescore_cache_salt is not None:
+        raise ReferenceError("rescore_cache_salt requires --prefill-rescore")
+    if prefill_rescore and policy != "policy-0":
+        raise ReferenceError("prefill-rescore is only supported for policy-0")
+    if trainer_seq_len is None:
+        trainer_seq_len = (
+            _PREFILL_RESCORE_SEQUENCE_TOKENS if prefill_rescore else 8192
+        )
+    if completion_tokens is None:
+        completion_tokens = (
+            _PREFILL_RESCORE_COMPLETION_TOKENS if prefill_rescore else 32
+        )
+    if minimum_completion_tokens is None:
+        minimum_completion_tokens = completion_tokens
     if not base_model or (policy == "policy-0" and not policy_model):
         raise ReferenceError("base_model and selected policy model are required")
     if isinstance(minimum_tokens, bool) or minimum_tokens < 0:
@@ -510,7 +593,7 @@ def build_reference(
     record = _load_record(input_record)
     input_ids = list(record["input_ids"])
     token_count = len(input_ids)
-    if token_count < minimum_tokens:
+    if not prefill_rescore and token_count < minimum_tokens:
         raise ReferenceError(
             f"input sequence has {token_count} tokens; at least {minimum_tokens} are required"
         )
@@ -562,85 +645,271 @@ def build_reference(
         policy_identity = None
     cache_salt = _validate_cache_salt(cache_salt, required=policy == "policy-0")
     if policy == "policy-0":
-        if completion_tokens != 32 or minimum_completion_tokens != 32:
+        if prefill_rescore:
+            if (
+                completion_tokens != _PREFILL_RESCORE_COMPLETION_TOKENS
+                or minimum_completion_tokens != _PREFILL_RESCORE_COMPLETION_TOKENS
+                or trainer_seq_len != _PREFILL_RESCORE_SEQUENCE_TOKENS
+                or token_count != _PREFILL_RESCORE_PROMPT_TOKENS
+            ):
+                raise ReferenceError(
+                    "prefill-rescore qualification requires prompt256, completion256, and seq_len512"
+                )
+            rescore_cache_salt = _validate_cache_salt(rescore_cache_salt, required=True)
+            if cache_salt == rescore_cache_salt:
+                raise ReferenceError("decode and prefill cache salts must be distinct")
+        elif completion_tokens != 32 or minimum_completion_tokens != 32:
             raise ReferenceError("policy-0 qualification requires exactly 32 generated tokens")
         expected_prompt_tokens = trainer_seq_len - completion_tokens
         if token_count != expected_prompt_tokens:
             raise ReferenceError(
                 f"policy-0 prompt must contain exactly {expected_prompt_tokens} tokens"
             )
-    sampling_params = {
-        "max_tokens": completion_tokens if policy == "policy-0" else 1,
-        "temperature": 0.0 if policy == "policy-0" else 1.0,
-        "top_p": 1.0,
-    }
-    if policy == "base":
-        sampling_params["prompt_logprobs"] = 1
-    if policy == "policy-0":
-        sampling_params["logprobs"] = 1
-        sampling_params["min_tokens"] = completion_tokens
-    request_body: dict[str, Any] = {
-        "model": model,
-        "token_ids": input_ids,
-        "sampling_params": sampling_params,
-    }
-    if cache_salt is not None:
-        request_body["cache_salt"] = cache_salt
-    response = post_json(generate_endpoint if policy == "policy-0" else _endpoint_url(endpoint), request_body, timeout)
-    choices = response.get("choices")
-    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
-        raise ReferenceError("serialized generate response must contain one choice")
-    choice = choices[0]
-    prompt_logprobs = (
-        [0.0] * token_count
-        if policy == "policy-0"
-        else _flatten_prompt_logprobs(response.get("prompt_logprobs"), input_ids)
-    )
+    response_hashes: dict[str, str] = {}
+    request_bodies: dict[str, dict[str, Any]] = {}
     generated_ids: list[int] = []
     generated_logprobs: list[float] = []
+    finish_reason: Any = None
     full_ids = input_ids
-    full_logprobs = prompt_logprobs
+    full_logprobs: list[float]
     loss_mask = [False] * token_count
-    if policy == "policy-0":
-        raw_generated_ids = choice.get("token_ids")
+    route: dict[str, Any]
+    prefill_comparison: dict[str, Any] | None = None
+    policy_identity_between: dict[str, Any] | None = None
+    if prefill_rescore:
+        decode_sampling_params = {
+            "max_tokens": _PREFILL_RESCORE_COMPLETION_TOKENS,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "logprobs": 1,
+            "min_tokens": _PREFILL_RESCORE_COMPLETION_TOKENS,
+        }
+        decode_request: dict[str, Any] = {
+            "model": model,
+            "token_ids": list(input_ids),
+            "sampling_params": decode_sampling_params,
+            "cache_salt": cache_salt,
+        }
+        request_bodies["decode"] = decode_request
+        decode_response = post_json(generate_endpoint, decode_request, timeout)
+        response_hashes["decode"] = _json_sha256(decode_response)
+        decode_choices = decode_response.get("choices")
+        if (
+            not isinstance(decode_choices, list)
+            or len(decode_choices) != 1
+            or not isinstance(decode_choices[0], dict)
+        ):
+            raise ReferenceError("decode response must contain one choice")
+        decode_choice = decode_choices[0]
+        raw_generated_ids = decode_choice.get("token_ids")
         if (
             not isinstance(raw_generated_ids, list)
-            or len(raw_generated_ids) < minimum_completion_tokens
-            or len(raw_generated_ids) > completion_tokens
+            or len(raw_generated_ids) != _PREFILL_RESCORE_COMPLETION_TOKENS
             or any(isinstance(token, bool) or not isinstance(token, int) for token in raw_generated_ids)
         ):
-            raise ReferenceError("policy-0 response has too few or invalid generated token IDs")
-        if len(input_ids) + len(raw_generated_ids) != trainer_seq_len:
-            raise ReferenceError(
-                f"policy-0 response must contain exactly trainer seq_len={trainer_seq_len} tokens"
-            )
+            raise ReferenceError("decode response must contain exactly 256 token IDs")
         generated_ids = list(raw_generated_ids)
+        finish_reason = decode_choice.get("finish_reason")
         generated_logprobs = _flatten_completion_logprobs(
-            choice.get("logprobs"), generated_ids
+            decode_choice.get("logprobs"), generated_ids
         )
         full_ids = input_ids + generated_ids
-        full_logprobs = prompt_logprobs + generated_logprobs
-        loss_mask = [False] * token_count + [True] * len(generated_ids)
-        if any(
-            logprob != 0.0
-            for logprob, trainable in zip(full_logprobs, loss_mask)
-            if not trainable
-        ):
-            raise ReferenceError("policy-0 prompt inference logprobs must be zero")
-    route = choice.get("routed_experts")
-    if not isinstance(route, dict):
-        raise ReferenceError("serialized generate response is missing routed experts")
-    # vLLM emits one fewer route row than tokens for the default MTP0 path:
-    # the final generated token has no following-token forward position.  The
-    # trainer loader applies the same zero-tail padding as production rollout
-    # packing; keep the serialized qualification artifact raw.
-    route_token_count = len(full_ids) - 1 if policy == "policy-0" else len(full_ids)
-    route = _normalise_route(route, route_token_count)
-    if expected_shape is not None and route.get("shape") != expected_shape:
-        raise ReferenceError("routed expert shape differs from the preserved expectation")
-    if expected_digest is not None and route.get("sha256") != expected_digest:
-        raise ReferenceError("routed expert digest differs from the preserved expectation")
+        decode_route = decode_choice.get("routed_experts")
+        if not isinstance(decode_route, dict):
+            raise ReferenceError("decode response is missing routed experts")
+        decode_route = _normalise_route(
+            decode_route, _PREFILL_RESCORE_SEQUENCE_TOKENS - 1
+        )
 
+        between_payload = get_json(readiness_url, timeout)
+        policy_identity_between = _validate_policy_receipt(
+            _extract_policy_receipt(between_payload, model),
+            expected_identity,
+            model,
+        )
+        if policy_identity_between != policy_identity_before:
+            raise ReferenceError("active policy receipt changed between decode and prefill")
+
+        rescore_sampling_params = {
+            "max_tokens": 1,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "prompt_logprobs": 1,
+        }
+        rescore_request: dict[str, Any] = {
+            "model": model,
+            "token_ids": list(full_ids),
+            "sampling_params": rescore_sampling_params,
+            "cache_salt": rescore_cache_salt,
+        }
+        request_bodies["prefill"] = rescore_request
+        rescore_response = post_json(generate_endpoint, rescore_request, timeout)
+        response_hashes["prefill"] = _json_sha256(rescore_response)
+        rescore_choices = rescore_response.get("choices")
+        if (
+            not isinstance(rescore_choices, list)
+            or len(rescore_choices) != 1
+            or not isinstance(rescore_choices[0], dict)
+        ):
+            raise ReferenceError("prefill response must contain one choice")
+        rescore_choice = rescore_choices[0]
+        rescored_logprobs = _flatten_prompt_logprobs(
+            rescore_response.get("prompt_logprobs"), full_ids
+        )
+        rescore_route = rescore_choice.get("routed_experts")
+        if not isinstance(rescore_route, dict):
+            raise ReferenceError("prefill response is missing routed experts")
+        rescore_route = _normalise_route(
+            rescore_route, _PREFILL_RESCORE_SEQUENCE_TOKENS
+        )
+        full_logprobs = [0.0] * _PREFILL_RESCORE_PROMPT_TOKENS + rescored_logprobs[
+            _PREFILL_RESCORE_PROMPT_TOKENS:
+        ]
+        loss_mask = [False] * _PREFILL_RESCORE_PROMPT_TOKENS + [True] * _PREFILL_RESCORE_COMPLETION_TOKENS
+        deltas = [
+            prefill - decoded
+            for decoded, prefill in zip(
+                generated_logprobs,
+                rescored_logprobs[_PREFILL_RESCORE_PROMPT_TOKENS:],
+            )
+        ]
+        if any(not math.isfinite(value) for value in deltas):
+            raise ReferenceError("decode-vs-prefill logprob delta is not finite")
+        route_differences = _route_prediction_comparison(
+            decode_route,
+            rescore_route,
+            prompt_tokens=_PREFILL_RESCORE_PROMPT_TOKENS,
+            completion_tokens=_PREFILL_RESCORE_COMPLETION_TOKENS,
+        )
+        request_bodies = {"decode": decode_request, "prefill": rescore_request}
+        prefill_comparison = {
+            "decode_request": decode_request,
+            "prefill_request": rescore_request,
+            "rescore_request": rescore_request,
+            "request_parameters": {
+                "decode": decode_sampling_params,
+                "prefill": rescore_sampling_params,
+            },
+            "salts": {
+                "decode": cache_salt,
+                "prefill": rescore_cache_salt,
+                "rescore": rescore_cache_salt,
+            },
+            "response_sha256": {
+                "decode": response_hashes["decode"],
+                "prefill": response_hashes["prefill"],
+                "rescore": response_hashes["prefill"],
+            },
+            "route_sha256": {
+                "decode": decode_route["sha256"],
+                "prefill": rescore_route["sha256"],
+                "rescore": rescore_route["sha256"],
+            },
+            "decode_route": decode_route,
+            "prefill_route": rescore_route,
+            "rescore_route": rescore_route,
+            "completion_logprob_deltas": deltas,
+            "per_completion": [
+                {
+                    "index": index,
+                    "token_id": token_id,
+                    "decode_logprob": decoded,
+                    "prefill_logprob": rescored,
+                    "delta": delta,
+                }
+                for index, (token_id, decoded, rescored, delta) in enumerate(
+                    zip(
+                        generated_ids,
+                        generated_logprobs,
+                        rescored_logprobs[_PREFILL_RESCORE_PROMPT_TOKENS:],
+                        deltas,
+                    )
+                )
+            ],
+            "predicting_route_differences": route_differences,
+        }
+        route = rescore_route
+        if expected_shape is not None and route.get("shape") != expected_shape:
+            raise ReferenceError("prefill routed expert shape differs from the preserved expectation")
+        if expected_digest is not None and route.get("sha256") != expected_digest:
+            raise ReferenceError("prefill routed expert digest differs from the preserved expectation")
+    else:
+        sampling_params = {
+            "max_tokens": completion_tokens if policy == "policy-0" else 1,
+            "temperature": 0.0 if policy == "policy-0" else 1.0,
+            "top_p": 1.0,
+        }
+        if policy == "base":
+            sampling_params["prompt_logprobs"] = 1
+        if policy == "policy-0":
+            sampling_params["logprobs"] = 1
+            sampling_params["min_tokens"] = completion_tokens
+        request_body: dict[str, Any] = {
+            "model": model,
+            "token_ids": input_ids,
+            "sampling_params": sampling_params,
+        }
+        if cache_salt is not None:
+            request_body["cache_salt"] = cache_salt
+        response = post_json(
+            generate_endpoint if policy == "policy-0" else _endpoint_url(endpoint),
+            request_body,
+            timeout,
+        )
+        response_hashes["decode"] = _json_sha256(response)
+        request_bodies["decode"] = request_body
+        choices = response.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+            raise ReferenceError("serialized generate response must contain one choice")
+        choice = choices[0]
+        finish_reason = choice.get("finish_reason")
+        prompt_logprobs = (
+            [0.0] * token_count
+            if policy == "policy-0"
+            else _flatten_prompt_logprobs(response.get("prompt_logprobs"), input_ids)
+        )
+        full_logprobs = prompt_logprobs
+        if policy == "policy-0":
+            raw_generated_ids = choice.get("token_ids")
+            if (
+                not isinstance(raw_generated_ids, list)
+                or len(raw_generated_ids) < minimum_completion_tokens
+                or len(raw_generated_ids) > completion_tokens
+                or any(isinstance(token, bool) or not isinstance(token, int) for token in raw_generated_ids)
+            ):
+                raise ReferenceError("policy-0 response has too few or invalid generated token IDs")
+            if len(input_ids) + len(raw_generated_ids) != trainer_seq_len:
+                raise ReferenceError(
+                    f"policy-0 response must contain exactly trainer seq_len={trainer_seq_len} tokens"
+                )
+            generated_ids = list(raw_generated_ids)
+            generated_logprobs = _flatten_completion_logprobs(
+                choice.get("logprobs"), generated_ids
+            )
+            full_ids = input_ids + generated_ids
+            full_logprobs = prompt_logprobs + generated_logprobs
+            loss_mask = [False] * token_count + [True] * len(generated_ids)
+            if any(
+                logprob != 0.0
+                for logprob, trainable in zip(full_logprobs, loss_mask)
+                if not trainable
+            ):
+                raise ReferenceError("policy-0 prompt inference logprobs must be zero")
+        route = choice.get("routed_experts")
+        if not isinstance(route, dict):
+            raise ReferenceError("serialized generate response is missing routed experts")
+        # vLLM emits one fewer route row than tokens for the default MTP0 path:
+        # the final generated token has no following-token forward position.  The
+        # trainer loader applies the same zero-tail padding as production rollout
+        # packing; keep the serialized qualification artifact raw.
+        route_token_count = len(full_ids) - 1 if policy == "policy-0" else len(full_ids)
+        route = _normalise_route(route, route_token_count)
+        if expected_shape is not None and route.get("shape") != expected_shape:
+            raise ReferenceError("routed expert shape differs from the preserved expectation")
+        if expected_digest is not None and route.get("sha256") != expected_digest:
+            raise ReferenceError("routed expert digest differs from the preserved expectation")
+
+    sampling_params = request_bodies["decode"]["sampling_params"]
     result = {
         "schema_version": 1,
         "source_kind": record["source_kind"],
@@ -656,9 +925,13 @@ def build_reference(
         "policy_identity": policy_identity,
         "cache_salt": cache_salt,
         "request_mode": (
-            "serialized_generate_completion_logprobs"
-            if policy == "policy-0"
-            else "serialized_generate_prompt_logprobs"
+            _PREFILL_RESCORE_REQUEST_MODE
+            if prefill_rescore
+            else (
+                "serialized_generate_completion_logprobs"
+                if policy == "policy-0"
+                else "serialized_generate_prompt_logprobs"
+            )
         ),
         "sampling_params": sampling_params,
         "source_input_sha256": hashlib.sha256(
@@ -676,12 +949,38 @@ def build_reference(
             raise ReferenceError("active policy receipt changed during generation")
         result["policy_identity_before"] = policy_identity_before
         result["policy_identity_after"] = policy_identity_after
+        if prefill_rescore:
+            assert policy_identity_between is not None
+            result["policy_identity_between"] = policy_identity_between
+            result["rescore_cache_salt"] = rescore_cache_salt
+            result["decode_route_sha256"] = prefill_comparison["route_sha256"]["decode"]
+            result["rescore_route_sha256"] = prefill_comparison["route_sha256"]["prefill"]
+            result["response_sha256"] = prefill_comparison["response_sha256"]
+            result["prefill_rescore_comparison"] = prefill_comparison
+            result["request_bodies"] = request_bodies
         result["loss_mask"] = loss_mask
         result["generated_token_ids"] = generated_ids
         result["generated_token_count"] = len(generated_ids)
-        result["finish_reason"] = choice.get("finish_reason")
+        result["finish_reason"] = finish_reason
+    serialized = json.dumps(result, separators=(",", ":")) + "\n"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(result, separators=(",", ":")) + "\n")
+    if prefill_rescore:
+        temporary_path = output_path.with_name(
+            f"{output_path.name}.partial.prefill-rescore.{os.getpid()}"
+        )
+        try:
+            with temporary_path.open("x") as stream:
+                stream.write(serialized)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, output_path)
+        finally:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+    else:
+        output_path.write_text(serialized)
     return result
 
 
@@ -699,10 +998,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-receipt", type=Path, help="JSON readiness/load receipt for policy-0")
     parser.add_argument("--expected-policy-identity", type=Path, help="JSON expected policy identity for policy-0")
     parser.add_argument("--cache-salt", help="fresh top-level prefix-cache salt for policy-0")
+    parser.add_argument(
+        "--prefill-rescore",
+        action="store_true",
+        help="opt in to the isolated decode256 then full-sequence prefill-rescore qualification",
+    )
+    parser.add_argument(
+        "--rescore-cache-salt",
+        help="distinct fresh top-level prefix-cache salt for prefill-rescore",
+    )
     parser.add_argument("--readiness-endpoint", help="explicit active staging readiness URL for policy-0")
-    parser.add_argument("--completion-tokens", type=int, default=32)
-    parser.add_argument("--minimum-completion-tokens", type=int, default=32)
-    parser.add_argument("--trainer-seq-len", type=int, default=8192)
+    parser.add_argument("--completion-tokens", type=int)
+    parser.add_argument("--minimum-completion-tokens", type=int)
+    parser.add_argument("--trainer-seq-len", type=int)
     parser.add_argument("--minimum-tokens", type=int, default=4097)
     parser.add_argument("--expected-route-shape", type=int, nargs=3)
     parser.add_argument("--expected-route-sha256")
@@ -736,6 +1044,8 @@ def main(argv: list[str] | None = None) -> int:
             policy_receipt=args.policy_receipt,
             expected_policy_identity=args.expected_policy_identity,
             cache_salt=args.cache_salt,
+            prefill_rescore=args.prefill_rescore,
+            rescore_cache_salt=args.rescore_cache_salt,
             readiness_endpoint=args.readiness_endpoint,
             completion_tokens=args.completion_tokens,
             minimum_completion_tokens=args.minimum_completion_tokens,

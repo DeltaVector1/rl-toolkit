@@ -6,6 +6,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from training_ops.runtime.h200.prepare_trinity_policy0_qualification import validate_reference
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,6 +82,119 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 "routed_experts": route_for(prompt_count + completion_count - 1),
             }],
         }
+
+    def prefill_record(self):
+        return {
+            "source_kind": "operator_non_rollout",
+            "input_ids": list(range(256)),
+            "sequence_lengths": [256],
+            "expected_route_shape": [512, 8, 2],
+        }
+
+    def prefill_responses(self):
+        prompt_ids = self.prefill_record()["input_ids"]
+        completion_ids = list(range(900, 1156))
+        full_ids = prompt_ids + completion_ids
+        decode = {
+            "choices": [{
+                "token_ids": completion_ids,
+                "logprobs": {
+                    "content": [
+                        {"token": f"token_id:{token}", "logprob": -0.1}
+                        for token in completion_ids
+                    ]
+                },
+                "routed_experts": route_for(511),
+                "finish_reason": "length",
+            }]
+        }
+        prefill = {
+            "prompt_logprobs": [
+                None,
+                *[
+                    {str(token): {"logprob": -0.2}}
+                    for token in full_ids[1:]
+                ],
+            ],
+            "choices": [{"routed_experts": route_for(512)}],
+        }
+        return decode, prefill
+
+    def test_prefill_rescore_uses_two_exact_requests_and_three_receipts(self):
+        calls = []
+        decode, prefill = self.prefill_responses()
+
+        def post(_url, body, _timeout):
+            calls.append(body)
+            return decode if len(calls) == 1 else prefill
+
+        states = iter((self.readiness(), self.readiness(), self.readiness()))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "reference.json"
+            result = reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=self.prefill_record(),
+                output_path=output,
+                base_model="/data/trinity-thinking-fp8",
+                policy="policy-0",
+                policy_model="policy-0-slot0",
+                expected_policy_identity=self.policy_receipt(),
+                cache_salt="decode-salt",
+                rescore_cache_salt="prefill-salt",
+                prefill_rescore=True,
+                readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                minimum_tokens=1,
+                post_json=post,
+                get_json=lambda *_: next(states),
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["token_ids"], list(range(256)))
+        self.assertEqual(len(calls[0]["token_ids"]), 256)
+        self.assertEqual(calls[0]["sampling_params"]["max_tokens"], 256)
+        self.assertEqual(calls[0]["cache_salt"], "decode-salt")
+        self.assertEqual(calls[1]["token_ids"], result["input_ids"])
+        self.assertEqual(len(calls[1]["token_ids"]), 512)
+        self.assertEqual(calls[1]["sampling_params"]["prompt_logprobs"], 1)
+        self.assertEqual(calls[1]["cache_salt"], "prefill-salt")
+        self.assertEqual(result["request_mode"], "serialized_generate_decode256_prefill_rescore")
+        self.assertEqual(result["loss_mask"], [False] * 256 + [True] * 256)
+        self.assertEqual(result["routed_experts"]["shape"][0], 512)
+        self.assertEqual(result["prefill_rescore_comparison"]["decode_route"]["shape"][0], 511)
+        self.assertEqual(
+            len(result["prefill_rescore_comparison"]["completion_logprob_deltas"]),
+            256,
+        )
+        self.assertEqual(result["policy_identity_between"], result["policy_identity_before"])
+        self.assertEqual(validate_reference(result)["request_mode"], result["request_mode"])
+
+    def test_prefill_rescore_failure_does_not_clobber_output(self):
+        decode, _ = self.prefill_responses()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "reference.json"
+            output.write_text("old artifact\n")
+
+            def post(_url, _body, _timeout):
+                raise reference.ReferenceError("timeout")
+
+            with self.assertRaisesRegex(reference.ReferenceError, "timeout"):
+                reference.build_reference(
+                    endpoint="http://engine:8000/inference/v1/generate",
+                    input_record=self.prefill_record(),
+                    output_path=output,
+                    base_model="base",
+                    policy="policy-0",
+                    policy_model="policy-0-slot0",
+                    expected_policy_identity=self.policy_receipt(),
+                    cache_salt="decode-salt",
+                    rescore_cache_salt="prefill-salt",
+                    prefill_rescore=True,
+                    readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                    minimum_tokens=1,
+                    post_json=post,
+                    get_json=lambda *_: self.readiness(),
+                )
+            self.assertEqual(output.read_text(), "old artifact\n")
+            self.assertEqual(list(output.parent.glob("*.partial.prefill-rescore.*")), [])
 
     def readiness(self, receipt=None):
         return {"loaded_receipt": receipt or self.policy_receipt()}

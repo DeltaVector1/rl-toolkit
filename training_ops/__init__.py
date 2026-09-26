@@ -6840,13 +6840,52 @@ test -f "$adapter" && test ! -L "$adapter"
 test -f "$config_file" && test ! -L "$config_file"
 test -f "$reference" && test ! -L "$reference"
 python3 - "$config_file" "$reference" {shlex.quote(expected_json)} {shlex.quote(file_json)} <<'PY'
-import json
+import base64
+import binascii
 import hashlib
+import json
+import math
 import sys
 
 config_path, reference_path, expected_json, file_json = sys.argv[1:]
 expected = json.loads(expected_json)
 expected_files = json.loads(file_json)
+
+def check_route(route, rows, label):
+    fields = {{"schema_version", "encoding", "dtype", "shape", "dense_layers", "experts", "sha256", "data"}}
+    if not isinstance(route, dict) or set(route) != fields:
+        raise SystemExit(label + " route schema is invalid")
+    shape = route.get("shape")
+    dense_layers = route.get("dense_layers")
+    experts = route.get("experts")
+    if (route.get("schema_version") != 1 or route.get("encoding") != "base64"
+            or route.get("dtype") != "uint8" or not isinstance(shape, list)
+            or len(shape) != 3 or any(type(item) is not int or item <= 0 for item in shape)
+            or shape[0] != rows or type(dense_layers) is not int
+            or not 0 <= dense_layers < shape[1] or type(experts) is not int
+            or not 1 <= experts <= 256):
+        raise SystemExit(label + " route metadata is invalid")
+    encoded = route.get("data")
+    digest = route.get("sha256")
+    if (not isinstance(encoded, str) or not isinstance(digest, str) or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)):
+        raise SystemExit(label + " route checksum metadata is invalid")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise SystemExit(label + " route data is invalid")
+    if len(raw) != shape[0] * shape[1] * shape[2] or hashlib.sha256(raw).hexdigest() != digest:
+        raise SystemExit(label + " route checksum is invalid")
+    row_width = shape[1] * shape[2]
+    for offset in range(0, len(raw), row_width):
+        row = raw[offset:offset + row_width]
+        dense_end = dense_layers * shape[2]
+        if any(row[:dense_end]):
+            raise SystemExit(label + " dense route IDs are invalid")
+        for layer in range(dense_layers, shape[1]):
+            selected = row[layer * shape[2]:(layer + 1) * shape[2]]
+            if any(expert >= experts for expert in selected) or len(set(selected)) != len(selected):
+                raise SystemExit(label + " sparse route IDs are invalid")
 config = json.loads(open(config_path, encoding="utf-8").read())
 for key in ("r", "lora_alpha", "lora_dropout"):
     if config.get(key) != expected[key]:
@@ -6858,7 +6897,8 @@ if (not isinstance(config.get("target_modules"), list)
 reference = json.loads(open(reference_path, encoding="utf-8").read())
 if reference.get("policy") != "policy-0":
     raise SystemExit("reference is not policy-0")
-if reference.get("request_mode") != "serialized_generate_completion_logprobs":
+request_mode = reference.get("request_mode")
+if request_mode not in {{"serialized_generate_completion_logprobs", "serialized_generate_decode256_prefill_rescore"}}:
     raise SystemExit("reference is not a completion qualification")
 if reference.get("source_kind") in {"rollout_batch", "cached_rollout_batch"}:
     raise SystemExit("cached rollout reference is not allowed")
@@ -6867,12 +6907,18 @@ logs = reference.get("inference_logprobs")
 mask = reference.get("loss_mask")
 lengths = reference.get("sequence_lengths")
 route = reference.get("routed_experts")
-if (not isinstance(ids, list) or not ids or len(logs or []) != len(ids)
+if not isinstance(ids, list) or not ids:
+    raise SystemExit("reference token fields are not aligned")
+expected_route_rows = len(ids) if request_mode == "serialized_generate_decode256_prefill_rescore" else len(ids) - 1
+if (len(logs or []) != len(ids)
         or not isinstance(mask, list) or len(mask) != len(ids)
         or not isinstance(lengths, list) or sum(lengths) != len(ids)
-        or not isinstance(route, dict) or route.get("shape", [None])[0] != len(ids) - 1
+        or not isinstance(route, dict) or route.get("shape", [None])[0] != expected_route_rows
         or not any(mask) or all(mask)):
     raise SystemExit("reference token fields are not aligned")
+if any(isinstance(logprob, bool) or not isinstance(logprob, (int, float))
+       or not math.isfinite(float(logprob)) for logprob in logs):
+    raise SystemExit("reference inference logprobs are not finite")
 if any(logprob != 0.0 for logprob, trainable in zip(logs, mask) if not trainable):
     raise SystemExit("reference prompt inference logprobs are not zero")
 if reference.get("policy_identity_before") != reference.get("policy_identity_after"):
@@ -6884,6 +6930,59 @@ if (not isinstance(generated_ids, list)
         or reference.get("generated_token_count") != len(generated_ids)
         or len(generated_ids) != sum(mask)):
     raise SystemExit("reference generated token metadata is not aligned")
+if request_mode == "serialized_generate_decode256_prefill_rescore":
+    if (len(ids) != 512 or mask != [False] * 256 + [True] * 256
+            or generated_ids != ids[256:]
+            or reference.get("policy_identity_between") != reference.get("policy_identity_before")
+            or not reference.get("rescore_cache_salt")
+            or reference.get("rescore_cache_salt") == reference.get("cache_salt")):
+        raise SystemExit("prefill-rescore reference is not aligned")
+    comparison = reference.get("prefill_rescore_comparison")
+    if (not isinstance(comparison, dict)
+            or not isinstance(comparison.get("decode_request"), dict)
+            or not isinstance(comparison.get("prefill_request"), dict)
+            or not isinstance(comparison.get("request_parameters"), dict)
+            or not isinstance(comparison.get("response_sha256"), dict)
+            or not isinstance(comparison.get("route_sha256"), dict)
+            or comparison["decode_request"].get("token_ids") != ids[:256]
+            or comparison["prefill_request"].get("token_ids") != ids):
+        raise SystemExit("prefill-rescore request diagnostic is not aligned")
+    decode_salt = comparison["decode_request"].get("cache_salt")
+    rescore_salt = comparison["prefill_request"].get("cache_salt")
+    if (not isinstance(decode_salt, str) or not isinstance(rescore_salt, str)
+            or not decode_salt or not rescore_salt or decode_salt == rescore_salt
+            or not isinstance(comparison.get("salts"), dict)
+            or comparison["salts"].get("decode") != decode_salt
+            or comparison["salts"].get("prefill") != rescore_salt):
+        raise SystemExit("prefill-rescore diagnostic salts are invalid")
+    for hash_map_name in ("response_sha256", "route_sha256"):
+        hashes = comparison[hash_map_name]
+        for phase in ("decode", "prefill"):
+            digest = hashes.get(phase)
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)):
+                raise SystemExit("prefill-rescore diagnostic hash is invalid")
+    deltas = comparison.get("completion_logprob_deltas")
+    per_completion = comparison.get("per_completion")
+    if (not isinstance(deltas, list) or len(deltas) != 256
+            or not isinstance(per_completion, list) or len(per_completion) != 256
+            or any(isinstance(item, bool) or not isinstance(item, (int, float))
+                   or not math.isfinite(float(item)) for item in deltas)):
+        raise SystemExit("prefill-rescore diagnostic deltas are invalid")
+    for index, entry in enumerate(per_completion):
+        if (not isinstance(entry, dict) or entry.get("index") != index
+                or entry.get("token_id") != generated_ids[index]
+                or entry.get("delta") != deltas[index]
+                or any(isinstance(entry.get(key), bool)
+                       or not isinstance(entry.get(key), (int, float))
+                       or not math.isfinite(float(entry.get(key)))
+                       for key in ("decode_logprob", "prefill_logprob", "delta"))):
+            raise SystemExit("prefill-rescore diagnostic completion is invalid")
+    check_route(comparison.get("decode_route"), 511, "decode")
+    check_route(route, 512, "prefill")
+    if (comparison["route_sha256"].get("decode") != comparison["decode_route"].get("sha256")
+            or comparison["route_sha256"].get("prefill") != route.get("sha256")):
+        raise SystemExit("prefill-rescore route hashes do not match payloads")
 if expected_files:
     identity = reference.get("policy_identity_after")
     if (not isinstance(identity, dict)
@@ -6978,14 +7077,54 @@ def _policy0_reference_source_verify_script(
 reference={shlex.quote(reference_path)}
 test -f "$reference" && test ! -L "$reference"
 python3 - "$reference" {shlex.quote(identity_json)} <<'PY'
+import base64
+import binascii
+import hashlib
 import json
+import math
 import sys
 
 reference = json.loads(open(sys.argv[1], encoding="utf-8").read())
 expected = json.loads(sys.argv[2])
+
+def check_route(route, rows, label):
+    fields = {{"schema_version", "encoding", "dtype", "shape", "dense_layers", "experts", "sha256", "data"}}
+    if not isinstance(route, dict) or set(route) != fields:
+        raise SystemExit(label + " route schema is invalid")
+    shape = route.get("shape")
+    dense_layers = route.get("dense_layers")
+    experts = route.get("experts")
+    if (route.get("schema_version") != 1 or route.get("encoding") != "base64"
+            or route.get("dtype") != "uint8" or not isinstance(shape, list)
+            or len(shape) != 3 or any(type(item) is not int or item <= 0 for item in shape)
+            or shape[0] != rows or type(dense_layers) is not int
+            or not 0 <= dense_layers < shape[1] or type(experts) is not int
+            or not 1 <= experts <= 256):
+        raise SystemExit(label + " route metadata is invalid")
+    encoded = route.get("data")
+    digest = route.get("sha256")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (TypeError, binascii.Error, ValueError):
+        raise SystemExit(label + " route data is invalid")
+    if (not isinstance(digest, str) or len(digest) != 64
+            or hashlib.sha256(raw).hexdigest() != digest
+            or len(raw) != shape[0] * shape[1] * shape[2]):
+        raise SystemExit(label + " route checksum is invalid")
+    row_width = shape[1] * shape[2]
+    for offset in range(0, len(raw), row_width):
+        row = raw[offset:offset + row_width]
+        dense_end = dense_layers * shape[2]
+        if any(row[:dense_end]):
+            raise SystemExit(label + " dense route IDs are invalid")
+        for layer in range(dense_layers, shape[1]):
+            selected = row[layer * shape[2]:(layer + 1) * shape[2]]
+            if any(expert >= experts for expert in selected) or len(set(selected)) != len(selected):
+                raise SystemExit(label + " sparse route IDs are invalid")
 if reference.get("policy") != "policy-0":
     raise SystemExit("reference is not policy-0")
-if reference.get("request_mode") != "serialized_generate_completion_logprobs":
+request_mode = reference.get("request_mode")
+if request_mode not in {{"serialized_generate_completion_logprobs", "serialized_generate_decode256_prefill_rescore"}}:
     raise SystemExit("reference is not a completion qualification")
 if reference.get("source_kind") in {"rollout_batch", "cached_rollout_batch"}:
     raise SystemExit("cached rollout reference is not allowed")
@@ -7000,6 +7139,43 @@ for prefix, identity in (("target", expected["adapter"]), ("config", expected["c
         raise SystemExit("reference receipt size differs for " + prefix)
 if not reference.get("cache_salt"):
     raise SystemExit("reference has no cache salt")
+ids = reference.get("input_ids")
+mask = reference.get("loss_mask")
+if request_mode == "serialized_generate_decode256_prefill_rescore":
+    if (not isinstance(ids, list) or len(ids) != 512
+            or mask != [False] * 256 + [True] * 256
+            or reference.get("generated_token_ids") != ids[256:]
+            or reference.get("policy_identity_between") != before
+            or not reference.get("rescore_cache_salt")
+            or reference.get("rescore_cache_salt") == reference.get("cache_salt")):
+        raise SystemExit("prefill-rescore reference is not aligned")
+    comparison = reference.get("prefill_rescore_comparison")
+    if (not isinstance(comparison, dict)
+            or not isinstance(comparison.get("decode_request"), dict)
+            or not isinstance(comparison.get("prefill_request"), dict)
+            or not isinstance(comparison.get("response_sha256"), dict)
+            or not isinstance(comparison.get("route_sha256"), dict)
+            or comparison["decode_request"].get("token_ids") != ids[:256]
+            or comparison["prefill_request"].get("token_ids") != ids):
+        raise SystemExit("prefill-rescore request diagnostic is not aligned")
+    decode_salt = comparison["decode_request"].get("cache_salt")
+    rescore_salt = comparison["prefill_request"].get("cache_salt")
+    if (not isinstance(decode_salt, str) or not isinstance(rescore_salt, str)
+            or not decode_salt or not rescore_salt or decode_salt == rescore_salt):
+        raise SystemExit("prefill-rescore diagnostic salts are invalid")
+    for hash_map_name in ("response_sha256", "route_sha256"):
+        for phase in ("decode", "prefill"):
+            digest = comparison[hash_map_name].get(phase)
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)):
+                raise SystemExit("prefill-rescore diagnostic hash is invalid")
+    deltas = comparison.get("completion_logprob_deltas")
+    if (not isinstance(deltas, list) or len(deltas) != 256
+            or any(isinstance(item, bool) or not isinstance(item, (int, float))
+                   or not math.isfinite(float(item)) for item in deltas)):
+        raise SystemExit("prefill-rescore diagnostic deltas are invalid")
+    check_route(comparison.get("decode_route"), 511, "decode")
+    check_route(reference.get("routed_experts"), 512, "prefill")
 PY
 printf 'QUAL_FILE reference.json %s %s\\n' \\
   "$(sha256sum -- "$reference" | cut -d' ' -f1)" "$(stat -c '%s' -- "$reference")"

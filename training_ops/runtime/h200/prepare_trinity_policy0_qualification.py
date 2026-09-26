@@ -6,14 +6,177 @@ validators before it stages the three files through its existing fan-out path.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
 
 class QualificationError(ValueError):
     """The policy-0 qualification artifact is not safe to stage."""
+
+
+_PREFILL_RESCORE_REQUEST_MODE = "serialized_generate_decode256_prefill_rescore"
+
+
+def _validate_route_payload(
+    value: Mapping[str, Any],
+    expected_rows: int,
+    label: str,
+) -> None:
+    if set(value) != {
+        "schema_version",
+        "encoding",
+        "dtype",
+        "shape",
+        "dense_layers",
+        "experts",
+        "sha256",
+        "data",
+    }:
+        raise QualificationError(f"{label} route schema is invalid")
+    shape = value.get("shape")
+    dense_layers = value.get("dense_layers")
+    experts = value.get("experts")
+    if (
+        value.get("schema_version") != 1
+        or value.get("encoding") != "base64"
+        or value.get("dtype") != "uint8"
+        or not isinstance(shape, list)
+        or len(shape) != 3
+        or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in shape)
+        or shape[0] != expected_rows
+        or isinstance(dense_layers, bool)
+        or not isinstance(dense_layers, int)
+        or not 0 <= dense_layers < shape[1]
+        or isinstance(experts, bool)
+        or not isinstance(experts, int)
+        or not 1 <= experts <= 256
+    ):
+        raise QualificationError(f"{label} route metadata is invalid")
+    encoded = value.get("data")
+    digest = value.get("sha256")
+    if (
+        not isinstance(encoded, str)
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise QualificationError(f"{label} route checksum metadata is invalid")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise QualificationError(f"{label} route data is invalid") from error
+    if len(raw) != shape[0] * shape[1] * shape[2] or hashlib.sha256(raw).hexdigest() != digest:
+        raise QualificationError(f"{label} route checksum is invalid")
+    row_width = shape[1] * shape[2]
+    for offset in range(0, len(raw), row_width):
+        row = raw[offset : offset + row_width]
+        dense_end = dense_layers * shape[2]
+        if any(row[:dense_end]):
+            raise QualificationError(f"{label} dense route IDs are invalid")
+        for layer in range(dense_layers, shape[1]):
+            selected = row[layer * shape[2] : (layer + 1) * shape[2]]
+            if any(expert >= experts for expert in selected) or len(set(selected)) != len(selected):
+                raise QualificationError(f"{label} sparse route IDs are invalid")
+
+
+def _validate_prefill_rescore_comparison(
+    value: Mapping[str, Any],
+    input_ids: list[int],
+    generated_ids: list[int],
+    route: Mapping[str, Any],
+) -> None:
+    comparison = value.get("prefill_rescore_comparison")
+    if not isinstance(comparison, Mapping):
+        raise QualificationError("prefill-rescore diagnostic comparison is missing")
+    for key in (
+        "decode_request",
+        "prefill_request",
+        "request_parameters",
+        "response_sha256",
+        "route_sha256",
+    ):
+        if not isinstance(comparison.get(key), Mapping):
+            raise QualificationError(f"prefill-rescore comparison is missing {key}")
+    decode_request = comparison["decode_request"]
+    prefill_request = comparison["prefill_request"]
+    if decode_request.get("token_ids") != input_ids[:256]:
+        raise QualificationError("decode request prompt IDs do not align")
+    if prefill_request.get("token_ids") != input_ids:
+        raise QualificationError("prefill request token IDs do not align")
+    decode_salt = decode_request.get("cache_salt")
+    prefill_salt = prefill_request.get("cache_salt")
+    if (
+        not isinstance(decode_salt, str)
+        or not isinstance(prefill_salt, str)
+        or not decode_salt
+        or not prefill_salt
+        or decode_salt == prefill_salt
+    ):
+        raise QualificationError("prefill-rescore cache salts are missing or not distinct")
+    if value.get("cache_salt") != decode_salt or value.get("rescore_cache_salt") != prefill_salt:
+        raise QualificationError("prefill-rescore cache salts do not match the reference")
+    salts = comparison.get("salts")
+    if (
+        not isinstance(salts, Mapping)
+        or salts.get("decode") != decode_salt
+        or salts.get("prefill") != prefill_salt
+    ):
+        raise QualificationError("prefill-rescore salt diagnostic differs")
+    for hash_map_name in ("response_sha256", "route_sha256"):
+        hashes = comparison[hash_map_name]
+        for phase in ("decode", "prefill"):
+            digest = hashes.get(phase)
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise QualificationError(f"prefill-rescore {hash_map_name} is invalid")
+    if comparison["route_sha256"].get("prefill") != route.get("sha256"):
+        raise QualificationError("prefill-rescore route hash does not match reference route")
+    decode_route = comparison.get("decode_route")
+    if not isinstance(decode_route, Mapping):
+        raise QualificationError("prefill-rescore decode route is missing")
+    _validate_route_payload(decode_route, 511, "decode")
+    _validate_route_payload(route, 512, "prefill")
+    if comparison["route_sha256"].get("decode") != decode_route.get("sha256"):
+        raise QualificationError("prefill-rescore decode route hash does not match diagnostic route")
+    deltas = comparison.get("completion_logprob_deltas")
+    if (
+        not isinstance(deltas, list)
+        or len(deltas) != len(generated_ids)
+        or any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)) for item in deltas)
+    ):
+        raise QualificationError("prefill-rescore completion deltas are invalid")
+    per_completion = comparison.get("per_completion")
+    if not isinstance(per_completion, list) or len(per_completion) != len(generated_ids):
+        raise QualificationError("prefill-rescore per-completion diagnostic is invalid")
+    for index, entry in enumerate(per_completion):
+        if (
+            not isinstance(entry, Mapping)
+            or entry.get("index") != index
+            or entry.get("token_id") != generated_ids[index]
+            or entry.get("delta") != deltas[index]
+            or any(
+                isinstance(entry.get(key), bool)
+                or not isinstance(entry.get(key), (int, float))
+                or not math.isfinite(float(entry.get(key)))
+                for key in ("decode_logprob", "prefill_logprob", "delta")
+            )
+        ):
+            raise QualificationError("prefill-rescore per-completion diagnostic is misaligned")
+    route_differences = comparison.get("predicting_route_differences")
+    if not isinstance(route_differences, Mapping):
+        raise QualificationError("prefill-rescore route comparison is missing")
+    if route_differences.get("compared_rows") != 256 or not isinstance(
+        route_differences.get("different_rows"), list
+    ):
+        raise QualificationError("prefill-rescore predicting routes are not aligned")
 
 
 def _sha256(path: Path) -> str:
@@ -67,7 +230,11 @@ def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
         raise QualificationError("reference must be an object")
     if value.get("policy") != "policy-0":
         raise QualificationError("reference is not a policy-0 reference")
-    if value.get("request_mode") != "serialized_generate_completion_logprobs":
+    request_mode = value.get("request_mode")
+    if request_mode not in {
+        "serialized_generate_completion_logprobs",
+        _PREFILL_RESCORE_REQUEST_MODE,
+    }:
         raise QualificationError("reference does not use completion qualification mode")
     if value.get("source_kind") in {"rollout_batch", "cached_rollout_batch"}:
         raise QualificationError("cached rollout reference is not allowed")
@@ -95,9 +262,13 @@ def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
     if any(loss_mask[:first_generated]) or not all(loss_mask[first_generated:]):
         raise QualificationError("reference loss mask is not prompt-then-completion")
     route = value.get("routed_experts")
-    if not isinstance(route, Mapping) or route.get("shape", [None])[0] != len(input_ids) - 1:
-        raise QualificationError("reference routes must omit the final token row")
-    for field in ("policy_identity_before", "policy_identity_after", "cache_salt"):
+    expected_route_rows = len(input_ids) if request_mode == _PREFILL_RESCORE_REQUEST_MODE else len(input_ids) - 1
+    if not isinstance(route, Mapping) or route.get("shape", [None])[0] != expected_route_rows:
+        raise QualificationError("reference routes have an invalid row count")
+    required_fields = ["policy_identity_before", "policy_identity_after", "cache_salt"]
+    if request_mode == _PREFILL_RESCORE_REQUEST_MODE:
+        required_fields.extend(("policy_identity_between", "rescore_cache_salt"))
+    for field in required_fields:
         if field not in value or value[field] is None:
             raise QualificationError(f"reference is missing {field}")
     if value["policy_identity_before"] != value["policy_identity_after"]:
@@ -105,12 +276,30 @@ def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
     generated_ids = value.get("generated_token_ids")
     if (
         not isinstance(generated_ids, list)
+        or any(isinstance(token, bool) or not isinstance(token, int) for token in generated_ids)
         or value.get("generated_token_count") != len(generated_ids)
         or len(generated_ids) != sum(loss_mask)
     ):
         raise QualificationError("reference generated token metadata is not aligned")
     if any(logprob != 0.0 for logprob, trainable in zip(logprobs, loss_mask) if not trainable):
         raise QualificationError("reference prompt inference logprobs must be zero")
+    if any(
+        isinstance(logprob, bool)
+        or not isinstance(logprob, (int, float))
+        or not math.isfinite(float(logprob))
+        for logprob in logprobs
+    ):
+        raise QualificationError("reference inference logprobs must be finite")
+    if request_mode == _PREFILL_RESCORE_REQUEST_MODE:
+        if len(input_ids) != 512 or sum(loss_mask) != 256 or loss_mask != [False] * 256 + [True] * 256:
+            raise QualificationError("prefill-rescore reference token alignment is invalid")
+        if value["policy_identity_between"] != value["policy_identity_before"]:
+            raise QualificationError("policy receipt changed between decode and prefill")
+        if value.get("rescore_cache_salt") == value.get("cache_salt"):
+            raise QualificationError("prefill-rescore cache salts must be distinct")
+        if generated_ids != input_ids[256:]:
+            raise QualificationError("prefill-rescore completion suffix does not align")
+        _validate_prefill_rescore_comparison(value, input_ids, generated_ids, route)
     return dict(value)
 
 
