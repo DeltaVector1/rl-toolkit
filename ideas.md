@@ -543,12 +543,15 @@ only after measured learning.
 - Measured topology failure: direct H200 access to `root@10.92.20.82:22`
   timed out, and the configured peer identity path was unavailable in the
   H200 host shell. No remote change was made.
+- Authoritative resolution: `china-trainer` is unresolved in the H200 host
+  shell. Local `ssh -G n82` resolves user `ubuntu`, hostname `10.92.20.82`,
+  `ProxyJump china-jump`, and the existing China rollout identity. The
+  reference is already verified locally.
 - Corrected plan: after five minutes without progress, stop only the owned
-  transfer and probe processes and preserve partial files. Use
-  `hosts.trainer_ssh = china-trainer`, the bounded H200-to-trainer-head route
-  already used by `start_orchestrator.sh`, for a read-only probe and seed to
-  n82. Only after that use n82's existing `trainer_lan` access to fan out the
-  same small JSON to n76, n77, n78, n80, n83, n84, and n85. Verify all eight
+  transfer and probe processes and preserve partial files. Perform one
+  sequential local-to-n82 transfer using the configured `n82` SSH route, then
+  verify exact size and SHA256 before using n82's LAN access to fan out to the
+  other seven hosts. Do not start parallel eight-host copies. Verify all eight
   SHA256 values match
   `df7d7b0baf5aa646751fc1762fb7882e4266afda3df2017f92ba44a3758af589` before
   the qualifier. No model transfer is involved.
