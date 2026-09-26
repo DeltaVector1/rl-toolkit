@@ -34,7 +34,7 @@ if [ "$download_streams" -lt 1 ] || [ "$download_streams" -gt 128 ]; then
   echo "PRIME_LORA_DOWNLOAD_STREAMS must be between 1 and 128" >&2
   exit 2
 fi
-runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" <<'PY'
+runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" "$inference_config" <<'PY'
 import sys
 import tomllib
 import json
@@ -43,6 +43,18 @@ import os
 with open(sys.argv[1], "rb") as stream:
     config = tomllib.load(stream)
 host = sys.argv[2]
+inference_path = sys.argv[3]
+with open(inference_path, "rb") as stream:
+    selected_inference = tomllib.load(stream)
+gpu_memory_utilization = selected_inference.get("gpu_memory_utilization")
+if (
+    isinstance(gpu_memory_utilization, bool)
+    or not isinstance(gpu_memory_utilization, (int, float))
+    or not 0 < gpu_memory_utilization < 1
+):
+    raise SystemExit(
+        "gpu_memory_utilization must be a numeric value strictly between 0 and 1"
+    )
 inference = config["inference"]
 if host not in inference:
     raise SystemExit(f"unknown inference host: {host}")
@@ -87,7 +99,7 @@ max_cudagraph_capture_size = max_num_seqs * (1 + mtp_tokens)
 vllm_extra = {
     "tensor_parallel_size": tp,
     "data_parallel_size": dp,
-    "gpu_memory_utilization": 0.920,
+    "gpu_memory_utilization": float(gpu_memory_utilization),
     # GLM keeps the existing FP8 cache. Trinity's H200 path uses BF16 KV
     # cache because its native FP8 cache path is not parity-qualified.
     "kv_cache_dtype": "bfloat16" if kind == "trinity" else "fp8",
