@@ -90,6 +90,60 @@ def _json_sha256(value: Any) -> str:
     ).hexdigest()
 
 
+def _strict_logprob(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise QualificationError(f"{label} is not numeric")
+    value = float(value)
+    if not math.isfinite(value):
+        raise QualificationError(f"{label} is not finite")
+    return value
+
+
+def _completion_evidence(response: Mapping[str, Any], generated_ids: list[int]) -> list[float]:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], Mapping):
+        raise QualificationError("prefill-rescore completion response is invalid")
+    choice = choices[0]
+    if choice.get("token_ids") != generated_ids:
+        raise QualificationError("prefill-rescore completion token IDs differ")
+    logprobs = choice.get("logprobs")
+    content = logprobs.get("content") if isinstance(logprobs, Mapping) else None
+    if not isinstance(content, list) or len(content) != len(generated_ids):
+        raise QualificationError("prefill-rescore completion logprob count differs")
+    result = []
+    for index, token_id in enumerate(generated_ids):
+        entry = content[index]
+        if not isinstance(entry, Mapping) or entry.get("token") != f"token_id:{token_id}":
+            raise QualificationError("prefill-rescore completion token key differs")
+        result.append(_strict_logprob(entry.get("logprob"), "completion logprob"))
+    return result
+
+
+def _prompt_evidence(response: Mapping[str, Any], token_ids: list[int]) -> list[float]:
+    raw = response.get("prompt_logprobs")
+    if not isinstance(raw, list) or len(raw) != len(token_ids):
+        raise QualificationError("prefill-rescore prompt logprob count differs")
+    result = []
+    for index, token_id in enumerate(token_ids):
+        entry = raw[index]
+        if index == 0 and entry is None:
+            result.append(0.0)
+            continue
+        if not isinstance(entry, Mapping):
+            raise QualificationError(f"prefill-rescore prompt logprob {index} is missing")
+        candidates = [
+            candidate
+            for key, candidate in entry.items()
+            if key == token_id or str(key) == str(token_id)
+        ]
+        if len(candidates) != 1 or not isinstance(candidates[0], Mapping):
+            raise QualificationError(
+                f"prefill-rescore prompt token key {index} does not match {token_id}"
+            )
+        result.append(_strict_logprob(candidates[0].get("logprob"), "prompt logprob"))
+    return result
+
+
 def _route_prediction_differences(
     decode_route: Mapping[str, Any],
     prefill_route: Mapping[str, Any],
@@ -197,6 +251,12 @@ def _validate_prefill_rescore_comparison(
         if _json_sha256(responses[phase]) != comparison["response_sha256"][phase]:
             raise QualificationError(f"prefill-rescore {phase} response hash differs")
     if (
+        responses["rescore"] != responses["prefill"]
+        or comparison["response_sha256"].get("rescore")
+        != comparison["response_sha256"].get("prefill")
+    ):
+        raise QualificationError("prefill-rescore response aliases differ")
+    if (
         comparison["route_sha256"].get("prefill") != route.get("sha256")
         or comparison["route_sha256"].get("rescore") != route.get("sha256")
     ):
@@ -208,6 +268,14 @@ def _validate_prefill_rescore_comparison(
     _validate_route_payload(route, 512, "prefill")
     if comparison["route_sha256"].get("decode") != decode_route.get("sha256"):
         raise QualificationError("prefill-rescore decode route hash does not match diagnostic route")
+    if (
+        value.get("response_sha256") != comparison["response_sha256"]
+        or value.get("decode_route_sha256") != comparison["route_sha256"].get("decode")
+        or value.get("rescore_route_sha256") != comparison["route_sha256"].get("prefill")
+        or comparison["route_sha256"].get("rescore")
+        != comparison["route_sha256"].get("prefill")
+    ):
+        raise QualificationError("prefill-rescore top-level hashes are not aliases")
     if (
         comparison.get("prefill_route") != route
         or comparison.get("rescore_route") != route
@@ -240,6 +308,21 @@ def _validate_prefill_rescore_comparison(
         expected_delta = float(entry["prefill_logprob"]) - float(entry["decode_logprob"])
         if not math.isclose(float(entry["delta"]), expected_delta, rel_tol=1e-12, abs_tol=1e-12):
             raise QualificationError("prefill-rescore completion delta was not recomputed")
+    decode_values = _completion_evidence(responses["decode"], generated_ids)
+    rescore_values = _prompt_evidence(responses["rescore"], input_ids)[256:]
+    trainer_values = [
+        _strict_logprob(logprob, "trainer inference logprob")
+        for logprob in value["inference_logprobs"][256:]
+    ]
+    if any(
+        float(entry["decode_logprob"]) != decoded
+        or float(entry["prefill_logprob"]) != rescored
+        or float(entry["prefill_logprob"]) != trainer
+        for entry, decoded, rescored, trainer in zip(
+            per_completion, decode_values, rescore_values, trainer_values
+        )
+    ):
+        raise QualificationError("prefill-rescore completion evidence is not bound")
     route_differences = comparison.get("predicting_route_differences")
     if not isinstance(route_differences, Mapping):
         raise QualificationError("prefill-rescore route comparison is missing")
@@ -327,6 +410,12 @@ def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
         or sum(lengths) != len(input_ids)
     ):
         raise QualificationError("reference token, logprob, mask, or length fields do not align")
+    first_generated = loss_mask.index(True) if any(loss_mask) else len(loss_mask)
+    expected_source_hash = hashlib.sha256(
+        json.dumps(input_ids[:first_generated], separators=(",", ":")).encode()
+    ).hexdigest()
+    if value.get("source_input_sha256") != expected_source_hash:
+        raise QualificationError("reference source input hash differs")
     if not any(loss_mask) or all(loss_mask):
         raise QualificationError("reference must contain prompt and generated loss-mask regions")
     first_generated = loss_mask.index(True)

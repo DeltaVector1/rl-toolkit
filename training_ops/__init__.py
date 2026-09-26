@@ -6905,6 +6905,49 @@ def route_differences(decode_route, prefill_route):
             "compared_rows": 256, "different_rows": differences,
             "different_row_count": len(differences)}}
 
+def strict_logprob(value, label):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise SystemExit(label + " is not finite numeric evidence")
+    return float(value)
+
+def completion_evidence(response, generated_ids):
+    choices = response.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise SystemExit("prefill-rescore completion response is invalid")
+    choice = choices[0]
+    if choice.get("token_ids") != generated_ids:
+        raise SystemExit("prefill-rescore completion token IDs differ")
+    logprobs = choice.get("logprobs")
+    content = logprobs.get("content") if isinstance(logprobs, dict) else None
+    if not isinstance(content, list) or len(content) != len(generated_ids):
+        raise SystemExit("prefill-rescore completion logprob count differs")
+    result = []
+    for index, token_id in enumerate(generated_ids):
+        entry = content[index]
+        if not isinstance(entry, dict) or entry.get("token") != "token_id:" + str(token_id):
+            raise SystemExit("prefill-rescore completion token key differs")
+        result.append(strict_logprob(entry.get("logprob"), "completion logprob"))
+    return result
+
+def prompt_evidence(response, token_ids):
+    raw = response.get("prompt_logprobs")
+    if not isinstance(raw, list) or len(raw) != len(token_ids):
+        raise SystemExit("prefill-rescore prompt logprob count differs")
+    result = []
+    for index, token_id in enumerate(token_ids):
+        entry = raw[index]
+        if index == 0 and entry is None:
+            result.append(0.0)
+            continue
+        if not isinstance(entry, dict):
+            raise SystemExit("prefill-rescore prompt logprob is missing")
+        candidates = [candidate for key, candidate in entry.items()
+                      if key == token_id or str(key) == str(token_id)]
+        if len(candidates) != 1 or not isinstance(candidates[0], dict):
+            raise SystemExit("prefill-rescore prompt token key differs")
+        result.append(strict_logprob(candidates[0].get("logprob"), "prompt logprob"))
+    return result
+
 config = json.loads(open(config_path, encoding="utf-8").read())
 for key in ("r", "lora_alpha", "lora_dropout"):
     if config.get(key) != expected[key]:
@@ -6926,15 +6969,22 @@ logs = reference.get("inference_logprobs")
 mask = reference.get("loss_mask")
 lengths = reference.get("sequence_lengths")
 route = reference.get("routed_experts")
-if not isinstance(ids, list) or not ids:
+if (not isinstance(ids, list) or not ids
+        or any(type(token) is not int for token in ids)):
     raise SystemExit("reference token fields are not aligned")
 expected_route_rows = len(ids) if request_mode == "serialized_generate_decode256_prefill_rescore" else len(ids) - 1
-if (len(logs or []) != len(ids)
+if (not isinstance(logs, list) or len(logs) != len(ids)
         or not isinstance(mask, list) or len(mask) != len(ids)
-        or not isinstance(lengths, list) or sum(lengths) != len(ids)
+        or any(type(flag) is not bool for flag in mask)
+        or not isinstance(lengths, list)
+        or any(type(length) is not int or length <= 0 for length in lengths)
+        or sum(lengths) != len(ids)
         or not isinstance(route, dict) or route.get("shape", [None])[0] != expected_route_rows
         or not any(mask) or all(mask)):
     raise SystemExit("reference token fields are not aligned")
+first_generated = mask.index(True)
+if mask != [False] * first_generated + [True] * (len(mask) - first_generated):
+    raise SystemExit("reference loss mask is not prompt-then-completion")
 if any(isinstance(logprob, bool) or not isinstance(logprob, (int, float))
        or not math.isfinite(float(logprob)) for logprob in logs):
     raise SystemExit("reference inference logprobs are not finite")
@@ -6946,9 +6996,15 @@ if not reference.get("cache_salt"):
     raise SystemExit("reference has no cache salt")
 generated_ids = reference.get("generated_token_ids")
 if (not isinstance(generated_ids, list)
+        or any(type(token) is not int for token in generated_ids)
         or reference.get("generated_token_count") != len(generated_ids)
         or len(generated_ids) != sum(mask)):
     raise SystemExit("reference generated token metadata is not aligned")
+source_input_sha256 = hashlib.sha256(json.dumps(
+    ids[:first_generated], separators=(",", ":")
+).encode()).hexdigest()
+if reference.get("source_input_sha256") != source_input_sha256:
+    raise SystemExit("reference source input hash differs")
 if request_mode == "serialized_generate_decode256_prefill_rescore":
     if (len(ids) != 512 or mask != [False] * 256 + [True] * 256
             or generated_ids != ids[256:]
@@ -7002,6 +7058,16 @@ if request_mode == "serialized_generate_decode256_prefill_rescore":
         ).encode()).hexdigest()
         if response_hash != comparison["response_sha256"][phase]:
             raise SystemExit("prefill-rescore exact response hash differs")
+    if (comparison["responses"]["rescore"] != comparison["responses"]["prefill"]
+            or comparison["response_sha256"].get("rescore")
+            != comparison["response_sha256"].get("prefill")):
+        raise SystemExit("prefill-rescore response aliases differ")
+    if (reference.get("response_sha256") != comparison["response_sha256"]
+            or reference.get("decode_route_sha256") != comparison["route_sha256"].get("decode")
+            or reference.get("rescore_route_sha256") != comparison["route_sha256"].get("prefill")
+            or comparison["route_sha256"].get("rescore")
+            != comparison["route_sha256"].get("prefill")):
+        raise SystemExit("prefill-rescore top-level hashes are not aliases")
     deltas = comparison.get("completion_logprob_deltas")
     per_completion = comparison.get("per_completion")
     if (not isinstance(deltas, list) or len(deltas) != 256
@@ -7023,6 +7089,16 @@ if request_mode == "serialized_generate_decode256_prefill_rescore":
                 float(entry["prefill_logprob"]) - float(entry["decode_logprob"]),
                 rel_tol=1e-12, abs_tol=1e-12):
             raise SystemExit("prefill-rescore completion delta is incorrect")
+    decode_values = completion_evidence(comparison["responses"]["decode"], generated_ids)
+    rescore_values = prompt_evidence(comparison["responses"]["rescore"], ids)[256:]
+    trainer_values = [strict_logprob(logprob, "trainer inference logprob")
+                      for logprob in logs[256:]]
+    if any(float(entry["decode_logprob"]) != decoded
+           or float(entry["prefill_logprob"]) != rescored
+           or float(entry["prefill_logprob"]) != trainer
+           for entry, decoded, rescored, trainer in zip(
+               per_completion, decode_values, rescore_values, trainer_values)):
+        raise SystemExit("prefill-rescore completion evidence is not bound")
     check_route(comparison.get("decode_route"), 511, "decode")
     check_route(route, 512, "prefill")
     if (comparison["route_sha256"].get("decode") != comparison["decode_route"].get("sha256")
@@ -7189,6 +7265,49 @@ def route_differences(decode_route, prefill_route):
     return {{"first_predicting_row": 255, "last_predicting_row_exclusive": 511,
             "compared_rows": 256, "different_rows": differences,
             "different_row_count": len(differences)}}
+
+def strict_logprob(value, label):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise SystemExit(label + " is not finite numeric evidence")
+    return float(value)
+
+def completion_evidence(response, generated_ids):
+    choices = response.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        raise SystemExit("prefill-rescore completion response is invalid")
+    choice = choices[0]
+    if choice.get("token_ids") != generated_ids:
+        raise SystemExit("prefill-rescore completion token IDs differ")
+    logprobs = choice.get("logprobs")
+    content = logprobs.get("content") if isinstance(logprobs, dict) else None
+    if not isinstance(content, list) or len(content) != len(generated_ids):
+        raise SystemExit("prefill-rescore completion logprob count differs")
+    result = []
+    for index, token_id in enumerate(generated_ids):
+        entry = content[index]
+        if not isinstance(entry, dict) or entry.get("token") != "token_id:" + str(token_id):
+            raise SystemExit("prefill-rescore completion token key differs")
+        result.append(strict_logprob(entry.get("logprob"), "completion logprob"))
+    return result
+
+def prompt_evidence(response, token_ids):
+    raw = response.get("prompt_logprobs")
+    if not isinstance(raw, list) or len(raw) != len(token_ids):
+        raise SystemExit("prefill-rescore prompt logprob count differs")
+    result = []
+    for index, token_id in enumerate(token_ids):
+        entry = raw[index]
+        if index == 0 and entry is None:
+            result.append(0.0)
+            continue
+        if not isinstance(entry, dict):
+            raise SystemExit("prefill-rescore prompt logprob is missing")
+        candidates = [candidate for key, candidate in entry.items()
+                      if key == token_id or str(key) == str(token_id)]
+        if len(candidates) != 1 or not isinstance(candidates[0], dict):
+            raise SystemExit("prefill-rescore prompt token key differs")
+        result.append(strict_logprob(candidates[0].get("logprob"), "prompt logprob"))
+    return result
 if reference.get("policy") != "policy-0":
     raise SystemExit("reference is not policy-0")
 request_mode = reference.get("request_mode")
@@ -7208,7 +7327,38 @@ for prefix, identity in (("target", expected["adapter"]), ("config", expected["c
 if not reference.get("cache_salt"):
     raise SystemExit("reference has no cache salt")
 ids = reference.get("input_ids")
+logs = reference.get("inference_logprobs")
 mask = reference.get("loss_mask")
+lengths = reference.get("sequence_lengths")
+if (not isinstance(ids, list) or not ids
+        or any(type(token) is not int for token in ids)
+        or not isinstance(logs, list) or len(logs) != len(ids)
+        or not isinstance(mask, list) or len(mask) != len(ids)
+        or any(type(flag) is not bool for flag in mask)
+        or not isinstance(lengths, list)
+        or any(type(length) is not int or length <= 0 for length in lengths)
+        or sum(lengths) != len(ids)
+        or not any(mask) or all(mask)):
+    raise SystemExit("reference token fields are not aligned")
+first_generated = mask.index(True)
+if mask != [False] * first_generated + [True] * (len(mask) - first_generated):
+    raise SystemExit("reference loss mask is not prompt-then-completion")
+if any(isinstance(logprob, bool) or not isinstance(logprob, (int, float))
+       or not math.isfinite(float(logprob)) for logprob in logs):
+    raise SystemExit("reference inference logprobs are not finite")
+if any(logprob != 0.0 for logprob, trainable in zip(logs, mask) if not trainable):
+    raise SystemExit("reference prompt inference logprobs are not zero")
+source_input_sha256 = hashlib.sha256(json.dumps(
+    ids[:first_generated], separators=(",", ":")
+).encode()).hexdigest()
+if reference.get("source_input_sha256") != source_input_sha256:
+    raise SystemExit("reference source input hash differs")
+generated_ids = reference.get("generated_token_ids")
+if (not isinstance(generated_ids, list)
+        or any(type(token) is not int for token in generated_ids)
+        or reference.get("generated_token_count") != len(generated_ids)
+        or len(generated_ids) != sum(mask)):
+    raise SystemExit("reference generated token metadata is not aligned")
 if request_mode == "serialized_generate_decode256_prefill_rescore":
     if (not isinstance(ids, list) or len(ids) != 512
             or mask != [False] * 256 + [True] * 256
@@ -7262,6 +7412,16 @@ if request_mode == "serialized_generate_decode256_prefill_rescore":
         ).encode()).hexdigest()
         if response_hash != comparison["response_sha256"][phase]:
             raise SystemExit("prefill-rescore exact response hash differs")
+    if (comparison["responses"]["rescore"] != comparison["responses"]["prefill"]
+            or comparison["response_sha256"].get("rescore")
+            != comparison["response_sha256"].get("prefill")):
+        raise SystemExit("prefill-rescore response aliases differ")
+    if (reference.get("response_sha256") != comparison["response_sha256"]
+            or reference.get("decode_route_sha256") != comparison["route_sha256"].get("decode")
+            or reference.get("rescore_route_sha256") != comparison["route_sha256"].get("prefill")
+            or comparison["route_sha256"].get("rescore")
+            != comparison["route_sha256"].get("prefill")):
+        raise SystemExit("prefill-rescore top-level hashes are not aliases")
     deltas = comparison.get("completion_logprob_deltas")
     if (not isinstance(deltas, list) or len(deltas) != 256
             or any(isinstance(item, bool) or not isinstance(item, (int, float))
@@ -7282,6 +7442,16 @@ if request_mode == "serialized_generate_decode256_prefill_rescore":
                                     float(entry["prefill_logprob"]) - float(entry["decode_logprob"]),
                                     rel_tol=1e-12, abs_tol=1e-12)):
             raise SystemExit("prefill-rescore diagnostic completion is invalid")
+    decode_values = completion_evidence(comparison["responses"]["decode"], generated_ids)
+    rescore_values = prompt_evidence(comparison["responses"]["rescore"], ids)[256:]
+    trainer_values = [strict_logprob(logprob, "trainer inference logprob")
+                      for logprob in logs[256:]]
+    if any(float(entry["decode_logprob"]) != decoded
+           or float(entry["prefill_logprob"]) != rescored
+           or float(entry["prefill_logprob"]) != trainer
+           for entry, decoded, rescored, trainer in zip(
+               per_completion, decode_values, rescore_values, trainer_values)):
+        raise SystemExit("prefill-rescore completion evidence is not bound")
     check_route(comparison.get("decode_route"), 511, "decode")
     check_route(reference.get("routed_experts"), 512, "prefill")
     if (comparison.get("route_sha256", {{}}).get("decode") != comparison["decode_route"].get("sha256")

@@ -3,11 +3,17 @@ import copy
 import hashlib
 import importlib.util
 import json
+import subprocess
 import tempfile
 import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+from training_ops import (
+    _policy0_qualification_verify_script,
+    _policy0_reference_source_verify_script,
+)
 from training_ops.runtime.h200.prepare_trinity_policy0_qualification import (
     QualificationError,
     validate_reference,
@@ -277,6 +283,149 @@ class TrinityParityReferenceTest(unittest.TestCase):
 
     def readiness(self, receipt=None):
         return {"loaded_receipt": receipt or self.policy_receipt()}
+
+    def build_prefill_result(self):
+        decode, prefill = self.prefill_responses()
+        calls = []
+
+        def post(_url, _body, _timeout):
+            calls.append(1)
+            return decode if len(calls) == 1 else prefill
+
+        states = iter((self.readiness(), self.readiness(), self.readiness()))
+        with tempfile.TemporaryDirectory() as directory:
+            return reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=self.prefill_record(),
+                output_path=Path(directory) / "reference.json",
+                base_model="base",
+                policy="policy-0",
+                policy_model="policy-0-slot0",
+                expected_policy_identity=self.policy_receipt(),
+                cache_salt="decode-salt",
+                rescore_cache_salt="prefill-salt",
+                prefill_rescore=True,
+                readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                minimum_tokens=1,
+                post_json=post,
+                get_json=lambda *_: next(states),
+            )
+
+    def run_generated_verifiers(self, result):
+        expected_lora = {
+            "r": 32,
+            "lora_alpha": 64,
+            "lora_dropout": 0.0,
+            "target_modules": [
+                "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj",
+                "down_proj", "shared_expert", "experts",
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = root / "adapter_model.safetensors"
+            config = root / "adapter_config.json"
+            reference_path = root / "reference.json"
+            adapter.write_bytes(b"adapter")
+            config.write_text(json.dumps(expected_lora), encoding="utf-8")
+            adapter_sha = hashlib.sha256(adapter.read_bytes()).hexdigest()
+            config_sha = hashlib.sha256(config.read_bytes()).hexdigest()
+            for receipt in (
+                result["policy_identity"], result["policy_identity_before"],
+                result["policy_identity_between"], result["policy_identity_after"],
+            ):
+                receipt.update({
+                    "target_sha256": adapter_sha,
+                    "target_size": adapter.stat().st_size,
+                    "config_sha256": config_sha,
+                    "config_size": config.stat().st_size,
+                })
+            reference_path.write_text(json.dumps(result), encoding="utf-8")
+            expected_files = {
+                "adapter_model.safetensors": {"sha256": adapter_sha, "size": adapter.stat().st_size},
+                "adapter_config.json": {"sha256": config_sha, "size": config.stat().st_size},
+                "reference.json": {
+                    "sha256": hashlib.sha256(reference_path.read_bytes()).hexdigest(),
+                    "size": reference_path.stat().st_size,
+                },
+            }
+            scripts = (
+                _policy0_reference_source_verify_script(
+                    str(reference_path), expected_files["adapter_model.safetensors"],
+                    expected_files["adapter_config.json"],
+                ),
+                _policy0_qualification_verify_script(
+                    str(adapter), str(config), str(reference_path), expected_lora,
+                    expected_files,
+                ),
+            )
+            return [subprocess.run(
+                ["bash", "-c", script], text=True, capture_output=True
+            ) for script in scripts]
+
+    def refresh_response_hashes(self, result, phases):
+        comparison = result["prefill_rescore_comparison"]
+        for phase in phases:
+            comparison["response_sha256"][phase] = hashlib.sha256(
+                json.dumps(
+                    comparison["responses"][phase], sort_keys=True, separators=(",", ":")
+                ).encode()
+            ).hexdigest()
+        result["response_sha256"] = copy.deepcopy(comparison["response_sha256"])
+
+    def test_prefill_rescore_tampering_rejected_by_local_and_generated_verifiers(self):
+        baseline = self.build_prefill_result()
+        self.assertEqual(validate_reference(baseline)["request_mode"], baseline["request_mode"])
+        self.assertTrue(all(result.returncode == 0 for result in self.run_generated_verifiers(copy.deepcopy(baseline))))
+
+        variants = {}
+
+        def trainer_logprob(value):
+            value["inference_logprobs"][256] += 9.0
+        variants["trainer logprob"] = trainer_logprob
+
+        def source_hash(value):
+            value["source_input_sha256"] = "0" * 64
+        variants["source input hash"] = source_hash
+
+        def response_hash_alias(value):
+            value["response_sha256"]["decode"] = "0" * 64
+        variants["top response hash alias"] = response_hash_alias
+
+        def decode_route_hash_alias(value):
+            value["decode_route_sha256"] = "0" * 64
+        variants["top decode route hash alias"] = decode_route_hash_alias
+
+        def rescore_route_hash_alias(value):
+            value["rescore_route_sha256"] = "0" * 64
+        variants["top rescore route hash alias"] = rescore_route_hash_alias
+
+        def response_alias(value):
+            value["prefill_rescore_comparison"]["responses"]["rescore"]["tampered"] = True
+            self.refresh_response_hashes(value, ["rescore"])
+        variants["response alias"] = response_alias
+
+        def decode_evidence(value):
+            value["prefill_rescore_comparison"]["responses"]["decode"]["choices"][0]["logprobs"]["content"][0]["logprob"] += 9.0
+            self.refresh_response_hashes(value, ["decode"])
+        variants["decode evidence"] = decode_evidence
+
+        def rescore_evidence(value):
+            for phase in ("prefill", "rescore"):
+                value["prefill_rescore_comparison"]["responses"][phase]["prompt_logprobs"][256]["900"]["logprob"] += 9.0
+            self.refresh_response_hashes(value, ["prefill", "rescore"])
+        variants["rescore evidence"] = rescore_evidence
+
+        for label, mutate in variants.items():
+            with self.subTest(label=label):
+                tampered = copy.deepcopy(baseline)
+                mutate(tampered)
+                with self.assertRaises(QualificationError):
+                    validate_reference(tampered)
+                self.assertTrue(all(
+                    result.returncode != 0
+                    for result in self.run_generated_verifiers(tampered)
+                ))
 
     def test_builds_reference_and_selects_policy_model(self):
         calls = []

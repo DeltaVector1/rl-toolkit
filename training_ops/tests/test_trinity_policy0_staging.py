@@ -49,6 +49,7 @@ def reference_payload():
         "generated_token_ids": [12, 13],
         "generated_token_count": 2,
         "sequence_lengths": [4],
+        "source_input_sha256": "43a2d66e5f850f64677fc2fae986fcdbdf190e6b6f026167f70b21d8860826b3",
         "routed_experts": {"shape": [3, 60, 4]},
         "policy_identity_before": {"server_instance": "h200"},
         "policy_identity_after": {"server_instance": "h200"},
