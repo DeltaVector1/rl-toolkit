@@ -111,6 +111,17 @@ def test_stage_http_and_json_failures_are_structured(response, category):
     assert result["category"] == category
 
 
+def test_http_status_preserves_status_and_response_body():
+    def handler(request):
+        return httpx.Response(504, text="server restart required", request=request)
+
+    result = run_remote(handler, request("stage"))
+    assert result["ok"] is False
+    assert result["category"] == "http"
+    assert "HTTP 504" in result["error"]
+    assert "server restart required" in result["error"]
+
+
 def test_timeout_is_reported_as_tunnel_failure():
     def handler(request):
         raise httpx.ReadTimeout("server did not answer", request=request)
@@ -120,7 +131,7 @@ def test_timeout_is_reported_as_tunnel_failure():
     assert result["category"] == "tunnel"
 
 
-def test_load_timeout_recovers_from_exact_staging_status():
+def test_load_timeout_reports_exact_staging_status_without_retry():
     loaded = receipt()
     calls = []
 
@@ -131,8 +142,42 @@ def test_load_timeout_recovers_from_exact_staging_status():
         return httpx.Response(200, json={"loaded_receipts": {"qualification-policy-0": loaded}}, request=request)
 
     result = run_remote(handler, request("load", expected_identity=IDENTITY))
-    assert result == {"ok": True, "result": [loaded]}
+    assert result["ok"] is False
+    assert result["category"] == "tunnel"
+    assert "observed staging status" in result["error"]
+    assert "instance-a" in result["error"]
     assert calls == ["/load_lora_adapter", "/staging_status"]
+
+
+def test_load_post_and_diagnostic_status_share_one_absolute_deadline():
+    class DummyClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    seen = []
+    deadlines = []
+
+    async def fake_request_all(_client, _urls, method, _path, *, timeout_seconds, **_kwargs):
+        seen.append((method, timeout_seconds))
+        if method == "POST":
+            raise httpx.ReadTimeout("response did not finish")
+        return [{"status": "staging", "loaded_receipts": {}}]
+
+    def fake_remaining(deadline):
+        deadlines.append(deadline)
+        return 600.0 if len(deadlines) == 1 else 599.0
+
+    with patch.object(remote.httpx, "AsyncClient", lambda: DummyClient()), patch.object(
+        remote, "_request_all", side_effect=fake_request_all
+    ), patch.object(remote, "_remaining", side_effect=fake_remaining):
+        result = asyncio.run(remote._run(request("load", expected_identity=IDENTITY)))
+    assert result["ok"] is False
+    assert len(deadlines) == 2
+    assert deadlines[0] == deadlines[1]
+    assert seen == [("POST", 600.0), ("GET", 599.0)]
 
 
 def test_identity_and_receipt_mismatch_fail_closed():

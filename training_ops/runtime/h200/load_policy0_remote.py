@@ -21,10 +21,10 @@ request_write_timeout_seconds = 60.0
 def _category(error: BaseException) -> str:
     name = type(error).__name__.lower()
     message = str(error).lower()
+    if isinstance(error, httpx.HTTPStatusError) or "status" in name or "http" in name:
+        return "http"
     if "transport" in name or "connect" in message or "connection" in message or "timeout" in name or "timeout" in message:
         return "tunnel"
-    if "status" in name or "http" in name:
-        return "http"
     if any(marker in message for marker in ("identity", "checksum", "receipt", "source_url")):
         return "identity"
     return "config"
@@ -118,7 +118,15 @@ async def _json_request(
         ),
         timeout=timeout_seconds,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        body = response.text[:2000]
+        raise httpx.HTTPStatusError(
+            f"HTTP {response.status_code} from {url}: {body}",
+            request=error.request,
+            response=error.response,
+        ) from error
     try:
         payload = response.json()
     except (TypeError, ValueError) as error:
@@ -208,6 +216,32 @@ async def _load_status(
     return receipts
 
 
+def _remaining(deadline: float) -> float:
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise TimeoutError("policy-0 load phase exceeded its 600-second deadline")
+    return remaining
+
+
+async def _diagnostic_status(
+    client: httpx.AsyncClient,
+    admin_urls: list[str],
+    deadline: float,
+) -> str:
+    try:
+        statuses = await _request_all(
+            client,
+            admin_urls,
+            "GET",
+            "/staging_status",
+            body=None,
+            timeout_seconds=_remaining(deadline),
+        )
+        return json.dumps(statuses, sort_keys=True, separators=(",", ":"))[:4000]
+    except Exception as error:
+        return f"status read failed: {error}"
+
+
 async def _run(request: dict[str, object]) -> dict[str, object]:
     try:
         admin_urls, source_url, slot, operation = _validate_request(request)
@@ -244,6 +278,7 @@ async def _run(request: dict[str, object]) -> dict[str, object]:
                 "require_delta": False,
                 "prefetched": True,
             }
+            load_deadline = asyncio.get_running_loop().time() + load_budget_seconds
             try:
                 responses = await _request_all(
                     client,
@@ -251,23 +286,25 @@ async def _run(request: dict[str, object]) -> dict[str, object]:
                     "POST",
                     "/load_lora_adapter",
                     body=payload,
-                    timeout_seconds=load_budget_seconds,
+                    timeout_seconds=_remaining(load_deadline),
                 )
             except (httpx.TimeoutException, asyncio.TimeoutError) as error:
-                try:
-                    recovered = await _load_status(
-                        client, admin_urls, source_url, slot, expected, load_budget_seconds
-                    )
-                except Exception:
-                    raise error
-                return {"ok": True, "result": recovered}
+                diagnostic = await _diagnostic_status(client, admin_urls, load_deadline)
+                raise TimeoutError(
+                    f"load_lora_adapter timed out; observed staging status: {diagnostic}"
+                ) from error
             loaded = []
             for index, response in enumerate(responses):
                 if response.get("status") != "ok":
                     raise ValueError(f"endpoint {index} adapter load failed")
                 loaded.append(_receipt(response.get("loaded_receipt"), source_url, slot, expected, f"endpoint {index} load"))
             status_receipts = await _load_status(
-                client, admin_urls, source_url, slot, expected, load_budget_seconds
+                client,
+                admin_urls,
+                source_url,
+                slot,
+                expected,
+                _remaining(load_deadline),
             )
             if loaded != status_receipts:
                 raise ValueError("staging status receipts differ from load responses")
