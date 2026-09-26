@@ -113,6 +113,10 @@ deployment_bundle_scp_timeout_seconds = 60
 large_file_transfer_timeout_seconds = 7200
 adapter_update_engine_startup_timeout_seconds = 900
 adapter_delta_stage_timeout_seconds = 600
+# The remote stage/load budgets are 1800/600 seconds; 60 seconds covers SSH
+# and response cleanup without changing either server-side measurement limit.
+policy0_remote_stage_timeout_seconds = 1860
+policy0_remote_load_timeout_seconds = 660
 adapter_stage_acceptance_target_seconds = 300
 trainer_seconds_max = 600
 rollout_seconds_max = 720
@@ -8698,7 +8702,12 @@ def _policy0_remote_client_op(plan: dict[str, object], operation: str, expected_
         + helper
         + "\nPY\n"
     )
-    code, output = _ssh(str(plan["inference_hosts"][0]), script, timeout=900)
+    remote_timeout = (
+        policy0_remote_stage_timeout_seconds
+        if operation == "stage"
+        else policy0_remote_load_timeout_seconds
+    )
+    code, output = _ssh(str(plan["inference_hosts"][0]), script, timeout=remote_timeout)
     response = None
     try:
         response = json.loads(output.strip().splitlines()[-1])

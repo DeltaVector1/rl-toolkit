@@ -10,6 +10,8 @@ from training_ops import (
     _policy0_load_engine_state_script,
     _policy0_load_service_state_script,
     _policy0_remote_client_op,
+    policy0_remote_load_timeout_seconds,
+    policy0_remote_stage_timeout_seconds,
 )
 from training_ops.runtime.h200.load_policy0 import (
     EXPECTED_LORA,
@@ -262,6 +264,17 @@ class Policy0LoadTest(unittest.TestCase):
         self.assertIn("/app/.venv/bin/python", script)
         self.assertIn("127.0.0.1:8000", script)
         self.assertNotIn("from prime_rl", inspect.getsource(__import__("training_ops")._policy0_load_apply))
+        self.assertEqual(ssh.call_args.kwargs["timeout"], policy0_remote_stage_timeout_seconds)
+
+    def test_remote_client_stage_timeout_covers_server_stage_budget(self):
+        response = '{"ok":true,"result":{"adapter_identity":{}}}'
+        with patch("training_ops._ssh", return_value=(0, response)) as ssh:
+            _policy0_remote_client_op(plan(), "stage")
+        self.assertGreater(policy0_remote_stage_timeout_seconds, 900)
+        self.assertEqual(ssh.call_args.kwargs["timeout"], 1860)
+        with patch("training_ops._ssh", return_value=(0, response)) as ssh:
+            _policy0_remote_client_op(plan(), "load", IDENTITY)
+        self.assertEqual(ssh.call_args.kwargs["timeout"], policy0_remote_load_timeout_seconds)
 
     def test_remote_client_error_category_is_preserved(self):
         with patch("training_ops._ssh", return_value=(1, "{\"ok\":false,\"category\":\"identity\",\"error\":\"receipt mismatch\"}")):
