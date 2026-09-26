@@ -533,3 +533,16 @@ only after measured learning.
   profile directly and derive its stable watchdog identity. Keep
   `current_run()` selection for implicit repair, then retry the same explicit
   engine repair without changing host or config validation.
+
+## Qualification reference LAN fanout
+
+- Measured stall: the local `training_ops` copy of the 2,850,051-byte
+  reference stayed live for more than 3m22s with only n76, n78, and n82
+  children, remote rsync servers, and no completion. A separate eight-host
+  hash probe ran for more than 1m11s.
+- Bounded plan: after five minutes without progress, stop only the owned
+  transfer and probe processes and preserve partial files. Seed n82 directly
+  from h200b using the configured peer identity and trainer LAN
+  `10.92.20.82`, then use n82 LAN access to fan out the same small JSON to
+  n76, n77, n78, n80, n83, n84, and n85. Verify all eight SHA256 values begin
+  with `df7d` before the qualifier. No model transfer is involved.
