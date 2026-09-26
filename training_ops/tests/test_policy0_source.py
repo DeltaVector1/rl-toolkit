@@ -75,9 +75,42 @@ def local_plan(tmp_path):
         "source_config": str(source / "adapter_config.json"),
         "destination_dir": str(destination),
         "configured_source_dir": str(root),
+        "source_url": "http://source/preserved/broadcasts/step_0",
         "destination_url": "http://source/policy0-qualification/step_0",
     }
     return plan, source, destination
+
+
+def add_receiver_marker(source, *, source_url="http://source/preserved/broadcasts/step_0", **overrides):
+    weight = source / "adapter_model.safetensors"
+    config = source / "adapter_config.json"
+    weight_sha = hashlib.sha256(weight.read_bytes()).hexdigest()
+    config_bytes = config.read_bytes()
+    payload = {
+        "version": 1,
+        "run_name": "run_preserved",
+        "step": 0,
+        "source_url": source_url,
+        "target_sha256": weight_sha,
+        "target_size": weight.stat().st_size,
+        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "config_size": len(config_bytes),
+        "slot": "trinity-policy-0",
+        "receivers": [{
+            "endpoint": "http://h200-a",
+            "receipt": {
+                "source_url": source_url,
+                "target_sha256": weight_sha,
+                "target_size": weight.stat().st_size,
+                "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+                "config_size": len(config_bytes),
+                "lora_name": "trinity-policy-0",
+                "server_instance": "server-a",
+            },
+        }],
+    }
+    payload.update(overrides)
+    (source / "receivers-ready.json").write_text(json.dumps(payload, separators=(",", ":")) + "\n")
 
 
 def add_transport_chunk(source):
@@ -166,6 +199,35 @@ def test_script_accepts_legacy_source_preserves_it_and_publishes_canonical(tmp_p
     assert not list(destination.parent.glob(".policy0-source.*"))
     expected_sha = hashlib.sha256((destination / "adapter_config.json").read_bytes()).hexdigest()
     assert fields[4] == expected_sha
+
+
+def test_script_accepts_optional_receiver_marker_but_does_not_copy_it(tmp_path):
+    plan, source, destination = local_plan(tmp_path)
+    add_receiver_marker(source)
+    result = run_script(build_apply_script(plan))
+    assert result.returncode == 0, result.stderr
+    assert (source / "receivers-ready.json").is_file()
+    assert not (destination / "receivers-ready.json").exists()
+
+
+@pytest.mark.parametrize("kind", ["invalid-json", "wrong-identity", "symlink", "directory", "extra"])
+def test_script_refuses_invalid_or_unrecognized_receiver_marker(tmp_path, kind):
+    plan, source, _ = local_plan(tmp_path)
+    marker = source / "receivers-ready.json"
+    if kind == "invalid-json":
+        marker.write_text("not json")
+    elif kind == "wrong-identity":
+        add_receiver_marker(source, target_sha256="0" * 64)
+    elif kind == "symlink":
+        marker.symlink_to(source / "adapter_manifest.json")
+    elif kind == "directory":
+        marker.mkdir()
+    else:
+        add_receiver_marker(source)
+        (source / "unrecognized.txt").write_text("extra")
+    result = run_script(build_apply_script(plan))
+    assert result.returncode != 0
+    assert "receivers-ready" in result.stderr or kind == "extra"
 
 
 def test_script_copies_and_validates_referenced_transport_chunks(tmp_path):

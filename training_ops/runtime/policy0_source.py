@@ -122,7 +122,7 @@ import sys
 import tempfile
 
 
-source_dir, source_adapter, source_config, destination, source_root, destination_url, legacy_json, canonical_json = sys.argv[1:]
+source_dir, source_adapter, source_config, destination, source_root, source_url, destination_url, legacy_json, canonical_json = sys.argv[1:]
 source_dir = Path(source_dir)
 source_adapter = Path(source_adapter)
 source_config = Path(source_config)
@@ -299,6 +299,74 @@ def validate_chunk_records(manifest, target_size):
     return chunks
 
 
+def validate_receiver_marker(marker_bytes, weight_identity, config_identity):
+    try:
+        marker = json.loads(marker_bytes.decode("utf-8"))
+    except (UnicodeError, ValueError) as error:
+        fail(f"source receivers-ready marker is invalid: {error}")
+    required = {
+        "version", "run_name", "step", "source_url", "target_sha256",
+        "target_size", "config_sha256", "config_size", "slot", "receivers",
+    }
+    if not isinstance(marker, dict) or set(marker) != required:
+        fail("source receivers-ready marker fields are invalid")
+    if (
+        type(marker["version"]) is not int
+        or marker["version"] != 1
+        or not isinstance(marker["run_name"], str)
+        or not marker["run_name"]
+        or type(marker["step"]) is not int
+        or marker["step"] != 0
+        or marker["source_url"] != source_url
+        or not valid_digest(marker["target_sha256"])
+        or type(marker["target_size"]) is not int
+        or marker["target_size"] <= 0
+        or not valid_digest(marker["config_sha256"])
+        or type(marker["config_size"]) is not int
+        or marker["config_size"] < 0
+        or not isinstance(marker["slot"], str)
+        or not marker["slot"]
+        or not isinstance(marker["receivers"], list)
+        or not marker["receivers"]
+    ):
+        fail("source receivers-ready marker identity is invalid")
+    expected = {
+        "target_sha256": weight_identity["sha256"],
+        "target_size": weight_identity["size"],
+        "config_sha256": config_identity["sha256"],
+        "config_size": config_identity["size"],
+    }
+    for name, value in expected.items():
+        if marker[name] != value:
+            fail(f"source receivers-ready marker {name} differs from the source")
+    endpoints = set()
+    for item in marker["receivers"]:
+        if not isinstance(item, dict) or set(item) != {"endpoint", "receipt"}:
+            fail("source receivers-ready marker receiver record is invalid")
+        endpoint = item["endpoint"]
+        receipt = item["receipt"]
+        if not isinstance(endpoint, str) or not endpoint or endpoint in endpoints:
+            fail("source receivers-ready marker endpoint set is invalid")
+        if not isinstance(receipt, dict) or set(receipt) != {
+            "source_url", "target_sha256", "target_size", "config_sha256",
+            "config_size", "lora_name", "server_instance",
+        }:
+            fail("source receivers-ready marker receipt is invalid")
+        if (
+            receipt["source_url"] != source_url
+            or receipt["target_sha256"] != expected["target_sha256"]
+            or receipt["target_size"] != expected["target_size"]
+            or receipt["config_sha256"] != expected["config_sha256"]
+            or receipt["config_size"] != expected["config_size"]
+            or receipt["lora_name"] != marker["slot"]
+            or not isinstance(receipt["server_instance"], str)
+            or not receipt["server_instance"]
+        ):
+            fail("source receivers-ready marker receipt identity differs")
+        endpoints.add(endpoint)
+    return marker
+
+
 def validate_source():
     if not source_root.is_absolute() or not source_dir.is_absolute() or not destination.is_absolute():
         fail("source paths must be absolute")
@@ -360,9 +428,17 @@ def validate_source():
             if record["size"] != item["wire_size"] or record["sha256"] != item["wire_sha256"]:
                 fail("source transport chunk identity differs")
             chunk_identities[item["file"]] = record
+    marker_bytes = None
+    marker_identity = None
+    marker_path = source_dir / "receivers-ready.json"
+    if marker_path.exists() or marker_path.is_symlink():
+        marker_bytes, marker_identity = read_regular_bytes(marker_path, "source receivers-ready marker")
+        validate_receiver_marker(marker_bytes, weight_identity, config_identity)
     expected_entries = {"STABLE", "adapter_config.json", "adapter_model.safetensors", "adapter_model.safetensors.sha256", "adapter_manifest.json"}
     if chunks:
         expected_entries.update(chunk_identities)
+    if marker_identity is not None:
+        expected_entries.add("receivers-ready.json")
     actual_entries = {path.name for path in source_dir.iterdir()}
     if actual_entries != expected_entries:
         fail("source adapter contains unexpected files")
@@ -374,6 +450,8 @@ def validate_source():
         "adapter_manifest.json": manifest_identity,
         **chunk_identities,
     }
+    if marker_identity is not None:
+        snapshot["receivers-ready.json"] = marker_identity
     return config_value, manifest, chunks, snapshot
 
 
@@ -526,6 +604,7 @@ def build_apply_script(plan):
         str(plan["source_config"]),
         str(plan["destination_dir"]),
         str(plan["configured_source_dir"]),
+        str(plan["source_url"]),
         str(plan["destination_url"]),
         json.dumps(list(LEGACY_TARGETS), separators=(",", ":")),
         json.dumps(list(CANONICAL_TARGETS), separators=(",", ":")),
