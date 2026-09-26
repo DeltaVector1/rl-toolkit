@@ -95,6 +95,11 @@ if [ "$MODE" = lease ]; then
   armed=$((1 - WAIT_FOR_INITIAL_HEALTH))
   startup_deadline=$(( $(date +%s) + STARTUP_GRACE ))
   while true; do
+    if [ "$armed" = 0 ] && [ "$(date +%s)" -ge "$startup_deadline" ]; then
+      log "FATAL: trainer health did not become healthy during startup grace; stopping orchestrator"
+      stop_edge
+      exit 1
+    fi
     snapshot=$(health_status 2>/dev/null || true)
     if [ "$armed" = 0 ]; then
       if [ -n "$snapshot" ]; then
@@ -104,17 +109,9 @@ if [ "$MODE" = lease ]; then
           missing_epoch=
           missing_count=0
           log "trainer health watchdog armed after fresh healthy status and lease"
-        elif [ "$(date +%s)" -ge "$startup_deadline" ]; then
-          log "FATAL: trainer health did not become healthy during startup grace; stopping orchestrator"
-          stop_edge
-          exit 1
         else
           log "startup: waiting for fresh healthy trainer status and lease (state=$state)"
         fi
-      elif [ "$(date +%s)" -ge "$startup_deadline" ]; then
-        log "FATAL: trainer health status stayed unknown during startup grace; stopping orchestrator"
-        stop_edge
-        exit 1
       else
         log "startup: trainer health status unknown; waiting for fresh healthy status"
       fi
