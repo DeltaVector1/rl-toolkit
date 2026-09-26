@@ -66,6 +66,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         archive=None,
         old_sha=OLD_SHA256,
         old_size=OLD_SIZE,
+        use_expected_old=True,
         expected_new_sha=None,
         expected_new_size=None,
     ):
@@ -82,9 +83,10 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             new_sha, new_size = _identity_bytes(partial)
             expected_new_sha = expected_new_sha or new_sha
             expected_new_size = new_size if expected_new_size is None else expected_new_size
+            script_args = (old_sha, old_size) if use_expected_old else (None, None)
             script = _policy0_transfer_reference_script(
                 str(partial_path), str(destination), expected_new_sha, expected_new_size,
-                old_sha, old_size
+                *script_args
             )
             result = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
             archive_path = destination.with_name(destination.name + ".preserved." + old_sha)
@@ -92,6 +94,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 "final": destination.read_bytes() if destination.exists() else None,
                 "partial_exists": partial_path.exists(),
                 "archive": archive_path.read_bytes() if archive_path.exists() else None,
+                "archive_path": str(archive_path),
             }
 
     def test_validates_exact_adapter_settings_and_reference(self):
@@ -215,8 +218,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertFalse(state["partial_exists"])
         self.assertIn("status=installed", result.stdout)
         self.assertIn(f"old_sha={old_sha}", result.stdout)
-        self.assertIn("preserved=", result.stdout)
-        self.assertIn(".preserved.", result.stdout)
+        self.assertIn(f"preserved={state['archive_path']}", result.stdout)
         self.assertIn(f"new_sha={hashlib.sha256(b'new-reference').hexdigest()}", result.stdout)
 
     def test_reference_script_already_new_reports_valid_preserved_archive(self):
@@ -231,8 +233,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertEqual(state["archive"], old)
         self.assertFalse(state["partial_exists"])
         self.assertIn("status=idempotent", result.stdout)
-        self.assertIn(f"preserved=", result.stdout)
-        self.assertIn(f".preserved.{old_sha}", result.stdout)
+        self.assertIn(f"preserved={state['archive_path']}", result.stdout)
 
     def test_reference_script_already_new_without_archive_is_not_recoverable(self):
         result, state = self.run_install(final=b"new-reference", partial=b"new-reference")
@@ -254,11 +255,38 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertFalse(state["partial_exists"])
 
     def test_reference_script_missing_installs_without_archive(self):
-        result, state = self.run_install(final=None, partial=b"new-reference")
+        result, state = self.run_install(
+            final=None, partial=b"new-reference", use_expected_old=False
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(state["final"], b"new-reference")
         self.assertFalse(state["partial_exists"])
         self.assertIsNone(state["archive"])
+
+    def test_reference_script_explicit_old_missing_refuses_and_no_old_retry_installs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "reference.json"
+            partial = root / "reference.partial"
+            partial.write_bytes(b"new-reference")
+            new_sha, new_size = _identity_bytes(b"new-reference")
+            explicit = _policy0_transfer_reference_script(
+                str(partial), str(target), new_sha, new_size, OLD_SHA256, OLD_SIZE
+            )
+            refused = subprocess.run(["bash", "-c", explicit], text=True, capture_output=True)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("explicit expected-old", refused.stderr)
+            self.assertFalse(target.exists())
+            self.assertFalse(partial.exists())
+
+            partial.write_bytes(b"new-reference")
+            retry = _policy0_transfer_reference_script(
+                str(partial), str(target), new_sha, new_size
+            )
+            installed = subprocess.run(["bash", "-c", retry], text=True, capture_output=True)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            self.assertEqual(target.read_bytes(), b"new-reference")
+            self.assertFalse(partial.exists())
 
     def test_reference_script_rejects_wrong_old_and_cleans_partial(self):
         result, state = self.run_install(final=b"wrong-old", partial=b"new-reference")
@@ -419,6 +447,64 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             )
             self.assertTrue(target.is_symlink(), result.stderr)
         self.assertNotEqual(result.returncode, 0)
+
+    def test_reference_script_rolls_back_late_symlink_at_exchange_boundary(self):
+        self._assert_exchange_boundary_injection("symlink")
+
+    def test_reference_script_rolls_back_late_directory_at_exchange_boundary(self):
+        self._assert_exchange_boundary_injection("directory")
+
+    def _assert_exchange_boundary_injection(self, kind):
+        old = b"old-reference"
+        new = b"new-reference"
+        old_sha, old_size = _identity_bytes(old)
+        new_sha, new_size = _identity_bytes(new)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "reference.json"
+            target.write_bytes(old)
+            partial = root / "reference.partial"
+            partial.write_bytes(new)
+            marker = root / "exchanged.marker"
+            wrapper_dir = root / "bin"
+            wrapper_dir.mkdir()
+            replacement = (
+                f"ln -s -- {str(partial)!r} {str(target)!r}"
+                if kind == "symlink"
+                else f"mkdir -- {str(target)!r}"
+            )
+            wrapper = wrapper_dir / "python3"
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$2\" = {str(partial)!r} ] && [ \"$3\" = {str(target)!r} ] && [ ! -e {str(marker)!r} ]; then\n"
+                f"  touch -- {str(marker)!r}\n"
+                "  /usr/bin/python3 \"$@\"\n"
+                "  status=$?\n"
+                f"  rm -rf -- {str(target)!r}\n"
+                f"  {replacement}\n"
+                "  exit $status\n"
+                "fi\n"
+                "exec /usr/bin/python3 \"$@\"\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = str(wrapper_dir) + os.pathsep + environment["PATH"]
+            result = subprocess.run(
+                ["bash", "-c", _policy0_transfer_reference_script(
+                    str(partial), str(target), new_sha, new_size, old_sha, old_size
+                )],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(target.read_bytes(), old)
+            self.assertTrue(partial.is_symlink() if kind == "symlink" else partial.is_dir())
+            self.assertTrue(marker.exists())
+            self.assertEqual(
+                (root / (target.name + ".preserved." + old_sha)).read_bytes(), old
+            )
 
     def test_controller_downloads_once_and_uploads_all_trainers(self):
         source_bytes = b"verified-reference"

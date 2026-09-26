@@ -7080,8 +7080,10 @@ directory=$(dirname -- "$final")
 archive_tmp=
 preserved=none
 completed=0
+rollback_safe=1
+exchanged=0
 cleanup() {{
-  if [ "$completed" -ne 1 ]; then
+  if [ "$completed" -ne 1 ] && [ "$rollback_safe" -eq 1 ]; then
     rm -f -- "$partial" "$archive_tmp" 2>/dev/null || true
   fi
 }}
@@ -7142,6 +7144,74 @@ try:
 finally:
     os.close(fd)
 PY
+}}
+
+verify_path_identity() {{
+  identity=$(read_regular_identity "$1") || {{
+    echo "reference path is not a readable regular file: $1" >&2
+    return 80
+  }}
+  path_sha=${{identity%% *}}
+  path_size=${{identity#* }}
+  test "$path_sha" = "$2" || {{
+    echo "reference path SHA256 differs: $1" >&2
+    return 81
+  }}
+  test "$path_size" = "$3" || {{
+    echo "reference path size differs: $1" >&2
+    return 82
+  }}
+}}
+
+atomic_exchange() {{
+  python3 - "$1" "$2" <<'PY'
+import ctypes
+import os
+import sys
+
+RENAME_EXCHANGE = 2
+AT_FDCWD = -100
+libc = ctypes.CDLL(None, use_errno=True)
+try:
+    renameat2 = libc.renameat2
+except AttributeError:
+    raise SystemExit("renameat2 is unavailable")
+renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+renameat2.restype = ctypes.c_int
+old_path = os.fsencode(sys.argv[1])
+new_path = os.fsencode(sys.argv[2])
+if renameat2(AT_FDCWD, old_path, AT_FDCWD, new_path, RENAME_EXCHANGE) != 0:
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error))
+PY
+}}
+
+rollback_exchange() {{
+  if [ "$exchanged" -ne 1 ]; then
+    return 0
+  fi
+  if ! atomic_exchange "$partial" "$final"; then
+    rollback_safe=0
+    return 1
+  fi
+  exchanged=0
+  if verify_final_regular && \
+     verify_path_identity "$final" "$expected_old_sha" "$expected_old_size" && \
+     verify_path_identity "$partial" "$new_sha" "$new_size"; then
+    return 0
+  fi
+  rollback_safe=0
+  return 1
+}}
+
+fail_exchange() {{
+  exchange_error=$1
+  if rollback_exchange; then
+    echo "$exchange_error; rollback verified" >&2
+  else
+    echo "$exchange_error; rollback could not be verified; paths retained" >&2
+  fi
+  exit 83
 }}
 
 verify_final_regular() {{
@@ -7292,12 +7362,34 @@ if [ -f "$final" ]; then
     exit 79
   fi
   verify_new_partial
-  mv -- "$partial" "$final"
+  if ! atomic_exchange "$partial" "$final"; then
+    echo "reference atomic exchange is unavailable or failed" >&2
+    exit 84
+  fi
+  exchanged=1
+  if ! verify_final_regular || \
+     ! verify_path_identity "$final" "$new_sha" "$new_size" || \
+     ! verify_path_identity "$partial" "$expected_old_sha" "$expected_old_size"; then
+    fail_exchange "reference atomic exchange identity check failed"
+  fi
+  if ! verify_final_regular || \
+     ! verify_path_identity "$final" "$new_sha" "$new_size" || \
+     ! verify_path_identity "$partial" "$expected_old_sha" "$expected_old_size"; then
+    fail_exchange "reference atomic exchange changed before old partial removal"
+  fi
+  if ! rm -f -- "$partial"; then
+    fail_exchange "reference displaced old partial removal failed"
+  fi
   partial=
+  exchanged=0
   fsync_file_and_directory "$final" "$directory"
   old_sha=$current_sha
   old_size=$current_size
 else
+  if [ -n "$expected_old_sha" ]; then
+    echo "reference destination is missing; explicit expected-old preservation cannot be recovered" >&2
+    exit 77
+  fi
   if [ -e "$archive" ] || [ -L "$archive" ]; then
     echo "reference preservation archive exists while destination is missing" >&2
     exit 72
