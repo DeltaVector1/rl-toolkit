@@ -269,6 +269,8 @@ def validate_chunk_records(manifest, target_size):
         if (
             not isinstance(name, str)
             or not name
+            or Path(name).is_absolute()
+            or any(part in {"", ".", ".."} for part in Path(name).parts)
             or Path(name).name != name
             or name in seen
             or name in {"adapter_config.json", "adapter_model.safetensors", "adapter_manifest.json"}
@@ -351,25 +353,16 @@ def validate_source():
         fail("source adapter manifest file identity differs")
     chunks = validate_chunk_records(manifest, weight_identity["size"])
     chunk_identities = {}
-    chunk_root = source_dir / "transport-chunks"
     if chunks:
-        if chunk_root.is_symlink() or not chunk_root.is_dir():
-            fail("source transport chunk directory is invalid")
         for item in chunks:
-            path = chunk_root / item["file"]
+            path = source_dir / item["file"]
             record = regular(path, "source transport chunk")
             if record["size"] != item["wire_size"] or record["sha256"] != item["wire_sha256"]:
                 fail("source transport chunk identity differs")
             chunk_identities[item["file"]] = record
-        actual_chunks = {path.name for path in chunk_root.iterdir()}
-        if actual_chunks != set(chunk_identities):
-            fail("source transport chunk directory contains unexpected files")
-    elif chunk_root.exists():
-        if chunk_root.is_symlink() or not chunk_root.is_dir() or any(chunk_root.iterdir()):
-            fail("source adapter has unexpected transport chunks")
     expected_entries = {"STABLE", "adapter_config.json", "adapter_model.safetensors", "adapter_model.safetensors.sha256", "adapter_manifest.json"}
     if chunks:
-        expected_entries.add("transport-chunks")
+        expected_entries.update(chunk_identities)
     actual_entries = {path.name for path in source_dir.iterdir()}
     if actual_entries != expected_entries:
         fail("source adapter contains unexpected files")
@@ -379,7 +372,7 @@ def validate_source():
         "adapter_model.safetensors": weight_identity,
         "adapter_model.safetensors.sha256": sidecar_identity,
         "adapter_manifest.json": manifest_identity,
-        **{f"transport-chunks/{name}": record for name, record in chunk_identities.items()},
+        **chunk_identities,
     }
     return config_value, manifest, chunks, snapshot
 
@@ -428,26 +421,19 @@ def validate_tree(root, config_bytes, manifest_bytes, *, stable):
     if weight_path.stat().st_size != published_manifest.get("target_size") or digest(weight_path) != published_manifest.get("target_sha256"):
         fail("published adapter weight identity differs")
     chunks = validate_chunk_records(published_manifest, weight_path.stat().st_size)
-    chunk_root = root / "transport-chunks"
     if chunks:
-        if chunk_root.is_symlink() or not chunk_root.is_dir():
-            fail("published transport chunk directory is invalid")
         names = set()
         for item in chunks:
             names.add(item["file"])
-            path = chunk_root / item["file"]
+            path = root / item["file"]
             record = regular(path, "published transport chunk")
             if record["size"] != item["wire_size"] or record["sha256"] != item["wire_sha256"]:
                 fail("published transport chunk identity differs")
-        if {path.name for path in chunk_root.iterdir()} != names:
-            fail("published transport chunk directory contains unexpected files")
-    elif chunk_root.exists():
-        fail("published adapter has unexpected transport chunks")
     expected = {"adapter_config.json", "adapter_model.safetensors.sha256", "adapter_model.safetensors", "adapter_manifest.json"}
     if stable:
         expected.add("STABLE")
     if chunks:
-        expected.add("transport-chunks")
+        expected.update(names)
     if {path.name for path in root.iterdir()} != expected:
         fail("published adapter contains unexpected files")
     if stable:
@@ -504,7 +490,7 @@ try:
     copy_reflink(source_adapter, temporary / "adapter_model.safetensors")
     copy_reflink(source_dir / "adapter_model.safetensors.sha256", temporary / "adapter_model.safetensors.sha256")
     for item in chunks:
-        copy_reflink(source_dir / "transport-chunks" / item["file"], temporary / "transport-chunks" / item["file"])
+        copy_reflink(source_dir / item["file"], temporary / item["file"])
     (temporary / "adapter_config.json").write_bytes(config_bytes)
     (temporary / "adapter_manifest.json").write_bytes(manifest_bytes)
     validate_tree(temporary, config_bytes, manifest_bytes, stable=False)

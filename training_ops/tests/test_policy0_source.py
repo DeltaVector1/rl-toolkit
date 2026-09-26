@@ -82,9 +82,7 @@ def local_plan(tmp_path):
 
 def add_transport_chunk(source):
     chunk = b"chunked"
-    chunk_dir = source / "transport-chunks"
-    chunk_dir.mkdir()
-    (chunk_dir / "chunk-0").write_bytes(chunk)
+    (source / "chunk-0").write_bytes(chunk)
     manifest_path = source / "adapter_manifest.json"
     manifest = json.loads(manifest_path.read_text())
     weight = source / "adapter_model.safetensors"
@@ -175,13 +173,26 @@ def test_script_copies_and_validates_referenced_transport_chunks(tmp_path):
     add_transport_chunk(source)
     result = run_script(build_apply_script(plan))
     assert result.returncode == 0, result.stderr
-    assert (destination / "transport-chunks" / "chunk-0").read_bytes() == b"chunked"
+    assert (destination / "chunk-0").read_bytes() == b"chunked"
     manifest = json.loads((destination / "adapter_manifest.json").read_text())
     assert manifest["target_url"] == plan["destination_url"]
     assert manifest["config_sha256"] == hashlib.sha256(
         (destination / "adapter_config.json").read_bytes()
     ).hexdigest()
     assert manifest["chunks"][0]["wire_sha256"] == hashlib.sha256(b"chunked").hexdigest()
+
+
+@pytest.mark.parametrize("unsafe_name", ["../chunk-0", "/tmp/chunk-0", "adapter_config.json"])
+def test_script_refuses_unsafe_or_metadata_chunk_path(tmp_path, unsafe_name):
+    plan, source, _ = local_plan(tmp_path)
+    add_transport_chunk(source)
+    manifest_path = source / "adapter_manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["chunks"][0]["file"] = unsafe_name
+    manifest_path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n")
+    result = run_script(build_apply_script(plan))
+    assert result.returncode != 0
+    assert "chunk record is invalid" in result.stderr
 
 
 def test_script_is_idempotent_and_refuses_conflicting_destination(tmp_path):
