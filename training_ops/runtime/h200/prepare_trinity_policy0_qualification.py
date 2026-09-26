@@ -84,6 +84,55 @@ def _validate_route_payload(
                 raise QualificationError(f"{label} sparse route IDs are invalid")
 
 
+def _normalise_response_route(
+    value: Mapping[str, Any],
+    expected_rows: int,
+    label: str,
+) -> dict[str, Any]:
+    if set(value) != {"data", "dtype", "shape", "start"}:
+        raise QualificationError(f"{label} response route schema is invalid")
+    shape = value.get("shape")
+    if (
+        value.get("dtype") != "uint8"
+        or value.get("start") != 0
+        or not isinstance(shape, list)
+        or len(shape) != 3
+        or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in shape)
+        or shape[0] != expected_rows
+        or shape[1] <= 6
+    ):
+        raise QualificationError(f"{label} response route metadata is invalid")
+    encoded = value.get("data")
+    if not isinstance(encoded, str):
+        raise QualificationError(f"{label} response route data is invalid")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise QualificationError(f"{label} response route data is invalid") from error
+    if len(raw) != shape[0] * shape[1] * shape[2]:
+        raise QualificationError(f"{label} response route data size is invalid")
+    row_width = shape[1] * shape[2]
+    for offset in range(0, len(raw), row_width):
+        row = raw[offset : offset + row_width]
+        dense_end = 6 * shape[2]
+        if any(row[:dense_end]):
+            raise QualificationError(f"{label} response dense route IDs are invalid")
+        for layer in range(6, shape[1]):
+            selected = row[layer * shape[2] : (layer + 1) * shape[2]]
+            if any(expert >= 256 for expert in selected) or len(set(selected)) != len(selected):
+                raise QualificationError(f"{label} response sparse route IDs are invalid")
+    return {
+        "schema_version": 1,
+        "encoding": "base64",
+        "dtype": "uint8",
+        "shape": shape,
+        "dense_layers": 6,
+        "experts": 256,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "data": encoded,
+    }
+
+
 def _json_sha256(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -94,7 +143,7 @@ def _strict_logprob(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise QualificationError(f"{label} is not numeric")
     value = float(value)
-    if not math.isfinite(value):
+    if not math.isfinite(value) or value == -9999.0:
         raise QualificationError(f"{label} is not finite")
     return value
 
@@ -268,6 +317,25 @@ def _validate_prefill_rescore_comparison(
     _validate_route_payload(route, 512, "prefill")
     if comparison["route_sha256"].get("decode") != decode_route.get("sha256"):
         raise QualificationError("prefill-rescore decode route hash does not match diagnostic route")
+    response_routes = {}
+    for phase in ("decode", "prefill", "rescore"):
+        response = responses[phase]
+        choices = response.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], Mapping):
+            raise QualificationError(f"prefill-rescore {phase} response choices are invalid")
+        response_route = choices[0].get("routed_experts")
+        if not isinstance(response_route, Mapping):
+            raise QualificationError(f"prefill-rescore {phase} response route is missing")
+        expected_rows = 511 if phase == "decode" else 512
+        response_routes[phase] = _normalise_response_route(
+            response_route, expected_rows, phase
+        )
+    if (
+        response_routes["decode"] != decode_route
+        or response_routes["prefill"] != route
+        or response_routes["rescore"] != route
+    ):
+        raise QualificationError("prefill-rescore response routes are not bound")
     if (
         value.get("response_sha256") != comparison["response_sha256"]
         or value.get("decode_route_sha256") != comparison["route_sha256"].get("decode")
@@ -447,6 +515,7 @@ def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
         isinstance(logprob, bool)
         or not isinstance(logprob, (int, float))
         or not math.isfinite(float(logprob))
+        or float(logprob) == -9999.0
         for logprob in logprobs
     ):
         raise QualificationError("reference inference logprobs must be finite")

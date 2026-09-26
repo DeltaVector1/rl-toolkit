@@ -400,6 +400,26 @@ class TrinityParityReferenceTest(unittest.TestCase):
             value["rescore_route_sha256"] = "0" * 64
         variants["top rescore route hash alias"] = rescore_route_hash_alias
 
+        def decode_response_route(value):
+            comparison = value["prefill_rescore_comparison"]
+            comparison["responses"]["decode"]["choices"][0]["routed_experts"] = copy.deepcopy(
+                comparison["responses"]["prefill"]["choices"][0]["routed_experts"]
+            )
+            self.refresh_response_hashes(value, ["decode"])
+        variants["decode response route"] = decode_response_route
+
+        def prefill_response_route(value):
+            comparison = value["prefill_rescore_comparison"]
+            replacement = copy.deepcopy(
+                comparison["responses"]["decode"]["choices"][0]["routed_experts"]
+            )
+            for phase in ("prefill", "rescore"):
+                comparison["responses"][phase]["choices"][0]["routed_experts"] = copy.deepcopy(
+                    replacement
+                )
+            self.refresh_response_hashes(value, ["prefill", "rescore"])
+        variants["prefill response route"] = prefill_response_route
+
         def response_alias(value):
             value["prefill_rescore_comparison"]["responses"]["rescore"]["tampered"] = True
             self.refresh_response_hashes(value, ["rescore"])
@@ -415,6 +435,16 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 value["prefill_rescore_comparison"]["responses"][phase]["prompt_logprobs"][256]["900"]["logprob"] += 9.0
             self.refresh_response_hashes(value, ["prefill", "rescore"])
         variants["rescore evidence"] = rescore_evidence
+
+        def sentinel_evidence(value):
+            comparison = value["prefill_rescore_comparison"]
+            comparison["responses"]["decode"]["choices"][0]["logprobs"]["content"][0]["logprob"] = -9999.0
+            comparison["per_completion"][0]["decode_logprob"] = -9999.0
+            delta = comparison["per_completion"][0]["prefill_logprob"] + 9999.0
+            comparison["per_completion"][0]["delta"] = delta
+            comparison["completion_logprob_deltas"][0] = delta
+            self.refresh_response_hashes(value, ["decode"])
+        variants["sentinel evidence"] = sentinel_evidence
 
         for label, mutate in variants.items():
             with self.subTest(label=label):

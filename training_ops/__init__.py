@@ -6887,6 +6887,30 @@ def check_route(route, rows, label):
             if any(expert >= experts for expert in selected) or len(set(selected)) != len(selected):
                 raise SystemExit(label + " sparse route IDs are invalid")
 
+def normalise_response_route(value, rows, label):
+    if not isinstance(value, dict) or set(value) != {{"data", "dtype", "shape", "start"}}:
+        raise SystemExit(label + " response route schema is invalid")
+    shape = value.get("shape")
+    if (value.get("dtype") != "uint8" or value.get("start") != 0
+            or not isinstance(shape, list) or len(shape) != 3
+            or any(type(item) is not int or item <= 0 for item in shape)
+            or shape[0] != rows or shape[1] <= 6):
+        raise SystemExit(label + " response route metadata is invalid")
+    encoded = value.get("data")
+    if not isinstance(encoded, str):
+        raise SystemExit(label + " response route data is invalid")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (TypeError, binascii.Error, ValueError):
+        raise SystemExit(label + " response route data is invalid")
+    if len(raw) != shape[0] * shape[1] * shape[2]:
+        raise SystemExit(label + " response route data size is invalid")
+    canonical = {{"schema_version": 1, "encoding": "base64", "dtype": "uint8",
+                 "shape": shape, "dense_layers": 6, "experts": 256,
+                 "sha256": hashlib.sha256(raw).hexdigest(), "data": encoded}}
+    check_route(canonical, rows, label + " response")
+    return canonical
+
 def route_differences(decode_route, prefill_route):
     decode_shape = decode_route["shape"]
     prefill_shape = prefill_route["shape"]
@@ -6906,7 +6930,8 @@ def route_differences(decode_route, prefill_route):
             "different_row_count": len(differences)}}
 
 def strict_logprob(value, label):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value)) or float(value) == -9999.0):
         raise SystemExit(label + " is not finite numeric evidence")
     return float(value)
 
@@ -6986,7 +7011,7 @@ first_generated = mask.index(True)
 if mask != [False] * first_generated + [True] * (len(mask) - first_generated):
     raise SystemExit("reference loss mask is not prompt-then-completion")
 if any(isinstance(logprob, bool) or not isinstance(logprob, (int, float))
-       or not math.isfinite(float(logprob)) for logprob in logs):
+       or not math.isfinite(float(logprob)) or float(logprob) == -9999.0 for logprob in logs):
     raise SystemExit("reference inference logprobs are not finite")
 if any(logprob != 0.0 for logprob, trainable in zip(logs, mask) if not trainable):
     raise SystemExit("reference prompt inference logprobs are not zero")
@@ -7101,6 +7126,23 @@ if request_mode == "serialized_generate_decode256_prefill_rescore":
         raise SystemExit("prefill-rescore completion evidence is not bound")
     check_route(comparison.get("decode_route"), 511, "decode")
     check_route(route, 512, "prefill")
+    response_routes = {{}}
+    for phase in ("decode", "prefill", "rescore"):
+        response = comparison["responses"][phase]
+        choices = response.get("choices")
+        if (not isinstance(choices, list) or len(choices) != 1
+                or not isinstance(choices[0], dict)):
+            raise SystemExit("prefill-rescore response choices are invalid")
+        response_route = choices[0].get("routed_experts")
+        if not isinstance(response_route, dict):
+            raise SystemExit("prefill-rescore response route is missing")
+        response_routes[phase] = normalise_response_route(
+            response_route, 511 if phase == "decode" else 512, phase
+        )
+    if (response_routes["decode"] != comparison["decode_route"]
+            or response_routes["prefill"] != route
+            or response_routes["rescore"] != route):
+        raise SystemExit("prefill-rescore response routes are not bound")
     if (comparison["route_sha256"].get("decode") != comparison["decode_route"].get("sha256")
             or comparison["route_sha256"].get("prefill") != route.get("sha256")
             or comparison["route_sha256"].get("rescore") != route.get("sha256")
@@ -7248,6 +7290,30 @@ def check_route(route, rows, label):
             if any(expert >= experts for expert in selected) or len(set(selected)) != len(selected):
                 raise SystemExit(label + " sparse route IDs are invalid")
 
+def normalise_response_route(value, rows, label):
+    if not isinstance(value, dict) or set(value) != {{"data", "dtype", "shape", "start"}}:
+        raise SystemExit(label + " response route schema is invalid")
+    shape = value.get("shape")
+    if (value.get("dtype") != "uint8" or value.get("start") != 0
+            or not isinstance(shape, list) or len(shape) != 3
+            or any(type(item) is not int or item <= 0 for item in shape)
+            or shape[0] != rows or shape[1] <= 6):
+        raise SystemExit(label + " response route metadata is invalid")
+    encoded = value.get("data")
+    if not isinstance(encoded, str):
+        raise SystemExit(label + " response route data is invalid")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (TypeError, binascii.Error, ValueError):
+        raise SystemExit(label + " response route data is invalid")
+    if len(raw) != shape[0] * shape[1] * shape[2]:
+        raise SystemExit(label + " response route data size is invalid")
+    canonical = {{"schema_version": 1, "encoding": "base64", "dtype": "uint8",
+                 "shape": shape, "dense_layers": 6, "experts": 256,
+                 "sha256": hashlib.sha256(raw).hexdigest(), "data": encoded}}
+    check_route(canonical, rows, label + " response")
+    return canonical
+
 def route_differences(decode_route, prefill_route):
     decode_shape = decode_route["shape"]
     prefill_shape = prefill_route["shape"]
@@ -7267,7 +7333,8 @@ def route_differences(decode_route, prefill_route):
             "different_row_count": len(differences)}}
 
 def strict_logprob(value, label):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value)) or float(value) == -9999.0):
         raise SystemExit(label + " is not finite numeric evidence")
     return float(value)
 
@@ -7344,7 +7411,7 @@ first_generated = mask.index(True)
 if mask != [False] * first_generated + [True] * (len(mask) - first_generated):
     raise SystemExit("reference loss mask is not prompt-then-completion")
 if any(isinstance(logprob, bool) or not isinstance(logprob, (int, float))
-       or not math.isfinite(float(logprob)) for logprob in logs):
+       or not math.isfinite(float(logprob)) or float(logprob) == -9999.0 for logprob in logs):
     raise SystemExit("reference inference logprobs are not finite")
 if any(logprob != 0.0 for logprob, trainable in zip(logs, mask) if not trainable):
     raise SystemExit("reference prompt inference logprobs are not zero")
@@ -7454,6 +7521,23 @@ if request_mode == "serialized_generate_decode256_prefill_rescore":
         raise SystemExit("prefill-rescore completion evidence is not bound")
     check_route(comparison.get("decode_route"), 511, "decode")
     check_route(reference.get("routed_experts"), 512, "prefill")
+    response_routes = {{}}
+    for phase in ("decode", "prefill", "rescore"):
+        response = comparison["responses"][phase]
+        choices = response.get("choices")
+        if (not isinstance(choices, list) or len(choices) != 1
+                or not isinstance(choices[0], dict)):
+            raise SystemExit("prefill-rescore response choices are invalid")
+        response_route = choices[0].get("routed_experts")
+        if not isinstance(response_route, dict):
+            raise SystemExit("prefill-rescore response route is missing")
+        response_routes[phase] = normalise_response_route(
+            response_route, 511 if phase == "decode" else 512, phase
+        )
+    if (response_routes["decode"] != comparison["decode_route"]
+            or response_routes["prefill"] != reference["routed_experts"]
+            or response_routes["rescore"] != reference["routed_experts"]):
+        raise SystemExit("prefill-rescore response routes are not bound")
     if (comparison.get("route_sha256", {{}}).get("decode") != comparison["decode_route"].get("sha256")
             or comparison.get("route_sha256", {{}}).get("prefill") != reference["routed_experts"].get("sha256")
             or comparison.get("route_sha256", {{}}).get("rescore") != reference["routed_experts"].get("sha256")
