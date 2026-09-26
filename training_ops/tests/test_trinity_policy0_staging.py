@@ -221,6 +221,19 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertIn(f"preserved={state['archive_path']}", result.stdout)
         self.assertIn(f"new_sha={hashlib.sha256(b'new-reference').hexdigest()}", result.stdout)
 
+    def test_reference_script_reuses_existing_archive_and_reports_path(self):
+        old = b"old-reference"
+        old_sha, old_size = _identity_bytes(old)
+        result, state = self.run_install(
+            final=old, partial=b"new-reference", archive=old,
+            old_sha=old_sha, old_size=old_size,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(state["final"], b"new-reference")
+        self.assertEqual(state["archive"], old)
+        self.assertFalse(state["partial_exists"])
+        self.assertIn(f"preserved={state['archive_path']}", result.stdout)
+
     def test_reference_script_already_new_reports_valid_preserved_archive(self):
         old = b"old-reference"
         old_sha, old_size = _identity_bytes(old)
@@ -596,6 +609,85 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                     )
             self.assertEqual(ssh.call_count, 2)
             self.assertIn("partial", ssh.call_args_list[-1].args[1])
+
+    def test_controller_install_failure_keeps_rollback_foreign_path_and_full_results(self):
+        old = b"old-reference"
+        new = b"new-reference"
+        old_sha, old_size = _identity_bytes(old)
+        source_sha, source_size = _identity_bytes(new)
+        nodes = ["n76"]
+        process_calls = []
+
+        def transfer(command, *, stdin, timeout):
+            process_calls.append(command)
+            if len(process_calls) == 1:
+                Path(command[-1]).write_bytes(new)
+            else:
+                remote_path = Path(command[-1].split(":", 1)[1])
+                remote_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(command[-2], remote_path)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "qualification" / "reference.json"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(old)
+            foreign = root / "foreign-reference"
+            foreign.write_bytes(b"foreign-displaced")
+            marker = root / "exchange.marker"
+            wrapper_dir = root / "bin"
+            wrapper_dir.mkdir()
+            wrapper = wrapper_dir / "python3"
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$3\" = {str(target)!r} ] && [ ! -e {str(marker)!r} ]; then\n"
+                f"  touch -- {str(marker)!r}\n"
+                "  /usr/bin/python3 \"$@\"\n"
+                "  status=$?\n"
+                f"  rm -rf -- {str(target)!r}\n"
+                f"  ln -s -- {str(foreign)!r} {str(target)!r}\n"
+                "  exit $status\n"
+                "fi\n"
+                "exec /usr/bin/python3 \"$@\"\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = str(wrapper_dir) + os.pathsep + environment["PATH"]
+
+            def remote(host, script, timeout):
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    text=True,
+                    capture_output=True,
+                    env=environment,
+                )
+                return result.returncode, result.stdout + result.stderr
+
+            with patch("training_ops._run_process", side_effect=transfer), patch(
+                "training_ops._ssh", side_effect=remote
+            ):
+                with self.assertRaises(RuntimeError) as raised:
+                    _policy0_controller_transfer_reference(
+                        "h200b", "/source/reference.json", str(target), nodes,
+                        {"sha256": source_sha, "size": source_size},
+                        old_sha, old_size,
+                    )
+
+            results = raised.exception.results
+            self.assertEqual(set(results), set(nodes))
+            record = results["n76"]
+            self.assertFalse(record["ok"])
+            self.assertEqual(record["phase"], "install")
+            self.assertIn("rollback could not be verified", record["message"])
+            self.assertEqual(record["message"], record["remote_diagnostic"])
+            self.assertTrue(Path(record["partial_path"]).is_symlink())
+            self.assertEqual(Path(record["partial_path"]).readlink(), foreign)
+            self.assertEqual(target.read_bytes(), old)
+            self.assertEqual(
+                target.with_name(target.name + ".preserved." + old_sha).read_bytes(), old
+            )
 
     def test_controller_failure_retains_complete_multi_host_results(self):
         source_bytes = b"verified"

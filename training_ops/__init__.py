@@ -7315,6 +7315,7 @@ if [ -f "$final" ]; then
   if [ -f "$archive" ]; then
     verify_archive
     fsync_file_and_directory "$archive" "$directory"
+    preserved=$archive
   else
     archive_tmp=$(mktemp --tmpdir="$directory" ".reference.json.preserved.$expected_old_sha.tmp.XXXXXX")
     cp -- "$final" "$archive_tmp"
@@ -7627,14 +7628,14 @@ test -d "$directory" && test ! -L "$directory"
             except Exception as error:
                 code, output = 1, f"install exception: {error}"
             if code:
-                cleaned, cleanup_output = cleanup_partial(host, partial_path)
-                detail = output.strip() or f"exit {code}"
-                if not cleaned:
-                    detail += f"; cleanup failed: {cleanup_output}"
+                remote_diagnostic = output if isinstance(output, str) else str(output)
+                detail = remote_diagnostic if remote_diagnostic.strip() else f"exit {code}"
                 return {
                     "ok": False,
                     "phase": "install",
-                    "message": detail[-500:],
+                    "message": detail,
+                    "remote_diagnostic": remote_diagnostic,
+                    "exit_code": code,
                     "partial_path": partial_path,
                     "preserved_path": archive_path,
                 }
