@@ -103,7 +103,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
         def encode(text):
             # The production path uses AutoTokenizer. This fixture keeps the
             # test local while preserving deterministic, diverse IDs.
-            return [index % 257 for index, _ in enumerate(text.split())]
+            return [index for index, _ in enumerate(text.split())]
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "input.json"
@@ -118,6 +118,40 @@ class TrinityParityReferenceTest(unittest.TestCase):
             self.assertEqual(result["source_kind"], "deterministic_local_tokenizer_seed")
             self.assertGreaterEqual(len(set(result["input_ids"])), 64)
             self.assertEqual(json.loads(output.read_text()), result)
+
+    def test_seed_generation_is_deterministic_and_exactly_sized(self):
+        def encode(text):
+            return [index for index, _ in enumerate(text.split())]
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = reference.write_input_record(
+                Path(directory) / "first.json",
+                "/data/trinity-thinking-fp8",
+                token_count=4097,
+                encode=encode,
+            )
+            second = reference.write_input_record(
+                Path(directory) / "second.json",
+                "/data/trinity-thinking-fp8",
+                token_count=4097,
+                encode=encode,
+            )
+        self.assertEqual(first["input_ids"], second["input_ids"])
+        self.assertEqual(first["sequence_lengths"], [4097])
+        self.assertEqual(len(first["input_ids"]), 4097)
+
+    def test_pathological_repeated_seed_is_refused(self):
+        def repeated_encode(text):
+            return [100 + index % 64 for index, _ in enumerate(text.split())]
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(reference.ReferenceError, "repeated 16-token"):
+                reference.write_input_record(
+                    Path(directory) / "repeated.json",
+                    "/data/trinity-thinking-fp8",
+                    token_count=4097,
+                    encode=repeated_encode,
+                )
 
     def test_short_or_mismatched_reference_is_refused(self):
         with self.assertRaisesRegex(reference.ReferenceError, "at least 4097"):

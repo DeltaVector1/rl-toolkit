@@ -577,3 +577,15 @@ only after measured learning.
   verified reference and compare its artifact and outlier. Do not change
   thresholds or optimizer settings. Repeat stability assigns the cause to
   inference or trainer nondeterminism.
+
+## Diverse Trinity qualifier seed
+
+- Measured fault: H200 and trainer repeated the current qualifier byte for
+  byte, including the deterministic token-1,074 mismatch. The phrase
+  `numbered condition` occurs 264 times, so this input is not
+  production-representative despite having 8,192 tokens.
+- Experiment: replace it with deterministic seeded prose using varied
+  templates, vocabulary, and indexed details. Keep one exact 8,192-token
+  sequence, native FP8, and strict gates. Reject excessive exact 16-token
+  window repetition after tokenization. Do not change thresholds, drop
+  tokens, or use rollout data.

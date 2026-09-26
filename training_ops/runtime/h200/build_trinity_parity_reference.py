@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
@@ -25,6 +26,10 @@ _RAW_ROUTE_FIELDS = {"data", "dtype", "shape", "start"}
 _MAX_ROUTE_BYTES = 512 * 1024 * 1024
 _POLICIES = {"base", "policy-0"}
 _DEFAULT_TOKEN_COUNT = 8192
+# A two-percent excess limit rejects a periodic seed while allowing ordinary
+# syntax to recur in long natural-language input.
+_REPETITION_WINDOW = 16
+_MAX_REPEATED_WINDOW_FRACTION = 0.02
 _NON_ROLLOUT_SOURCES = {
     "deterministic_local_tokenizer_seed",
     "hub_cache_non_rollout",
@@ -36,14 +41,64 @@ class ReferenceError(ValueError):
     """The preserved prompt or serialized generate response is unsafe to use."""
 
 
+_SEED_TEMPLATES = (
+    "Ledger sample {index}: the {color} {subject} {verb} {object}; record "
+    "window {window}, checksum {digest}, and policy note {note}.",
+    "For case {index}, inspect {subject} near the {color} {object}; preserve "
+    "the {verb} route, window {window}, digest {digest}, and note {note}.",
+    "Route memo {index} says the {object} is {verb} by a {color} {subject}; "
+    "retain window {window}, digest {digest}, and policy note {note}.",
+    "At ledger position {index}, compare the {color} {subject} with {object}; "
+    "the selected action is {verb}, window {window}, digest {digest}, note {note}.",
+)
+_SEED_COLORS = ("amber", "cobalt", "coral", "emerald", "indigo", "silver", "violet")
+_SEED_SUBJECTS = ("beacon", "cartographer", "compiler", "curator", "navigator", "scribe", "surveyor")
+_SEED_VERBS = ("balances", "checks", "maps", "measures", "revises", "stabilizes", "verifies")
+_SEED_OBJECTS = ("a quiet harbor", "the cedar archive", "a copper relay", "the lunar index", "a paper atlas", "the river switch", "a winter garden")
+
+
 def _seed_text(blocks: int) -> str:
-    """Return a deterministic, varied natural-language parity prompt."""
-    return "\n".join(
-        f"Parity block {index}: compare the exact token ledger, preserve every "
-        f"route decision, and report whether the numbered condition {index % 97} "
-        "remains stable under the selected policy."
-        for index in range(blocks)
-    )
+    """Return deterministic prose with indexed and hashed local variation."""
+    lines = []
+    for index in range(blocks):
+        digest = hashlib.sha256(f"trinity-qualifier-seed:{index}".encode()).hexdigest()[:12]
+        values = [
+            index,
+            _SEED_COLORS[int(digest[0:2], 16) % len(_SEED_COLORS)],
+            _SEED_SUBJECTS[int(digest[2:4], 16) % len(_SEED_SUBJECTS)],
+            _SEED_VERBS[int(digest[4:6], 16) % len(_SEED_VERBS)],
+            _SEED_OBJECTS[int(digest[6:8], 16) % len(_SEED_OBJECTS)],
+            f"{int(digest[8:10], 16)}-{index % 997}",
+            digest,
+            f"{(index * 37) % 1009}",
+        ]
+        lines.append(_SEED_TEMPLATES[index % len(_SEED_TEMPLATES)].format(
+            index=values[0],
+            color=values[1],
+            subject=values[2],
+            verb=values[3],
+            object=values[4],
+            window=values[5],
+            digest=values[6],
+            note=values[7],
+        ))
+    return "\n".join(lines)
+
+
+def _validate_token_diversity(input_ids: list[int]) -> None:
+    if len(set(input_ids)) < 64:
+        raise ReferenceError("deterministic seed did not produce diverse token IDs")
+    if len(input_ids) < _REPETITION_WINDOW:
+        return
+    windows = [
+        tuple(input_ids[index : index + _REPETITION_WINDOW])
+        for index in range(len(input_ids) - _REPETITION_WINDOW + 1)
+    ]
+    repeated_excess = sum(count - 1 for count in Counter(windows).values() if count > 1)
+    if repeated_excess > int(len(windows) * _MAX_REPEATED_WINDOW_FRACTION):
+        raise ReferenceError(
+            "deterministic seed has excessive repeated 16-token windows"
+        )
 
 
 def write_input_record(
@@ -88,8 +143,7 @@ def write_input_record(
     if len(input_ids) < token_count:
         raise ReferenceError("deterministic seed did not produce enough tokens")
     input_ids = input_ids[:token_count]
-    if len(set(input_ids)) < 64:
-        raise ReferenceError("deterministic seed did not produce diverse token IDs")
+    _validate_token_diversity(input_ids)
     result = {
         "source_kind": "deterministic_local_tokenizer_seed",
         "tokenizer": tokenizer_path,
