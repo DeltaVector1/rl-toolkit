@@ -2,6 +2,8 @@ import base64
 import copy
 import importlib.util
 import json
+import math
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -137,7 +139,14 @@ class H200PrefixStabilityTest(unittest.TestCase):
             })
         return responses
 
-    def execute(self, mutate_response=None, readiness=None, after=None):
+    def execute(
+        self,
+        mutate_response=None,
+        readiness=None,
+        after=None,
+        endpoint="http://engine:8000/inference/v1/generate",
+        readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             reference_path = self.build_reference(root)
@@ -157,8 +166,8 @@ class H200PrefixStabilityTest(unittest.TestCase):
             output = root / "diagnostic.json"
             result = prefix_stability.run_diagnostic(
                 reference_path=reference_path,
-                endpoint="http://engine:8000/inference/v1/generate",
-                readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                endpoint=endpoint,
+                readiness_endpoint=readiness_endpoint,
                 expected_policy_identity=self.receipt(),
                 policy_model="policy-0-slot0",
                 fresh_salt_prefix="prefix-test",
@@ -231,6 +240,89 @@ class H200PrefixStabilityTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as raised:
             prefix_stability.main([])
         self.assertEqual(raised.exception.code, 2)
+
+    def test_endpoints_must_bind_to_same_origin_and_distinct_paths(self):
+        for endpoint, readiness_endpoint in (
+            (
+                "https://other-engine:8000/inference/v1/generate",
+                "http://engine:8000/inference/v1/staging-status",
+            ),
+            (
+                "http://engine:8000/inference/v1/generate",
+                "http://engine:8000/inference/v1/generate",
+            ),
+        ):
+            with self.subTest(endpoint=endpoint, readiness_endpoint=readiness_endpoint):
+                with self.assertRaisesRegex(prefix_stability.PrefixStabilityError, "endpoint"):
+                    self.execute(endpoint=endpoint, readiness_endpoint=readiness_endpoint)
+
+    def test_validate_diagnostic_recomputes_collections_and_derived_evidence(self):
+        result, _, _ = self.execute()
+        missing = copy.deepcopy(result)
+        del missing["comparisons"]["common_prefix_routes"]
+        with self.assertRaises(prefix_stability.PrefixStabilityError):
+            prefix_stability.validate_diagnostic(missing)
+
+        changed_comparison = copy.deepcopy(result)
+        changed_comparison["comparisons"]["common_prefix_routes"][0]["different_row_count"] += 1
+        with self.assertRaises(prefix_stability.PrefixStabilityError):
+            prefix_stability.validate_diagnostic(changed_comparison)
+
+        changed_delta = copy.deepcopy(result)
+        changed_delta["original_evidence"]["first_decode_score_delta"] += 1.0
+        with self.assertRaises(prefix_stability.PrefixStabilityError):
+            prefix_stability.validate_diagnostic(changed_delta)
+
+        nonfinite = copy.deepcopy(result)
+        nonfinite["original_evidence"]["first_decoded_logprob"] = math.nan
+        with self.assertRaises(prefix_stability.PrefixStabilityError):
+            prefix_stability.validate_diagnostic(nonfinite)
+
+    def test_route_comparison_reports_sparse_layer_sets_and_order(self):
+        def route(rows):
+            raw = bytearray()
+            for layer_values in rows:
+                raw.extend((0,) * 12)
+                for values in layer_values:
+                    raw.extend(values)
+            encoded = base64.b64encode(raw).decode()
+            return prefix_stability._normalise_route(
+                {"data": encoded, "dtype": "uint8", "shape": [len(rows), 8, 2], "start": 0},
+                len(rows),
+            )
+
+        left = route([((1, 2), (3, 4))])
+        swapped_layers = route([((3, 4), (1, 2))])
+        swapped_order = route([((2, 1), (3, 4))])
+        layer_difference = prefix_stability._route_comparison(
+            left, swapped_layers, "left", "swapped_layers"
+        )
+        self.assertEqual(layer_difference["different_set_layer_count"], 2)
+        self.assertEqual(layer_difference["order_only_layer_count"], 0)
+        self.assertEqual(layer_difference["different_row_count"], 1)
+        order_difference = prefix_stability._route_comparison(
+            left, swapped_order, "left", "swapped_order"
+        )
+        self.assertEqual(order_difference["different_set_layer_count"], 0)
+        self.assertEqual(order_difference["order_only_layer_count"], 1)
+        self.assertEqual(order_difference["different_row_count"], 1)
+
+    def test_stale_same_pid_temp_is_not_removed(self):
+        stale_bytes = b"stale temp from another invocation\n"
+
+        def check_stale_temp(result, output):
+            output.unlink()
+            stale = output.with_name(
+                f"{output.name}.partial.prefix-stability.{os.getpid()}"
+            )
+            stale.write_bytes(stale_bytes)
+            with self.assertRaisesRegex(prefix_stability.PrefixStabilityError, "temporary"):
+                prefix_stability.publish_diagnostic(result, output)
+            self.assertFalse(output.exists())
+            self.assertEqual(stale.read_bytes(), stale_bytes)
+            stale.unlink()
+
+        self.execute(after=check_stale_temp)
 
 
 if __name__ == "__main__":

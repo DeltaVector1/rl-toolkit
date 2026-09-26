@@ -122,6 +122,23 @@ def _completion_logprob(response: Mapping[str, Any], token_id: int) -> float:
     return _finite_number(entry.get("logprob"), "decode completion logprob")
 
 
+def _completion_logprobs(
+    response: Mapping[str, Any], token_ids: list[int], label: str
+) -> list[float]:
+    choice = _choice(response)
+    raw = choice.get("logprobs")
+    content = raw.get("content") if isinstance(raw, Mapping) else None
+    if not isinstance(content, list) or len(content) != len(token_ids):
+        raise PrefixStabilityError(f"{label} completion logprob count is misaligned")
+    result = []
+    for index, token_id in enumerate(token_ids):
+        entry = content[index]
+        if not isinstance(entry, Mapping) or entry.get("token") != f"token_id:{token_id}":
+            raise PrefixStabilityError(f"{label} completion token key is misaligned")
+        result.append(_finite_number(entry.get("logprob"), f"{label} completion logprob"))
+    return result
+
+
 def _choice(response: Mapping[str, Any]) -> Mapping[str, Any]:
     choices = response.get("choices")
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], Mapping):
@@ -149,23 +166,72 @@ def _route_comparison(
     left_label: str,
     right_label: str,
 ) -> dict[str, Any]:
+    left_shape = left.get("shape")
+    right_shape = right.get("shape")
+    left_dense_layers = left.get("dense_layers")
+    right_dense_layers = right.get("dense_layers")
+    if (
+        not isinstance(left_shape, list)
+        or not isinstance(right_shape, list)
+        or len(left_shape) != 3
+        or len(right_shape) != 3
+        or left_shape[1:] != right_shape[1:]
+        or left_dense_layers != right_dense_layers
+    ):
+        raise PrefixStabilityError("route comparison layer schemas differ")
     left_rows = _route_rows(left)
     right_rows = _route_rows(right)
     compared = min(len(left_rows), len(right_rows))
     differences: list[dict[str, Any]] = []
+    different_set_layer_count = 0
+    order_only_layer_count = 0
+    different_set_row_count = 0
+    order_only_row_count = 0
+    sparse_layers = range(left_dense_layers, left_shape[1])
+    top_k = left_shape[2]
     for row in range(compared):
         left_values = left_rows[row]
         right_values = right_rows[row]
-        route_set_equal = set(left_values) == set(right_values)
-        route_order_equal = left_values == right_values
-        if not route_set_equal or not route_order_equal:
+        layer_differences = []
+        row_has_set_difference = False
+        row_has_order_only_difference = False
+        for layer in sparse_layers:
+            start = layer * top_k
+            left_layer = left_values[start : start + top_k]
+            right_layer = right_values[start : start + top_k]
+            route_set_equal = set(left_layer) == set(right_layer)
+            route_order_equal = left_layer == right_layer
+            if not route_set_equal or not route_order_equal:
+                if route_set_equal:
+                    order_only_layer_count += 1
+                    row_has_order_only_difference = True
+                else:
+                    different_set_layer_count += 1
+                    row_has_set_difference = True
+                layer_differences.append(
+                    {
+                        "layer": layer,
+                        "left": left_layer,
+                        "right": right_layer,
+                        "route_set_equal": route_set_equal,
+                        "route_order_equal": route_order_equal,
+                    }
+                )
+        if row_has_set_difference:
+            different_set_row_count += 1
+        elif row_has_order_only_difference:
+            order_only_row_count += 1
+        if layer_differences:
             differences.append(
                 {
                     "row": row,
                     "left": left_values,
                     "right": right_values,
-                    "route_set_equal": route_set_equal,
-                    "route_order_equal": route_order_equal,
+                    "route_set_equal": not row_has_set_difference,
+                    "route_order_equal": not (
+                        row_has_set_difference or row_has_order_only_difference
+                    ),
+                    "layers": layer_differences,
                 }
             )
     return {
@@ -175,6 +241,11 @@ def _route_comparison(
         "right_rows": len(right_rows),
         "compared_rows": compared,
         "different_row_count": len(differences),
+        "different_set_row_count": different_set_row_count,
+        "order_only_row_count": order_only_row_count,
+        "different_set_layer_count": different_set_layer_count,
+        "order_only_layer_count": order_only_layer_count,
+        "different_layer_rows": differences,
         "different_rows": differences,
     }
 
@@ -208,6 +279,99 @@ def _score_comparison(
         "compared_positions": compared,
         "different_position_count": len(differences),
         "different_positions": differences,
+    }
+
+
+def _comparison_collections(
+    requests: list[Mapping[str, Any]],
+    decode_route: Mapping[str, Any],
+    rescore_route: Mapping[str, Any],
+    rescore_logprobs: list[float],
+) -> dict[str, list[dict[str, Any]]]:
+    route_pairs = []
+    for left_index in range(len(requests)):
+        for right_index in range(left_index + 1, len(requests)):
+            route_pairs.append(
+                _route_comparison(
+                    requests[left_index]["route"],
+                    requests[right_index]["route"],
+                    f"prefix_{requests[left_index]['prefix_length']}",
+                    f"prefix_{requests[right_index]['prefix_length']}",
+                )
+            )
+    original_decode_routes = []
+    original_rescore_routes = []
+    for request in requests:
+        original_decode_routes.append(
+            _route_comparison(
+                request["route"],
+                decode_route,
+                f"prefix_{request['prefix_length']}",
+                "original_decode",
+            )
+        )
+        original_rescore_routes.append(
+            _route_comparison(
+                request["route"],
+                rescore_route,
+                f"prefix_{request['prefix_length']}",
+                "original_rescore",
+            )
+        )
+    prompt_requests = [request for request in requests if request["prefix_length"] > 256]
+    score_pairs = []
+    for left_index in range(len(prompt_requests)):
+        for right_index in range(left_index + 1, len(prompt_requests)):
+            score_pairs.append(
+                _score_comparison(
+                    prompt_requests[left_index]["prompt_logprobs"],
+                    prompt_requests[right_index]["prompt_logprobs"],
+                    f"prefix_{prompt_requests[left_index]['prefix_length']}",
+                    f"prefix_{prompt_requests[right_index]['prefix_length']}",
+                    start=1,
+                )
+            )
+    original_score_comparisons = []
+    for request in prompt_requests:
+        original_score_comparisons.append(
+            _score_comparison(
+                request["prompt_logprobs"],
+                rescore_logprobs,
+                f"prefix_{request['prefix_length']}",
+                "original_rescore",
+                start=1,
+            )
+        )
+    return {
+        "common_prefix_routes": route_pairs,
+        "original_decode_routes": original_decode_routes,
+        "original_rescore_routes": original_rescore_routes,
+        "common_prefix_logprobs": score_pairs,
+        "original_rescore_logprobs": original_score_comparisons,
+    }
+
+
+def _original_predicting_route_differences(
+    decode_route: Mapping[str, Any], rescore_route: Mapping[str, Any]
+) -> dict[str, Any]:
+    decode_rows = _route_rows(decode_route)
+    rescore_rows = _route_rows(rescore_route)
+    differences = []
+    for row in range(255, 511):
+        if decode_rows[row] != rescore_rows[row]:
+            differences.append(
+                {
+                    "row": row,
+                    "decode": decode_rows[row],
+                    "prefill": rescore_rows[row],
+                }
+            )
+    return {
+        "first_predicting_row": 255,
+        "last_predicting_row_exclusive": 511,
+        "compared_rows": 256,
+        "different_rows": differences,
+        "different_row_count": len(differences),
     }
 
 
@@ -302,7 +466,28 @@ def _validate_endpoint(endpoint: str, label: str) -> str:
     parsed = urlsplit(endpoint)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise PrefixStabilityError(f"{label} must be an HTTP URL")
-    return endpoint
+    return endpoint.rstrip("/")
+
+
+def _validate_endpoints(endpoint: str, readiness_endpoint: str) -> tuple[str, str]:
+    generated = _validate_endpoint(endpoint, "serialized generate endpoint")
+    readiness = _validate_endpoint(readiness_endpoint, "readiness endpoint")
+    generated_parts = urlsplit(generated)
+    readiness_parts = urlsplit(readiness)
+    if not generated_parts.path.endswith("/inference/v1/generate"):
+        raise PrefixStabilityError(
+            "serialized generate endpoint must be the /inference/v1/generate URL"
+        )
+    if (
+        readiness_parts.scheme != generated_parts.scheme
+        or readiness_parts.netloc != generated_parts.netloc
+        or not readiness_parts.path
+        or readiness_parts.path == generated_parts.path
+    ):
+        raise PrefixStabilityError(
+            "readiness endpoint must match the generate endpoint origin and use a distinct path"
+        )
+    return generated, readiness
 
 
 def _salt(prefix: str, length: int) -> str:
@@ -397,6 +582,63 @@ def _receipt_event(
     return {"stage": stage, "request_index": request_index, "receipt": dict(receipt)}
 
 
+def _artifact_original_evidence(
+    value: Mapping[str, Any], input_ids: list[int]
+) -> dict[str, Any]:
+    original = value.get("original_evidence")
+    if not isinstance(original, Mapping):
+        raise PrefixStabilityError("diagnostic original evidence is missing")
+    decode_response = original.get("decode_response")
+    rescore_response = original.get("rescore_response")
+    if not isinstance(decode_response, Mapping) or not isinstance(rescore_response, Mapping):
+        raise PrefixStabilityError("diagnostic original responses are missing")
+    decode_choice = _choice(decode_response)
+    generated_ids = decode_choice.get("token_ids")
+    if (
+        not isinstance(generated_ids, list)
+        or len(generated_ids) != 256
+        or any(isinstance(token, bool) or not isinstance(token, int) for token in generated_ids)
+    ):
+        raise PrefixStabilityError("original decode token IDs are invalid")
+    decode_logprobs = _completion_logprobs(
+        decode_response, generated_ids, "original decode"
+    )
+    rescore_logprobs = _prompt_logprobs(rescore_response, input_ids)
+    try:
+        decode_route = _normalise_route(
+            decode_choice["routed_experts"], 511
+        )
+        rescore_route = _normalise_route(
+            _choice(rescore_response)["routed_experts"], 512
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise PrefixStabilityError("original response route is invalid") from error
+    expected = {
+        "decode_response_sha256": _json_sha256(decode_response),
+        "rescore_response_sha256": _json_sha256(rescore_response),
+        "decode_route_sha256": decode_route["sha256"],
+        "rescore_route_sha256": rescore_route["sha256"],
+        "first_decoded_token_id": generated_ids[0],
+        "first_decoded_logprob": decode_logprobs[0],
+        "first_rescored_actual_token_logprob": rescore_logprobs[256],
+        "reference_route_differences": _original_predicting_route_differences(
+            decode_route, rescore_route
+        ),
+    }
+    for key, expected_value in expected.items():
+        if original.get(key) != expected_value:
+            raise PrefixStabilityError(f"original evidence field {key} is not recomputed")
+    return {
+        "decode_response": decode_response,
+        "rescore_response": rescore_response,
+        "generated_ids": generated_ids,
+        "decode_logprobs": decode_logprobs,
+        "rescore_logprobs": rescore_logprobs,
+        "decode_route": decode_route,
+        "rescore_route": rescore_route,
+    }
+
+
 def validate_diagnostic(value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate artifact structure, hashes, exact token prefixes, and evidence."""
     if not isinstance(value, Mapping) or value.get("schema_version") != 1:
@@ -428,21 +670,8 @@ def validate_diagnostic(value: Mapping[str, Any]) -> dict[str, Any]:
     except (ValueError, TypeError) as error:
         raise PrefixStabilityError("diagnostic policy identity is invalid") from error
     original = value.get("original_evidence")
-    if not isinstance(original, Mapping):
-        raise PrefixStabilityError("diagnostic original evidence is missing")
-    _validate_digest(original.get("decode_response_sha256"), "original decode response hash")
-    _validate_digest(original.get("rescore_response_sha256"), "original rescore response hash")
-    if not isinstance(original.get("decode_response"), Mapping) or not isinstance(
-        original.get("rescore_response"), Mapping
-    ):
-        raise PrefixStabilityError("diagnostic original responses are missing")
-    if _json_sha256(original["decode_response"]) != original["decode_response_sha256"]:
-        raise PrefixStabilityError("original decode response hash differs")
-    if _json_sha256(original["rescore_response"]) != original["rescore_response_sha256"]:
-        raise PrefixStabilityError("original rescore response hash differs")
-    expected_first_token = original.get("first_decoded_token_id")
-    if isinstance(expected_first_token, bool) or not isinstance(expected_first_token, int):
-        raise PrefixStabilityError("original first decoded token is invalid")
+    original_info = _artifact_original_evidence(value, input_ids)
+    expected_first_token = original_info["generated_ids"][0]
     requests = value.get("requests")
     if not isinstance(requests, list) or len(requests) != len(PREFIX_LENGTHS):
         raise PrefixStabilityError("diagnostic request count is invalid")
@@ -490,6 +719,32 @@ def validate_diagnostic(value: Mapping[str, Any]) -> dict[str, Any]:
             raise PrefixStabilityError("diagnostic response evidence is not bound")
         if entry.get("actual_token_logprob") is not None:
             _finite_number(entry["actual_token_logprob"], "diagnostic actual-token logprob")
+    first_request = requests[0]
+    expected_original = {
+        "first_decode_score_delta": (
+            first_request["actual_token_logprob"] - original_info["decode_logprobs"][0]
+        ),
+        "first_rescore_score_delta": (
+            first_request["actual_token_logprob"] - original_info["rescore_logprobs"][256]
+        ),
+    }
+    for key, expected_value in expected_original.items():
+        if original.get(key) != expected_value or not math.isfinite(float(expected_value)):
+            raise PrefixStabilityError(f"original evidence field {key} is not recomputed")
+    comparisons = value.get("comparisons")
+    if not isinstance(comparisons, Mapping):
+        raise PrefixStabilityError("diagnostic comparisons are missing")
+    expected_comparisons = _comparison_collections(
+        requests,
+        original_info["decode_route"],
+        original_info["rescore_route"],
+        original_info["rescore_logprobs"],
+    )
+    if set(comparisons) != set(expected_comparisons):
+        raise PrefixStabilityError("diagnostic comparison collections differ")
+    for key, expected_value in expected_comparisons.items():
+        if comparisons.get(key) != expected_value:
+            raise PrefixStabilityError(f"diagnostic comparison collection {key} differs")
     sequence = value.get("receipt_sequence")
     if not isinstance(sequence, list) or len(sequence) != len(PREFIX_LENGTHS) + 1:
         raise PrefixStabilityError("diagnostic receipt sequence is incomplete")
@@ -519,8 +774,7 @@ def build_diagnostic(
     """Run the five bounded requests and return an unpublished artifact."""
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise PrefixStabilityError("timeout must be positive")
-    endpoint = _validate_endpoint(endpoint, "serialized generate endpoint")
-    readiness_endpoint = _validate_endpoint(readiness_endpoint, "readiness endpoint")
+    endpoint, readiness_endpoint = _validate_endpoints(endpoint, readiness_endpoint)
     if not isinstance(policy_model, str) or not policy_model:
         raise PrefixStabilityError("exact policy model is required")
     reference = _load_json(reference_path, "reference")
@@ -599,60 +853,12 @@ def build_diagnostic(
                     index,
                 )
             )
-    route_pairs = []
-    for left_index in range(len(requests)):
-        for right_index in range(left_index + 1, len(requests)):
-            route_pairs.append(
-                _route_comparison(
-                    requests[left_index]["route"],
-                    requests[right_index]["route"],
-                    f"prefix_{requests[left_index]['prefix_length']}",
-                    f"prefix_{requests[right_index]['prefix_length']}",
-                )
-            )
-    original_decode_routes = []
-    original_rescore_routes = []
-    for request in requests:
-        original_decode_routes.append(
-            _route_comparison(
-                request["route"],
-                reference_info["decode_route"],
-                f"prefix_{request['prefix_length']}",
-                "original_decode",
-            )
-        )
-        original_rescore_routes.append(
-            _route_comparison(
-                request["route"],
-                reference_info["rescore_route"],
-                f"prefix_{request['prefix_length']}",
-                "original_rescore",
-            )
-        )
-    prompt_requests = [request for request in requests if request["prefix_length"] > 256]
-    score_pairs = []
-    for left_index in range(len(prompt_requests)):
-        for right_index in range(left_index + 1, len(prompt_requests)):
-            score_pairs.append(
-                _score_comparison(
-                    prompt_requests[left_index]["prompt_logprobs"],
-                    prompt_requests[right_index]["prompt_logprobs"],
-                    f"prefix_{prompt_requests[left_index]['prefix_length']}",
-                    f"prefix_{prompt_requests[right_index]['prefix_length']}",
-                    start=1,
-                )
-            )
-    original_score_comparisons = []
-    for request in prompt_requests:
-        original_score_comparisons.append(
-            _score_comparison(
-                request["prompt_logprobs"],
-                reference_info["rescore_logprobs"],
-                f"prefix_{request['prefix_length']}",
-                "original_rescore",
-                start=1,
-            )
-        )
+    comparisons = _comparison_collections(
+        requests,
+        reference_info["decode_route"],
+        reference_info["rescore_route"],
+        reference_info["rescore_logprobs"],
+    )
     first_request = requests[0]
     original_first_decode = reference_info["decode_logprobs"][0]
     original_first_rescore = reference_info["rescore_logprobs"][256]
@@ -668,13 +874,7 @@ def build_diagnostic(
         "prefix_lengths": list(PREFIX_LENGTHS),
         "receipt_sequence": receipt_sequence,
         "requests": requests,
-        "comparisons": {
-            "common_prefix_routes": route_pairs,
-            "original_decode_routes": original_decode_routes,
-            "original_rescore_routes": original_rescore_routes,
-            "common_prefix_logprobs": score_pairs,
-            "original_rescore_logprobs": original_score_comparisons,
-        },
+        "comparisons": comparisons,
         "original_evidence": {
             "decode_response": reference_info["decode_response"],
             "rescore_response": reference_info["rescore_response"],
@@ -687,8 +887,8 @@ def build_diagnostic(
             "first_rescored_actual_token_logprob": original_first_rescore,
             "first_decode_score_delta": first_request["actual_token_logprob"] - original_first_decode,
             "first_rescore_score_delta": first_request["actual_token_logprob"] - original_first_rescore,
-            "reference_route_differences": reference_info["comparison"].get(
-                "predicting_route_differences"
+            "reference_route_differences": _original_predicting_route_differences(
+                reference_info["decode_route"], reference_info["rescore_route"]
             ),
         },
     }
@@ -707,11 +907,18 @@ def publish_diagnostic(value: Mapping[str, Any], output_path: Path) -> None:
         f"{output_path.name}.partial.prefix-stability.{os.getpid()}"
     )
     serialized = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    created = False
     try:
-        with temporary_path.open("x", encoding="utf-8") as stream:
-            stream.write(serialized)
-            stream.flush()
-            os.fsync(stream.fileno())
+        try:
+            with temporary_path.open("x", encoding="utf-8") as stream:
+                created = True
+                stream.write(serialized)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except FileExistsError as error:
+            raise PrefixStabilityError(
+                f"temporary output already exists; refusing to remove it: {temporary_path}"
+            ) from error
         try:
             os.link(temporary_path, output_path, follow_symlinks=False)
         except FileExistsError as error:
@@ -725,10 +932,11 @@ def publish_diagnostic(value: Mapping[str, Any], output_path: Path) -> None:
         finally:
             os.close(directory_fd)
     finally:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
+        if created:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def run_diagnostic(
