@@ -33,6 +33,11 @@ from training_ops.runtime.h200.load_policy0 import (
     build_plan as build_policy0_load_plan,
     execute_policy0_load,
 )
+from training_ops.runtime.policy0_source import (
+    Policy0SourceError,
+    build_plan as build_policy0_source_plan,
+    parse_result as parse_policy0_source_result,
+)
 
 repo_root = Path(__file__).resolve().parents[1]
 nodes_path = repo_root / "configs" / "nodes.toml"
@@ -8897,6 +8902,63 @@ def _prepare_policy0_action(arguments: list[str]):
     return result
 
 
+def _prepare_policy0_source_action(arguments: list[str]):
+    config_dir = "configs/trinity-decensor-experimental-fixed"
+    mode = "plan"
+    source = destination = None
+    positional: list[str] = []
+    options = {"--source-adapter-dir": "source", "--destination-adapter-dir": "destination"}
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in options:
+            index += 1
+            if index >= len(arguments):
+                raise Refused(f"{argument} requires a value")
+            if options[argument] == "source":
+                source = arguments[index]
+            else:
+                destination = arguments[index]
+        elif argument.startswith("--"):
+            raise Refused(f"unknown prepare-policy0-source option {argument}")
+        else:
+            positional.append(argument)
+        index += 1
+    if positional:
+        config_dir = positional[0]
+    if len(positional) > 1:
+        mode = positional[1]
+    if len(positional) > 2:
+        raise Refused("prepare-policy0-source accepts one config directory and one mode")
+    if mode not in {"plan", "apply"}:
+        raise Refused("prepare-policy0-source mode must be plan or apply")
+    if not isinstance(source, str) or not isinstance(destination, str):
+        raise Refused("prepare-policy0-source requires source and destination adapter directories")
+    try:
+        plan = build_policy0_source_plan(
+            config_dir,
+            source,
+            destination,
+            repo_root=repo_root,
+            resolve_config=_config_dir,
+            trainer_head=trainer_head,
+        )
+    except Policy0SourceError as error:
+        raise Refused(str(error)) from error
+    if mode == "plan":
+        print(json.dumps({key: value for key, value in plan.items() if key != "apply_script"}, indent=2))
+        return plan
+    code, output = _ssh(str(plan["trainer_head"]), str(plan["apply_script"]), timeout=1800)
+    if code:
+        raise Refused(f"policy-0 source preparation failed on {plan['trainer_head']}: {output.strip()}")
+    try:
+        result = parse_policy0_source_result(output, plan)
+    except Policy0SourceError as error:
+        raise Refused(str(error)) from error
+    print(json.dumps(result, indent=2))
+    return result
+
+
 def _archive_action(arguments: list[str]):
     if not arguments:
         raise Refused("archive needs a run name")
@@ -8940,6 +9002,7 @@ actions = {
     "qualify": _qualify_action,
     "load-policy0": _load_policy0_action,
     "prepare-policy0": _prepare_policy0_action,
+    "prepare-policy0-source": _prepare_policy0_source_action,
     "stop": _stop_action,
     "mounts": lambda a: print("\n".join(mounted_files())),
 }
@@ -8976,6 +9039,8 @@ usage = f"""training-ops <action> [args]
                                   verify and load one exact step-0 adapter
   prepare-policy0 [config-dir] [plan|stage] \
     --source-adapter-dir DIR --source-reference-path FILE  preflight or stage policy-0 files
+  prepare-policy0-source [config-dir] [plan|apply] \
+    --source-adapter-dir DIR --destination-adapter-dir DIR  correct one preserved adapter
   mounts                        list live-mounted source files
   stop                          stop the run but keep inference loaded
 

@@ -741,18 +741,29 @@ def save_lora_config(model: nn.Module, save_path, rank: int, alpha: float, dropo
             else:
                 module_suffix = name.split(".")[-1]
                 target_modules.add(module_suffix)
+            # The native FP8 shared-expert wrapper reports its three weight
+            # projections, but the adapter is selected by the semantic
+            # ``shared_expert`` target in PEFT metadata.
+            if isinstance(module, MultiLoRAFP8CheckpointFeedForward):
+                target_modules.add("shared_expert")
 
     for name, param in model.named_parameters():
         if param.requires_grad and "lora_A" not in name and "lora_B" not in name:
             module_name = name.rsplit(".", 1)[0].split(".")[-1]
             modules_to_save.add(module_name)
 
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        raise TypeError("LoRA alpha must be numeric")
+    if isinstance(alpha, float) and not math.isfinite(alpha):
+        raise ValueError("LoRA alpha must be finite")
+    normalized_alpha = int(alpha) if float(alpha).is_integer() else alpha
+
     adapter_config = {
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
         "base_model_name_or_path": model.config._name_or_path,
         "r": rank,
-        "lora_alpha": alpha,
+        "lora_alpha": normalized_alpha,
         "lora_dropout": dropout,
         "bias": "none",
         "target_modules": sorted(list(target_modules)),
