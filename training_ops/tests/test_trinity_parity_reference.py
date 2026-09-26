@@ -35,6 +35,17 @@ def route_for(token_count: int) -> dict:
 
 
 class TrinityParityReferenceTest(unittest.TestCase):
+    def policy_receipt(self):
+        return {
+            "target_sha256": "a" * 64,
+            "target_size": 123,
+            "config_sha256": "b" * 64,
+            "config_size": 456,
+            "source_url": "http://engine:18100/policy-0",
+            "lora_name": "policy-0-slot0",
+            "server_instance": "h200b-instance-1",
+        }
+
     def record(self, token_count=4):
         return {
             "source_kind": "operator_non_rollout",
@@ -71,12 +82,17 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 base_model="/data/trinity-thinking-fp8",
                 policy="policy-0",
                 policy_model="policy-0-slot0",
+                policy_receipt=self.policy_receipt(),
+                expected_policy_identity=self.policy_receipt(),
+                cache_salt="qualifier-policy-0-fresh-1",
                 minimum_tokens=1,
                 post_json=post,
             )
             self.assertEqual(calls[0][0], "http://engine:8000/inference/v1/generate")
             self.assertEqual(calls[0][1]["model"], "policy-0-slot0")
             self.assertEqual(calls[0][1]["token_ids"], self.record()["input_ids"])
+            self.assertEqual(calls[0][1]["cache_salt"], "qualifier-policy-0-fresh-1")
+            self.assertNotIn("cache_salt", calls[0][1]["sampling_params"])
             self.assertEqual(
                 calls[0][1]["sampling_params"],
                 {
@@ -97,7 +113,79 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 result["routed_experts"]["sha256"],
                 hashlib.sha256(base64.b64decode(route_for(4)["data"])).hexdigest(),
             )
+            self.assertEqual(result["policy_identity"], self.policy_receipt())
+            self.assertEqual(result["cache_salt"], "qualifier-policy-0-fresh-1")
+            self.assertEqual(result["request_mode"], "serialized_generate_prompt_logprobs")
+            self.assertEqual(result["input_ids"], self.record()["input_ids"])
+            self.assertEqual(result["sampling_params"]["prompt_logprobs"], 1)
             self.assertEqual(json.loads(output.read_text()), result)
+
+    def test_policy_zero_requires_matching_readiness_receipt(self):
+        with self.assertRaisesRegex(reference.ReferenceError, "readiness receipt"):
+            reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=self.record(),
+                output_path=Path("unused.json"),
+                base_model="base",
+                policy="policy-0",
+                policy_model="policy-0-slot0",
+                cache_salt="fresh",
+                minimum_tokens=1,
+                post_json=lambda *_: self.response(),
+            )
+
+        with self.assertRaisesRegex(reference.ReferenceError, "fresh cache_salt"):
+            reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=self.record(),
+                output_path=Path("unused.json"),
+                base_model="base",
+                policy="policy-0",
+                policy_model="policy-0-slot0",
+                policy_receipt=self.policy_receipt(),
+                expected_policy_identity=self.policy_receipt(),
+                minimum_tokens=1,
+                post_json=lambda *_: self.response(),
+            )
+
+        receipt = self.policy_receipt()
+        receipt["target_sha256"] = "c" * 64
+        with self.assertRaisesRegex(reference.ReferenceError, "differs in target_sha256"):
+            reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=self.record(),
+                output_path=Path("unused.json"),
+                base_model="base",
+                policy="policy-0",
+                policy_model="policy-0-slot0",
+                policy_receipt=receipt,
+                expected_policy_identity=self.policy_receipt(),
+                cache_salt="fresh",
+                minimum_tokens=1,
+                post_json=lambda *_: self.response(),
+            )
+
+    def test_base_policy_keeps_no_adapter_receipt_or_cache_salt(self):
+        calls = []
+
+        def post(url, body, timeout):
+            calls.append(body)
+            return self.response()
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=self.record(),
+                output_path=Path(directory) / "reference.json",
+                base_model="base-model",
+                policy="base",
+                minimum_tokens=1,
+                post_json=post,
+            )
+        self.assertEqual(calls[0]["model"], "base-model")
+        self.assertNotIn("cache_salt", calls[0])
+        self.assertIsNone(result["policy_identity"])
+        self.assertIsNone(result["cache_salt"])
 
     def test_fresh_input_mode_writes_exact_diverse_non_rollout_sequence(self):
         def encode(text):
@@ -303,6 +391,10 @@ class TrinityParityReferenceTest(unittest.TestCase):
             config = tomllib.load(stream)
         self.assertEqual(config["model"]["seq_len"], 8192)
         self.assertEqual(config["model"]["name"], "/data/trinity-thinking-fp8")
+        self.assertEqual(
+            config["model"]["lora"]["initial_adapter_path"],
+            "/data/glm52-rl/qualifications/trinity-h200-parity-production/policy-0/adapter_model.safetensors",
+        )
         self.assertEqual(config["model"]["quantization"]["type"], "fp8")
         self.assertTrue(config["enable_router_replay"])
         self.assertEqual(config["parity_guard"]["max_unmasked_mismatch_kl"], 0.1)

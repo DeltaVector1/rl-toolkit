@@ -46,6 +46,7 @@ dequantize_checkpoint = false
 expert_activation_transport = "bf16"
 
 [model.lora]
+initial_adapter_path = "/data/glm52-rl/qualifications/trinity-h200-parity-production/policy-0/adapter_model.safetensors"
 rank = 32
 alpha = 64
 dropout = 0.0

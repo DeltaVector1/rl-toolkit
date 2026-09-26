@@ -14,11 +14,13 @@ import binascii
 import hashlib
 import json
 import math
+import re
 import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -35,6 +37,13 @@ _NON_ROLLOUT_SOURCES = {
     "hub_cache_non_rollout",
     "operator_non_rollout",
 }
+_POLICY_RECEIPT_DIGEST_FIELDS = ("target_sha256", "config_sha256")
+_POLICY_RECEIPT_MATCH_FIELDS = (
+    "target_sha256",
+    "config_sha256",
+    "lora_name",
+    "server_instance",
+)
 
 
 class ReferenceError(ValueError):
@@ -303,6 +312,70 @@ def _endpoint_url(endpoint: str) -> str:
     return endpoint
 
 
+def _load_mapping(value: Path | Mapping[str, Any], label: str) -> dict[str, Any]:
+    if isinstance(value, Path):
+        try:
+            value = json.loads(value.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise ReferenceError(f"cannot read {label}") from error
+    if not isinstance(value, Mapping):
+        raise ReferenceError(f"{label} must be a JSON object")
+    return dict(value)
+
+
+def _validate_policy_receipt(
+    receipt: Path | Mapping[str, Any],
+    expected: Path | Mapping[str, Any],
+    policy_model: str,
+) -> dict[str, Any]:
+    actual = _load_mapping(receipt, "policy readiness receipt")
+    expected_identity = _load_mapping(expected, "expected policy identity")
+    for field in _POLICY_RECEIPT_DIGEST_FIELDS:
+        value = actual.get(field)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ReferenceError(f"policy receipt has an invalid {field}")
+        expected_value = expected_identity.get(field)
+        if (
+            not isinstance(expected_value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_value) is None
+        ):
+            raise ReferenceError(f"expected policy identity has an invalid {field}")
+    for field in ("target_size", "config_size"):
+        value = actual.get(field)
+        if type(value) is not int or value <= (0 if field == "target_size" else -1):
+            raise ReferenceError(f"policy receipt has an invalid {field}")
+        if field in expected_identity and expected_identity[field] != value:
+            raise ReferenceError(f"policy receipt differs in {field}")
+    source_url = actual.get("source_url")
+    parsed_source_url = urlsplit(source_url) if isinstance(source_url, str) else None
+    if (
+        parsed_source_url is None
+        or parsed_source_url.scheme not in {"http", "https"}
+        or not parsed_source_url.netloc
+    ):
+        raise ReferenceError("policy receipt has no source URL")
+    lora_name = actual.get("lora_name")
+    if lora_name != policy_model:
+        raise ReferenceError("policy receipt has the wrong LoRA name")
+    server_instance = actual.get("server_instance")
+    if not isinstance(server_instance, str) or not server_instance:
+        raise ReferenceError("policy receipt has no server instance")
+    for field in _POLICY_RECEIPT_MATCH_FIELDS:
+        if expected_identity.get(field) != actual.get(field):
+            raise ReferenceError(f"policy receipt differs in {field}")
+    return actual
+
+
+def _validate_cache_salt(value: str | None, *, required: bool) -> str | None:
+    if value is None:
+        if required:
+            raise ReferenceError("policy-0 requires a fresh cache_salt")
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value) > 256:
+        raise ReferenceError("cache_salt must be a non-empty string of at most 256 characters")
+    return value
+
+
 def build_reference(
     *,
     endpoint: str,
@@ -311,6 +384,9 @@ def build_reference(
     base_model: str,
     policy: str,
     policy_model: str | None = None,
+    policy_receipt: Path | Mapping[str, Any] | None = None,
+    expected_policy_identity: Path | Mapping[str, Any] | None = None,
+    cache_salt: str | None = None,
     minimum_tokens: int = 4097,
     expected_route_shape: list[int] | None = None,
     expected_route_sha256: str | None = None,
@@ -345,18 +421,37 @@ def build_reference(
 
     model = base_model if policy == "base" else policy_model
     assert model is not None
+    if policy == "policy-0":
+        if policy_receipt is None or expected_policy_identity is None:
+            raise ReferenceError(
+                "policy-0 requires a readiness receipt and expected policy identity"
+            )
+        policy_identity = _validate_policy_receipt(
+            policy_receipt,
+            expected_policy_identity,
+            model,
+        )
+    else:
+        if policy_receipt is not None or expected_policy_identity is not None:
+            raise ReferenceError("base policy cannot use a policy readiness receipt")
+        policy_identity = None
+    cache_salt = _validate_cache_salt(cache_salt, required=policy == "policy-0")
+    sampling_params = {
+        "max_tokens": 1,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "prompt_logprobs": 1,
+    }
+    request_body: dict[str, Any] = {
+        "model": model,
+        "token_ids": input_ids,
+        "sampling_params": sampling_params,
+    }
+    if cache_salt is not None:
+        request_body["cache_salt"] = cache_salt
     response = post_json(
         _endpoint_url(endpoint),
-        {
-            "model": model,
-            "token_ids": input_ids,
-            "sampling_params": {
-                "max_tokens": 1,
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "prompt_logprobs": 1,
-            },
-        },
+        request_body,
         timeout,
     )
     logprobs = _flatten_prompt_logprobs(response.get("prompt_logprobs"), input_ids)
@@ -382,6 +477,10 @@ def build_reference(
         "temperature": 1.0,
         "policy": policy,
         "model": model,
+        "policy_identity": policy_identity,
+        "cache_salt": cache_salt,
+        "request_mode": "serialized_generate_prompt_logprobs",
+        "sampling_params": sampling_params,
         "source_input_sha256": hashlib.sha256(
             json.dumps(input_ids, separators=(",", ":")).encode()
         ).hexdigest(),
@@ -402,6 +501,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-model")
     parser.add_argument("--policy", choices=sorted(_POLICIES))
     parser.add_argument("--policy-model", help="exact loaded LoRA model name; required for policy-0")
+    parser.add_argument("--policy-receipt", type=Path, help="JSON readiness/load receipt for policy-0")
+    parser.add_argument("--expected-policy-identity", type=Path, help="JSON expected policy identity for policy-0")
+    parser.add_argument("--cache-salt", help="fresh top-level prefix-cache salt for policy-0")
     parser.add_argument("--minimum-tokens", type=int, default=4097)
     parser.add_argument("--expected-route-shape", type=int, nargs=3)
     parser.add_argument("--expected-route-sha256")
@@ -432,6 +534,9 @@ def main(argv: list[str] | None = None) -> int:
             base_model=args.base_model,
             policy=args.policy,
             policy_model=args.policy_model,
+            policy_receipt=args.policy_receipt,
+            expected_policy_identity=args.expected_policy_identity,
+            cache_salt=args.cache_salt,
             minimum_tokens=args.minimum_tokens,
             expected_route_shape=args.expected_route_shape,
             expected_route_sha256=args.expected_route_sha256,

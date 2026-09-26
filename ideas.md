@@ -634,3 +634,19 @@ only after measured learning.
 - Plan: follow the existing orchestrator path contract and use the bare
   `rollout-metrics.jsonl` filename. Keep the trainer's nested filename because
   its output directory is the run root. Add a test for both effective paths.
+
+## Exact policy-0 parity qualification
+
+- Measured production failure: the fixed run's first step failed the parity
+  guard with unmasked mismatch KL `1.734912`, masked mismatch KL `2.133168`,
+  and masked fraction `0.266403`. The passing diverse qualifier used the base
+  model and prompt-prefill path, so it did not qualify the policy-0 generated
+  path.
+- Controlled experiment: require an explicit loaded policy model and a
+  readiness/load receipt whose adapter SHA, config SHA, LoRA name, and server
+  instance match the expected values. Send a fresh top-level cache salt with
+  the serialized generate request and persist the policy identity, request
+  mode, token IDs, cache salt, and routes in the reference metadata. Keep the
+  strict gates and native FP8 settings unchanged. Trainer LR0 must point its
+  `model.lora.initial_adapter_path` at the same verified step-0 adapter; no
+  cached rollout data is used.
