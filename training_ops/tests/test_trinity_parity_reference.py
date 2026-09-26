@@ -83,7 +83,10 @@ class TrinityParityReferenceTest(unittest.TestCase):
                     "max_tokens": 1,
                     "temperature": 1.0,
                     "top_p": 1.0,
-                    "prompt_logprobs": 1,
+                    "prompt_logprobs": 0,
+                    "extra_args": {
+                        "prime_exact_target_prompt_logprobs": True,
+                    },
                 },
             )
             self.assertEqual(result["inference_logprobs"], [0.0, -1.0, -2.0, -3.0])
@@ -203,6 +206,39 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 policy="base",
                 minimum_tokens=1,
                 post_json=wrong_token_key,
+            )
+
+    def test_exact_target_requires_full_and_well_formed_prompt_logprobs(self):
+        def missing_target(*_):
+            response = self.response()
+            response.pop("prompt_logprobs")
+            return response
+
+        with self.assertRaisesRegex(reference.ReferenceError, "logprob count"):
+            reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=self.record(),
+                output_path=Path("unused.json"),
+                base_model="base",
+                policy="base",
+                minimum_tokens=1,
+                post_json=missing_target,
+            )
+
+        def malformed_target(*_):
+            response = self.response()
+            response["prompt_logprobs"][2] = {"102": {}}
+            return response
+
+        with self.assertRaisesRegex(reference.ReferenceError, "not numeric"):
+            reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=self.record(),
+                output_path=Path("unused.json"),
+                base_model="base",
+                policy="base",
+                minimum_tokens=1,
+                post_json=malformed_target,
             )
 
     def test_policy_zero_requires_explicit_loaded_model_name(self):

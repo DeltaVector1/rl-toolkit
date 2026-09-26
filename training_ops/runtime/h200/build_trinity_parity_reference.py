@@ -300,7 +300,10 @@ def build_reference(
                 "max_tokens": 1,
                 "temperature": 1.0,
                 "top_p": 1.0,
-                "prompt_logprobs": 1,
+                "prompt_logprobs": 0,
+                "extra_args": {
+                    "prime_exact_target_prompt_logprobs": True,
+                },
             },
         },
         timeout,
