@@ -97,6 +97,12 @@ class OrchestratorRepairTest(unittest.TestCase):
         self.assertEqual(deploy.call_args_list, [mock.call("configs/nodes.toml", nodes=[host]), mock.call("training_ops/runtime/h200/start_inference.sh", nodes=[host]), mock.call("configs/general-agent/inference.toml", nodes=[host])])
         expected_config = f"{training_ops.remote_repo}/configs/general-agent/inference.toml"
         self.assertTrue(all(expected_config in script for _, script, _ in ssh_calls))
+        self.assertTrue(
+            any(
+                f"engine-watchdog:{host}:glm-perf-3:" in script
+                for _, script, _ in ssh_calls
+            )
+        )
 
     def test_engine_repair_rejects_missing_explicit_config_before_ssh(self):
         host = training_ops.inference_hosts[0]

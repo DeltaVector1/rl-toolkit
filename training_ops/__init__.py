@@ -180,6 +180,25 @@ def _selected_inference_config(selected: dict) -> str:
     return inference
 
 
+def _selected_run_name(selected: dict) -> str:
+    trainer = selected.get("trainer")
+    if not isinstance(trainer, str):
+        raise Refused("selected run config has no trainer.toml")
+    path = repo_root / trainer
+    try:
+        with path.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(f"cannot read trainer config {path}: {error}") from error
+    output_dir = config.get("output_dir")
+    if not isinstance(output_dir, str) or not output_dir:
+        raise Refused(f"trainer config {path} has no output_dir")
+    run = PurePosixPath(output_dir.rstrip("/")).name
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run):
+        raise Refused(f"trainer config {path} has an invalid output run name")
+    return run
+
+
 def _config_for_run(
     run: str,
     required: bool = True,
@@ -5561,11 +5580,12 @@ def _repair_engine(host: str, config_dir: str | None = None) -> str:
     _check_host(host)
     if host not in inference_hosts:
         raise Refused(f"{host} is not an engine host. Use one of {inference_hosts}.")
-    run = current_run()
     if config_dir is None:
+        run = current_run()
         selected = _config_for_run(run)
     else:
         selected = _config_dir(config_dir, require_inference=True)
+        run = _selected_run_name(selected)
     inference_config = f"{remote_repo}/{_selected_inference_config(selected)}"
     engine_container = glm_inference_container
     engine_kind = selected.get("kind", "glm52")

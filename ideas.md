@@ -523,3 +523,13 @@ only after measured learning.
   reference against the base model only, then run strict trainer parity. This
   isolates long-context trainer/base parity; it does not qualify the loaded
   policy-0 adapter. No optimizer runs in this diagnostic.
+
+## Explicit engine repair config resolution
+
+- Measured failure: `training-ops repair engine:h200b:configs/trinity-h200-parity-production`
+  stopped before deployment at 05:00:31 because `_repair_engine()` called
+  `current_run()` and the trainer container on n82 had no run path.
+- Bounded retry: when an explicit config directory is supplied, resolve that
+  profile directly and derive its stable watchdog identity. Keep
+  `current_run()` selection for implicit repair, then retry the same explicit
+  engine repair without changing host or config validation.
