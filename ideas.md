@@ -35,6 +35,23 @@
   output. This isolates sequence-shape and chunked-prefill numerical drift
   without changing a qualification gate.
 
+## H200 batch-invariant inference diagnostic
+
+- **Planned, diagnostic only.** Add a clean H200 inference config that is
+  semantically identical to `trinity-h200-parity-production`, except for
+  `VLLM_BATCH_INVARIANT="1"`. Do not add a trainer or orchestrator. Keep the
+  native FP8 model, TP8/DP1, expert parallel, routed experts, all LoRA targets,
+  0.85 memory limit, prefix caching, BF16 KV cache, and 65,536-token maximum.
+- **Diagnostic effects and risk.** Batch-invariant scheduling may reduce
+  throughput and increase latency or memory pressure. It can also change
+  prefill/decode batching and expose startup or LoRA-load regressions, so this
+  profile must stay isolated from production and qualification gates.
+- **Pass criteria.** At prefix lengths 256 and 512, common routes and actual
+  token logprobs must match the reference. Actual decode behavior must match
+  trainer parity, and startup plus LoRA load must succeed with the expected
+  readiness identity. Any mismatch, nonfinite output, or startup/load failure
+  fails the diagnostic; no production setting changes.
+
 ## Isolated decode256 to prefill-rescore parity qualification
 
 - **Planned, opt-in only.** Keep the existing policy-0 qualification unchanged
