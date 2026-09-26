@@ -371,3 +371,10 @@ only after measured learning.
   the fail-closed gates pass: unmasked KL <= 0.1, masked KL <= 0.5, and masked
   fraction <= 0.06. Do not start production training until this qualification
   passes. The live operator must capture the serialized response first.
+
+- The first BF16-KV plus route-replay qualification stopped before the update:
+  masked fraction was 0, unmasked mismatch KL was 0.6094949245 versus the 0.1
+  gate, mean/max valid logprob delta was 0.9332404137, and PP time was 140.48s.
+  This improved from the prior step-1 unmasked KL of 2.8270 but still failed
+  safely. Next test: change only the trainer router dtype to BF16 to align it
+  with inference; keep the production config unchanged until this passes.

@@ -40,7 +40,7 @@ global_ep = false
 ep_comm_backend = "torch"
 optimization_dtype = "bfloat16"
 reduce_dtype = "bfloat16"
-moe_router_dtype = "float32"
+moe_router_dtype = "bfloat16"
 moe_use_grouped_mm = true
 fused_lm_head_token_chunk_size = 1024
 
