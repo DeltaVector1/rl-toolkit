@@ -512,3 +512,14 @@ only after measured learning.
   temporarily reduce engine KV allocation only enough to leave at least 8 GiB
   free, rerun the same reference, then restore the setting. Prefer a
   source-supported chunked prompt-logit computation if a small repair exists.
+
+## Base-only long-context diagnostic
+
+- Measured state: the live image does not contain the exact-target
+  prompt-logprob extension. After a clean restart, the base-only engine has
+  about 9.75 GiB free per GPU, which is about 3.64 GiB above the measured
+  6.11 GiB allocation.
+- Diagnostic: run the unchanged normal 8,192-token `prompt_logprobs`
+  reference against the base model only, then run strict trainer parity. This
+  isolates long-context trainer/base parity; it does not qualify the loaded
+  policy-0 adapter. No optimizer runs in this diagnostic.
