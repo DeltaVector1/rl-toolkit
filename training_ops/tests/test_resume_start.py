@@ -264,6 +264,7 @@ class ResumeStartTest(unittest.TestCase):
         orch = next(i for i, command in enumerate(commands) if command.endswith(training_ops.orchestrator_launcher))
         control = next(i for i, command in enumerate(commands) if "orchestrator control file did not arrive" in command)
         trainer = next(i for i, command in enumerate(commands) if command.endswith(" trainer"))
+        self.assertIn("TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH=1", commands[orch])
         self.assertLess(orch, control)
         self.assertLess(control, trainer)
 
@@ -275,6 +276,7 @@ class ResumeStartTest(unittest.TestCase):
         trainer = next(i for i, command in enumerate(commands) if command.endswith(" trainer"))
         broadcast = next(i for i, command in enumerate(commands) if "fresh adapter ready" in command)
         orch = next(i for i, command in enumerate(commands) if command.endswith(training_ops.orchestrator_launcher))
+        self.assertIn("TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH=0", commands[orch])
         self.assertLess(trainer, broadcast)
         self.assertLess(broadcast, orch)
 

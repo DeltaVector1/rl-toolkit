@@ -277,6 +277,7 @@ class RolloutPullTest(unittest.TestCase):
         self.assertIn('"$part" 9>&- &', source)
         self.assertIn(") 9>&- &", source)
         self.assertIn("health_lease_loop' 9>&- &", source)
+        self.assertIn('if [ "${ONCE:-0}" = 1 ]; then\n    refresh_health_lease', source)
 
     def test_health_lease_renews_during_blocked_scan(self):
         with tempfile.TemporaryDirectory() as directory:

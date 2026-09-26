@@ -9068,6 +9068,7 @@ def start(
             f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
             f"TRAINER_CT={shlex.quote(trainer_container)} "
             f"ORCH_CT={shlex.quote(orchestrator_container)} "
+            f"TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH={'1' if mode == 'cold' else '0'} "
             + (f"adapter_resume_step={resume_step} " if resume_adapter is not None else "")
             + f"bash {orchestrator_launcher}",
             300,

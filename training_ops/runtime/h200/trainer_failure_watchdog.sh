@@ -15,6 +15,12 @@ run_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"
 LEASE_FILE=${LEASE_FILE:-"$run_dir/.trainer-health-lease"}
 STATUS_FILE=${STATUS_FILE:-"$run_dir/.trainer-health-status"}
 LEASE_MAX_AGE=${LEASE_MAX_AGE:-90}
+WAIT_FOR_INITIAL_HEALTH=${WAIT_FOR_INITIAL_HEALTH:-0}
+
+case "$WAIT_FOR_INITIAL_HEALTH" in
+  0|1) ;;
+  *) echo "WAIT_FOR_INITIAL_HEALTH must be 0 or 1" >&2; exit 2 ;;
+esac
 
 case "$MODE" in
   ssh) [ -n "$TRAINER_ADDRESSES" ] || { echo "set TRAINER_ADDRESSES" >&2; exit 2; } ;;
@@ -86,8 +92,35 @@ deadline=$(( $(date +%s) + STARTUP_GRACE ))
 if [ "$MODE" = lease ]; then
   missing_epoch=
   missing_count=0
+  armed=$((1 - WAIT_FOR_INITIAL_HEALTH))
+  startup_deadline=$(( $(date +%s) + STARTUP_GRACE ))
   while true; do
     snapshot=$(health_status 2>/dev/null || true)
+    if [ "$armed" = 0 ]; then
+      if [ -n "$snapshot" ]; then
+        read -r state epoch <<<"$snapshot"
+        if [ "$state" = healthy ] && lease_fresh; then
+          armed=1
+          missing_epoch=
+          missing_count=0
+          log "trainer health watchdog armed after fresh healthy status and lease"
+        elif [ "$(date +%s)" -ge "$startup_deadline" ]; then
+          log "FATAL: trainer health did not become healthy during startup grace; stopping orchestrator"
+          stop_edge
+          exit 1
+        else
+          log "startup: waiting for fresh healthy trainer status and lease (state=$state)"
+        fi
+      elif [ "$(date +%s)" -ge "$startup_deadline" ]; then
+        log "FATAL: trainer health status stayed unknown during startup grace; stopping orchestrator"
+        stop_edge
+        exit 1
+      else
+        log "startup: trainer health status unknown; waiting for fresh healthy status"
+      fi
+      sleep "$INTERVAL"
+      continue
+    fi
     if [ -z "$snapshot" ]; then
       missing_epoch=
       missing_count=0
@@ -110,11 +143,15 @@ if [ "$MODE" = lease ]; then
           log "trainer health probe unknown; no failure recorded"
           ;;
         missing)
-          if [ "$epoch" != "$missing_epoch" ]; then
+          if [ -z "$missing_epoch" ] || [ "$epoch" -gt "$missing_epoch" ]; then
             missing_epoch=$epoch
             missing_count=$((missing_count + 1))
+            log "confirmed trainer probe missing epoch $epoch ($missing_count/$MAX_MISSES)"
+          elif [ "$epoch" = "$missing_epoch" ]; then
+            log "repeated trainer probe missing epoch $epoch ($missing_count/$MAX_MISSES)"
+          else
+            log "ignored backward trainer probe missing epoch $epoch (latest $missing_epoch)"
           fi
-          log "confirmed trainer probe missing epoch $epoch ($missing_count/$MAX_MISSES)"
           if [ "$missing_count" -ge "$MAX_MISSES" ]; then
             log "FATAL: trainer probes confirmed missing; stopping orchestrator"
             stop_edge

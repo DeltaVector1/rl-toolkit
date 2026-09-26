@@ -474,10 +474,12 @@ while true; do
     echo "$(date -u +%FT%TZ) rollout pull failed; retrying" >&2
     status=1
   }
-  refresh_health_lease || {
-    echo "$(date -u +%FT%TZ) trainer health lease update failed; retrying" >&2
-    status=1
-  }
+  if [ "${ONCE:-0}" = 1 ]; then
+    refresh_health_lease || {
+      echo "$(date -u +%FT%TZ) trainer health lease update failed; retrying" >&2
+      status=1
+    }
+  fi
   [ "${ONCE:-0}" = 1 ] && exit "$status"
   sleep "$interval"
 done

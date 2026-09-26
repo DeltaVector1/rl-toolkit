@@ -18,6 +18,11 @@ deployment=/data/glm52-rl/deployment
 config_file=${ORCH_CONFIG:-$deployment/configs/general-agent/orchestrator.toml}
 nodes_file="$deployment/configs/nodes.toml"
 training_env_file=/data/trinity/training.env
+trainer_watchdog_wait_for_initial_health=${TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH:-0}
+case "$trainer_watchdog_wait_for_initial_health" in
+  0|1) ;;
+  *) echo "TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH must be 0 or 1" >&2; exit 2 ;;
+esac
 test -f "$config_file" || {
   echo "orchestrator config is missing: $config_file" >&2
   exit 2
@@ -4437,6 +4442,7 @@ if [ "$rollout_transfer_direction" = orchestrator_push ]; then
   nohup setsid env RUN="$RUN" RUN_NAME="$RUN_NAME" \
     TRAINER_ADDRESSES="$TRAINER_ADDRESSES" \
     TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
+    WAIT_FOR_INITIAL_HEALTH="$trainer_watchdog_wait_for_initial_health" \
     bash "$deployment/training_ops/runtime/h200/trainer_failure_watchdog.sh" \
     >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
   trainer_watchdog_pid=$!
@@ -4452,6 +4458,7 @@ else
   nohup setsid env MODE=lease RUN="$RUN" RUN_NAME="$RUN_NAME" \
     LEASE_FILE="/data/glm52-rl/runs/$RUN/$RUN_NAME/.trainer-health-lease" \
     TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
+    WAIT_FOR_INITIAL_HEALTH="$trainer_watchdog_wait_for_initial_health" \
     bash "$deployment/training_ops/runtime/h200/trainer_failure_watchdog.sh" \
     >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
   trainer_watchdog_pid=$!
