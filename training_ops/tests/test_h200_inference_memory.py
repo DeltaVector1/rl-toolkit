@@ -93,6 +93,20 @@ mtp_tokens = 0
         self.assertNotIn("0.920", source)
         self.assertRegex(source, re.compile(r'"gpu_memory_utilization": float\(gpu_memory_utilization\)'))
 
+    def test_launcher_mounts_and_applies_prompt_logprob_patch_after_flashmla(self):
+        source = LAUNCHER.read_text()
+        mount = '-v "$deployment/prime-rl/deps/vllm/prompt_logprobs_rows.patch":/tmp/prompt_logprobs_rows.patch:ro'
+        self.assertIn(mount, source)
+        flash_index = source.index("flashmla_sparse_mtp.patch")
+        prompt_index = source.index("prompt_logprobs_rows.patch")
+        self.assertLess(flash_index, prompt_index)
+        self.assertIn(
+            "patch --batch --forward --fuzz=0 -p1 -d /app/.venv/lib/python3.12/site-packages < /tmp/prompt_logprobs_rows.patch",
+            source,
+        )
+        self.assertIn("grep -Fxc", source)
+        self.assertIn("# prime-rl prompt logprob row chunking: vllm-0.26", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,26 @@
 # Difficulty ideas
 
+## vLLM prompt-logprob row chunking
+
+- **Measured failure.** An 8,192-row prompt-logprob request allocates about
+  6.09 GiB for the full-vocabulary logits while only about 2.97 GiB is free.
+- **Plan.** Patch only vLLM 0.26's `_get_prompt_logprobs_dict` output head. Keep
+  model forward and request behavior unchanged, and process logits, scoring,
+  gathering, and CPU copies in chunks of at most 128 prompt rows. Preserve
+  target shifting, offsets, request accumulation, raw/processed modes, ranks,
+  LoRA mapping, tensor parallel behavior, and the API schema. Apply the patch
+  read-only after the FlashMLA patch and fail closed on duplicate or drifted
+  patch context.
+- **Gates.** Patch application must pass once, fail on a second application,
+  and fail on upstream context drift. A bounded fake model must match the
+  unchunked oracle for lengths 512, 974, 8192, 11324, and 32768, including
+  tails, offsets, call counts, scheduler accumulation, raw/processed modes,
+  LoRA, no-logprob requests, and response schema. Run launcher, memory,
+  compile, bash, and patch-diff checks before commit.
+- **TDD red baseline.** Before the patch existed, the focused suite ran 11
+  tests with 6 missing-patch errors, 1 missing-launcher-mount failure, and 4
+  passes.
+
 ## H200 prefix-stability diagnostic
 
 - **Planned, diagnostic only.** Reuse the exact fresh 512-token reference and

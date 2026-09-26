@@ -146,6 +146,7 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   -v "$deployment/prime-rl/src/prime_rl/utils/checkpoint_delta.py":/app/src/prime_rl/utils/checkpoint_delta.py:ro \
   -v "$deployment/prime-rl/src/prime_rl/utils/adapter_delta.py":/app/src/prime_rl/utils/adapter_delta.py:ro \
   -v "$deployment/prime-rl/deps/vllm/flashmla_sparse_mtp.patch":/tmp/flashmla_sparse_mtp.patch:ro \
+  -v "$deployment/prime-rl/deps/vllm/prompt_logprobs_rows.patch":/tmp/prompt_logprobs_rows.patch:ro \
   -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e PYTHONUNBUFFERED=1 \
   -e OMP_NUM_THREADS=1 \
@@ -162,6 +163,6 @@ docker run -d --name glm52-decensor-h200 --restart unless-stopped \
   -e PRIME_LORA_SOURCE_PORTS="$lora_source_port_list" \
   --entrypoint /bin/bash \
   prime-rl:glm52-v080-glm52-h200-router \
-  -lc 'set -e; patch --batch --forward -p1 -d /app/.venv/lib/python3.12/site-packages < /tmp/flashmla_sparse_mtp.patch || grep -q "MIN_HEADS_FOR_BF16_PREFILL = 0" /app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py; exec /app/.venv/bin/inference "$@"' bash \
+  -lc 'set -e; patch --batch --forward -p1 -d /app/.venv/lib/python3.12/site-packages < /tmp/flashmla_sparse_mtp.patch || grep -q "MIN_HEADS_FOR_BF16_PREFILL = 0" /app/.venv/lib/python3.12/site-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py; prompt_logprobs_target=/app/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py; if ! patch --batch --forward --fuzz=0 -p1 -d /app/.venv/lib/python3.12/site-packages < /tmp/prompt_logprobs_rows.patch; then test "$(grep -Fxc "            # prime-rl prompt logprob row chunking: vllm-0.26" "$prompt_logprobs_target")" -eq 1; fi; exec /app/.venv/bin/inference "$@"' bash \
   @ "$inference_config" \
   --vllm-extra "$vllm_extra"
