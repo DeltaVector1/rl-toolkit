@@ -7661,6 +7661,7 @@ source={source}
 peer={peer}
 partial={target}
 copied=0
+completed=0
 read_regular_identity() {{
   python3 - "$1" <<'PY'
 import hashlib
@@ -7685,7 +7686,7 @@ finally:
 PY
 }}
 cleanup() {{
-  if [ "$copied" -eq 1 ]; then
+  if [ "$copied" -eq 1 ] && [ "$completed" -ne 1 ]; then
     ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \\
       "$peer" {remote_cleanup} || true
   fi
@@ -7701,6 +7702,7 @@ scp -q -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new
   \"$source\" \"$peer:$partial\"
 ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \\
   \"$peer\" {remote_verify}
+completed=1
 """
 
 

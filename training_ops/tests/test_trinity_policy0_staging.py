@@ -860,6 +860,48 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(target.exists())
 
+    def test_lan_fanout_success_keeps_verified_partial_for_install(self):
+        payload = b"verified-reference"
+        expected_sha, expected_size = _identity_bytes(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "seed.partial"
+            target = root / "peer.partial"
+            source.write_bytes(payload)
+            wrapper_dir = root / "bin"
+            wrapper_dir.mkdir()
+            (wrapper_dir / "ssh").write_text(
+                "#!/bin/sh\n"
+                "last=\"\"\n"
+                "for value in \"$@\"; do last=\"$value\"; done\n"
+                "exec bash -c \"$last\"\n",
+                encoding="utf-8",
+            )
+            (wrapper_dir / "scp").write_text(
+                "#!/bin/sh\n"
+                "previous=\"\"\n"
+                "source=\"\"\n"
+                "destination=\"\"\n"
+                "for value in \"$@\"; do source=\"$previous\"; previous=\"$value\"; done\n"
+                "destination=\"${previous#*:}\"\n"
+                "cp -- \"$source\" \"$destination\"\n",
+                encoding="utf-8",
+            )
+            for wrapper in (wrapper_dir / "ssh", wrapper_dir / "scp"):
+                wrapper.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = str(wrapper_dir) + os.pathsep + environment["PATH"]
+            result = subprocess.run(
+                ["bash", "-c", _policy0_reference_lan_fanout_script(
+                    str(source), str(target), "10.92.20.77", expected_sha, expected_size
+                )],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(target.read_bytes(), payload)
+
     def test_controller_rejects_corrupt_download(self):
         def corrupt_download(command, *, stdin, timeout):
             Path(command[-1]).write_bytes(b"corrupt")
