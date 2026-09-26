@@ -399,3 +399,9 @@ only after measured learning.
   exact 2048 token IDs, expects 2048 prompt logprobs and exact routes of shape
   `[2048, 60, 4]`, and retains the 2047 non-leading tokens. This tests direct
   numerical parity only; it does not prove production 32768-token capacity.
+
+- The bounded qualification passed: 2048 tokens, 2047 selected, mean absolute
+  delta 0.0795838, p95 0.2749004, maximum 0.7428370, masked fraction 0,
+  unmasked mismatch KL 0.00738006, and masked KL 0. Strict gates pass. The
+  flawed one-token 0.609 result is superseded; this remains a 2048-token
+  numerical parity result, not proof of production capacity.

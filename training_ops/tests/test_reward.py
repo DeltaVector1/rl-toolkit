@@ -398,6 +398,22 @@ class StepsReaderTest(unittest.TestCase):
 
 
 class ParityReaderTest(unittest.TestCase):
+    def test_trinity_trainer_only_profile_is_discoverable_by_run_name(self):
+        selected = training_ops._config_for_run("trinity-h200-parity")
+
+        self.assertEqual(
+            selected["trainer"], "configs/trinity-h200-parity/trainer.toml"
+        )
+        self.assertNotIn("orchestrator", selected)
+        config_path = Path(__file__).resolve().parents[2] / selected["trainer"]
+        with config_path.open("rb") as stream:
+            config = training_ops.tomllib.load(stream)
+        self.assertEqual(Path(config["output_dir"]).name, "trinity-h200-parity")
+        self.assertEqual(
+            config["data"]["fake"]["reference_path"],
+            "/data/glm52-rl/qualifications/trinity-h200-parity/reference.json",
+        )
+
     def run_reader(self, record):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "parity.json"

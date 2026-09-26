@@ -2,7 +2,7 @@
 # The reference file is produced by the serialized /inference/v1/generate
 # helper before this config is started.
 
-output_dir = "/data/glm52-rl/qualifications/trinity-h200-parity/trainer"
+output_dir = "/data/glm52-rl/qualifications/trinity-h200-parity"
 max_steps = 1
 dist_timeout_seconds = 5400
 enable_router_replay = true
