@@ -717,6 +717,9 @@ def validate_diagnostic(value: Mapping[str, Any]) -> dict[str, Any]:
             or actual_score != entry.get("actual_token_logprob")
         ):
             raise PrefixStabilityError("diagnostic response evidence is not bound")
+        expected_position = 256 if index == 0 else PREFIX_LENGTHS[index] - 1
+        if entry.get("actual_token_position") != expected_position:
+            raise PrefixStabilityError("diagnostic actual-token position is not aligned")
         if entry.get("actual_token_logprob") is not None:
             _finite_number(entry["actual_token_logprob"], "diagnostic actual-token logprob")
     first_request = requests[0]
@@ -748,14 +751,39 @@ def validate_diagnostic(value: Mapping[str, Any]) -> dict[str, Any]:
     sequence = value.get("receipt_sequence")
     if not isinstance(sequence, list) or len(sequence) != len(PREFIX_LENGTHS) + 1:
         raise PrefixStabilityError("diagnostic receipt sequence is incomplete")
-    receipts = [entry.get("receipt") for entry in sequence if isinstance(entry, Mapping)]
+    reference_receipt = original.get("reference_policy_receipt")
+    if not isinstance(reference_receipt, Mapping):
+        raise PrefixStabilityError("original reference policy receipt is missing")
+    _validate_digest(
+        original.get("reference_policy_receipt_sha256"),
+        "original reference policy receipt hash",
+    )
     if (
-        len(receipts) != len(sequence)
-        or not receipts
-        or any(receipt != receipts[0] for receipt in receipts[1:])
-        or any(receipt != expected_identity for receipt in receipts)
+        _json_sha256(reference_receipt) != original["reference_policy_receipt_sha256"]
+        or dict(reference_receipt) != dict(expected_identity)
     ):
-        raise PrefixStabilityError("diagnostic receipt sequence changed")
+        raise PrefixStabilityError("policy identity is not bound to original reference evidence")
+    try:
+        _validate_policy_receipt(reference_receipt, reference_receipt, policy_model)
+    except (ValueError, TypeError) as error:
+        raise PrefixStabilityError("original reference policy receipt is invalid") from error
+    expected_events = [
+        {"stage": "before", "request_index": 0},
+        *[
+            {"stage": "between", "request_index": index}
+            for index in range(len(PREFIX_LENGTHS) - 1)
+        ],
+        {"stage": "after", "request_index": len(PREFIX_LENGTHS) - 1},
+    ]
+    for entry, expected_event in zip(sequence, expected_events):
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != {"stage", "request_index", "receipt"}
+            or entry.get("stage") != expected_event["stage"]
+            or entry.get("request_index") != expected_event["request_index"]
+            or entry.get("receipt") != reference_receipt
+        ):
+            raise PrefixStabilityError("diagnostic receipt sequence changed")
     return dict(value)
 
 
@@ -882,6 +910,8 @@ def build_diagnostic(
             "rescore_response_sha256": _json_sha256(reference_info["rescore_response"]),
             "decode_route_sha256": reference_info["decode_route"]["sha256"],
             "rescore_route_sha256": reference_info["rescore_route"]["sha256"],
+            "reference_policy_receipt": dict(reference_info["receipt"]),
+            "reference_policy_receipt_sha256": _json_sha256(reference_info["receipt"]),
             "first_decoded_token_id": reference_info["generated_ids"][0],
             "first_decoded_logprob": original_first_decode,
             "first_rescored_actual_token_logprob": original_first_rescore,

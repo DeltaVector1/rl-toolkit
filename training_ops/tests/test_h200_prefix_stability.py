@@ -195,6 +195,22 @@ class H200PrefixStabilityTest(unittest.TestCase):
         self.assertEqual(result["requests"][0]["generated_token_id"], 900)
         self.assertIsNotNone(output)
 
+        self.assertEqual(
+            [(entry["stage"], entry["request_index"]) for entry in result["receipt_sequence"]],
+            [
+                ("before", 0),
+                ("between", 0),
+                ("between", 1),
+                ("between", 2),
+                ("between", 3),
+                ("after", 4),
+            ],
+        )
+        self.assertEqual(
+            [entry["actual_token_position"] for entry in result["requests"]],
+            [256, 256, 287, 383, 511],
+        )
+
     def test_receipt_change_is_rejected(self):
         changed = self.receipt()
         changed["server_instance"] = "h200-instance-2"
@@ -277,6 +293,39 @@ class H200PrefixStabilityTest(unittest.TestCase):
         nonfinite["original_evidence"]["first_decoded_logprob"] = math.nan
         with self.assertRaises(prefix_stability.PrefixStabilityError):
             prefix_stability.validate_diagnostic(nonfinite)
+
+    def test_original_reference_receipt_evidence_is_present(self):
+        result, _, _ = self.execute()
+        self.assertIn("reference_policy_receipt", result["original_evidence"])
+        self.assertIn("reference_policy_receipt_sha256", result["original_evidence"])
+
+    def test_metadata_receipts_and_positions_are_bound(self):
+        result, _, _ = self.execute()
+        changed_stage = copy.deepcopy(result)
+        changed_stage["receipt_sequence"][1]["stage"] = "after"
+        with self.subTest(case="stage"):
+            with self.assertRaises(prefix_stability.PrefixStabilityError):
+                prefix_stability.validate_diagnostic(changed_stage)
+
+        changed_index = copy.deepcopy(result)
+        changed_index["receipt_sequence"][2]["request_index"] = 4
+        with self.subTest(case="request index"):
+            with self.assertRaises(prefix_stability.PrefixStabilityError):
+                prefix_stability.validate_diagnostic(changed_index)
+
+        changed_position = copy.deepcopy(result)
+        changed_position["requests"][0]["actual_token_position"] = 255
+        with self.subTest(case="actual token position"):
+            with self.assertRaises(prefix_stability.PrefixStabilityError):
+                prefix_stability.validate_diagnostic(changed_position)
+
+        changed_identity = copy.deepcopy(result)
+        changed_identity["expected_policy_identity"]["server_instance"] = "joint-substitution"
+        for entry in changed_identity["receipt_sequence"]:
+            entry["receipt"]["server_instance"] = "joint-substitution"
+        with self.subTest(case="joint receipt substitution"):
+            with self.assertRaises(prefix_stability.PrefixStabilityError):
+                prefix_stability.validate_diagnostic(changed_identity)
 
     def test_route_comparison_reports_sparse_layer_sets_and_order(self):
         def route(rows):
