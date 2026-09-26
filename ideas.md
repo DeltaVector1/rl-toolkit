@@ -1,5 +1,19 @@
 # Difficulty ideas
 
+## H200 prefix-stability diagnostic
+
+- **Planned, diagnostic only.** Reuse the exact fresh 512-token reference and
+  loaded policy receipt to compare isolated exact-token requests at prefix
+  lengths 256, 257, 288, 384, and 512. Keep request salts distinct, require
+  the same readiness receipt before, between, and after every request, and
+  compare common-prefix route order/sets plus actual-token logprobs.
+- At length 256, reproduce the original one-token decode with prompt
+  logprobs. At longer lengths, use teacher-forced exact tokens and prompt
+  logprobs. Reject nonfinite, sentinel, misaligned, tampered, or changed-
+  receipt evidence and publish atomically without clobbering an existing
+  output. This isolates sequence-shape and chunked-prefill numerical drift
+  without changing a qualification gate.
+
 ## Isolated decode256 to prefill-rescore parity qualification
 
 - **Planned, opt-in only.** Keep the existing policy-0 qualification unchanged
