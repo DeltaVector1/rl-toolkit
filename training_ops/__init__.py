@@ -7117,7 +7117,12 @@ PY
 }}
 
 fsync_file_and_directory() {{
-  fsync_file "$1"
+  if fsync_file "$1"; then
+    :
+  else
+    status=$?
+    return "$status"
+  fi
   fsync_directory "$2"
 }}
 

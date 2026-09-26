@@ -468,22 +468,31 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self._assert_exchange_boundary_injection("directory")
 
     def test_reference_script_fsyncs_before_reporting_verified_rollback(self):
-        result, state, events = self._run_transient_exchange_mismatch(fail_fsync=False)
+        result, state, events = self._run_transient_exchange_mismatch(fsync_failure=None)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("rollback verified", result.stderr)
         self.assertEqual(events[-2:], ["fsync-file", "fsync-directory"])
         self.assertEqual(state["final"], b"old-reference")
         self.assertIsNone(state["partial"])
 
-    def test_reference_script_fsync_failure_retains_rollback_evidence(self):
-        result, state, events = self._run_transient_exchange_mismatch(fail_fsync=True)
+    def test_reference_script_file_fsync_failure_retains_rollback_evidence(self):
+        result, state, events = self._run_transient_exchange_mismatch(fsync_failure="file")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rollback could not be verified", result.stderr)
+        self.assertEqual(events[-2:], ["target-read", "fsync-file-failed"])
+        self.assertNotIn("fsync-directory", events)
+        self.assertEqual(state["final"], b"old-reference")
+        self.assertEqual(state["partial"], b"new-reference")
+
+    def test_reference_script_directory_fsync_failure_retains_rollback_evidence(self):
+        result, state, events = self._run_transient_exchange_mismatch(fsync_failure="directory")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("rollback could not be verified", result.stderr)
         self.assertEqual(events[-2:], ["fsync-file", "fsync-directory-failed"])
         self.assertEqual(state["final"], b"old-reference")
         self.assertEqual(state["partial"], b"new-reference")
 
-    def _run_transient_exchange_mismatch(self, *, fail_fsync):
+    def _run_transient_exchange_mismatch(self, *, fsync_failure):
         old = b"old-reference"
         new = b"new-reference"
         old_sha, old_size = _identity_bytes(old)
@@ -496,17 +505,12 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             partial.write_bytes(new)
             exchange_marker = root / "exchange.marker"
             mismatch_marker = root / "mismatch.marker"
+            target_calls = root / "target.calls"
             events_path = root / "events"
             wrapper_dir = root / "bin"
             wrapper_dir.mkdir()
             wrapper = wrapper_dir / "python3"
-            if fail_fsync:
-                fsync_failure = "\n".join([
-                    f"  printf '%s\\n' fsync-directory-failed >> {str(events_path)!r}",
-                    "  exit 97",
-                ])
-            else:
-                fsync_failure = f"  printf '%s\\n' fsync-directory >> {str(events_path)!r}"
+            failure_mode = str(fsync_failure or "none")
             wrapper.write_text(
                 "#!/bin/sh\n"
                 f"if [ \"$2\" = {str(partial)!r} ] && [ \"$3\" = {str(target)!r} ] && [ ! -e {str(exchange_marker)!r} ]; then\n"
@@ -520,13 +524,24 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 "  exit 0\n"
                 "fi\n"
                 f"if [ \"$2\" = {str(target)!r} ] && [ -e {str(mismatch_marker)!r} ]; then\n"
-                f"  printf '%s\\n' target-read >> {str(events_path)!r}\n"
+                f"  target_call=$(cat -- {str(target_calls)!r} 2>/dev/null || printf '0')\n"
+                "  target_call=$((target_call + 1))\n"
+                f"  printf '%s\\n' \"$target_call\" > {str(target_calls)!r}\n"
+                "  if [ \"$target_call\" -eq 1 ]; then\n"
+                f"    printf '%s\\n' target-read >> {str(events_path)!r}\n"
+                f"  elif [ {failure_mode!r} = file ]; then\n"
+                f"    printf '%s\\n' fsync-file-failed >> {str(events_path)!r}\n"
+                "    exit 96\n"
+                "  else\n"
+                f"    printf '%s\\n' fsync-file >> {str(events_path)!r}\n"
+                "  fi\n"
                 "fi\n"
-                f"if [ \"$2\" = {str(target)!r} ] && [ -e {str(mismatch_marker)!r} ]; then\n"
-                f"  printf '%s\\n' fsync-file >> {str(events_path)!r}\n"
+                f"if [ \"$2\" = {str(target.parent)!r} ] && [ -e {str(mismatch_marker)!r} ] && [ {failure_mode!r} = directory ]; then\n"
+                f"  printf '%s\\n' fsync-directory-failed >> {str(events_path)!r}\n"
+                "  exit 97\n"
                 "fi\n"
                 f"if [ \"$2\" = {str(target.parent)!r} ] && [ -e {str(mismatch_marker)!r} ]; then\n"
-                + fsync_failure + "\n"
+                f"  printf '%s\\n' fsync-directory >> {str(events_path)!r}\n"
                 "fi\n"
                 "exec /usr/bin/python3 \"$@\"\n",
                 encoding="utf-8",
