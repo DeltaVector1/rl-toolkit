@@ -317,6 +317,12 @@ class Policy0LoadTest(unittest.TestCase):
         cases = (
             (r"/glm52-decensor-h200\tcontainer-a\tstarted\ttrue", "identity-mismatch"),
             ("/other-engine|container-a|started|true", "identity-mismatch"),
+            ("/glm52-decensor-h200|container-a|started|true|", "identity-mismatch"),
+            ("/glm52-decensor-h200|container-a|started|true|extra", "identity-mismatch"),
+            ("/glm52-decensor-h200|container-a|started|true\nsecond", "identity-mismatch"),
+            ("/glm52-decensor-h200||started|true", "identity-mismatch"),
+            ("/glm52-decensor-h200|container-a||true", "identity-mismatch"),
+            ("/glm52-decensor-h200|container-a|started|", "identity-mismatch"),
             ("/glm52-decensor-h200|container-a|started|false", "engine-stopped"),
         )
         for inspect_line, error in cases:

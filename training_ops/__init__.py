@@ -8602,7 +8602,12 @@ def _policy0_load_engine_state_script(container: str, ports_for_host: list[int])
     return f"""set -euo pipefail
 container={shlex.quote(container)}
 inspect=$(sudo docker inspect --format '{{{{.Name}}}}|{{{{.Id}}}}|{{{{.State.StartedAt}}}}|{{{{.State.Running}}}}' "$container" 2>/dev/null) || {{ echo unknown >&2; exit 81; }}
+if [[ "$inspect" == *$'\\n'* || "$inspect" == *$'\\r'* || ! "$inspect" =~ ^[^|]+\\|[^|]+\\|[^|]+\\|[^|]+$ ]]; then
+  echo identity-mismatch >&2
+  exit 82
+fi
 IFS='|' read -r name container_id container_started_at running <<< "$inspect"
+[ -n "$name" ] && [ -n "$container_id" ] && [ -n "$container_started_at" ] && [ -n "$running" ] || {{ echo identity-mismatch >&2; exit 82; }}
 [ "$name" = "/$container" ] || {{ echo identity-mismatch >&2; exit 82; }}
 [ "$running" = true ] || {{ echo engine-stopped >&2; exit 83; }}
 listener_identity=""
