@@ -347,7 +347,8 @@ push_stable() {
 }
 
 scan() {
-  local listing remote_file local_file status=0 attempt pushed
+  local listing remote_file local_file step status=0 attempt pushed
+  local -a rollout_files=()
   while IFS= read -r -d '' local_file; do
     pushed=0
     for attempt in 1 2 3; do
@@ -365,8 +366,23 @@ scan() {
   listing=$(remote "{ printf '%s\\n' '$source_dir/control/orch.toml'; find '$source_dir/broadcasts' '$source_dir/rollouts' -type f \( -path '*/broadcasts/step_*/receivers-ready.json' -o -path '*/rollouts/step_*/train_rollouts.bin' \) -print 2>/dev/null; } | while IFS= read -r file; do [ -f \"\$file\" ] || continue; marker=\"\$file.delivered\"; [ ! -L \"\$marker\" ] || exit 1; if [ -e \"\$marker\" ]; then [ -f \"\$marker\" ] || exit 1; continue; fi; if [ \"\$file\" = '$source_dir/control/orch.toml' ] && [ \$(( \$(date +%s) - \$(stat -c %Y \"\$file\") )) -lt 2 ]; then continue; fi; printf '%s\\n' \"\$file\"; done") || return 1
   while IFS= read -r remote_file; do
     [ -n "$remote_file" ] || continue
-    pull_one "$remote_file" || status=1
+    if [[ "$remote_file" =~ /rollouts/step_[0-9]+/train_rollouts\.bin$ ]]; then
+      rollout_files+=("$remote_file")
+    else
+      pull_one "$remote_file" || status=1
+    fi
   done <<<"$listing"
+  [ "$status" = 0 ] || return "$status"
+  while IFS=$'\t' read -r step remote_file; do
+    [ -n "$remote_file" ] || continue
+    pull_one "$remote_file" || return 1
+  done < <(
+    for remote_file in "${rollout_files[@]}"; do
+      step=${remote_file##*/step_}
+      step=${step%/train_rollouts.bin}
+      printf '%s\t%s\n' "$step" "$remote_file"
+    done | sort -n -k1,1 -k2,2
+  )
   return "$status"
 }
 

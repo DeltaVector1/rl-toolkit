@@ -458,3 +458,14 @@ only after measured learning.
   TERM then KILL grace. Keep rsync `--timeout=60`, `--partial`, and
   `--append-verify`; let timeout failures return to the existing scan retry
   loop without deleting partials.
+
+## Oldest-first rollout pull retry
+
+- Observed result: after a timeout, step 1 reached 346,422,813 bytes with 13
+  full and 3 partial parts, but the same scan continued to steps 2 and 3.
+  Step 1 then stayed unchanged for about 10 minutes while newer partials grew;
+  the trainer remained at step 0.
+- Repair plan: order rollout files by numeric step and stop the scan on the
+  first failed rollout pull. The next loop must retry that same oldest
+  undelivered rollout, while control and receiver files still run before
+  rollouts and receipts, hashes, and partials remain unchanged.

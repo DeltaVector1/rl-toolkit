@@ -45,6 +45,9 @@ class RolloutPullTest(unittest.TestCase):
                 "#!/usr/bin/env bash\nset -eu\na=(\"$@\"); "
                 "src=${a[${#a[@]}-2]}; dst=${a[${#a[@]}-1]}; "
                 "[[ $src = *:* ]] && src=${src#*:}; [[ $dst = *:* ]] && dst=${dst#*:}; "
+                "if [ -n \"${RSYNC_ATTEMPTS_LOG:-}\" ]; then printf '%s\\n' \"$src\" >>\"$RSYNC_ATTEMPTS_LOG\"; fi; "
+                "if [ -n \"${RSYNC_FAIL_SOURCE:-}\" ] && [[ \"$src\" == *\"$RSYNC_FAIL_SOURCE\"* ]] && [ ! -e \"${RSYNC_FAIL_MARKER:?}\" ]; then "
+                "if (set -C; : >\"$RSYNC_FAIL_MARKER\") 2>/dev/null; then exit 1; fi; fi; "
                 "mkdir -p \"$(dirname \"$dst\")\"; "
                 "if [ -n \"${RSYNC_SLEEP_ONCE_MARKER:-}\" ] && [ ! -e \"$RSYNC_SLEEP_ONCE_MARKER\" ]; then "
                 "(set -C; : >\"$RSYNC_SLEEP_ONCE_MARKER\") 2>/dev/null || true; "
@@ -402,6 +405,84 @@ class RolloutPullTest(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 2, value)
                 self.assertIn("PULL_PART_TIMEOUT", result.stderr)
+
+    def test_failed_oldest_rollout_stops_scan_and_next_scan_retries_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            for step in (1, 2):
+                rollout = source / f"rollouts/step_{step}/train_rollouts.bin"
+                rollout.parent.mkdir(parents=True)
+                rollout.write_bytes(bytes([step]) * 256)
+            attempts = base / "rsync-attempts"
+            environment = self.environment(source, destination, self.tools(directory))
+            environment.update(
+                ONCE="1",
+                PARALLEL_THRESHOLD="1",
+                PARALLEL_STREAMS="2",
+                RSYNC_ATTEMPTS_LOG=str(attempts),
+                RSYNC_FAIL_SOURCE="step_1",
+                RSYNC_FAIL_MARKER=str(base / "rsync-failed"),
+            )
+
+            failed = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            self.assertNotEqual(failed.returncode, 0, failed.stderr)
+            first_scan = attempts.read_text().splitlines()
+            self.assertTrue(first_scan)
+            self.assertTrue(all("step_1" in attempt for attempt in first_scan))
+            self.assertFalse((destination / "rollouts/step_2/train_rollouts.bin").exists())
+
+            resumed = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertTrue(any("step_2" in attempt for attempt in attempts.read_text().splitlines()))
+            for step in (1, 2):
+                self.assertTrue((destination / f"rollouts/step_{step}/train_rollouts.bin").is_file())
+
+    def test_rollout_steps_are_sorted_numerically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "source/alpha/run_alpha"
+            destination = base / "destination/alpha/run_alpha"
+            for step in (10, 2):
+                rollout = source / f"rollouts/step_{step}/train_rollouts.bin"
+                rollout.parent.mkdir(parents=True)
+                rollout.write_bytes(bytes([step]) * 256)
+            attempts = base / "rsync-attempts"
+            environment = self.environment(source, destination, self.tools(directory))
+            environment.update(
+                ONCE="1",
+                PARALLEL_THRESHOLD="1",
+                PARALLEL_STREAMS="1",
+                RSYNC_ATTEMPTS_LOG=str(attempts),
+            )
+
+            result = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            order = [
+                2 if "step_2" in attempt else 10
+                for attempt in attempts.read_text().splitlines()
+                if "step_2" in attempt or "step_10" in attempt
+            ]
+            self.assertEqual(order, [2, 10])
 
     def test_pull_is_checksummed_resumable_and_no_replace(self):
         with tempfile.TemporaryDirectory() as directory:
