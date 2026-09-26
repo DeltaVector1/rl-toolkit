@@ -1,5 +1,9 @@
+import os
+import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
 from training_ops import prepare_policy0_qualification
 from training_ops.runtime.h200.prepare_trinity_policy0_qualification import (
@@ -83,6 +87,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertIn("tmp.policy0", plan["transfer_reference_script"])
         self.assertIn("china-trainer", plan["transfer_reference_script"])
         self.assertIn("scp -q", plan["transfer_reference_script"])
+        self.assertNotIn("ssh -n", plan["transfer_reference_script"])
 
     def test_stage_accepts_all_verified_hosts_and_refuses_one_bad_hash(self):
         source_manifest = "\n".join([
@@ -108,7 +113,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                         source_reference_path="/data/glm52-rl/fresh-h200/reference.json",
                     )
         self.assertTrue(result["staged"])
-        self.assertEqual(copy.call_count, 2)
+        self.assertEqual(copy.call_count, 3)
         self.assertEqual(fan.call_count, 1)
         self.assertGreaterEqual(ssh.call_count, 1)
 
@@ -150,6 +155,51 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                     source_reference_path="/data/glm52-rl/fresh-h200/reference.json",
                 )
         self.assertEqual(ssh.call_count, 1)
+
+    def test_reference_transfer_uses_stdin_capable_remote_bash_stub(self):
+        from training_ops import _policy0_transfer_reference_script
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "reference.json"
+            target = root / "destination" / "reference.json"
+            source.write_text("fresh-reference")
+            stub_dir = root / "bin"
+            stub_dir.mkdir()
+            ssh = stub_dir / "ssh"
+            ssh.write_text(
+                "#!/bin/sh\n"
+                "last=\"\"\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  if [ \"$1\" = bash ]; then shift; exec bash \"$@\"; fi\n"
+                "  last=\"$1\"; shift\n"
+                "done\n"
+                "case \"$last\" in mkdir*|rm*) sh -c \"$last\";; esac\n"
+                "exit 0\n"
+            )
+            scp = stub_dir / "scp"
+            scp.write_text(
+                "#!/bin/sh\n"
+                "previous=\"\"; last=\"\"\n"
+                "for arg in \"$@\"; do previous=\"$last\"; last=\"$arg\"; done\n"
+                "source=\"$previous\"\n"
+                "destination=\"$last\"\n"
+                "destination=${destination#*:}\n"
+                "cp -- \"$source\" \"$destination\"\n"
+            )
+            for stub in (ssh, scp):
+                stub.chmod(stub.stat().st_mode | 0o111)
+            script = _policy0_transfer_reference_script(
+                str(source), str(target), "stub"
+            )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                env={"PATH": str(stub_dir) + os.pathsep + os.environ["PATH"]},
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(target.read_text(), "fresh-reference")
 
 
 if __name__ == "__main__":

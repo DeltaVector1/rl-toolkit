@@ -7039,7 +7039,7 @@ trainer_target={remote_target}
 test -f "$source" && test ! -L "$source"
 source_sha=$(sha256sum -- "$source" | cut -d' ' -f1)
 source_size=$(stat -c '%s' -- "$source")
-remote_state=$(ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
+remote_state=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
   bash -s -- "$final" <<'REMOTE_STATE'
 set -e
 final=$1
@@ -7058,14 +7058,14 @@ case "$remote_state" in
   *) echo "reference destination conflicts: $remote_state" >&2; exit 44 ;;
 esac
 tmp={remote_tmp}
-cleanup() {{ ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
+cleanup() {{ ssh -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
   "rm -f -- {remote_tmp}" >/dev/null 2>&1 || true; }}
 trap cleanup EXIT
-ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
+ssh -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
   "mkdir -p -- {remote_dir}"
 scp -q -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 \
   -- "$source" "$trainer_target:$tmp"
-ssh -n -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
+ssh -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
   bash -s -- "$source_sha" "$source_size" "$tmp" "$final" <<'REMOTE_MOVE'
 set -e
 source_sha=$1
@@ -7251,6 +7251,7 @@ def prepare_policy0_qualification(
     if code:
         detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
         raise Refused(f"fresh H200 reference staging failed: {detail}")
+    _copy_resume_adapter(reference_path, selected_nodes, allow_qualification=True)
     for source, target in (
         (source_adapter_path, adapter_path),
         (source_config_path, config_path),

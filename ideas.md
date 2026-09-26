@@ -659,3 +659,8 @@ only after measured learning.
 
 - Review measured that remote verification read the full 16.5 GB adapter into one Python buffer. The verifier must hash in bounded blocks. Review also found that `prepare-policy0 stage` only checked files already present on n82; it did not stage the preserved step-0 adapter/config or the fresh H200 reference.
 - The corrected local-only plan adds explicit source paths and host identities, refuses missing, symlinked, conflicting, or digest-mismatched sources/destinations, stages the small reference through the configured H200 connection, stages adapter/config only from n82 over the trainer LAN, and atomically verifies every destination. It must preserve source files and bind the reference receipt to the staged adapter/config SHA and size. No model-weight transfer is allowed.
+
+## Policy-0 staging final review corrections
+
+- Review measured that `ssh -n` cannot consume the heredoc remote scripts, and that the fresh reference stopped at n82 instead of reaching all configured trainers. The corrected path must use stdin-capable SSH for remote bash, fan out the verified reference from n82, and verify every host.
+- Review also requires an exact trainer-length contract: policy-0 uses an 8160-token prompt plus exactly 32 generated tokens, requests `min_tokens=max_tokens=32`, refuses early stop or any total other than trainer `seq_len=8192`, and keeps the base qualifier unchanged. Route and logprob scaling remain pending deployed audit.

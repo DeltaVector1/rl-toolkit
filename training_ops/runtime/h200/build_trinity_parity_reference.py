@@ -27,7 +27,7 @@ from urllib.request import Request, urlopen
 _RAW_ROUTE_FIELDS = {"data", "dtype", "shape", "start"}
 _MAX_ROUTE_BYTES = 512 * 1024 * 1024
 _POLICIES = {"base", "policy-0"}
-_DEFAULT_TOKEN_COUNT = 8192
+_DEFAULT_TOKEN_COUNT = 8160
 # A two-percent excess limit rejects a periodic seed while allowing ordinary
 # syntax to recur in long natural-language input.
 _REPETITION_WINDOW = 16
@@ -481,7 +481,8 @@ def build_reference(
     cache_salt: str | None = None,
     readiness_endpoint: str | None = None,
     completion_tokens: int = 32,
-    minimum_completion_tokens: int = 8,
+    minimum_completion_tokens: int = 32,
+    trainer_seq_len: int = 8192,
     minimum_tokens: int = 4097,
     expected_route_shape: list[int] | None = None,
     expected_route_sha256: str | None = None,
@@ -502,6 +503,8 @@ def build_reference(
         or isinstance(minimum_completion_tokens, bool)
         or minimum_completion_tokens < 1
         or minimum_completion_tokens > completion_tokens
+        or isinstance(trainer_seq_len, bool)
+        or trainer_seq_len < 1
     ):
         raise ReferenceError("completion token limits are invalid")
     record = _load_record(input_record)
@@ -558,6 +561,14 @@ def build_reference(
             raise ReferenceError("base policy cannot use a policy readiness receipt")
         policy_identity = None
     cache_salt = _validate_cache_salt(cache_salt, required=policy == "policy-0")
+    if policy == "policy-0":
+        if completion_tokens != 32 or minimum_completion_tokens != 32:
+            raise ReferenceError("policy-0 qualification requires exactly 32 generated tokens")
+        expected_prompt_tokens = trainer_seq_len - completion_tokens
+        if token_count != expected_prompt_tokens:
+            raise ReferenceError(
+                f"policy-0 prompt must contain exactly {expected_prompt_tokens} tokens"
+            )
     sampling_params = {
         "max_tokens": completion_tokens if policy == "policy-0" else 1,
         "temperature": 0.0 if policy == "policy-0" else 1.0,
@@ -566,6 +577,7 @@ def build_reference(
     }
     if policy == "policy-0":
         sampling_params["logprobs"] = 1
+        sampling_params["min_tokens"] = completion_tokens
     request_body: dict[str, Any] = {
         "model": model,
         "token_ids": input_ids,
@@ -593,6 +605,10 @@ def build_reference(
             or any(isinstance(token, bool) or not isinstance(token, int) for token in raw_generated_ids)
         ):
             raise ReferenceError("policy-0 response has too few or invalid generated token IDs")
+        if len(input_ids) + len(raw_generated_ids) != trainer_seq_len:
+            raise ReferenceError(
+                f"policy-0 response must contain exactly trainer seq_len={trainer_seq_len} tokens"
+            )
         generated_ids = list(raw_generated_ids)
         generated_logprobs = _flatten_completion_logprobs(
             choice.get("logprobs"), generated_ids
@@ -669,7 +685,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-salt", help="fresh top-level prefix-cache salt for policy-0")
     parser.add_argument("--readiness-endpoint", help="explicit active staging readiness URL for policy-0")
     parser.add_argument("--completion-tokens", type=int, default=32)
-    parser.add_argument("--minimum-completion-tokens", type=int, default=8)
+    parser.add_argument("--minimum-completion-tokens", type=int, default=32)
+    parser.add_argument("--trainer-seq-len", type=int, default=8192)
     parser.add_argument("--minimum-tokens", type=int, default=4097)
     parser.add_argument("--expected-route-shape", type=int, nargs=3)
     parser.add_argument("--expected-route-sha256")
@@ -706,6 +723,7 @@ def main(argv: list[str] | None = None) -> int:
             readiness_endpoint=args.readiness_endpoint,
             completion_tokens=args.completion_tokens,
             minimum_completion_tokens=args.minimum_completion_tokens,
+            trainer_seq_len=args.trainer_seq_len,
             minimum_tokens=args.minimum_tokens,
             expected_route_shape=args.expected_route_shape,
             expected_route_sha256=args.expected_route_sha256,

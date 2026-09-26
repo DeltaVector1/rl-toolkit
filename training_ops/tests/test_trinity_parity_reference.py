@@ -66,7 +66,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
             "choices": [{"routed_experts": route_for(token_count)}],
         }
 
-    def policy_response(self, prompt_count=4, completion_count=8):
+    def policy_response(self, prompt_count=4, completion_count=32):
         generated_ids = list(range(900, 900 + completion_count))
         return {
             "prompt_logprobs": self.response(prompt_count)["prompt_logprobs"],
@@ -107,6 +107,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 expected_policy_identity=self.policy_receipt(),
                 cache_salt="qualifier-policy-0-fresh-1",
                 readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                trainer_seq_len=36,
                 minimum_tokens=1,
                 post_json=post,
                 get_json=lambda *_: self.readiness(),
@@ -120,16 +121,17 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 calls[0][1]["sampling_params"],
                 {
                     "max_tokens": 32,
+                    "min_tokens": 32,
                     "temperature": 0.0,
                     "top_p": 1.0,
                     "prompt_logprobs": 1,
                     "logprobs": 1,
                 },
             )
-            self.assertEqual(len(result["input_ids"]), 12)
+            self.assertEqual(len(result["input_ids"]), 36)
             self.assertEqual(result["inference_logprobs"][:4], [0.0, -1.0, -2.0, -3.0])
-            self.assertEqual(result["loss_mask"], [False] * 4 + [True] * 8)
-            self.assertEqual(result["sequence_lengths"], [12])
+            self.assertEqual(result["loss_mask"], [False] * 4 + [True] * 32)
+            self.assertEqual(result["sequence_lengths"], [36])
             self.assertEqual(
                 set(result["routed_experts"]),
                 {"schema_version", "encoding", "dtype", "shape", "dense_layers", "experts", "sha256", "data"},
@@ -138,12 +140,12 @@ class TrinityParityReferenceTest(unittest.TestCase):
             self.assertEqual(result["routed_experts"]["experts"], 256)
             self.assertEqual(
                 result["routed_experts"]["sha256"],
-                hashlib.sha256(base64.b64decode(route_for(12)["data"])).hexdigest(),
+                hashlib.sha256(base64.b64decode(route_for(36)["data"])).hexdigest(),
             )
             self.assertEqual(result["policy_identity"], self.policy_receipt())
             self.assertEqual(result["cache_salt"], "qualifier-policy-0-fresh-1")
             self.assertEqual(result["request_mode"], "serialized_generate_completion_prompt_logprobs")
-            self.assertEqual(result["generated_token_count"], 8)
+            self.assertEqual(result["generated_token_count"], 32)
             self.assertEqual(result["policy_identity_before"], self.policy_receipt())
             self.assertEqual(result["policy_identity_after"], self.policy_receipt())
             self.assertEqual(result["sampling_params"]["prompt_logprobs"], 1)
@@ -193,10 +195,42 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 expected_policy_identity=self.policy_receipt(),
                 cache_salt="fresh",
                 readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                trainer_seq_len=36,
                 minimum_tokens=1,
                 post_json=lambda *_: self.policy_response(),
                 get_json=lambda *_: self.readiness(receipt),
             )
+
+    def test_policy0_profile_matches_trainer_seq_len_and_fake_loader_contract(self):
+        with (ROOT / "configs/trinity-h200-parity-production/trainer.toml").open("rb") as stream:
+            trainer_seq_len = tomllib.load(stream)["model"]["seq_len"]
+        self.assertEqual(trainer_seq_len, 8192)
+        record = self.record(token_count=8160)
+        record.pop("expected_route_shape")
+        with tempfile.TemporaryDirectory() as directory:
+            result = reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=record,
+                output_path=Path(directory) / "reference.json",
+                base_model="base",
+                policy="policy-0",
+                policy_model="policy-0-slot0",
+                expected_policy_identity=self.policy_receipt(),
+                cache_salt="fresh-profile",
+                readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                post_json=lambda *_: self.policy_response(prompt_count=8160),
+                trainer_seq_len=trainer_seq_len,
+                get_json=lambda *_: self.readiness(),
+            )
+        self.assertEqual(len(result["input_ids"]), trainer_seq_len)
+        self.assertEqual(result["sequence_lengths"], [trainer_seq_len])
+        self.assertEqual(sum(result["loss_mask"]), 32)
+        self.assertEqual(result["routed_experts"]["shape"][0], trainer_seq_len)
+        self.assertEqual(len(result["inference_logprobs"]), trainer_seq_len)
+        self.assertTrue(
+            set(("input_ids", "inference_logprobs", "loss_mask", "sequence_lengths", "routed_experts"))
+            <= result.keys()
+        )
 
     def test_policy_zero_requires_active_receipt_to_stay_stable(self):
         changed = self.policy_receipt()
@@ -216,6 +250,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 expected_policy_identity=self.policy_receipt(),
                 cache_salt="fresh",
                 readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                trainer_seq_len=36,
                 minimum_tokens=1,
                 post_json=lambda *_: self.policy_response(),
                 get_json=lambda *_: next(states),
@@ -257,6 +292,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 expected_policy_identity=self.policy_receipt(),
                 cache_salt="fresh",
                 readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                trainer_seq_len=36,
                 minimum_tokens=1,
                 post_json=lambda *_: self.policy_response(),
                 get_json=lambda *_: next(states),
@@ -280,6 +316,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 expected_policy_identity=self.policy_receipt(),
                 cache_salt="fresh",
                 readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                trainer_seq_len=36,
                 minimum_tokens=1,
                 post_json=wrong_key,
                 get_json=lambda *_: self.readiness(),
