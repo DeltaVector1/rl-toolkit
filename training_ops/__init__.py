@@ -7571,7 +7571,6 @@ if [ -e "$raw_partial" ] || [ -L "$raw_partial" ]; then
   echo "reference seed raw partial already exists" >&2
   exit 92
 fi
-raw_owned=1
 python3 - "$compressed" "$raw_partial" <<'PY'
 import gzip
 import os
@@ -7580,6 +7579,7 @@ import sys
 
 source_fd = os.open(sys.argv[1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
 destination_fd = None
+created_identity = None
 try:
     if not stat.S_ISREG(os.fstat(source_fd).st_mode):
         raise SystemExit("compressed seed is not a regular file")
@@ -7588,6 +7588,7 @@ try:
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
+    created_identity = os.fstat(destination_fd)
     with os.fdopen(source_fd, "rb") as source:
         source_fd = None
         with gzip.GzipFile(fileobj=source, mode="rb") as stream:
@@ -7600,12 +7601,28 @@ try:
                     destination.write(block)
                 destination.flush()
                 os.fsync(destination.fileno())
+except BaseException:
+    if destination_fd is not None:
+        os.close(destination_fd)
+        destination_fd = None
+    if created_identity is not None:
+        try:
+            current = os.stat(sys.argv[2], follow_symlinks=False)
+            if (
+                current.st_dev == created_identity.st_dev
+                and current.st_ino == created_identity.st_ino
+            ):
+                os.unlink(sys.argv[2])
+        except OSError:
+            pass
+    raise
 finally:
     if source_fd is not None:
         os.close(source_fd)
     if destination_fd is not None:
         os.close(destination_fd)
 PY
+raw_owned=1
 raw_identity=$(read_regular_identity "$raw_partial") || {{
   echo "reference seed raw partial is not readable" >&2
   exit 93
@@ -8063,20 +8080,34 @@ test -d \"$directory\" && test ! -L \"$directory\"
         results = _fan(selected_nodes, install_one)
         failures = {host: result for host, result in results.items() if not result.get("ok")}
         if not failures:
-            cleanup_code, cleanup_output = _ssh(
-                trainer_head,
-                _policy0_reference_stage_cleanup_script(
-                    compressed_path, seed_partial_path, {}
-                ),
-                timeout=120,
+            cleanup_script = _policy0_reference_stage_cleanup_script(
+                compressed_path, seed_partial_path, {}
             )
-            cleanup_status = (
-                cleanup_output.strip() or f"exit {cleanup_code}"
-                if cleanup_code
-                else "cleaned"
-            )
+            try:
+                cleanup_code, cleanup_output = _ssh(
+                    trainer_head, cleanup_script, timeout=120
+                )
+            except Exception as error:
+                cleanup_code, cleanup_output = 1, f"seed cleanup exception: {error}"
+            if cleanup_code:
+                cleanup_detail = cleanup_output.strip() or f"exit {cleanup_code}"
+                cleanup_message = (
+                    f"seed cleanup failed: {cleanup_detail}; "
+                    f"compressed_path={compressed_path}; raw_seed_path={seed_partial_path}"
+                )
+                for result in results.values():
+                    result.update({
+                        "ok": False,
+                        "phase": "cleanup",
+                        "message": cleanup_message,
+                        "seed_cleanup": cleanup_detail,
+                        "cleanup_diagnostic": cleanup_detail,
+                        "cleanup_exit_code": cleanup_code,
+                        "cleanup_paths": [compressed_path, seed_partial_path],
+                    })
+                raise _Policy0ReferenceTransferError(results)
             for result in results.values():
-                result["seed_cleanup"] = cleanup_status
+                result["seed_cleanup"] = "cleaned"
         if failures:
             raise _Policy0ReferenceTransferError(results)
         return results

@@ -658,6 +658,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 )
         self.assertEqual(set(result), set(nodes))
         self.assertTrue(all(record["ok"] for record in result.values()))
+        self.assertTrue(all(record["seed_cleanup"] == "cleaned" for record in result.values()))
         self.assertEqual(len(process_commands), 2)
         self.assertEqual(gzip.decompress(compressed_uploads[0]), source_bytes)
         self.assertGreaterEqual(ssh.call_count, 1 + 2 * len(nodes))
@@ -680,6 +681,64 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         with path.open("wb") as stream:
             with gzip.GzipFile(fileobj=stream, mode="wb", filename="", mtime=0) as compressed:
                 compressed.write(payload)
+
+    def test_seed_prepare_preserves_foreign_file_on_o_excl_race(self):
+        payload = b"verified-reference"
+        raw_sha, raw_size = _identity_bytes(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compressed = root / "seed.json.gz"
+            self._write_compressed_seed(compressed, payload)
+            compressed_sha, compressed_size = _identity_bytes(compressed.read_bytes())
+            raw = root / "reference.partial"
+            wrapper_dir = root / "bin"
+            wrapper_dir.mkdir()
+            wrapper = wrapper_dir / "python3"
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$#\" -ge 3 ] && [ \"$3\" = {str(raw)!r} ]; then\n"
+                f"  printf foreign > {str(raw)!r}\n"
+                "fi\n"
+                "exec /usr/bin/python3 \"$@\"\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = str(wrapper_dir) + os.pathsep + environment["PATH"]
+            result = subprocess.run(
+                ["bash", "-c", _policy0_reference_seed_prepare_script(
+                    str(compressed), str(raw), compressed_sha, compressed_size, raw_sha, raw_size
+                )],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(raw.read_bytes(), b"foreign")
+            self.assertFalse(compressed.exists())
+
+    def test_seed_prepare_cleans_own_incomplete_decompression(self):
+        payload = b"verified-reference"
+        raw_sha, raw_size = _identity_bytes(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            compressed = root / "seed.json.gz"
+            self._write_compressed_seed(compressed, payload)
+            damaged = bytearray(compressed.read_bytes())
+            damaged[-1] ^= 1
+            compressed.write_bytes(damaged)
+            compressed_sha, compressed_size = _identity_bytes(bytes(damaged))
+            raw = root / "reference.partial"
+            result = subprocess.run(
+                ["bash", "-c", _policy0_reference_seed_prepare_script(
+                    str(compressed), str(raw), compressed_sha, compressed_size, raw_sha, raw_size
+                )],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(raw.exists())
+            self.assertFalse(compressed.exists())
 
     def test_seed_prepare_rejects_corrupt_uploaded_bytes(self):
         payload = b"verified-reference"
@@ -945,6 +1004,60 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                     )
             self.assertEqual(ssh.call_count, 2)
             self.assertIn("partial.policy0", ssh.call_args_list[-1].args[1])
+
+    def test_controller_seed_cleanup_failure_preserves_install_evidence(self):
+        source_bytes = b"verified-reference"
+        source_sha, source_size = _identity_bytes(source_bytes)
+        install_report = (
+            f"REFERENCE_INSTALL status=installed old_sha={OLD_SHA256} "
+            f"old_size={OLD_SIZE} preserved=/tmp/reference.preserved.{OLD_SHA256} "
+            f"new_sha={source_sha} new_size={source_size}"
+        )
+
+        for cleanup_result in ((9, "cleanup denied"), OSError("cleanup socket closed")):
+            with self.subTest(cleanup_result=cleanup_result):
+                process_calls = []
+
+                def process(command, *, stdin, timeout):
+                    process_calls.append(command)
+                    if len(process_calls) == 1:
+                        Path(command[-1]).write_bytes(source_bytes)
+                    else:
+                        remote_path = Path(command[-1].split(":", 1)[1])
+                        remote_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(command[-2], remote_path)
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+                with tempfile.TemporaryDirectory() as directory:
+                    source = Path(directory) / "source.json"
+                    source.write_bytes(source_bytes)
+                    ssh_results = [
+                        (0, "guard"),
+                        (0, "seed"),
+                        (0, "parent"),
+                        (0, install_report),
+                        cleanup_result,
+                    ]
+                    with patch("training_ops._run_process", side_effect=process), patch(
+                        "training_ops._ssh", side_effect=ssh_results
+                    ):
+                        with self.assertRaises(RuntimeError) as raised:
+                            _policy0_controller_transfer_reference(
+                                "h200b", str(source), str(Path(directory) / "reference.json"),
+                                ["n82"], {"sha256": source_sha, "size": source_size},
+                                OLD_SHA256, OLD_SIZE,
+                            )
+                record = raised.exception.results["n82"]
+                self.assertFalse(record["ok"])
+                self.assertEqual(record["phase"], "cleanup")
+                self.assertEqual(record["status"], "installed")
+                self.assertEqual(record["new_sha"], source_sha)
+                self.assertIn("seed cleanup", record["message"])
+                self.assertIn(record["seed_compressed_path"], record["message"])
+                self.assertIn(record["seed_partial_path"], record["message"])
+                self.assertEqual(record["cleanup_paths"], [
+                    record["seed_compressed_path"], record["seed_partial_path"]
+                ])
 
     def test_controller_install_failure_keeps_rollback_foreign_path_and_full_results(self):
         old = b"old-reference"
