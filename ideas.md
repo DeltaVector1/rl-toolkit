@@ -599,3 +599,14 @@ only after measured learning.
   reference under its exact loaded model name, and rerun the unchanged strict
   gate. The base pass does not qualify the adapter path. Do not change
   thresholds or optimizer settings and do not transfer model weights.
+
+## Clean Trinity experimental run config
+
+- Basis: the diverse base qualification passed its strict gate, but the
+  policy adapter was not independently preloaded and tested. The next
+  qualification must start with a fresh adapter under the supported H200
+  policy path.
+- Plan: add a new clean production-shaped run identity with the same native
+  FP8, topology, reward, rollout, and strict parity settings. The guard must
+  fail closed before optimizer or weight broadcast when parity mismatches.
+  Preserve the completed parity run and do not change production settings.
