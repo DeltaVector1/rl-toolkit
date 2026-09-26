@@ -405,3 +405,15 @@ only after measured learning.
   unmasked mismatch KL 0.00738006, and masked KL 0. Strict gates pass. The
   flawed one-token 0.609 result is superseded; this remains a 2048-token
   numerical parity result, not proof of production capacity.
+
+## Stale engine watchdog replacement
+
+- Observed failure: one stale canonical `engine_watchdog.sh` on port 8000 had
+  an old run/profile environment. The narrow repair refused it with exit 74;
+  the engine was not restarted.
+- Repair plan: replace exactly one stale process only when its command is the
+  exact deployed watchdog path, its environment has the configured port, its
+  PID is its own process group, and termination is verified. Keep refusal for
+  multiple or ambiguous candidates, wrong commands, unreadable environments,
+  or a PGID mismatch. Start the canonical exact environment after cleanup and
+  test without restarting the engine.

@@ -3,7 +3,9 @@ import hashlib
 import io
 import importlib.util
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1130,6 +1132,126 @@ class AdapterUpdateTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             return result, sorted(path.name for path in proc_root.iterdir())
+
+    def run_watchdog_repair_script(self, entries):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            watchdog = root / "engine_watchdog.sh"
+            watchdog.write_text(
+                "#!/usr/bin/env bash\n"
+                "trap 'exit 0' TERM INT\n"
+                "while :; do sleep 1; done\n",
+                encoding="utf-8",
+            )
+            watchdog.chmod(0o755)
+            spec = {
+                "environment": {
+                    "ENGINE_HOST": "h200a",
+                    "STARTUP_GRACE": "600",
+                    "MODEL": "/models/glm52-fp8",
+                    "START": "/data/deployment/training_ops/runtime/h200/start_inference.sh",
+                    "ENGINE_CONTAINER": "glm52-decensor-h200",
+                    "ENGINE_KIND": "glm52",
+                    "inference_config": "/data/deployment/configs/current/inference.toml",
+                    "PORT": "8000",
+                    "WATCHDOG_IDENTITY": "engine-watchdog:h200a:new-run:8000",
+                },
+                "log": str(root / "watchdog.log"),
+            }
+            script = training_ops._engine_watchdog_repair_script(str(watchdog), [spec])
+            processes = []
+            try:
+                for environment, own_group in entries:
+                    process = subprocess.Popen(
+                        ["bash", str(watchdog)],
+                        env={
+                            **os.environ,
+                            **dict(item.split("=", 1) for item in environment),
+                        },
+                        start_new_session=own_group,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    processes.append((process, own_group))
+                result = subprocess.run(
+                    ["bash", "-c", script],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=15,
+                )
+                return result
+            finally:
+                for process, own_group in processes:
+                    if process.poll() is None:
+                        if own_group:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        else:
+                            process.kill()
+                        process.wait(timeout=3)
+                command_prefix = f"bash {watchdog}"
+                for proc_dir in Path("/proc").glob("[0-9]*"):
+                    try:
+                        pid = int(proc_dir.name)
+                        command_line = (proc_dir / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+                    except (OSError, ValueError, UnicodeDecodeError):
+                        continue
+                    if command_line.startswith(command_prefix) and pid != os.getpid():
+                        try:
+                            os.killpg(pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+
+    def watchdog_environment(self, *, identity="engine-watchdog:h200a:old-run:8000"):
+        return [
+            "ENGINE_HOST=h200a",
+            "STARTUP_GRACE=600",
+            "MODEL=/models/glm52-fp8",
+            "START=/data/deployment/training_ops/runtime/h200/start_inference.sh",
+            "ENGINE_CONTAINER=glm52-decensor-h200",
+            "ENGINE_KIND=glm52",
+            "inference_config=/data/deployment/configs/old/inference.toml",
+            "PORT=8000",
+            f"WATCHDOG_IDENTITY={identity}",
+        ]
+
+    def test_repair_replaces_one_stale_exact_port_watchdog(self):
+        result = self.run_watchdog_repair_script(
+            [(self.watchdog_environment(), True)]
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "reloaded exact engine watchdog(s) without restarting an engine",
+            result.stdout,
+        )
+
+    def test_repair_rejects_ambiguous_stale_watchdogs(self):
+        result = self.run_watchdog_repair_script(
+            [
+                (self.watchdog_environment(identity="engine-watchdog:h200a:old-1:8000"), True),
+                (self.watchdog_environment(identity="engine-watchdog:h200a:old-2:8000"), True),
+            ]
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ambiguous", result.stderr)
+
+    def test_repair_rejects_watchdog_with_shared_process_group(self):
+        result = self.run_watchdog_repair_script(
+            [(self.watchdog_environment(), False)]
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not its own process group", result.stderr)
+
+    def test_repair_rejects_watchdog_with_mismatched_static_settings(self):
+        environment = self.watchdog_environment()
+        environment[2] = "MODEL=/models/other-fp8"
+        result = self.run_watchdog_repair_script([(environment, True)])
+
+        self.assertEqual(result.returncode, 74)
+        self.assertIn("settings mismatch", result.stderr)
 
     def test_watchdog_migration_cleans_one_known_parent_version_process(self):
         environment = [

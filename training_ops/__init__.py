@@ -5674,44 +5674,48 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
         "  case \"$command_line\" in \"bash $watchdog_script\"|\"/bin/bash $watchdog_script\"|\"/usr/bin/bash $watchdog_script\") return 0;; esac",
         "  return 1",
         "}",
-        "watchdog_legacy_matches() {",
+        "watchdog_script_command_present() {",
+        "  local pid=$1 command_line",
+        "  case \"$pid\" in ''|*[!0-9]*) return 1;; esac",
+        "  [ -r \"/proc/$pid/cmdline\" ] || return 1",
+        "  command_line=$(cat \"/proc/$pid/cmdline\" 2>/dev/null | tr '\\0' ' ' || true)",
+        "  command_line=${command_line% }",
+        "  case \"$command_line\" in *engine_watchdog.sh*) return 0;; esac",
+        "  return 1",
+        "}",
+        "watchdog_replacement_matches() {",
         "  local pid=$1 environment",
         "  watchdog_command_matches \"$pid\" || return 1",
-        "  environment=$(cat \"/proc/$pid/environ\" 2>/dev/null | tr '\\0' '\\n' || true)",
-        "  printf '%s\\n' \"$environment\" | grep -Eq '^WATCHDOG_IDENTITY=' && return 1",
-        ]
+        "  [ -r \"/proc/$pid/environ\" ] || return 2",
+        "  environment=$(cat \"/proc/$pid/environ\" 2>/dev/null | tr '\\0' '\\n') || return 2",
+    ]
     )
     for index, spec in enumerate(specs):
-        port = str(spec["environment"]["PORT"])
         lines.append(f"  if [ \"${{watchdog_identity:-}}\" = {index!r} ]; then")
-        lines.append(
-            f"    if printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote('PORT=' + port)}; then"
-        )
         for key, value in spec["environment"].items():
-            if key not in {"WATCHDOG_IDENTITY", "inference_config"}:
-                lines.append(
-                    f"      printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'{key}={value}')} || return 1"
-                )
-        lines.append("      return 0")
-        lines.append("    fi")
-        lines.append(
-            "    if ! printf '%s\\n' \"$environment\" | grep -Eq '^(PORT|MODEL|START|ENGINE_CONTAINER|WATCHDOG_IDENTITY)'; then return 0; fi"
-        )
+            if key in {"WATCHDOG_IDENTITY", "inference_config"}:
+                continue
+            lines.append(
+                f"    printf '%s\\n' \"$environment\" | grep -Fxq {shlex.quote(f'{key}={value}')} || return 1"
+            )
         lines.append("  fi")
     lines.extend(
         [
-            "  return 1",
+            "  return 0",
+            "}",
+            "watchdog_legacy_matches() {",
+            "  watchdog_replacement_matches \"$1\"",
             "}",
         "stop_watchdog() {",
             "  local pid=$1 pgid",
-            "  (watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\") || return 0",
+            "  (watchdog_matches \"$pid\" || watchdog_replacement_matches \"$pid\") || return 0",
             "  pgid=$(awk '{print $5}' \"/proc/$pid/stat\" 2>/dev/null || true)",
             "  [ \"$pgid\" = \"$pid\" ] || { echo \"watchdog identity is not its own process group: pid=$pid pgid=$pgid\" >&2; return 1; }",
             "  kill -TERM -- \"-$pid\" 2>/dev/null || true",
-            "  for _ in $(seq 1 50); do (watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\") || break; sleep 0.1; done",
-            "  if (watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\"); then kill -KILL -- \"-$pid\" 2>/dev/null || true; fi",
-            "  for _ in $(seq 1 20); do (watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\") || break; sleep 0.1; done",
-            "  if watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\"; then echo \"watchdog did not exit: pid=$pid\" >&2; return 1; fi",
+            "  for _ in $(seq 1 50); do (watchdog_matches \"$pid\" || watchdog_replacement_matches \"$pid\") || break; sleep 0.1; done",
+            "  if (watchdog_matches \"$pid\" || watchdog_replacement_matches \"$pid\"); then kill -KILL -- \"-$pid\" 2>/dev/null || true; fi",
+            "  for _ in $(seq 1 20); do (watchdog_matches \"$pid\" || watchdog_replacement_matches \"$pid\") || break; sleep 0.1; done",
+            "  if watchdog_matches \"$pid\" || watchdog_replacement_matches \"$pid\"; then echo \"watchdog did not exit: pid=$pid\" >&2; return 1; fi",
             "  return 0",
             "}",
         ]
@@ -5729,7 +5733,12 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
                 "candidates=()",
                 "for proc_dir in /proc/[0-9]*; do",
                 "  pid=${proc_dir##*/}",
+                "  if watchdog_script_command_present \"$pid\" && ! watchdog_command_matches \"$pid\"; then",
+                "    [ -r \"/proc/$pid/environ\" ] || { echo 'watchdog environment is unreadable' >&2; exit 74; }",
+                f"    if tr '\\0' '\\n' <\"/proc/$pid/environ\" 2>/dev/null | grep -Fxq {shlex.quote('PORT=' + port)}; then echo 'watchdog command mismatch' >&2; exit 74; fi",
+                "  fi",
                 "  if watchdog_command_matches \"$pid\"; then",
+                "    [ -r \"/proc/$pid/environ\" ] || { echo 'watchdog environment is unreadable' >&2; exit 74; }",
                 f"    if tr '\\0' '\\n' <\"/proc/$pid/environ\" 2>/dev/null | grep -Fxq {shlex.quote(f'PORT={spec["environment"]["PORT"]}')}; then",
                 f"      (watchdog_matches \"$pid\" || watchdog_legacy_matches \"$pid\") || {{ echo {shlex.quote(f'watchdog settings mismatch for port {spec["environment"]["PORT"]}')} >&2; exit 74; }}",
                 "      candidates+=(\"$pid\")",
@@ -5739,6 +5748,7 @@ def _engine_watchdog_repair_script(watchdog_script: str, specs: list[dict]) -> s
                 "  fi",
                 "done",
                 f"if [ \"${{#candidates[@]}}\" = 1 ] && [ \"${{#matches[@]}}\" = 0 ]; then echo {shlex.quote(f'watchdog settings mismatch for port {spec["environment"]["PORT"]}')} >&2; exit 74; fi",
+                "[ \"${#candidates[@]}\" -le 1 ] || { echo 'watchdog identity is ambiguous' >&2; exit 74; }",
                 "for pid in \"${matches[@]}\"; do stop_watchdog \"$pid\"; done",
             ]
         )
