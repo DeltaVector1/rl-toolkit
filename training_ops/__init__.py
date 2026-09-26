@@ -7198,6 +7198,10 @@ rollback_exchange() {{
   if verify_final_regular && \
      verify_path_identity "$final" "$expected_old_sha" "$expected_old_size" && \
      verify_path_identity "$partial" "$new_sha" "$new_size"; then
+    if ! fsync_file_and_directory "$final" "$directory"; then
+      rollback_safe=0
+      return 1
+    fi
     return 0
   fi
   rollback_safe=0

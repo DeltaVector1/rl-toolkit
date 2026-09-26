@@ -467,6 +467,88 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
     def test_reference_script_rolls_back_late_directory_at_exchange_boundary(self):
         self._assert_exchange_boundary_injection("directory")
 
+    def test_reference_script_fsyncs_before_reporting_verified_rollback(self):
+        result, state, events = self._run_transient_exchange_mismatch(fail_fsync=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rollback verified", result.stderr)
+        self.assertEqual(events[-2:], ["fsync-file", "fsync-directory"])
+        self.assertEqual(state["final"], b"old-reference")
+        self.assertIsNone(state["partial"])
+
+    def test_reference_script_fsync_failure_retains_rollback_evidence(self):
+        result, state, events = self._run_transient_exchange_mismatch(fail_fsync=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rollback could not be verified", result.stderr)
+        self.assertEqual(events[-2:], ["fsync-file", "fsync-directory-failed"])
+        self.assertEqual(state["final"], b"old-reference")
+        self.assertEqual(state["partial"], b"new-reference")
+
+    def _run_transient_exchange_mismatch(self, *, fail_fsync):
+        old = b"old-reference"
+        new = b"new-reference"
+        old_sha, old_size = _identity_bytes(old)
+        new_sha, new_size = _identity_bytes(new)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "reference.json"
+            target.write_bytes(old)
+            partial = root / "reference.partial"
+            partial.write_bytes(new)
+            exchange_marker = root / "exchange.marker"
+            mismatch_marker = root / "mismatch.marker"
+            events_path = root / "events"
+            wrapper_dir = root / "bin"
+            wrapper_dir.mkdir()
+            wrapper = wrapper_dir / "python3"
+            if fail_fsync:
+                fsync_failure = "\n".join([
+                    f"  printf '%s\\n' fsync-directory-failed >> {str(events_path)!r}",
+                    "  exit 97",
+                ])
+            else:
+                fsync_failure = f"  printf '%s\\n' fsync-directory >> {str(events_path)!r}"
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                f"if [ \"$2\" = {str(partial)!r} ] && [ \"$3\" = {str(target)!r} ] && [ ! -e {str(exchange_marker)!r} ]; then\n"
+                f"  touch -- {str(exchange_marker)!r}\n"
+                "  exec /usr/bin/python3 \"$@\"\n"
+                "fi\n"
+                f"if [ \"$2\" = {str(target)!r} ] && [ -e {str(exchange_marker)!r} ] && [ ! -e {str(mismatch_marker)!r} ]; then\n"
+                f"  touch -- {str(mismatch_marker)!r}\n"
+                "  /usr/bin/python3 \"$@\" >/dev/null\n"
+                "  printf '%s %s\\n' " + "0" * 64 + " 0\n"
+                "  exit 0\n"
+                "fi\n"
+                f"if [ \"$2\" = {str(target)!r} ] && [ -e {str(mismatch_marker)!r} ]; then\n"
+                f"  printf '%s\\n' target-read >> {str(events_path)!r}\n"
+                "fi\n"
+                f"if [ \"$2\" = {str(target)!r} ] && [ -e {str(mismatch_marker)!r} ]; then\n"
+                f"  printf '%s\\n' fsync-file >> {str(events_path)!r}\n"
+                "fi\n"
+                f"if [ \"$2\" = {str(target.parent)!r} ] && [ -e {str(mismatch_marker)!r} ]; then\n"
+                + fsync_failure + "\n"
+                "fi\n"
+                "exec /usr/bin/python3 \"$@\"\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            environment = dict(os.environ)
+            environment["PATH"] = str(wrapper_dir) + os.pathsep + environment["PATH"]
+            result = subprocess.run(
+                ["bash", "-c", _policy0_transfer_reference_script(
+                    str(partial), str(target), new_sha, new_size, old_sha, old_size
+                )],
+                text=True,
+                capture_output=True,
+                env=environment,
+            )
+            state = {
+                "final": target.read_bytes() if target.exists() else None,
+                "partial": partial.read_bytes() if partial.exists() else None,
+            }
+            events = events_path.read_text(encoding="utf-8").splitlines()
+            return result, state, events
+
     def _assert_exchange_boundary_injection(self, kind):
         old = b"old-reference"
         new = b"new-reference"
