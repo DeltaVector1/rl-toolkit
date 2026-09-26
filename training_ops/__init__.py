@@ -8630,8 +8630,8 @@ for port in {ports_text}; do
   [ -n "$api_exe_identity" ] && [ "$api_exe_identity" = "$container_exe_identity" ] || {{ echo "listener executable identity differs from container init on $port" >&2; exit 85; }}
   cgroup=$(sudo cat "/proc/$api_pid/cgroup" 2>/dev/null || true)
   [[ "$cgroup" =~ (^|/)${{container_id}}(/|$) ]] || {{ echo "listener cgroup does not bind the exact container" >&2; exit 85; }}
-  nspid=$(sudo awk '$1 == "NSpid:" {{print $2, $3; found=1}} END {{if (!found) exit 1}}' "/proc/$api_pid/status" 2>/dev/null || true)
-  [[ "$nspid" =~ ^${{api_pid}}\\ 1$ ]] || {{ echo "listener NSpid does not bind host PID to container PID 1" >&2; exit 85; }}
+  nspid=$(sudo awk -v expected_pid="$api_pid" '$1 == "NSpid:" {{ if (found || NF != 3 || $2 != expected_pid || $3 != "1") exit 2; found=1 }} END {{ if (!found) exit 3; print "ok" }}' "/proc/$api_pid/status" 2>/dev/null) || {{ echo "listener NSpid does not bind host PID to container PID 1" >&2; exit 85; }}
+  [ "$nspid" = ok ] || {{ echo "listener NSpid does not bind host PID to container PID 1" >&2; exit 85; }}
   api_start_time=$(sudo awk '{{ line=$0; sub(/^.*\\) /, "", line); split(line, fields, /[[:space:]]+/); print fields[20] }}' "/proc/$api_pid/stat" 2>/dev/null || true)
   [[ "$api_start_time" =~ ^[1-9][0-9]*$ ]] || {{ echo "listener start identity is unreadable on $port" >&2; exit 86; }}
   current_identity="$api_pid:$api_start_time"

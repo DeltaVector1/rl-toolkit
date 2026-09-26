@@ -105,10 +105,14 @@ def run_engine_probe(
     cgroup_id=None,
     nspid_host=321,
     nspid_container=1,
+    nspid_status="",
     start_ticks_after="",
 ):
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
+        if not nspid_status:
+            nspid_status = f"Name:\tfixture\nNSpid:\t{nspid_host}\t{nspid_container}\n"
+        (root / "status").write_text(nspid_status)
         (root / "sudo").write_text(
             """#!/bin/sh
 set -eu
@@ -147,7 +151,7 @@ case "$1" in
     ;;
   awk)
     case "$*" in
-      */status) printf '%s %s\\n' "$NSPID_HOST" "$NSPID_CONTAINER" ;;
+      */status) /usr/bin/awk "$2" "$3" "$4" "$NSPID_STATUS_FILE" ;;
       */stat)
         count=0
         if [ -f "$STAT_COUNT" ]; then IFS= read -r count <"$STAT_COUNT"; fi
@@ -189,6 +193,7 @@ esac
         environment["LISTENER_COMM"] = listener_comm
         environment["NSPID_HOST"] = str(nspid_host)
         environment["NSPID_CONTAINER"] = str(nspid_container)
+        environment["NSPID_STATUS_FILE"] = str(root / "status")
         environment["START_TICKS_AFTER"] = start_ticks_after
         environment["DOCKER_COUNT"] = str(root / "docker-count")
         environment["SS_COUNT"] = str(root / "ss-count")
@@ -424,6 +429,22 @@ class Policy0LoadTest(unittest.TestCase):
                 result = run_engine_probe(engine, **kwargs)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(error, result.stderr)
+
+    def test_engine_probe_parses_exactly_one_nspid_row_with_real_awk(self):
+        engine = _policy0_load_engine_state_script("glm52-decensor-h200", [8000])
+        valid = f"/glm52-decensor-h200|{'a' * 64}|2026-09-26T00:00:00Z|true|321"
+        invalid_statuses = (
+            "Name:\tfixture\nNSpid:\t321\t1\t2\n",
+            "Name:\tfixture\nNSpid:\t321\t1\nNSpid:\t321\t1\n",
+            "Name:\tfixture\n",
+            "Name:\tfixture\nNSpid:\t321x\t1\n",
+            "Name:\tfixture\nNSpid:\t321\t01\n",
+        )
+        for status in invalid_statuses:
+            with self.subTest(status=status):
+                result = run_engine_probe(engine, valid, nspid_status=status)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("listener NSpid", result.stderr)
 
     def test_engine_probe_rejects_multiple_or_changed_listeners(self):
         engine = _policy0_load_engine_state_script("glm52-decensor-h200", [8000])
