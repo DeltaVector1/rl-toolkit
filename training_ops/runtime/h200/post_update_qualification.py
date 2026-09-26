@@ -10,6 +10,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import base64
+import binascii
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -22,6 +25,11 @@ from .prepare_trinity_policy0_qualification import (
 POST_UPDATE_STEP = 1
 POST_UPDATE_LOAD_SLOT = "trinity-h200-post-update-qualification-slot1"
 POST_UPDATE_REQUEST_MODE = "serialized_generate_completion_logprobs"
+POST_UPDATE_SEQ_LEN = 8192
+POST_UPDATE_PROMPT_TOKENS = 8160
+POST_UPDATE_COMPLETION_TOKENS = 32
+POST_UPDATE_ROUTE_SHAPE = [8191, 60, 4]
+POST_UPDATE_ADVANTAGE_VALUE = 1.0
 FORWARD_BACKWARD_GATE_SECONDS = 600.0
 
 _EXPECTED_TARGETS = {
@@ -49,6 +57,166 @@ _RECEIPT_FIELDS = (
 
 class PostUpdateQualificationError(ValueError):
     """The post-update smoke qualification evidence is unsafe or incomplete."""
+
+
+def _json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _post_update_binding(
+    reference: Mapping[str, Any],
+    *,
+    advantage_value: float = POST_UPDATE_ADVANTAGE_VALUE,
+) -> dict[str, Any]:
+    receipt = reference.get("policy_identity_before")
+    request_bodies = reference.get("request_bodies")
+    responses = reference.get("responses")
+    route = reference.get("routed_experts")
+    if not isinstance(receipt, Mapping) or not isinstance(request_bodies, Mapping) or not isinstance(responses, Mapping):
+        raise PostUpdateQualificationError("post-update reference request or receipt evidence is missing")
+    if not isinstance(route, Mapping) or route.get("shape") != POST_UPDATE_ROUTE_SHAPE:
+        raise PostUpdateQualificationError("post-update reference route shape is invalid")
+    request = request_bodies.get("decode")
+    response = responses.get("decode")
+    if not isinstance(request, Mapping) or not isinstance(response, Mapping):
+        raise PostUpdateQualificationError("post-update reference decode evidence is missing")
+    server_instance = receipt.get("server_instance")
+    target_sha = receipt.get("target_sha256")
+    config_sha = receipt.get("config_sha256")
+    if not isinstance(server_instance, str) or not server_instance:
+        raise PostUpdateQualificationError("post-update reference server identity is missing")
+    if not _valid_digest(target_sha) or not _valid_digest(config_sha):
+        raise PostUpdateQualificationError("post-update reference adapter identity is invalid")
+    input_ids = reference.get("input_ids")
+    loss_mask = reference.get("loss_mask")
+    if not isinstance(input_ids, list) or not isinstance(loss_mask, list):
+        raise PostUpdateQualificationError("post-update reference input fields are missing")
+    first_generated = loss_mask.index(True) if True in loss_mask else len(loss_mask)
+    return {
+        "seq_len": POST_UPDATE_SEQ_LEN,
+        "prompt_tokens": POST_UPDATE_PROMPT_TOKENS,
+        "completion_tokens": POST_UPDATE_COMPLETION_TOKENS,
+        "mask_false": POST_UPDATE_PROMPT_TOKENS,
+        "mask_true": POST_UPDATE_COMPLETION_TOKENS,
+        "request_mode": POST_UPDATE_REQUEST_MODE,
+        "policy_receipt": dict(receipt),
+        "receipt_sha256": _json_sha256(receipt),
+        "adapter_sha256": target_sha,
+        "config_sha256": config_sha,
+        "server_instance": server_instance,
+        "server_instance_sha256": hashlib.sha256(server_instance.encode()).hexdigest(),
+        "input_sha256": hashlib.sha256(
+            json.dumps(input_ids[:first_generated], separators=(",", ":")).encode()
+        ).hexdigest(),
+        "full_input_sha256": _json_sha256(input_ids),
+        "request_sha256": _json_sha256(request),
+        "response_sha256": _json_sha256(response),
+        "route_shape": list(route["shape"]),
+        "route_sha256": route.get("sha256"),
+        "advantage_value": advantage_value,
+    }
+
+
+def build_post_update_reference(
+    *,
+    endpoint: str,
+    input_record: Path | Mapping[str, Any],
+    output_path: Path,
+    base_model: str,
+    policy_model: str,
+    expected_policy_identity: Path | Mapping[str, Any],
+    policy_receipt: Path | Mapping[str, Any],
+    cache_salt: str,
+    readiness_endpoint: str,
+    timeout: float = 120.0,
+    post_json: Any = None,
+    get_json: Any = None,
+    advantage_value: float = POST_UPDATE_ADVANTAGE_VALUE,
+) -> dict[str, Any]:
+    """Build one strict reference from one fresh serialized completion decode."""
+    if isinstance(advantage_value, bool) or not math.isfinite(float(advantage_value)) or float(advantage_value) == 0.0:
+        raise PostUpdateQualificationError("post-update advantage value must be finite and nonzero")
+    from .build_trinity_parity_reference import build_reference
+
+    kwargs: dict[str, Any] = {}
+    if post_json is not None:
+        kwargs["post_json"] = post_json
+    if get_json is not None:
+        kwargs["get_json"] = get_json
+    try:
+        result = build_reference(
+            endpoint=endpoint,
+            input_record=input_record,
+            output_path=output_path,
+            base_model=base_model,
+            policy="policy-0",
+            policy_model=policy_model,
+            policy_receipt=policy_receipt,
+            expected_policy_identity=expected_policy_identity,
+            cache_salt=cache_salt,
+            prefill_rescore=False,
+            readiness_endpoint=readiness_endpoint,
+            completion_tokens=POST_UPDATE_COMPLETION_TOKENS,
+            minimum_completion_tokens=POST_UPDATE_COMPLETION_TOKENS,
+            trainer_seq_len=POST_UPDATE_SEQ_LEN,
+            minimum_tokens=POST_UPDATE_PROMPT_TOKENS,
+            expected_route_shape=POST_UPDATE_ROUTE_SHAPE,
+            timeout=timeout,
+            **kwargs,
+        )
+    except Exception as error:
+        if error.__class__.__name__ == "ReferenceError":
+            raise PostUpdateQualificationError(str(error)) from error
+        raise
+    if result.get("request_mode") != POST_UPDATE_REQUEST_MODE or "prefill_rescore_comparison" in result:
+        raise PostUpdateQualificationError("post-update reference must use one completion decode")
+    if len(result.get("input_ids", [])) != POST_UPDATE_SEQ_LEN:
+        raise PostUpdateQualificationError("post-update reference length is not 8192")
+    result["advantages"] = [0.0] * POST_UPDATE_PROMPT_TOKENS + [float(advantage_value)] * POST_UPDATE_COMPLETION_TOKENS
+    result["qualification_binding"] = _post_update_binding(
+        result, advantage_value=float(advantage_value)
+    )
+    output_path.write_text(json.dumps(result, separators=(",", ":")) + "\n")
+    return result
+
+
+def build_post_update_references(
+    *,
+    input_records: list[Path | Mapping[str, Any]],
+    output_path: Path,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Build exactly eight distinct decode references for PP8 fake data."""
+    if len(input_records) != 8:
+        raise PostUpdateQualificationError("post-update qualification requires eight distinct references")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    post_json = kwargs.pop("post_json", None)
+    get_json = kwargs.pop("get_json", None)
+    cache_salt = kwargs.pop("cache_salt", None)
+    if not isinstance(cache_salt, str) or not cache_salt:
+        raise PostUpdateQualificationError("post-update qualification requires a fresh cache salt")
+    built: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(dir=output_path.parent) as directory:
+        for index, record in enumerate(input_records):
+            per_reference = dict(kwargs)
+            per_reference["cache_salt"] = f"{cache_salt}-{index}"
+            current = build_post_update_reference(
+                input_record=record,
+                output_path=Path(directory) / f"reference-{index}.json",
+                post_json=post_json,
+                get_json=get_json,
+                **per_reference,
+            )
+            built.append(current)
+    input_hashes = [item["qualification_binding"]["input_sha256"] for item in built]
+    response_hashes = [item["qualification_binding"]["response_sha256"] for item in built]
+    if len(set(input_hashes)) != 8 or len(set(response_hashes)) != 8:
+        raise PostUpdateQualificationError("post-update references must have unique input and response hashes")
+    result = {"schema_version": 1, "microbatches": built}
+    output_path.write_text(json.dumps(result, separators=(",", ":")) + "\n")
+    return result
 
 
 def post_update_adapter_path(output_dir: str | Path) -> Path:
@@ -80,7 +248,50 @@ def validate_forward_backward_seconds(value: Any) -> float:
     return value
 
 
-def validate_post_update_reference(value: Mapping[str, Any]) -> dict[str, Any]:
+def _validate_post_update_route(value: Mapping[str, Any]) -> None:
+    fields = {
+        "schema_version",
+        "encoding",
+        "dtype",
+        "shape",
+        "dense_layers",
+        "experts",
+        "sha256",
+        "data",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        raise PostUpdateQualificationError("post-update reference route schema is invalid")
+    shape = value.get("shape")
+    if shape != POST_UPDATE_ROUTE_SHAPE or value.get("schema_version") != 1 or value.get("encoding") != "base64" or value.get("dtype") != "uint8" or value.get("dense_layers") != 6 or value.get("experts") != 256:
+        raise PostUpdateQualificationError("post-update reference route metadata is invalid")
+    encoded = value.get("data")
+    digest = value.get("sha256")
+    if not isinstance(encoded, str) or not _valid_digest(digest):
+        raise PostUpdateQualificationError("post-update reference route checksum metadata is invalid")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise PostUpdateQualificationError("post-update reference route data is invalid") from error
+    if len(raw) != shape[0] * shape[1] * shape[2] or hashlib.sha256(raw).hexdigest() != digest:
+        raise PostUpdateQualificationError("post-update reference route checksum differs")
+    row_width = shape[1] * shape[2]
+    for offset in range(0, len(raw), row_width):
+        row = raw[offset : offset + row_width]
+        if any(row[: 6 * shape[2]]):
+            raise PostUpdateQualificationError("post-update reference dense route IDs are invalid")
+        for layer in range(6, shape[1]):
+            selected = row[layer * shape[2] : (layer + 1) * shape[2]]
+            if len(set(selected)) != len(selected) or any(item >= 256 for item in selected):
+                raise PostUpdateQualificationError("post-update reference sparse route IDs are invalid")
+
+
+def validate_post_update_reference(
+    value: Mapping[str, Any],
+    *,
+    expected_seq_len: int | None = None,
+    expected_policy_identity: Mapping[str, Any] | None = None,
+    expected_response: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Validate one non-rescore reference with real, aligned advantages."""
     if not isinstance(value, Mapping):
         raise PostUpdateQualificationError("post-update reference must be an object")
@@ -129,7 +340,66 @@ def validate_post_update_reference(value: Mapping[str, Any]) -> dict[str, Any]:
         raise PostUpdateQualificationError(
             "post-update reference advantages are all zero"
         )
+    if expected_seq_len is None:
+        return dict(validated)
+    if expected_seq_len != POST_UPDATE_SEQ_LEN:
+        raise PostUpdateQualificationError("post-update config seq_len must be 8192")
+    if len(input_ids) != POST_UPDATE_SEQ_LEN or validated.get("sequence_lengths") != [POST_UPDATE_SEQ_LEN]:
+        raise PostUpdateQualificationError("post-update reference length does not match config seq_len=8192")
+    if loss_mask != [False] * POST_UPDATE_PROMPT_TOKENS + [True] * POST_UPDATE_COMPLETION_TOKENS:
+        raise PostUpdateQualificationError("post-update reference loss mask must be 8160 false and 32 true")
+    if validated.get("routed_experts", {}).get("shape") != POST_UPDATE_ROUTE_SHAPE:
+        raise PostUpdateQualificationError("post-update reference route shape must be [8191,60,4]")
+    _validate_post_update_route(validated["routed_experts"])
+    before = validated.get("policy_identity_before")
+    after = validated.get("policy_identity_after")
+    policy = validated.get("policy_identity")
+    if not isinstance(before, Mapping) or not isinstance(after, Mapping) or before != after or policy != before:
+        raise PostUpdateQualificationError("post-update policy receipt is stale or mismatched")
+    if expected_policy_identity is not None and dict(before) != dict(expected_policy_identity):
+        raise PostUpdateQualificationError("post-update policy receipt differs from expected receipt")
+    advantages = validated.get("advantages")
+    if not isinstance(advantages, list) or len(advantages) != POST_UPDATE_SEQ_LEN:
+        raise PostUpdateQualificationError("post-update reference advantages do not align with seq_len")
+    for index, advantage in enumerate(advantages):
+        if isinstance(advantage, bool) or not isinstance(advantage, (int, float)) or not math.isfinite(float(advantage)):
+            raise PostUpdateQualificationError(f"post-update reference advantage {index} is not finite")
+        expected = 0.0 if not loss_mask[index] else POST_UPDATE_ADVANTAGE_VALUE
+        if float(advantage) != expected:
+            raise PostUpdateQualificationError("post-update reference advantages are not deterministically aligned")
+    expected_binding = _post_update_binding(validated)
+    binding = validated.get("qualification_binding")
+    if binding != expected_binding:
+        raise PostUpdateQualificationError("post-update reference receipt or hash binding differs")
+    if expected_response is not None and _json_sha256(expected_response) != binding["response_sha256"]:
+        raise PostUpdateQualificationError("post-update reference response hash differs")
     return dict(validated)
+
+
+def validate_post_update_references(
+    value: Mapping[str, Any],
+    *,
+    expected_seq_len: int = POST_UPDATE_SEQ_LEN,
+    expected_policy_identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or value.get("schema_version") != 1:
+        raise PostUpdateQualificationError("post-update reference collection schema is invalid")
+    microbatches = value.get("microbatches")
+    if not isinstance(microbatches, list) or len(microbatches) != 8:
+        raise PostUpdateQualificationError("post-update qualification requires eight microbatches")
+    validated = [
+        validate_post_update_reference(
+            item,
+            expected_seq_len=expected_seq_len,
+            expected_policy_identity=expected_policy_identity,
+        )
+        for item in microbatches
+    ]
+    input_hashes = [item["qualification_binding"]["input_sha256"] for item in validated]
+    response_hashes = [item["qualification_binding"]["response_sha256"] for item in validated]
+    if len(set(input_hashes)) != 8 or len(set(response_hashes)) != 8:
+        raise PostUpdateQualificationError("post-update microbatch input or response hashes are reused")
+    return {"schema_version": 1, "microbatches": validated}
 
 
 def _regular(path: Path, label: str) -> None:

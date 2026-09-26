@@ -40,6 +40,10 @@ from training_ops.runtime.policy0_source import (
     build_plan as build_policy0_source_plan,
     parse_result as parse_policy0_source_result,
 )
+from training_ops.runtime.h200.post_update_qualification import (
+    PostUpdateQualificationError,
+    validate_post_update_references,
+)
 
 repo_root = Path(__file__).resolve().parents[1]
 nodes_path = repo_root / "configs" / "nodes.toml"
@@ -6030,6 +6034,33 @@ def _qualification_launch_env(profile: dict) -> dict[str, str]:
     return validated
 
 
+def _validate_post_update_qualification_reference(
+    trainer_config: dict, reference_path: Path
+) -> dict:
+    """Validate the local eight-reference post-update input before any SSH."""
+    fake = trainer_config.get("data", {}).get("fake", {})
+    model = trainer_config.get("model", {})
+    if fake.get("batch_size") != 8 or model.get("seq_len") != 8192:
+        raise Refused("post-update qualification requires batch_size=8 and seq_len=8192")
+    if reference_path.is_symlink() or not reference_path.is_file():
+        raise Refused(f"missing local post-update reference {reference_path}")
+    try:
+        reference = json.loads(reference_path.read_text(encoding="utf-8"))
+        validate_post_update_references(
+            reference,
+            expected_seq_len=model["seq_len"],
+        )
+    except (
+        OSError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        PostUpdateQualificationError,
+    ) as error:
+        raise Refused(f"post-update reference validation failed: {error}") from error
+    return reference
+
+
 def deploy(
     path: str,
     nodes: list[str] | None = None,
@@ -9964,6 +9995,13 @@ def qualify(
     if "fake" not in config.get("data", {}):
         raise Refused(
             f"{relative_config} has no [data.fake]; use start() for an RL run"
+        )
+    if selected.get("trainer") == "configs/trinity-h200-post-update-qualification/trainer.toml":
+        configured_reference = config["data"]["fake"].get("reference_path")
+        if not isinstance(configured_reference, str):
+            raise Refused("post-update qualification reference_path is missing")
+        _validate_post_update_qualification_reference(
+            config, Path(configured_reference)
         )
     if selected.get("kind") == "trinity":
         _trinity_trainer_loss_preflight(nodes)

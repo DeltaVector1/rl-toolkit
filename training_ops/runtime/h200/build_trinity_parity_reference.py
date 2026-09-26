@@ -673,6 +673,7 @@ def build_reference(
             )
     response_hashes: dict[str, str] = {}
     request_bodies: dict[str, dict[str, Any]] = {}
+    responses: dict[str, dict[str, Any]] = {}
     generated_ids: list[int] = []
     generated_logprobs: list[float] = []
     finish_reason: Any = None
@@ -698,6 +699,7 @@ def build_reference(
         }
         request_bodies["decode"] = decode_request
         decode_response = post_json(generate_endpoint, decode_request, timeout)
+        responses["decode"] = decode_response
         response_hashes["decode"] = _json_sha256(decode_response)
         decode_choices = decode_response.get("choices")
         if (
@@ -750,6 +752,7 @@ def build_reference(
         }
         request_bodies["prefill"] = rescore_request
         rescore_response = post_json(generate_endpoint, rescore_request, timeout)
+        responses["prefill"] = rescore_response
         response_hashes["prefill"] = _json_sha256(rescore_response)
         rescore_choices = rescore_response.get("choices")
         if (
@@ -867,6 +870,7 @@ def build_reference(
             request_body,
             timeout,
         )
+        responses["decode"] = response
         response_hashes["decode"] = _json_sha256(response)
         request_bodies["decode"] = request_body
         choices = response.get("choices")
@@ -978,6 +982,16 @@ def build_reference(
         result["generated_token_ids"] = generated_ids
         result["generated_token_count"] = len(generated_ids)
         result["finish_reason"] = finish_reason
+    if prefill_rescore:
+        response_hashes["rescore"] = response_hashes["prefill"]
+    result["request_sha256"] = {
+        name: _json_sha256(body) for name, body in request_bodies.items()
+    }
+    result["response_sha256"] = {
+        name: digest for name, digest in response_hashes.items()
+    }
+    result["request_bodies"] = request_bodies
+    result["responses"] = responses
     serialized = json.dumps(result, separators=(",", ":")) + "\n"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if prefill_rescore:

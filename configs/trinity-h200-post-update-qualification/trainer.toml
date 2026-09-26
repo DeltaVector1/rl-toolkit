@@ -7,7 +7,7 @@ dist_timeout_seconds = 5400
 enable_router_replay = true
 
 [data.fake]
-batch_size = 1
+batch_size = 8
 generate_samples = false
 reference_path = "/data/glm52-rl/qualifications/trinity-h200-post-update-qualification/reference.json"
 export_final_adapter = true

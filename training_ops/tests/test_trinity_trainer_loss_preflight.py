@@ -164,6 +164,10 @@ class TrinityTrainerLossPreflightTest(unittest.TestCase):
             side_effect=lambda nodes: events.append("loss"),
         ), mock.patch.object(
             training_ops,
+            "_validate_post_update_qualification_reference",
+            side_effect=lambda config, path: events.append("reference"),
+        ), mock.patch.object(
+            training_ops,
             "_trainer_dependency_inventory",
             side_effect=lambda config, nodes: events.append("inventory") or [],
         ), mock.patch.object(
@@ -179,7 +183,7 @@ class TrinityTrainerLossPreflightTest(unittest.TestCase):
                 config_dir="configs/trinity-h200-post-update-qualification",
             )
 
-        self.assertEqual(events[:3], ["loss", "inventory", "deploy"])
+        self.assertEqual(events[:4], ["reference", "loss", "inventory", "deploy"])
         self.assertIn("launch", events)
 
 

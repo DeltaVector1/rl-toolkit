@@ -135,7 +135,7 @@ class H200PostUpdateQualificationTest(unittest.TestCase):
         self.assertFalse((CONFIG_DIR / "orchestrator.toml").exists())
         self.assertEqual(trainer["output_dir"], "/data/glm52-rl/qualifications/trinity-h200-post-update-qualification")
         self.assertEqual(trainer["max_steps"], 1)
-        self.assertEqual(trainer["data"]["fake"]["batch_size"], 1)
+        self.assertEqual(trainer["data"]["fake"]["batch_size"], 8)
         self.assertEqual(
             trainer["data"]["fake"]["reference_path"],
             "/data/glm52-rl/qualifications/trinity-h200-post-update-qualification/reference.json",
