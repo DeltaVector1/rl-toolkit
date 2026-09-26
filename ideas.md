@@ -563,3 +563,17 @@ only after measured learning.
   peer:` without a username, while the n82 session uses `ubuntu`. The next
   bounded probe and fanout must inherit or explicitly use `ubuntu`, not root;
   the exact SHA256 gate remains required.
+
+## Trinity reference determinism split
+
+- Measured fresh qualifier: one masked token out of 8,192 at index 1,074
+  changed from ` numbered` to ` condition`. Reference logprob was
+  `-0.000221228`, trainer logprob was `-1.698086739`, delta was
+  `-1.697865511`, and KL was `0.880939387`. Unmasked mean delta was
+  `0.00002744046`; routes were valid; the phrase repeated 264 times.
+- Experiment: first independently regenerate the same H200 base reference at
+  0.85 from the identical input and compare every input, logprob, route, SHA,
+  and index-1,074 value. Then run the trainer once against the unchanged
+  verified reference and compare its artifact and outlier. Do not change
+  thresholds or optimizer settings. Repeat stability assigns the cause to
+  inference or trainer nondeterminism.
