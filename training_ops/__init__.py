@@ -28,6 +28,11 @@ from training_ops.runtime.h200.prepare_trinity_policy0_qualification import (
     QualificationError,
     validate_lora_config,
 )
+from training_ops.runtime.h200.load_policy0 import (
+    EXPECTED_LORA as POLICY0_LOAD_LORA,
+    build_plan as build_policy0_load_plan,
+    execute_policy0_load,
+)
 
 repo_root = Path(__file__).resolve().parents[1]
 nodes_path = repo_root / "configs" / "nodes.toml"
@@ -8409,6 +8414,404 @@ def _qualify_action(arguments: list[str]):
     )
 
 
+def _policy0_load_config_plan(
+    config_dir: str,
+    source_run: str,
+    source_adapter_dir: str,
+    qualification_slot: str,
+    source_config_path: str | None = None,
+) -> dict[str, object]:
+    """Resolve a policy-0 load plan without a live call."""
+    selected = _config_dir(config_dir, require_orchestrator=True, require_inference=True)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", source_run):
+        raise Refused("policy-0 source run is invalid")
+    source_path = PurePosixPath(source_adapter_dir)
+    if (
+        not source_path.is_absolute()
+        or source_path.as_posix() != source_adapter_dir
+        or any(part in {"", ".", ".."} for part in source_path.parts)
+        or source_path.name != "step_0"
+        or f"/{source_run}/" not in source_path.as_posix() + "/"
+    ):
+        raise Refused("source adapter directory must be the exact source run step_0 directory")
+    if not source_adapter_dir.startswith(storage_root.rstrip("/") + "/"):
+        raise Refused("source adapter directory must be below configured storage")
+    derived_config = f"{source_adapter_dir.rstrip('/')}/adapter_config.json"
+    if source_config_path is None:
+        source_config_path = derived_config
+    if source_config_path != derived_config:
+        raise Refused("source config path must be the adapter_config.json in step_0")
+    try:
+        with (repo_root / selected["orchestrator"]).open("rb") as stream:
+            orchestrator = tomllib.load(stream)
+        with (repo_root / selected["trainer"]).open("rb") as stream:
+            trainer = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Refused(f"cannot read policy-0 load config: {error}") from error
+    broadcast = orchestrator.get("weight_broadcast")
+    source_root = broadcast.get("source_url") if isinstance(broadcast, dict) else None
+    if not isinstance(source_root, str) or not source_root.startswith(("http://", "https://")):
+        raise Refused("policy-0 load source URL is missing")
+    source_root = source_root.rstrip("/")
+    if not source_root.endswith("/" + source_run):
+        raise Refused("source run does not match configured adapter source URL")
+    source_url = source_root + "/step_0"
+    model = orchestrator.get("model")
+    client = model.get("client") if isinstance(model, dict) else None
+    admin_urls = client.get("admin_base_url") if isinstance(client, dict) else None
+    origin_urls = client.get("adapter_origin_base_urls") if isinstance(client, dict) else None
+    if not isinstance(admin_urls, list) or not admin_urls or not all(isinstance(url, str) and url.startswith(("http://", "https://")) for url in admin_urls):
+        raise Refused("policy-0 load admin endpoints are empty or invalid")
+    if not isinstance(origin_urls, list) or not origin_urls or not all(isinstance(url, str) and url.startswith(("http://", "https://")) for url in origin_urls):
+        raise Refused("policy-0 load adapter origin endpoints are empty or invalid")
+    lora = trainer.get("model", {}).get("lora", {})
+    expected_lora = {
+        "r": lora.get("rank"),
+        "lora_alpha": lora.get("alpha"),
+        "lora_dropout": lora.get("dropout"),
+        "target_modules": lora.get("target_modules"),
+    }
+    expected_values = {**POLICY0_LOAD_LORA, "target_modules": list(POLICY0_LOAD_LORA["target_modules"])}
+    if expected_lora != expected_values:
+        raise Refused("qualification LoRA must be rank32/alpha64/dropout0 with the exact targets")
+    selected_hosts = [_check_host(host) for host in trainer_hosts]
+    engine_ports: dict[str, list[int]] = {}
+    for host in inference_hosts:
+        settings = _inference_config(host, "trinity")
+        configured = settings.get("ports")
+        if not isinstance(configured, list) or not configured or not all(isinstance(port, int) and 1 <= port <= 65535 for port in configured):
+            raise Refused(f"policy-0 load inference ports are invalid on {host}")
+        engine_ports[host] = list(configured)
+    plan = build_policy0_load_plan(
+        config_dir=config_dir,
+        source_run=source_run,
+        source_adapter_dir=source_adapter_dir,
+        source_config_path=source_config_path,
+        source_url=source_url,
+        qualification_slot=qualification_slot,
+        admin_urls=list(admin_urls),
+        origin_urls=list(origin_urls),
+        trainer_hosts=selected_hosts,
+        orchestrator_host=orchestrator_host,
+        inference_hosts=list(inference_hosts),
+        engine_ports=engine_ports,
+        engine_container=glm_inference_container,
+    )
+    plan["source_adapter_host"] = trainer_head
+    return plan
+
+
+def _policy0_load_source_script(plan: dict[str, object]) -> str:
+    script = _policy0_adapter_source_manifest_script(
+        f"{str(plan['source_adapter_dir']).rstrip('/')}/adapter_model.safetensors",
+        str(plan["source_config_path"]),
+        dict(plan["expected_lora"]),
+    )
+    directory = shlex.quote(str(plan["source_adapter_dir"]))
+    return (
+        "set -euo pipefail\n"
+        f"source_dir={directory}\n"
+        'test -f "$source_dir/STABLE" && test ! -L "$source_dir/STABLE"\n'
+        + script
+    )
+
+
+def _policy0_parse_source_manifest(output: str, plan: dict[str, object]) -> dict[str, object]:
+    records: dict[str, dict[str, object]] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if (
+            len(fields) == 4
+            and fields[0] == "QUAL_FILE"
+            and re.fullmatch(r"[0-9a-f]{64}", fields[2])
+            and fields[3].isdigit()
+        ):
+            if fields[1] in records:
+                raise Refused("source step-0 adapter identity output is duplicated")
+            records[fields[1]] = {"sha256": fields[2], "size": int(fields[3])}
+    if set(records) != {"adapter_model.safetensors", "adapter_config.json"}:
+        raise Refused("source step-0 adapter identity output is incomplete")
+    return {
+        "stable": True,
+        "identity": {
+            "source_url": plan["source_url"],
+            "target_sha256": records["adapter_model.safetensors"]["sha256"],
+            "target_size": records["adapter_model.safetensors"]["size"],
+            "config_sha256": records["adapter_config.json"]["sha256"],
+            "config_size": records["adapter_config.json"]["size"],
+        },
+        "lora": plan["expected_lora"],
+    }
+
+
+def _policy0_load_service_state_script(container: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", container):
+        raise Refused("policy-0 load container name is invalid")
+    quoted = shlex.quote(container)
+    return f"""set -euo pipefail
+container={quoted}
+if ! name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null); then
+  listed=$(sudo docker ps -a --filter "name=^$container$" --format '{{{{.Names}}}}' 2>/dev/null) || {{ echo unknown >&2; exit 71; }}
+  [ -z "$listed" ] || {{ echo unknown >&2; exit 72; }}
+  printf '{{"known":true,"active":false,"state":"absent"}}\\n'
+  exit 0
+fi
+[ "$name" = "/$container" ] || {{ echo identity-mismatch >&2; exit 73; }}
+state=$(sudo docker inspect --format '{{{{.State.Running}}}}' "$container" 2>/dev/null || true)
+case "$state" in
+  true) printf '{{"known":true,"active":true,"state":"running"}}\\n' ;;
+  false) printf '{{"known":true,"active":false,"state":"stopped"}}\\n' ;;
+  *) echo unknown >&2; exit 74 ;;
+esac
+"""
+
+
+def _policy0_load_engine_state_script(container: str, ports_for_host: list[int]) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", container):
+        raise Refused("policy-0 load engine container name is invalid")
+    if not ports_for_host or not all(isinstance(port, int) and 1 <= port <= 65535 for port in ports_for_host):
+        raise Refused("policy-0 load engine ports are invalid")
+    ports_text = " ".join(str(port) for port in ports_for_host)
+    return f"""set -euo pipefail
+container={shlex.quote(container)}
+inspect=$(sudo docker inspect --format '{{{{.Name}}}}\\t{{{{.Id}}}}\\t{{{{.State.StartedAt}}}}\\t{{{{.State.Pid}}}}\\t{{{{.State.Running}}}}' "$container" 2>/dev/null) || {{ echo unknown >&2; exit 81; }}
+IFS=$'\\t' read -r name container_id container_started_at api_pid running <<< "$inspect"
+[ "$name" = "/$container" ] || {{ echo identity-mismatch >&2; exit 82; }}
+[ "$running" = true ] || {{ echo engine-stopped >&2; exit 83; }}
+case "$api_pid" in ''|*[!0-9]*) echo invalid-api-pid >&2; exit 84;; esac
+api_start_time=$(sudo awk '{{print $22}}' "/proc/$api_pid/stat" 2>/dev/null || true)
+[ -n "$api_start_time" ] || {{ echo invalid-api-start >&2; exit 85; }}
+tmp=$(mktemp -d /tmp/training-ops-policy0-load.XXXXXX)
+trap 'rm -rf -- "$tmp"' EXIT
+for port in {ports_text}; do
+  curl -fsS -m 30 "http://127.0.0.1:$port/health" > "$tmp/health.$port" || exit 86
+  curl -fsS -m 30 "http://127.0.0.1:$port/metrics" > "$tmp/metrics.$port" || exit 87
+  curl -fsS -m 30 "http://127.0.0.1:$port/staging_status" > "$tmp/status.$port" || exit 88
+done
+python3 - "$tmp" "$container_id" "$container_started_at" "$api_pid" "$api_start_time" {shlex.quote(ports_text)} <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+container_id, started, api_pid, api_start = sys.argv[2:6]
+ports = [int(value) for value in sys.argv[6:]]
+records = []
+for port in ports:
+    metrics = (root / f"metrics.{{port}}").read_text()
+    values = {{"running": None, "waiting": None}}
+    for line in metrics.splitlines():
+        match = re.match(r"^vllm:num_requests_(running|waiting)(?:\\{{[^}}]*\\}})?\\s+([0-9]+(?:\\.[0-9]+)?)$", line)
+        if match:
+            values[match.group(1)] = float(match.group(2))
+    if any(value is None or value != 0 for value in values.values()):
+        raise SystemExit("engine has active or unreadable requests")
+    status = json.loads((root / f"status.{{port}}").read_text())
+    if not isinstance(status, dict) or not isinstance(status.get("loaded_receipts"), dict):
+        raise SystemExit("staging status is invalid")
+    records.append({{"port": port, "status": status}})
+if len({{record["status"].get("status") for record in records}}) != 1:
+    raise SystemExit("inference endpoints have different staging states")
+if any(record["status"].get("loaded_receipts") != records[0]["status"].get("loaded_receipts") for record in records[1:]):
+    raise SystemExit("inference endpoints have different loaded receipts")
+status = records[0]["status"]
+print(json.dumps({{
+    "healthy": True,
+    "container_id": container_id,
+    "container_started_at": started,
+    "api_pid": int(api_pid),
+    "api_start_time": api_start,
+    "running": 0,
+    "waiting": 0,
+    "stage_status": status.get("status"),
+    "active_stage": status.get("status") == "staging",
+    "stage_conflict": status.get("status") == "staging",
+    "endpoints": [f"http://127.0.0.1:{{record['port']}}" for record in records],
+    "loaded_receipts": status["loaded_receipts"],
+}}))
+PY
+"""
+
+
+def _policy0_load_live_state(plan: dict[str, object]) -> dict[str, object]:
+    services: dict[str, object] = {"trainers": {}, "orchestrator": None}
+    trainer_results = _fan(
+        list(plan["trainer_hosts"]),
+        lambda host: _ssh(host, _policy0_load_service_state_script(trainer_container), timeout=90),
+    )
+    for host, (code, output) in trainer_results.items():
+        if code:
+            raise Refused(f"trainer service state is unknown on {host}: {output.strip()}")
+        try:
+            services["trainers"][host] = json.loads(output)
+        except (TypeError, ValueError) as error:
+            raise Refused(f"trainer service state on {host} is invalid") from error
+    code, output = _ssh(
+        orchestrator_host,
+        _policy0_load_service_state_script(orchestrator_container),
+        timeout=90,
+    )
+    if code:
+        raise Refused(f"orchestrator service state is unknown: {output.strip()}")
+    try:
+        services["orchestrator"] = json.loads(output)
+    except (TypeError, ValueError) as error:
+        raise Refused("orchestrator service state is invalid") from error
+    engines = []
+    for host in plan["inference_hosts"]:
+        code, output = _ssh(
+            host,
+            _policy0_load_engine_state_script(plan["engine_container"], plan["engine_ports"][host]),
+            timeout=120,
+        )
+        if code:
+            raise Refused(f"inference engine state is unsafe on {host}: {output.strip()}")
+        try:
+            engines.append(json.loads(output))
+        except (TypeError, ValueError) as error:
+            raise Refused(f"inference engine state on {host} is invalid") from error
+    if len(engines) != 1:
+        raise Refused("policy-0 load requires one unambiguous inference engine state")
+    return {"services": services, "engine": engines[0]}
+
+
+def _policy0_load_apply(plan: dict[str, object]) -> dict[str, object]:
+    try:
+        from prime_rl.configs.shared import ClientConfig
+        from prime_rl.utils.client import load_lora_adapter, setup_admin_clients, stage_lora_adapter
+    except Exception as error:
+        raise Refused(f"policy-0 load client primitives are unavailable: {error}") from error
+    code, output = _ssh(
+        str(plan["source_adapter_host"]), _policy0_load_source_script(plan), timeout=180
+    )
+    if code:
+        raise Refused(
+            "source step-0 adapter or tunnel validation failed: "
+            f"{output.strip()}; run {plan['repair_command']} if the configured tunnel is missing"
+        )
+    source = _policy0_parse_source_manifest(output, plan)
+    import asyncio
+
+    def clients():
+        config = ClientConfig(
+            base_url=list(plan["admin_urls"]),
+            admin_base_url=list(plan["admin_urls"]),
+            adapter_origin_base_urls=list(plan["origin_urls"]),
+        )
+        return setup_admin_clients(config)
+
+    def stage(source_url: str, **kwargs):
+        async def operation():
+            admin_clients = clients()
+            try:
+                return await stage_lora_adapter(
+                    admin_clients,
+                    source_url,
+                    require_delta=False,
+                    policy_step=None,
+                    origin_base_urls=list(plan["origin_urls"]),
+                )
+            finally:
+                await asyncio.gather(
+                    *(client.aclose() for client in admin_clients), return_exceptions=True
+                )
+
+        try:
+            return asyncio.run(operation())
+        except Exception as error:
+            raise Refused(
+                f"source or adapter tunnel is unreachable; run {plan['repair_command']}: {error}"
+            ) from error
+
+    def load(slot: str, source_url: str, *, expected_identity, **kwargs):
+        async def operation():
+            admin_clients = clients()
+            try:
+                return await load_lora_adapter(
+                    admin_clients,
+                    slot,
+                    source_url,
+                    require_delta=False,
+                    prefetched=True,
+                    expected_identity=expected_identity,
+                )
+            finally:
+                await asyncio.gather(
+                    *(client.aclose() for client in admin_clients), return_exceptions=True
+                )
+
+        try:
+            return asyncio.run(operation())
+        except Exception as error:
+            raise Refused(
+                f"source or adapter tunnel is unreachable; run {plan['repair_command']}: {error}"
+            ) from error
+
+    return execute_policy0_load(
+        plan,
+        read_state=lambda: _policy0_load_live_state(plan),
+        read_source=lambda: source,
+        stage=stage,
+        load=load,
+    )
+
+
+def _load_policy0_action(arguments: list[str]):
+    config_dir = "configs/trinity-decensor-experimental-fixed"
+    mode = "plan"
+    source_run = None
+    source_adapter_dir = None
+    source_config_path = None
+    qualification_slot = None
+    positional: list[str] = []
+    values: dict[str, str] = {}
+    options = {
+        "--source-run": "source_run",
+        "--source-adapter-dir": "source_adapter_dir",
+        "--source-config-path": "source_config_path",
+        "--qualification-slot": "qualification_slot",
+    }
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in options:
+            index += 1
+            if index >= len(arguments):
+                raise Refused(f"{argument} requires a value")
+            values[options[argument]] = arguments[index]
+        elif argument.startswith("--"):
+            raise Refused(f"unknown load-policy0 option {argument}")
+        else:
+            positional.append(argument)
+        index += 1
+    config_dir = positional[0] if positional else config_dir
+    mode = positional[1] if len(positional) > 1 else mode
+    if len(positional) > 2:
+        raise Refused("load-policy0 accepts one config directory and one mode")
+    if mode not in {"plan", "apply"}:
+        raise Refused("load-policy0 mode must be plan or apply")
+    source_run = values.get("source_run")
+    source_adapter_dir = values.get("source_adapter_dir")
+    source_config_path = values.get("source_config_path")
+    qualification_slot = values.get("qualification_slot")
+    if not all(isinstance(value, str) and value for value in (source_run, source_adapter_dir, qualification_slot)):
+        raise Refused("load-policy0 requires --source-run, --source-adapter-dir, and --qualification-slot")
+    plan = _policy0_load_config_plan(
+        config_dir,
+        source_run,
+        source_adapter_dir,
+        qualification_slot,
+        source_config_path,
+    )
+    if mode == "plan":
+        print(json.dumps(plan, indent=2))
+        return plan
+    result = _policy0_load_apply(plan)
+    print(json.dumps(result, indent=2))
+    return result
+
+
 def _prepare_policy0_action(arguments: list[str]):
     config_dir = "configs/trinity-h200-parity-production"
     mode = "plan"
@@ -8512,6 +8915,7 @@ actions = {
     "start": _start_action,
     "archive": _archive_action,
     "qualify": _qualify_action,
+    "load-policy0": _load_policy0_action,
     "prepare-policy0": _prepare_policy0_action,
     "stop": _stop_action,
     "mounts": lambda a: print("\n".join(mounted_files())),
@@ -8544,6 +8948,9 @@ usage = f"""training-ops <action> [args]
   archive <run> [step ...]      upload stable old LoRA adapters
                                 add --finished after another run is active
   qualify <name> [mode] [config-dir]  start a trainer-only config directory
+  load-policy0 [config-dir] [plan|apply] \
+    --source-run RUN --source-adapter-dir DIR --qualification-slot NAME
+                                  verify and load one exact step-0 adapter
   prepare-policy0 [config-dir] [plan|stage] \
     --source-adapter-dir DIR --source-reference-path FILE  preflight or stage policy-0 files
   mounts                        list live-mounted source files
