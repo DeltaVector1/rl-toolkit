@@ -8601,8 +8601,8 @@ def _policy0_load_engine_state_script(container: str, ports_for_host: list[int])
     ports_text = " ".join(str(port) for port in ports_for_host)
     return f"""set -euo pipefail
 container={shlex.quote(container)}
-inspect=$(sudo docker inspect --format '{{{{.Name}}}}\\t{{{{.Id}}}}\\t{{{{.State.StartedAt}}}}\\t{{{{.State.Running}}}}' "$container" 2>/dev/null) || {{ echo unknown >&2; exit 81; }}
-IFS=$'\\t' read -r name container_id container_started_at running <<< "$inspect"
+inspect=$(sudo docker inspect --format '{{{{.Name}}}}|{{{{.Id}}}}|{{{{.State.StartedAt}}}}|{{{{.State.Running}}}}' "$container" 2>/dev/null) || {{ echo unknown >&2; exit 81; }}
+IFS='|' read -r name container_id container_started_at running <<< "$inspect"
 [ "$name" = "/$container" ] || {{ echo identity-mismatch >&2; exit 82; }}
 [ "$running" = true ] || {{ echo engine-stopped >&2; exit 83; }}
 listener_identity=""

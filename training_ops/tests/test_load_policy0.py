@@ -1,6 +1,11 @@
 import copy
 import io
 import inspect
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
@@ -81,6 +86,44 @@ def source():
 
 def receipt(server="instance-a"):
     return {**IDENTITY, "lora_name": "qualification-policy-0", "server_instance": server}
+
+
+def run_engine_probe(script, inspect_line):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "sudo").write_text(
+            """#!/bin/sh
+set -eu
+case "$1" in
+  docker) printf '%s\\n' "$DOCKER_INSPECT" ;;
+  ss) printf '%s\\n' 'LISTEN users:(("python",pid=321,fd=8))' ;;
+  cat) printf '%s\\n' '/usr/bin/python' ;;
+  awk) printf '%s\\n' '1001' ;;
+  *) exit 1 ;;
+esac
+"""
+        )
+        (root / "curl").write_text(
+            """#!/bin/sh
+set -eu
+case "$*" in
+  *metrics*) printf '%s\\n' 'vllm:num_requests_running 0' 'vllm:num_requests_waiting 0' ;;
+  *staging_status*) printf '%s\\n' '{"status":"idle","loaded_receipts":{}}' ;;
+  *) printf '%s\\n' '{}' ;;
+esac
+"""
+        )
+        for path in (root / "sudo", root / "curl"):
+            path.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{directory}:{environment['PATH']}"
+        environment["DOCKER_INSPECT"] = inspect_line
+        return subprocess.run(
+            ["bash", "-ceu", script],
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
 
 
 class Policy0LoadTest(unittest.TestCase):
@@ -253,6 +296,34 @@ class Policy0LoadTest(unittest.TestCase):
         self.assertIn("num_requests_(running|waiting)", engine)
         self.assertIn("staging_status", engine)
         self.assertNotIn("docker restart", engine)
+
+    def test_engine_probe_uses_literal_pipe_delimiters_and_parses_valid_identity(self):
+        engine = _policy0_load_engine_state_script("glm52-decensor-h200", [8000])
+        self.assertIn("{{.Name}}|{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}", engine)
+        self.assertIn("IFS='|' read -r name container_id container_started_at running", engine)
+        self.assertNotIn(r"{{.Name}}\t{{.Id}}", engine)
+        result = run_engine_probe(
+            engine,
+            "/glm52-decensor-h200|container-a|2026-09-26T00:00:00Z|true",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = json.loads(result.stdout)
+        self.assertEqual(parsed["container_id"], "container-a")
+        self.assertEqual(parsed["container_started_at"], "2026-09-26T00:00:00Z")
+        self.assertEqual(parsed["api_pid"], 321)
+
+    def test_engine_probe_rejects_malformed_or_mismatched_identity(self):
+        engine = _policy0_load_engine_state_script("glm52-decensor-h200", [8000])
+        cases = (
+            (r"/glm52-decensor-h200\tcontainer-a\tstarted\ttrue", "identity-mismatch"),
+            ("/other-engine|container-a|started|true", "identity-mismatch"),
+            ("/glm52-decensor-h200|container-a|started|false", "engine-stopped"),
+        )
+        for inspect_line, error in cases:
+            with self.subTest(inspect_line=inspect_line):
+                result = run_engine_probe(engine, inspect_line)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
 
     def test_remote_client_call_is_h200_local_and_controller_has_no_client_import(self):
         response = '{"ok":true,"result":{"adapter_identity":{}}}'
