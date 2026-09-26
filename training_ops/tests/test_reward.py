@@ -223,6 +223,59 @@ class TrainerComputeProbeTest(unittest.TestCase):
             self.assertNotIn("TRAINER_COMPUTE", report)
 
 
+class TrainerLogAgeWarningTest(unittest.TestCase):
+    def _has_trainer_stall_warning(self, warnings):
+        return any(message.startswith("trainer has written nothing") for message in warnings)
+
+    def _status(self, **engine):
+        return training_ops.Status(
+            trainer_up=True,
+            orch_up=True,
+            trainer_log_age=training_ops.stall_seconds + 1,
+            engines=[training_ops.EngineState(host="h200a", **engine)],
+        )
+
+    def test_active_exact_rollout_suppresses_trainer_log_age_warning(self):
+        status = self._status(
+            policy_state="ready",
+            running=1,
+            throughput=5.0,
+        )
+
+        self.assertFalse(
+            self._has_trainer_stall_warning(training_ops._warnings(status))
+        )
+
+    def test_negative_rollout_states_keep_trainer_log_age_warning(self):
+        cases = (
+            ("idle", {"running": 0, "throughput": 20.0}),
+            ("non-exact-policy", {"policy_state": "staging", "running": 1, "throughput": 20.0}),
+            ("stalled-throughput", {"running": 1, "throughput": 4.99}),
+            ("unreachable", {"reachable": False, "running": 1, "throughput": 20.0}),
+        )
+        for name, engine in cases:
+            with self.subTest(name=name):
+                self.assertTrue(
+                    self._has_trainer_stall_warning(
+                        training_ops._warnings(self._status(**engine))
+                    )
+                )
+
+        with self.subTest(name="orchestrator-down"):
+            status = self._status(policy_state="ready", running=1, throughput=20.0)
+            status.orch_up = False
+            self.assertTrue(
+                self._has_trainer_stall_warning(training_ops._warnings(status))
+            )
+
+        with self.subTest(name="trainer-only"):
+            status = self._status(policy_state="ready", running=1, throughput=20.0)
+            status.mode = "trainer-only"
+            self.assertTrue(
+                self._has_trainer_stall_warning(training_ops._warnings(status))
+            )
+
+
 class ActiveRewardRowsTest(unittest.TestCase):
     def test_selects_rows_after_active_container_start(self):
         rows = [

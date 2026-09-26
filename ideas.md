@@ -417,3 +417,16 @@ only after measured learning.
   multiple or ambiguous candidates, wrong commands, unreadable environments,
   or a PGID mismatch. Start the canonical exact environment after cleanup and
   test without restarting the engine.
+
+## Trainer silence during active rollouts
+
+- Observed failure: the exact policy was ready, the queue fell from 128 to 98,
+  throughput was 2,126-2,499 tok/s, and the orchestrator was up. The trainer
+  was correctly waiting for a batch, but a warning and stop fired only because
+  the trainer log age exceeded 600 seconds.
+- Repair plan: keep the 600-second limit and suppress only this trainer log-age
+  warning when the trainer and orchestrator are up and at least one reachable
+  exact-policy-ready engine has running requests and throughput above the
+  existing 5 tok/s health threshold. Keep the warning for idle queues,
+  non-exact policy, stalled throughput, orchestrator-down, and trainer-only
+  states.
