@@ -9,9 +9,10 @@ import training_ops
 APPROVED_SHA256 = "102b14539a2aa7e4b807967f9c9caeaaa974373391a21602ce45b24414fb7863"
 IDENTITY = {
     "sha256": APPROVED_SHA256,
-    "size": 12345,
+    "size": 16446,
     "mode": "644",
 }
+FULL_TRAINERS = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
 
 
 class TrinityTrainerLossPreflightTest(unittest.TestCase):
@@ -36,7 +37,7 @@ class TrinityTrainerLossPreflightTest(unittest.TestCase):
         self.assertIn("docker ps -aq", script)
         self.assertIn("image='prime-rl:bad\"; echo INJECTED; #'", script)
 
-    def test_preflight_fans_out_to_selected_trainers_but_never_n79(self):
+    def test_preflight_checks_full_configured_set_not_launch_subset(self):
         calls = []
 
         def fake_ssh(host, script, timeout=120):
@@ -45,11 +46,37 @@ class TrinityTrainerLossPreflightTest(unittest.TestCase):
 
         with mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh):
             training_ops._trinity_trainer_loss_preflight(
-                ["n82", "n79", "n76"], expected_identity=IDENTITY
+                ["n82"], expected_identity=IDENTITY
             )
 
-        self.assertEqual([host for host, _, _ in calls], ["n82", "n76"])
+        self.assertEqual([host for host, _, _ in calls], FULL_TRAINERS)
         self.assertTrue(all(timeout == 180 for _, _, timeout in calls))
+
+    def test_probe_runs_by_captured_immutable_id_not_mutable_tag(self):
+        script = training_ops._trinity_trainer_loss_inspection_script(
+            training_ops.trainer_image, IDENTITY
+        )
+        self.assertIn(
+            '--entrypoint /bin/bash "$image_id" -c',
+            script,
+        )
+        self.assertNotIn(
+            '--entrypoint /bin/bash "$image" -c',
+            script,
+        )
+        self.assertIn('image_id=$(sudo docker image inspect', script)
+
+    def test_identity_rejects_wrong_measured_size_or_mode_before_ssh(self):
+        for field, value in (("size", 16445), ("mode", "640")):
+            with self.subTest(field=field):
+                wrong = dict(IDENTITY)
+                wrong[field] = value
+                with mock.patch.object(training_ops, "_ssh") as ssh:
+                    with self.assertRaisesRegex(training_ops.Refused, "identity"):
+                        training_ops._trinity_trainer_loss_preflight(
+                            ["n82"], expected_identity=wrong
+                        )
+                ssh.assert_not_called()
 
     def test_preflight_rejects_one_host_failure(self):
         def fake_ssh(host, script, timeout=120):

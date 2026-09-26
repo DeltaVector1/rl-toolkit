@@ -140,6 +140,8 @@ trinity_trainer_loss_module = "/app/src/prime_rl/trainer/rl/loss.py"
 trinity_trainer_loss_sha256 = (
     "102b14539a2aa7e4b807967f9c9caeaaa974373391a21602ce45b24414fb7863"
 )
+trinity_trainer_loss_size = 16446
+trinity_trainer_loss_mode = "644"
 trinity_trainer_loss_identity_env = "PRIME_RL_TRAINER_LOSS_IDENTITY"
 
 
@@ -9385,10 +9387,10 @@ def _validate_trinity_trainer_loss_identity(value: object) -> dict[str, str | in
         raise Refused("Trinity trainer loss identity has an invalid SHA-256")
     if digest != trinity_trainer_loss_sha256:
         raise Refused("Trinity trainer loss identity SHA-256 is not approved")
-    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
-        raise Refused("Trinity trainer loss identity size is not configured")
-    if not isinstance(mode, str) or not re.fullmatch(r"[0-7]{3,4}", mode):
-        raise Refused("Trinity trainer loss identity mode is not configured")
+    if size != trinity_trainer_loss_size:
+        raise Refused("Trinity trainer loss identity size is not approved")
+    if mode != trinity_trainer_loss_mode:
+        raise Refused("Trinity trainer loss identity mode is not approved")
     return {"sha256": digest, "size": size, "mode": mode}
 
 
@@ -9462,7 +9464,7 @@ printf '%s\\n' "TRINITY_TRAINER_LOSS_INSPECTION_OK sha256=$expected_sha256 size=
             'case "$image_id" in sha256:*) ;; *) echo "configured trainer image has invalid immutable id: $image_id" >&2; exit 22;; esac',
             'image_digest=${image_id#sha256:}; [ "${#image_digest}" -eq 64 ] && [[ "$image_digest" =~ ^[0-9a-f]+$ ]] || { echo "configured trainer image has invalid immutable id: $image_id" >&2; exit 22; }',
             'set +e',
-            f"result=$(sudo docker run --rm --pull=never --network none --gpus none --name \"$container_name\" --entrypoint /bin/bash \"$image\" -c {shlex.quote(inspection)})",
+            f"result=$(sudo docker run --rm --pull=never --network none --gpus none --name \"$container_name\" --entrypoint /bin/bash \"$image_id\" -c {shlex.quote(inspection)})",
             "run_code=$?",
             "set -e",
             'leftover=$(sudo docker ps -aq --filter "name=^/${container_name}$")',
@@ -9474,14 +9476,14 @@ printf '%s\\n' "TRINITY_TRAINER_LOSS_INSPECTION_OK sha256=$expected_sha256 size=
 
 
 def _trinity_trainer_loss_preflight(
-    nodes: list[str], *, expected_identity: dict[str, str | int] | None = None
+    nodes: list[str] | None = None, *, expected_identity: dict[str, str | int] | None = None
 ) -> None:
     identity = (
         _trinity_trainer_loss_identity()
         if expected_identity is None
         else _validate_trinity_trainer_loss_identity(expected_identity)
     )
-    selected = [host for host in nodes if host not in blocked_hosts]
+    selected = [host for host in trainer_hosts if host not in blocked_hosts]
     if not selected:
         raise Refused("Trinity trainer loss preflight has no permitted trainer hosts")
     script = _trinity_trainer_loss_inspection_script(trainer_image, identity)
