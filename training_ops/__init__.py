@@ -22,7 +22,7 @@ import tomllib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from training_ops.runtime.h200.prepare_trinity_policy0_qualification import (
     QualificationError,
@@ -8450,12 +8450,30 @@ def _policy0_load_config_plan(
         raise Refused(f"cannot read policy-0 load config: {error}") from error
     broadcast = orchestrator.get("weight_broadcast")
     source_root = broadcast.get("source_url") if isinstance(broadcast, dict) else None
-    if not isinstance(source_root, str) or not source_root.startswith(("http://", "https://")):
+    configured_source_dir = broadcast.get("source_dir") if isinstance(broadcast, dict) else None
+    if (
+        not isinstance(source_root, str)
+        or not source_root.startswith(("http://", "https://"))
+        or not isinstance(configured_source_dir, str)
+    ):
         raise Refused("policy-0 load source URL is missing")
+    source_dir_path = PurePosixPath(configured_source_dir)
+    if (
+        not source_dir_path.is_absolute()
+        or source_dir_path.as_posix() != configured_source_dir
+        or any(part in {"", ".", ".."} for part in source_dir_path.parts)
+    ):
+        raise Refused("configured weight_broadcast.source_dir is unsafe")
+    try:
+        relative_source_path = source_path.relative_to(source_dir_path)
+    except ValueError as error:
+        raise Refused("source adapter directory is outside weight_broadcast.source_dir") from error
+    if not relative_source_path.parts:
+        raise Refused("source adapter directory must be strictly below weight_broadcast.source_dir")
     source_root = source_root.rstrip("/")
     if not source_root.endswith("/" + source_run):
         raise Refused("source run does not match configured adapter source URL")
-    source_url = source_root + "/step_0"
+    source_url = source_root + "/" + quote(relative_source_path.as_posix())
     model = orchestrator.get("model")
     client = model.get("client") if isinstance(model, dict) else None
     admin_urls = client.get("admin_base_url") if isinstance(client, dict) else None

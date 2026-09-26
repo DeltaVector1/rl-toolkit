@@ -223,9 +223,21 @@ class Policy0LoadTest(unittest.TestCase):
         with patch("training_ops._ssh") as ssh, redirect_stdout(io.StringIO()) as output:
             result = _load_policy0_action(args)
         ssh.assert_not_called()
-        self.assertEqual(result["source_url"], "http://127.0.0.1:18100/trinity-decensor-experimental-fixed/step_0")
+        self.assertEqual(
+            result["source_url"],
+            "http://127.0.0.1:18100/trinity-decensor-experimental-fixed/run_trinity-decensor-experimental-fixed/broadcasts/step_0",
+        )
         self.assertEqual(result["source_adapter_host"], "n82")
         self.assertIn("exact H200 container ID", output.getvalue())
+
+    def test_plan_refuses_source_outside_configured_source_dir(self):
+        with self.assertRaisesRegex(RuntimeError, "outside weight_broadcast.source_dir"):
+            _load_policy0_action([
+                "configs/trinity-decensor-experimental-fixed", "plan",
+                "--source-run", "trinity-decensor-experimental-fixed",
+                "--source-adapter-dir", "/data/glm52-rl/other/trinity-decensor-experimental-fixed/broadcasts/step_0",
+                "--qualification-slot", "trinity-decensor-experimental-fixed-r32-node-local",
+            ])
 
     def test_live_scripts_are_read_only_and_pin_engine_identity(self):
         service = _policy0_load_service_state_script("glm52-decensor-trainer")
