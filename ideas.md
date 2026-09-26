@@ -481,3 +481,24 @@ only after measured learning.
   exact RUN/source/destination/identity environment and an fd pointing to the
   exact lock inode, then must verify that the lock is free. Do not use broad
   process matching or pkill.
+
+## Production-sequence Trinity parity qualification
+
+- Measured fault: the old qualifier used `[1, 2, 3, 4]` repeated, so it had
+  only four unique input IDs. The production parity guard therefore failed
+  on a non-representative sequence.
+- Experiment: create a fresh deterministic natural-language input from an
+  existing Hub/cache dataset or an operator-provided JSON that is not a
+  rollout artifact. Use a diverse 8,192-11,945-token sequence, then call the
+  serialized `/inference/v1/generate` endpoint with temperature 1.0,
+  `top_p=1.0`, `max_tokens=1`, and prompt logprobs enabled. Select base or
+  policy-0 explicitly. Preserve the exact input IDs, sequence lengths, prompt
+  logprobs, and routed-expert payload. Fail closed on token, logprob,
+  route-shape, or route-digest mismatch. Keep the strict parity gates, native
+  FP8, and trainer-only scope; do not use a full rollout batch or cached
+  rollout batch.
+- Follow-up risk to test separately: the policy-version `cache_salt` is placed
+  in environment `extra_body`, then flattened by `TrainClient` into
+  `sampling_params`, while `GenerateRequest` expects it at the top level. A
+  same-name policy reload may therefore reuse stale prefix KV or routes. This
+  commit records the risk only; it does not change the client.
