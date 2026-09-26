@@ -66,27 +66,50 @@ class TrinityParityReferenceTest(unittest.TestCase):
             "choices": [{"routed_experts": route_for(token_count)}],
         }
 
+    def policy_response(self, prompt_count=4, completion_count=8):
+        generated_ids = list(range(900, 900 + completion_count))
+        return {
+            "prompt_logprobs": self.response(prompt_count)["prompt_logprobs"],
+            "choices": [{
+                "token_ids": generated_ids,
+                "logprobs": {
+                    "content": [
+                        {"token": f"token_id:{token}", "logprob": -0.01 * index}
+                        for index, token in enumerate(generated_ids)
+                    ]
+                },
+                "finish_reason": "length",
+                "routed_experts": route_for(prompt_count + completion_count),
+            }],
+        }
+
+    def readiness(self, receipt=None):
+        return {"loaded_receipt": receipt or self.policy_receipt()}
+
     def test_builds_reference_and_selects_policy_model(self):
         calls = []
 
         def post(url, body, timeout):
             calls.append((url, body, timeout))
-            return self.response()
+            return self.policy_response()
 
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "reference.json"
+            policy_record = self.record()
+            policy_record.pop("expected_route_shape")
             result = reference.build_reference(
                 endpoint="http://engine:8000/inference/v1/generate",
-                input_record=self.record(),
+                input_record=policy_record,
                 output_path=output,
                 base_model="/data/trinity-thinking-fp8",
                 policy="policy-0",
                 policy_model="policy-0-slot0",
-                policy_receipt=self.policy_receipt(),
                 expected_policy_identity=self.policy_receipt(),
                 cache_salt="qualifier-policy-0-fresh-1",
+                readiness_endpoint="http://engine:8000/inference/v1/staging-status",
                 minimum_tokens=1,
                 post_json=post,
+                get_json=lambda *_: self.readiness(),
             )
             self.assertEqual(calls[0][0], "http://engine:8000/inference/v1/generate")
             self.assertEqual(calls[0][1]["model"], "policy-0-slot0")
@@ -96,13 +119,17 @@ class TrinityParityReferenceTest(unittest.TestCase):
             self.assertEqual(
                 calls[0][1]["sampling_params"],
                 {
-                    "max_tokens": 1,
-                    "temperature": 1.0,
+                    "max_tokens": 32,
+                    "temperature": 0.0,
                     "top_p": 1.0,
                     "prompt_logprobs": 1,
+                    "logprobs": 1,
                 },
             )
-            self.assertEqual(result["inference_logprobs"], [0.0, -1.0, -2.0, -3.0])
+            self.assertEqual(len(result["input_ids"]), 12)
+            self.assertEqual(result["inference_logprobs"][:4], [0.0, -1.0, -2.0, -3.0])
+            self.assertEqual(result["loss_mask"], [False] * 4 + [True] * 8)
+            self.assertEqual(result["sequence_lengths"], [12])
             self.assertEqual(
                 set(result["routed_experts"]),
                 {"schema_version", "encoding", "dtype", "shape", "dense_layers", "experts", "sha256", "data"},
@@ -111,12 +138,14 @@ class TrinityParityReferenceTest(unittest.TestCase):
             self.assertEqual(result["routed_experts"]["experts"], 256)
             self.assertEqual(
                 result["routed_experts"]["sha256"],
-                hashlib.sha256(base64.b64decode(route_for(4)["data"])).hexdigest(),
+                hashlib.sha256(base64.b64decode(route_for(12)["data"])).hexdigest(),
             )
             self.assertEqual(result["policy_identity"], self.policy_receipt())
             self.assertEqual(result["cache_salt"], "qualifier-policy-0-fresh-1")
-            self.assertEqual(result["request_mode"], "serialized_generate_prompt_logprobs")
-            self.assertEqual(result["input_ids"], self.record()["input_ids"])
+            self.assertEqual(result["request_mode"], "serialized_generate_completion_prompt_logprobs")
+            self.assertEqual(result["generated_token_count"], 8)
+            self.assertEqual(result["policy_identity_before"], self.policy_receipt())
+            self.assertEqual(result["policy_identity_after"], self.policy_receipt())
             self.assertEqual(result["sampling_params"]["prompt_logprobs"], 1)
             self.assertEqual(json.loads(output.read_text()), result)
 
@@ -131,7 +160,7 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 policy_model="policy-0-slot0",
                 cache_salt="fresh",
                 minimum_tokens=1,
-                post_json=lambda *_: self.response(),
+                post_json=lambda *_: self.policy_response(),
             )
 
         with self.assertRaisesRegex(reference.ReferenceError, "fresh cache_salt"):
@@ -144,8 +173,10 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 policy_model="policy-0-slot0",
                 policy_receipt=self.policy_receipt(),
                 expected_policy_identity=self.policy_receipt(),
+                readiness_endpoint="http://engine:8000/inference/v1/staging-status",
                 minimum_tokens=1,
-                post_json=lambda *_: self.response(),
+                post_json=lambda *_: self.policy_response(),
+                get_json=lambda *_: self.readiness(),
             )
 
         receipt = self.policy_receipt()
@@ -161,8 +192,97 @@ class TrinityParityReferenceTest(unittest.TestCase):
                 policy_receipt=receipt,
                 expected_policy_identity=self.policy_receipt(),
                 cache_salt="fresh",
+                readiness_endpoint="http://engine:8000/inference/v1/staging-status",
                 minimum_tokens=1,
-                post_json=lambda *_: self.response(),
+                post_json=lambda *_: self.policy_response(),
+                get_json=lambda *_: self.readiness(receipt),
+            )
+
+    def test_policy_zero_requires_active_receipt_to_stay_stable(self):
+        changed = self.policy_receipt()
+        changed["server_instance"] = "h200b-instance-2"
+        states = iter((self.readiness(), self.readiness(changed)))
+        policy_record = self.record()
+        policy_record.pop("expected_route_shape")
+        with self.assertRaisesRegex(reference.ReferenceError, "differs in server_instance"):
+            reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=policy_record,
+                output_path=Path("unused.json"),
+                base_model="base",
+                policy="policy-0",
+                policy_model="policy-0-slot0",
+                policy_receipt=self.policy_receipt(),
+                expected_policy_identity=self.policy_receipt(),
+                cache_salt="fresh",
+                readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                minimum_tokens=1,
+                post_json=lambda *_: self.policy_response(),
+                get_json=lambda *_: next(states),
+            )
+
+    def test_policy_zero_rejects_readiness_endpoint_for_another_engine(self):
+        with self.assertRaisesRegex(reference.ReferenceError, "active generate endpoint"):
+            reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=self.record(),
+                output_path=Path("unused.json"),
+                base_model="base",
+                policy="policy-0",
+                policy_model="policy-0-slot0",
+                policy_receipt=self.policy_receipt(),
+                expected_policy_identity=self.policy_receipt(),
+                cache_salt="fresh",
+                readiness_endpoint="http://other-engine:8000/inference/v1/staging-status",
+                minimum_tokens=1,
+                post_json=lambda *_: self.policy_response(),
+                get_json=lambda *_: self.readiness(),
+            )
+
+    def test_policy_zero_rejects_active_source_url_change(self):
+        changed = self.policy_receipt()
+        changed["source_url"] = "http://other-engine:18100/policy-0"
+        states = iter((self.readiness(), self.readiness(changed)))
+        policy_record = self.record()
+        policy_record.pop("expected_route_shape")
+        with self.assertRaisesRegex(reference.ReferenceError, "differs in source_url"):
+            reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=policy_record,
+                output_path=Path("unused.json"),
+                base_model="base",
+                policy="policy-0",
+                policy_model="policy-0-slot0",
+                policy_receipt=self.policy_receipt(),
+                expected_policy_identity=self.policy_receipt(),
+                cache_salt="fresh",
+                readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                minimum_tokens=1,
+                post_json=lambda *_: self.policy_response(),
+                get_json=lambda *_: next(states),
+            )
+
+    def test_completion_token_key_and_count_are_fail_closed(self):
+        def wrong_key(*_):
+            response = self.policy_response()
+            response["choices"][0]["logprobs"]["content"][0]["token"] = "token_id:999"
+            return response
+
+        with self.assertRaisesRegex(reference.ReferenceError, "wrong token key"):
+            reference.build_reference(
+                endpoint="http://engine:8000/inference/v1/generate",
+                input_record=self.record(),
+                output_path=Path("unused.json"),
+                base_model="base",
+                policy="policy-0",
+                policy_model="policy-0-slot0",
+                policy_receipt=self.policy_receipt(),
+                expected_policy_identity=self.policy_receipt(),
+                cache_salt="fresh",
+                readiness_endpoint="http://engine:8000/inference/v1/staging-status",
+                minimum_tokens=1,
+                post_json=wrong_key,
+                get_json=lambda *_: self.readiness(),
             )
 
     def test_base_policy_keeps_no_adapter_receipt_or_cache_salt(self):
@@ -186,6 +306,9 @@ class TrinityParityReferenceTest(unittest.TestCase):
         self.assertNotIn("cache_salt", calls[0])
         self.assertIsNone(result["policy_identity"])
         self.assertIsNone(result["cache_salt"])
+        self.assertEqual(result["request_mode"], "serialized_generate_prompt_logprobs")
+        self.assertEqual(result["input_ids"], self.record()["input_ids"])
+        self.assertNotIn("loss_mask", result)
 
     def test_fresh_input_mode_writes_exact_diverse_non_rollout_sequence(self):
         def encode(text):

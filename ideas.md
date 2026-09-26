@@ -650,3 +650,7 @@ only after measured learning.
   strict gates and native FP8 settings unchanged. Trainer LR0 must point its
   `model.lora.initial_adapter_path` at the same verified step-0 adapter; no
   cached rollout data is used.
+## Exact policy-0 decode qualification correction
+
+- Reviewer measured that the prior policy-0 reference requested `max_tokens=1` and prompt logprobs, then discarded generated token IDs and scores. It did not qualify the decode path and compared only a caller-supplied receipt.
+- The corrected experiment requests a fresh deterministic completion with exact prompt and completion IDs/logprobs, a zero prompt loss mask and completion-token loss mask, and routed experts aligned to every token. It fetches an explicit readiness receipt immediately before and after generation and requires the active endpoint identity to remain unchanged. A verified step-0 adapter, config, and reference are staged to every configured trainer with existing `training_ops` APIs before an operator invokes qualification. No cached rollout data or live action is part of this change.

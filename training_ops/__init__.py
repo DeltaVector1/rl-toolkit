@@ -24,6 +24,11 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
+from training_ops.runtime.h200.prepare_trinity_policy0_qualification import (
+    QualificationError,
+    validate_lora_config,
+)
+
 repo_root = Path(__file__).resolve().parents[1]
 nodes_path = repo_root / "configs" / "nodes.toml"
 default_config_dir = "configs/general-agent"
@@ -6707,10 +6712,18 @@ def _start_dependency_inventory(
     return list(inventory.items())
 
 
-def _copy_resume_adapter(path: str, nodes: list[str]) -> None:
-    """Copy one adapter from the trainer head to missing trainer nodes."""
-    if not path.startswith(f"{run_root}/"):
-        raise Refused(f"resume adapter must be below {run_root}")
+def _copy_resume_adapter(
+    path: str,
+    nodes: list[str],
+    *,
+    allow_qualification: bool = False,
+) -> None:
+    """Copy one adapter or explicitly staged qualification file to peers."""
+    allowed = (f"{run_root}/",)
+    if allow_qualification:
+        allowed += (f"{storage_root.rstrip('/')}/qualifications/",)
+    if not path.startswith(allowed):
+        raise Refused(f"staged file is outside an allowed training path: {path}")
     targets = [host for host in nodes if host != trainer_head]
     if not targets:
         return
@@ -6777,6 +6790,204 @@ exit "$fail"
     if code:
         detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
         raise RuntimeError(f"resume adapter copy failed: {detail}")
+
+
+def _policy0_qualification_verify_script(
+    adapter_path: str,
+    config_path: str,
+    reference_path: str,
+    expected_lora: dict,
+    expected_files: dict[str, dict[str, int | str]] | None = None,
+) -> str:
+    """Return one exact remote check for the staged qualification files."""
+    expected_json = json.dumps(expected_lora, separators=(",", ":"))
+    file_json = json.dumps(expected_files or {}, separators=(",", ":"))
+    return f"""set -euo pipefail
+adapter={shlex.quote(adapter_path)}
+config_file={shlex.quote(config_path)}
+reference={shlex.quote(reference_path)}
+test -f "$adapter" && test ! -L "$adapter"
+test -f "$config_file" && test ! -L "$config_file"
+test -f "$reference" && test ! -L "$reference"
+python3 - "$config_file" "$reference" {shlex.quote(expected_json)} {shlex.quote(file_json)} <<'PY'
+import json
+import hashlib
+import sys
+
+config_path, reference_path, expected_json, file_json = sys.argv[1:]
+expected = json.loads(expected_json)
+expected_files = json.loads(file_json)
+config = json.loads(open(config_path, encoding="utf-8").read())
+for key in ("r", "lora_alpha", "lora_dropout"):
+    if config.get(key) != expected[key]:
+        raise SystemExit("adapter configuration differs in " + key)
+if (not isinstance(config.get("target_modules"), list)
+        or set(config.get("target_modules")) != set(expected["target_modules"])
+        or len(config.get("target_modules")) != len(expected["target_modules"])):
+    raise SystemExit("adapter target_modules differ")
+reference = json.loads(open(reference_path, encoding="utf-8").read())
+if reference.get("policy") != "policy-0":
+    raise SystemExit("reference is not policy-0")
+if reference.get("request_mode") != "serialized_generate_completion_prompt_logprobs":
+    raise SystemExit("reference is not a completion qualification")
+if reference.get("source_kind") in {"rollout_batch", "cached_rollout_batch"}:
+    raise SystemExit("cached rollout reference is not allowed")
+ids = reference.get("input_ids")
+logs = reference.get("inference_logprobs")
+mask = reference.get("loss_mask")
+lengths = reference.get("sequence_lengths")
+route = reference.get("routed_experts")
+if (not isinstance(ids, list) or not ids or len(logs or []) != len(ids)
+        or not isinstance(mask, list) or len(mask) != len(ids)
+        or not isinstance(lengths, list) or sum(lengths) != len(ids)
+        or not isinstance(route, dict) or route.get("shape", [None])[0] != len(ids)
+        or not any(mask) or all(mask)):
+    raise SystemExit("reference token fields are not aligned")
+if reference.get("policy_identity_before") != reference.get("policy_identity_after"):
+    raise SystemExit("reference policy identity changed")
+if not reference.get("cache_salt"):
+    raise SystemExit("reference has no cache salt")
+generated_ids = reference.get("generated_token_ids")
+if (not isinstance(generated_ids, list)
+        or reference.get("generated_token_count") != len(generated_ids)
+        or len(generated_ids) != sum(mask)):
+    raise SystemExit("reference generated token metadata is not aligned")
+if expected_files:
+    paths = {{
+        "adapter_model.safetensors": {adapter_path!r},
+        "adapter_config.json": {config_path!r},
+        "reference.json": {reference_path!r},
+    }}
+    for name, path in paths.items():
+        record = expected_files.get(name)
+        if not isinstance(record, dict):
+            raise SystemExit("missing expected artifact identity: " + name)
+        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        size = __import__("os").stat(path).st_size
+        if digest != record.get("sha256") or size != record.get("size"):
+            raise SystemExit("artifact identity differs: " + name)
+PY
+sha256sum -- "$adapter" "$config_file" "$reference"
+stat -c '%s' -- "$adapter" "$config_file" "$reference"
+"""
+
+
+def _policy0_qualification_manifest_script(
+    adapter_path: str,
+    config_path: str,
+    reference_path: str,
+) -> str:
+    return f"""set -euo pipefail
+for item in \
+  adapter_model.safetensors:{shlex.quote(adapter_path)} \
+  adapter_config.json:{shlex.quote(config_path)} \
+  reference.json:{shlex.quote(reference_path)}; do
+  name=${{item%%:*}}
+  path=${{item#*:}}
+  test -f "$path" && test ! -L "$path"
+  printf 'QUAL_FILE %s %s %s\\n' "$name" "$(sha256sum -- "$path" | cut -d' ' -f1)" "$(stat -c '%s' -- "$path")"
+done
+"""
+
+
+def prepare_policy0_qualification(
+    config_dir: str = "configs/trinity-h200-parity-production",
+    nodes: list[str] | None = None,
+    *,
+    apply: bool = False,
+) -> dict[str, object]:
+    """Preflight or stage policy-0 files on every configured trainer.
+
+    The default is a local plan only.  ``apply=True`` uses the existing
+    trainer-head fan-out and verifies the exact files on every selected host.
+    """
+    selected = _config_dir(config_dir)
+    if "orchestrator" in selected:
+        raise Refused("policy-0 qualification staging accepts a trainer-only config")
+    trainer_path = repo_root / selected["trainer"]
+    try:
+        with trainer_path.open("rb") as stream:
+            config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Refused(f"cannot read qualification config {trainer_path}: {error}") from error
+    data = config.get("data", {}).get("fake", {})
+    reference_path = data.get("reference_path")
+    lora = config.get("model", {}).get("lora", {})
+    adapter_path = lora.get("initial_adapter_path")
+    if not isinstance(adapter_path, str) or not adapter_path.endswith("/adapter_model.safetensors"):
+        raise Refused("qualification config must name one staged adapter_model.safetensors")
+    if not isinstance(reference_path, str) or not reference_path.endswith("/reference.json"):
+        raise Refused("qualification config must name one staged reference.json")
+    qualification_root = f"{storage_root.rstrip('/')}/qualifications/"
+    if not adapter_path.startswith(qualification_root) or not reference_path.startswith(qualification_root):
+        raise Refused("qualification adapter and reference must be below the qualification path")
+    adapter_dir = PurePosixPath(adapter_path).parent.as_posix()
+    config_path = f"{adapter_dir}/adapter_config.json"
+    expected_lora = {
+        "r": lora.get("rank"),
+        "lora_alpha": lora.get("alpha"),
+        "lora_dropout": lora.get("dropout"),
+        "target_modules": lora.get("target_modules"),
+    }
+    if expected_lora["r"] != 32 or expected_lora["lora_alpha"] != 64 or expected_lora["lora_dropout"] != 0.0:
+        raise Refused("qualification LoRA must be rank32/alpha64/dropout0")
+    try:
+        validate_lora_config(expected_lora, expected_lora)
+    except QualificationError as error:
+        raise Refused(f"qualification LoRA settings are invalid: {error}") from error
+    selected_nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
+    selected_nodes = list(dict.fromkeys(selected_nodes))
+    verify_script = _policy0_qualification_verify_script(
+        adapter_path, config_path, reference_path, expected_lora
+    )
+    manifest_script = _policy0_qualification_manifest_script(
+        adapter_path, config_path, reference_path
+    )
+    plan = {
+        "config": selected["trainer"],
+        "nodes": selected_nodes,
+        "adapter_path": adapter_path,
+        "config_path": config_path,
+        "reference_path": reference_path,
+        "verify_script": verify_script,
+        "manifest_script": manifest_script,
+        "apply": apply,
+    }
+    if not apply:
+        return plan
+    code, output = _ssh(trainer_head, verify_script, timeout=180)
+    if code:
+        detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
+        raise Refused(f"trainer-head qualification artifacts failed validation: {detail}")
+    code, output = _ssh(trainer_head, manifest_script, timeout=180)
+    if code:
+        detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
+        raise Refused(f"trainer-head qualification identities failed validation: {detail}")
+    manifest: dict[str, dict[str, int | str]] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[0] == "QUAL_FILE":
+            name, digest, size_text = parts[1:]
+            if re.fullmatch(r"[0-9a-f]{64}", digest) and size_text.isdigit():
+                manifest[name] = {"sha256": digest, "size": int(size_text)}
+    if set(manifest) != {"adapter_model.safetensors", "adapter_config.json", "reference.json"}:
+        raise Refused("trainer-head qualification identity output is incomplete")
+    verify_script = _policy0_qualification_verify_script(
+        adapter_path, config_path, reference_path, expected_lora, manifest
+    )
+    plan["verify_script"] = verify_script
+    plan["manifest"] = manifest
+    for path in (adapter_path, config_path, reference_path):
+        _copy_resume_adapter(path, selected_nodes, allow_qualification=True)
+    results = _fan(selected_nodes, lambda host: _ssh(host, verify_script, timeout=180))
+    failed = {
+        host: " | ".join(output.strip().splitlines()[-3:]) if output.strip() else f"exit {code}"
+        for host, (code, output) in results.items()
+        if code
+    }
+    if failed:
+        raise RuntimeError(f"qualification artifact verification failed: {failed}")
+    return {**plan, "staged": True}
 
 
 def _cold_run_paths(run: str) -> tuple[str, str, str]:
@@ -7896,6 +8107,19 @@ def _qualify_action(arguments: list[str]):
     )
 
 
+def _prepare_policy0_action(arguments: list[str]):
+    config_dir = arguments[0] if arguments else "configs/trinity-h200-parity-production"
+    mode = arguments[1] if len(arguments) > 1 else "plan"
+    if mode not in {"plan", "stage"}:
+        raise Refused("prepare-policy0 mode must be plan or stage")
+    result = prepare_policy0_qualification(config_dir, apply=mode == "stage")
+    if mode == "plan":
+        print(json.dumps({key: value for key, value in result.items() if key != "verify_script"}, indent=2))
+    else:
+        print("staged and verified policy-0 qualification artifacts on all selected trainers")
+    return result
+
+
 def _archive_action(arguments: list[str]):
     if not arguments:
         raise Refused("archive needs a run name")
@@ -7937,6 +8161,7 @@ actions = {
     "start": _start_action,
     "archive": _archive_action,
     "qualify": _qualify_action,
+    "prepare-policy0": _prepare_policy0_action,
     "stop": _stop_action,
     "mounts": lambda a: print("\n".join(mounted_files())),
 }
@@ -7968,6 +8193,7 @@ usage = f"""training-ops <action> [args]
   archive <run> [step ...]      upload stable old LoRA adapters
                                 add --finished after another run is active
   qualify <name> [mode] [config-dir]  start a trainer-only config directory
+  prepare-policy0 [config-dir] [plan|stage]  preflight or stage policy-0 qualification files
   mounts                        list live-mounted source files
   stop                          stop the run but keep inference loaded
 

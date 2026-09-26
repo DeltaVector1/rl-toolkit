@@ -40,7 +40,10 @@ _NON_ROLLOUT_SOURCES = {
 _POLICY_RECEIPT_DIGEST_FIELDS = ("target_sha256", "config_sha256")
 _POLICY_RECEIPT_MATCH_FIELDS = (
     "target_sha256",
+    "target_size",
     "config_sha256",
+    "config_size",
+    "source_url",
     "lora_name",
     "server_instance",
 )
@@ -288,6 +291,33 @@ def _flatten_prompt_logprobs(raw: Any, input_ids: list[int]) -> list[float]:
     return result
 
 
+def _flatten_completion_logprobs(raw: Any, completion_ids: list[int]) -> list[float]:
+    """Validate the exact generated-token logprob contract."""
+    if not isinstance(raw, Mapping):
+        raise ReferenceError("completion logprobs must be an object")
+    content = raw.get("content")
+    if not isinstance(content, list) or len(content) != len(completion_ids):
+        raise ReferenceError("completion logprob count does not match generated token count")
+    result: list[float] = []
+    for index, token_id in enumerate(completion_ids):
+        entry = content[index]
+        if not isinstance(entry, Mapping):
+            raise ReferenceError(f"completion logprob entry {index} is malformed")
+        expected_token = f"token_id:{token_id}"
+        if entry.get("token") != expected_token:
+            raise ReferenceError(
+                f"completion logprob entry {index} has the wrong token key"
+            )
+        value = entry.get("logprob")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ReferenceError(f"completion logprob entry {index} is not numeric")
+        value = float(value)
+        if not math.isfinite(value) or value == -9999.0:
+            raise ReferenceError(f"completion logprob entry {index} has no sampling evidence")
+        result.append(value)
+    return result
+
+
 def _post_json(endpoint: str, body: Mapping[str, Any], timeout: float) -> dict[str, Any]:
     request = Request(
         endpoint,
@@ -305,11 +335,40 @@ def _post_json(endpoint: str, body: Mapping[str, Any], timeout: float) -> dict[s
     return value
 
 
+def _get_json(endpoint: str, timeout: float) -> dict[str, Any]:
+    request = Request(endpoint, headers={"Connection": "close"}, method="GET")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            value = json.load(response)
+    except (OSError, HTTPError, URLError, json.JSONDecodeError) as error:
+        raise ReferenceError(f"staging readiness request failed: {error}") from error
+    if not isinstance(value, dict):
+        raise ReferenceError("staging readiness response must be an object")
+    return value
+
+
 def _endpoint_url(endpoint: str) -> str:
     endpoint = endpoint.rstrip("/")
     if not endpoint.endswith("/inference/v1/generate"):
         raise ReferenceError("endpoint must be the serialized /inference/v1/generate URL")
     return endpoint
+
+
+def _readiness_url(endpoint: str | None, generate_endpoint: str) -> str:
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise ReferenceError("policy-0 requires an explicit staging readiness endpoint")
+    value = endpoint.rstrip("/")
+    parsed = urlsplit(value)
+    generated = urlsplit(generate_endpoint)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not parsed.path
+        or parsed.netloc != generated.netloc
+        or value == generate_endpoint
+    ):
+        raise ReferenceError("staging readiness endpoint must match the active generate endpoint")
+    return value
 
 
 def _load_mapping(value: Path | Mapping[str, Any], label: str) -> dict[str, Any]:
@@ -344,7 +403,10 @@ def _validate_policy_receipt(
         value = actual.get(field)
         if type(value) is not int or value <= (0 if field == "target_size" else -1):
             raise ReferenceError(f"policy receipt has an invalid {field}")
-        if field in expected_identity and expected_identity[field] != value:
+        expected_value = expected_identity.get(field)
+        if type(expected_value) is not int or expected_value <= (0 if field == "target_size" else -1):
+            raise ReferenceError(f"expected policy identity has an invalid {field}")
+        if expected_value != value:
             raise ReferenceError(f"policy receipt differs in {field}")
     source_url = actual.get("source_url")
     parsed_source_url = urlsplit(source_url) if isinstance(source_url, str) else None
@@ -360,10 +422,40 @@ def _validate_policy_receipt(
     server_instance = actual.get("server_instance")
     if not isinstance(server_instance, str) or not server_instance:
         raise ReferenceError("policy receipt has no server instance")
+    expected_source = expected_identity.get("source_url")
+    expected_source_parts = urlsplit(expected_source) if isinstance(expected_source, str) else None
+    if (
+        expected_source_parts is None
+        or expected_source_parts.scheme not in {"http", "https"}
+        or not expected_source_parts.netloc
+    ):
+        raise ReferenceError("expected policy identity has no source URL")
     for field in _POLICY_RECEIPT_MATCH_FIELDS:
         if expected_identity.get(field) != actual.get(field):
             raise ReferenceError(f"policy receipt differs in {field}")
     return actual
+
+
+def _extract_policy_receipt(payload: Mapping[str, Any], policy_model: str) -> dict[str, Any]:
+    """Extract one active loaded receipt, refusing ambiguous status payloads."""
+    if all(field in payload for field in _POLICY_RECEIPT_MATCH_FIELDS):
+        return dict(payload)
+    direct = payload.get("loaded_receipt")
+    if isinstance(direct, Mapping):
+        return dict(direct)
+    loaded = payload.get("loaded_receipts")
+    candidates: list[Any]
+    if isinstance(loaded, Mapping):
+        candidates = [loaded.get(policy_model)]
+    elif isinstance(loaded, list):
+        candidates = loaded
+    else:
+        candidates = []
+    candidates = [item for item in candidates if isinstance(item, Mapping)]
+    matching = [item for item in candidates if item.get("lora_name") == policy_model]
+    if len(matching) != 1:
+        raise ReferenceError("staging readiness has no unique loaded policy receipt")
+    return dict(matching[0])
 
 
 def _validate_cache_salt(value: str | None, *, required: bool) -> str | None:
@@ -387,11 +479,15 @@ def build_reference(
     policy_receipt: Path | Mapping[str, Any] | None = None,
     expected_policy_identity: Path | Mapping[str, Any] | None = None,
     cache_salt: str | None = None,
+    readiness_endpoint: str | None = None,
+    completion_tokens: int = 32,
+    minimum_completion_tokens: int = 8,
     minimum_tokens: int = 4097,
     expected_route_shape: list[int] | None = None,
     expected_route_sha256: str | None = None,
     timeout: float = 120.0,
     post_json: Callable[[str, Mapping[str, Any], float], dict[str, Any]] = _post_json,
+    get_json: Callable[[str, float], dict[str, Any]] = _get_json,
 ) -> dict[str, Any]:
     if policy not in _POLICIES:
         raise ReferenceError(f"policy must be one of {sorted(_POLICIES)}")
@@ -399,6 +495,15 @@ def build_reference(
         raise ReferenceError("base_model and selected policy model are required")
     if isinstance(minimum_tokens, bool) or minimum_tokens < 0:
         raise ReferenceError("minimum_tokens must be non-negative")
+    if (
+        isinstance(completion_tokens, bool)
+        or completion_tokens < 1
+        or completion_tokens > 4096
+        or isinstance(minimum_completion_tokens, bool)
+        or minimum_completion_tokens < 1
+        or minimum_completion_tokens > completion_tokens
+    ):
+        raise ReferenceError("completion token limits are invalid")
     record = _load_record(input_record)
     input_ids = list(record["input_ids"])
     token_count = len(input_ids)
@@ -422,26 +527,45 @@ def build_reference(
     model = base_model if policy == "base" else policy_model
     assert model is not None
     if policy == "policy-0":
-        if policy_receipt is None or expected_policy_identity is None:
+        if expected_policy_identity is None:
             raise ReferenceError(
                 "policy-0 requires a readiness receipt and expected policy identity"
             )
-        policy_identity = _validate_policy_receipt(
-            policy_receipt,
-            expected_policy_identity,
+        generate_endpoint = _endpoint_url(endpoint)
+        readiness_url = _readiness_url(readiness_endpoint, generate_endpoint)
+        expected_identity = _load_mapping(expected_policy_identity, "expected policy identity")
+        before_payload = get_json(readiness_url, timeout)
+        policy_identity_before = _validate_policy_receipt(
+            _extract_policy_receipt(before_payload, model),
+            expected_identity,
             model,
         )
+        if policy_receipt is not None:
+            caller_identity = _validate_policy_receipt(
+                policy_receipt,
+                expected_identity,
+                model,
+            )
+            if policy_identity_before != caller_identity:
+                raise ReferenceError("active readiness receipt differs from caller receipt")
+        policy_identity = policy_identity_before
     else:
-        if policy_receipt is not None or expected_policy_identity is not None:
+        if (
+            policy_receipt is not None
+            or expected_policy_identity is not None
+            or readiness_endpoint is not None
+        ):
             raise ReferenceError("base policy cannot use a policy readiness receipt")
         policy_identity = None
     cache_salt = _validate_cache_salt(cache_salt, required=policy == "policy-0")
     sampling_params = {
-        "max_tokens": 1,
-        "temperature": 1.0,
+        "max_tokens": completion_tokens if policy == "policy-0" else 1,
+        "temperature": 0.0 if policy == "policy-0" else 1.0,
         "top_p": 1.0,
         "prompt_logprobs": 1,
     }
+    if policy == "policy-0":
+        sampling_params["logprobs"] = 1
     request_body: dict[str, Any] = {
         "model": model,
         "token_ids": input_ids,
@@ -449,19 +573,37 @@ def build_reference(
     }
     if cache_salt is not None:
         request_body["cache_salt"] = cache_salt
-    response = post_json(
-        _endpoint_url(endpoint),
-        request_body,
-        timeout,
-    )
-    logprobs = _flatten_prompt_logprobs(response.get("prompt_logprobs"), input_ids)
+    response = post_json(generate_endpoint if policy == "policy-0" else _endpoint_url(endpoint), request_body, timeout)
     choices = response.get("choices")
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
         raise ReferenceError("serialized generate response must contain one choice")
-    route = choices[0].get("routed_experts")
+    choice = choices[0]
+    prompt_logprobs = _flatten_prompt_logprobs(response.get("prompt_logprobs"), input_ids)
+    generated_ids: list[int] = []
+    generated_logprobs: list[float] = []
+    full_ids = input_ids
+    full_logprobs = prompt_logprobs
+    loss_mask = [False] * token_count
+    if policy == "policy-0":
+        raw_generated_ids = choice.get("token_ids")
+        if (
+            not isinstance(raw_generated_ids, list)
+            or len(raw_generated_ids) < minimum_completion_tokens
+            or len(raw_generated_ids) > completion_tokens
+            or any(isinstance(token, bool) or not isinstance(token, int) for token in raw_generated_ids)
+        ):
+            raise ReferenceError("policy-0 response has too few or invalid generated token IDs")
+        generated_ids = list(raw_generated_ids)
+        generated_logprobs = _flatten_completion_logprobs(
+            choice.get("logprobs"), generated_ids
+        )
+        full_ids = input_ids + generated_ids
+        full_logprobs = prompt_logprobs + generated_logprobs
+        loss_mask = [False] * token_count + [True] * len(generated_ids)
+    route = choice.get("routed_experts")
     if not isinstance(route, dict):
         raise ReferenceError("serialized generate response is missing routed experts")
-    route = _normalise_route(route, token_count)
+    route = _normalise_route(route, len(full_ids))
     if expected_shape is not None and route.get("shape") != expected_shape:
         raise ReferenceError("routed expert shape differs from the preserved expectation")
     if expected_digest is not None and route.get("sha256") != expected_digest:
@@ -470,21 +612,42 @@ def build_reference(
     result = {
         "schema_version": 1,
         "source_kind": record["source_kind"],
-        "input_ids": input_ids,
-        "inference_logprobs": logprobs,
-        "sequence_lengths": list(record["sequence_lengths"]),
+        "input_ids": full_ids,
+        "inference_logprobs": full_logprobs,
+        "sequence_lengths": (
+            [len(full_ids)] if policy == "policy-0" else list(record["sequence_lengths"])
+        ),
         "routed_experts": route,
-        "temperature": 1.0,
+        "temperature": sampling_params["temperature"],
         "policy": policy,
         "model": model,
         "policy_identity": policy_identity,
         "cache_salt": cache_salt,
-        "request_mode": "serialized_generate_prompt_logprobs",
+        "request_mode": (
+            "serialized_generate_completion_prompt_logprobs"
+            if policy == "policy-0"
+            else "serialized_generate_prompt_logprobs"
+        ),
         "sampling_params": sampling_params,
         "source_input_sha256": hashlib.sha256(
             json.dumps(input_ids, separators=(",", ":")).encode()
         ).hexdigest(),
     }
+    if policy == "policy-0":
+        after_payload = get_json(readiness_url, timeout)
+        policy_identity_after = _validate_policy_receipt(
+            _extract_policy_receipt(after_payload, model),
+            expected_identity,
+            model,
+        )
+        if policy_identity_after != policy_identity_before:
+            raise ReferenceError("active policy receipt changed during generation")
+        result["policy_identity_before"] = policy_identity_before
+        result["policy_identity_after"] = policy_identity_after
+        result["loss_mask"] = loss_mask
+        result["generated_token_ids"] = generated_ids
+        result["generated_token_count"] = len(generated_ids)
+        result["finish_reason"] = choice.get("finish_reason")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, separators=(",", ":")) + "\n")
     return result
@@ -504,6 +667,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-receipt", type=Path, help="JSON readiness/load receipt for policy-0")
     parser.add_argument("--expected-policy-identity", type=Path, help="JSON expected policy identity for policy-0")
     parser.add_argument("--cache-salt", help="fresh top-level prefix-cache salt for policy-0")
+    parser.add_argument("--readiness-endpoint", help="explicit active staging readiness URL for policy-0")
+    parser.add_argument("--completion-tokens", type=int, default=32)
+    parser.add_argument("--minimum-completion-tokens", type=int, default=8)
     parser.add_argument("--minimum-tokens", type=int, default=4097)
     parser.add_argument("--expected-route-shape", type=int, nargs=3)
     parser.add_argument("--expected-route-sha256")
@@ -537,6 +703,9 @@ def main(argv: list[str] | None = None) -> int:
             policy_receipt=args.policy_receipt,
             expected_policy_identity=args.expected_policy_identity,
             cache_salt=args.cache_salt,
+            readiness_endpoint=args.readiness_endpoint,
+            completion_tokens=args.completion_tokens,
+            minimum_completion_tokens=args.minimum_completion_tokens,
             minimum_tokens=args.minimum_tokens,
             expected_route_shape=args.expected_route_shape,
             expected_route_sha256=args.expected_route_sha256,
