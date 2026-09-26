@@ -88,17 +88,75 @@ def receipt(server="instance-a"):
     return {**IDENTITY, "lora_name": "qualification-policy-0", "server_instance": server}
 
 
-def run_engine_probe(script, inspect_line):
+def run_engine_probe(
+    script,
+    inspect_line,
+    *,
+    inspect_after="",
+    listener_initial="LISTEN users:((\"python\",pid=321,fd=8))",
+    listener_after="",
+    docker_id="a" * 64,
+    listener_exe="/usr/bin/python3.12",
+    container_exe="/usr/bin/python3.12",
+    listener_exe_identity="8:123",
+    container_exe_identity="8:123",
+    listener_title="PRIME-RL::Inference",
+    listener_comm="PRIME-RL::Infer",
+    cgroup_id=None,
+    nspid_host=321,
+    nspid_container=1,
+    start_ticks_after="",
+):
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         (root / "sudo").write_text(
             """#!/bin/sh
 set -eu
 case "$1" in
-  docker) printf '%s\\n' "$DOCKER_INSPECT" ;;
-  ss) printf '%s\\n' 'LISTEN users:(("python",pid=321,fd=8))' ;;
-  cat) printf '%s\\n' '/usr/bin/python' ;;
-  awk) printf '%s\\n' '1001' ;;
+  docker)
+    count=0
+    if [ -f "$DOCKER_COUNT" ]; then IFS= read -r count <"$DOCKER_COUNT"; fi
+    printf '1\\n' >"$DOCKER_COUNT"
+    if [ "$count" = 0 ] || [ -z "$DOCKER_INSPECT_AFTER" ]; then printf '%s\\n' "$DOCKER_INSPECT"; else printf '%s\\n' "$DOCKER_INSPECT_AFTER"; fi
+    ;;
+  ss)
+    count=0
+    if [ -f "$SS_COUNT" ]; then IFS= read -r count <"$SS_COUNT"; fi
+    printf '1\\n' >"$SS_COUNT"
+    if [ "$count" = 0 ] || [ -z "$DOCKER_LISTENER_AFTER" ]; then printf '%s\\n' "$DOCKER_LISTENER_INITIAL"; else printf '%s\\n' "$DOCKER_LISTENER_AFTER"; fi
+    ;;
+  cat)
+    case "$*" in
+      */cmdline) printf '%s\\0' "$LISTENER_TITLE" ;;
+      */comm) printf '%s\\n' "$LISTENER_COMM" ;;
+      */cgroup) printf '0::/docker/%s\\n' "$CGROUP_ID" ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  readlink)
+    case "$*" in
+      */root/proc/1/exe) printf '%s\\n' "$CONTAINER_EXE" ;;
+      *) printf '%s\\n' "$LISTENER_EXE" ;;
+    esac
+    ;;
+  stat)
+    case "$*" in
+      */root/proc/1/exe) printf '%s\\n' "$CONTAINER_EXE_IDENTITY" ;;
+      *) printf '%s\\n' "$LISTENER_EXE_IDENTITY" ;;
+    esac
+    ;;
+  awk)
+    case "$*" in
+      */status) printf '%s %s\\n' "$NSPID_HOST" "$NSPID_CONTAINER" ;;
+      */stat)
+        count=0
+        if [ -f "$STAT_COUNT" ]; then IFS= read -r count <"$STAT_COUNT"; fi
+        printf '1\\n' >"$STAT_COUNT"
+        if [ "$count" != 0 ] && [ -n "$START_TICKS_AFTER" ]; then printf '%s\\n' "$START_TICKS_AFTER"; else printf '12345\\n'; fi
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
   *) exit 1 ;;
 esac
 """
@@ -118,6 +176,23 @@ esac
         environment = os.environ.copy()
         environment["PATH"] = f"{directory}:{environment['PATH']}"
         environment["DOCKER_INSPECT"] = inspect_line
+        environment["DOCKER_INSPECT_AFTER"] = inspect_after
+        environment["DOCKER_LISTENER_INITIAL"] = listener_initial
+        environment["DOCKER_LISTENER_AFTER"] = listener_after
+        environment["DOCKER_ID"] = docker_id
+        environment["CGROUP_ID"] = cgroup_id or docker_id
+        environment["LISTENER_EXE"] = listener_exe
+        environment["CONTAINER_EXE"] = container_exe
+        environment["LISTENER_EXE_IDENTITY"] = listener_exe_identity
+        environment["CONTAINER_EXE_IDENTITY"] = container_exe_identity
+        environment["LISTENER_TITLE"] = listener_title
+        environment["LISTENER_COMM"] = listener_comm
+        environment["NSPID_HOST"] = str(nspid_host)
+        environment["NSPID_CONTAINER"] = str(nspid_container)
+        environment["START_TICKS_AFTER"] = start_ticks_after
+        environment["DOCKER_COUNT"] = str(root / "docker-count")
+        environment["SS_COUNT"] = str(root / "ss-count")
+        environment["STAT_COUNT"] = str(root / "stat-count")
         return subprocess.run(
             ["bash", "-ceu", script],
             text=True,
@@ -299,37 +374,77 @@ class Policy0LoadTest(unittest.TestCase):
 
     def test_engine_probe_uses_literal_pipe_delimiters_and_parses_valid_identity(self):
         engine = _policy0_load_engine_state_script("glm52-decensor-h200", [8000])
-        self.assertIn("{{.Name}}|{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}", engine)
-        self.assertIn("IFS='|' read -r name container_id container_started_at running", engine)
+        self.assertIn("{{.Name}}|{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}|{{.State.Pid}}", engine)
+        self.assertIn("IFS='|' read -r name container_id container_started_at running container_pid", engine)
+        self.assertIn("/proc/$api_pid/comm", engine)
         self.assertNotIn(r"{{.Name}}\t{{.Id}}", engine)
         result = run_engine_probe(
             engine,
-            "/glm52-decensor-h200|container-a|2026-09-26T00:00:00Z|true",
+            f"/glm52-decensor-h200|{'a' * 64}|2026-09-26T00:00:00Z|true|321",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         parsed = json.loads(result.stdout)
-        self.assertEqual(parsed["container_id"], "container-a")
+        self.assertEqual(parsed["container_id"], "a" * 64)
         self.assertEqual(parsed["container_started_at"], "2026-09-26T00:00:00Z")
         self.assertEqual(parsed["api_pid"], 321)
 
     def test_engine_probe_rejects_malformed_or_mismatched_identity(self):
         engine = _policy0_load_engine_state_script("glm52-decensor-h200", [8000])
         cases = (
-            (r"/glm52-decensor-h200\tcontainer-a\tstarted\ttrue", "identity-mismatch"),
-            ("/other-engine|container-a|started|true", "identity-mismatch"),
-            ("/glm52-decensor-h200|container-a|started|true|", "identity-mismatch"),
-            ("/glm52-decensor-h200|container-a|started|true|extra", "identity-mismatch"),
-            ("/glm52-decensor-h200|container-a|started|true\nsecond", "identity-mismatch"),
-            ("/glm52-decensor-h200||started|true", "identity-mismatch"),
-            ("/glm52-decensor-h200|container-a||true", "identity-mismatch"),
-            ("/glm52-decensor-h200|container-a|started|", "identity-mismatch"),
-            ("/glm52-decensor-h200|container-a|started|false", "engine-stopped"),
+            (r"/glm52-decensor-h200\t" + "a" * 64 + r"\tstarted\ttrue\t321", "identity-mismatch"),
+            ("/other-engine|" + "a" * 64 + "|started|true|321", "identity-mismatch"),
+            ("/glm52-decensor-h200|" + "a" * 64 + "|started|true|", "identity-mismatch"),
+            ("/glm52-decensor-h200|" + "a" * 64 + "|started|true|extra", "identity-mismatch"),
+            ("/glm52-decensor-h200|" + "a" * 64 + "|started|true|321\nsecond", "identity-mismatch"),
+            ("/glm52-decensor-h200||started|true|321", "identity-mismatch"),
+            ("/glm52-decensor-h200|" + "a" * 64 + "||true|321", "identity-mismatch"),
+            ("/glm52-decensor-h200|" + "a" * 64 + "|started|true|0", "identity-mismatch"),
+            ("/glm52-decensor-h200|" + "a" * 64 + "|started|false|321", "engine-stopped"),
         )
         for inspect_line, error in cases:
             with self.subTest(inspect_line=inspect_line):
                 result = run_engine_probe(engine, inspect_line)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(error, result.stderr)
+
+    def test_engine_probe_rejects_listener_identity_mismatches(self):
+        engine = _policy0_load_engine_state_script("glm52-decensor-h200", [8000])
+        valid = f"/glm52-decensor-h200|{'a' * 64}|2026-09-26T00:00:00Z|true|321"
+        cases = (
+            (dict(inspect_line=valid.replace("|321", "|322")), "listener PID differs"),
+            (dict(inspect_line=valid, listener_title="PRIME-RL::Infer"), "command title"),
+            (dict(inspect_line=valid, listener_comm="PRIME-RL::Inference"), "comm"),
+            (dict(inspect_line=valid, listener_exe="/usr/bin/python3.11"), "executable is not"),
+            (dict(inspect_line=valid, cgroup_id="b" * 64), "cgroup"),
+            (dict(inspect_line=valid, nspid_host=999), "NSpid"),
+            (dict(inspect_line=valid, container_exe_identity="8:999"), "executable identity"),
+        )
+        for kwargs, error in cases:
+            with self.subTest(error=error):
+                result = run_engine_probe(engine, **kwargs)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(error, result.stderr)
+
+    def test_engine_probe_rejects_multiple_or_changed_listeners(self):
+        engine = _policy0_load_engine_state_script("glm52-decensor-h200", [8000])
+        valid = f"/glm52-decensor-h200|{'a' * 64}|2026-09-26T00:00:00Z|true|321"
+        result = run_engine_probe(
+            engine,
+            valid,
+            listener_initial='LISTEN users:(("python",pid=321,fd=8),("python",pid=322,fd=9))',
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not unique", result.stderr)
+        result = run_engine_probe(
+            engine,
+            valid,
+            inspect_after=f"/glm52-decensor-h200|{'b' * 64}|2026-09-26T00:00:00Z|true|321",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("engine identity changed after health checks", result.stderr)
+        result = run_engine_probe(engine, valid, start_ticks_after="67890")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("listener start identity changed", result.stderr)
 
     def test_remote_client_call_is_h200_local_and_controller_has_no_client_import(self):
         response = '{"ok":true,"result":{"adapter_identity":{}}}'

@@ -8601,13 +8601,13 @@ def _policy0_load_engine_state_script(container: str, ports_for_host: list[int])
     ports_text = " ".join(str(port) for port in ports_for_host)
     return f"""set -euo pipefail
 container={shlex.quote(container)}
-inspect=$(sudo docker inspect --format '{{{{.Name}}}}|{{{{.Id}}}}|{{{{.State.StartedAt}}}}|{{{{.State.Running}}}}' "$container" 2>/dev/null) || {{ echo unknown >&2; exit 81; }}
-if [[ "$inspect" == *$'\\n'* || "$inspect" == *$'\\r'* || ! "$inspect" =~ ^[^|]+\\|[^|]+\\|[^|]+\\|[^|]+$ ]]; then
+inspect=$(sudo docker inspect --format '{{{{.Name}}}}|{{{{.Id}}}}|{{{{.State.StartedAt}}}}|{{{{.State.Running}}}}|{{{{.State.Pid}}}}' "$container" 2>/dev/null) || {{ echo unknown >&2; exit 81; }}
+if [[ "$inspect" == *$'\\n'* || "$inspect" == *$'\\r'* || ! "$inspect" =~ ^[^|]+\\|[0-9a-f]{{64}}\\|[^|]+\\|[^|]+\\|[1-9][0-9]*$ ]]; then
   echo identity-mismatch >&2
   exit 82
 fi
-IFS='|' read -r name container_id container_started_at running <<< "$inspect"
-[ -n "$name" ] && [ -n "$container_id" ] && [ -n "$container_started_at" ] && [ -n "$running" ] || {{ echo identity-mismatch >&2; exit 82; }}
+IFS='|' read -r name container_id container_started_at running container_pid <<< "$inspect"
+[ -n "$name" ] && [ -n "$container_id" ] && [ -n "$container_started_at" ] && [ -n "$running" ] && [ -n "$container_pid" ] || {{ echo identity-mismatch >&2; exit 82; }}
 [ "$name" = "/$container" ] || {{ echo identity-mismatch >&2; exit 82; }}
 [ "$running" = true ] || {{ echo engine-stopped >&2; exit 83; }}
 listener_identity=""
@@ -8618,15 +8618,44 @@ for port in {ports_text}; do
   pids=$(printf '%s\\n' "$owner" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
   [ "$(printf '%s\\n' "$pids" | sed '/^$/d' | wc -l)" = 1 ] || {{ echo "listener identity is not unique on $port" >&2; exit 84; }}
   api_pid=$(printf '%s\\n' "$pids" | sed -n '1p')
-  api_command=$(sudo cat "/proc/$api_pid/cmdline" 2>/dev/null | tr '\\0' ' ' || true)
-  case "$api_command" in *python*|*vllm*|*inference*) ;; *) echo "listener command is not the inference API on $port" >&2; exit 85;; esac
-  api_start_time=$(sudo awk '{{print $22}}' "/proc/$api_pid/stat" 2>/dev/null || true)
-  [ -n "$api_start_time" ] || {{ echo "listener start identity is unreadable on $port" >&2; exit 86; }}
+  [ "$api_pid" = "$container_pid" ] || {{ echo "listener PID differs from Docker container PID on $port" >&2; exit 84; }}
+  api_command=$(sudo cat "/proc/$api_pid/cmdline" 2>/dev/null | tr '\\0' '\\n' | sed '/^$/d' || true)
+  [ "$api_command" = "PRIME-RL::Inference" ] || {{ echo "listener command title is not the audited inference title on $port" >&2; exit 85; }}
+  api_comm=$(sudo cat "/proc/$api_pid/comm" 2>/dev/null | tr -d '\\0\\n\\r' || true)
+  [ "$api_comm" = "PRIME-RL::Infer" ] || {{ echo "listener comm is not the audited inference comm on $port" >&2; exit 85; }}
+  api_exe=$(sudo readlink "/proc/$api_pid/exe" 2>/dev/null || true)
+  [ "$api_exe" = "/usr/bin/python3.12" ] || {{ echo "listener executable is not the audited Python executable on $port" >&2; exit 85; }}
+  api_exe_identity=$(sudo stat -Lc '%d:%i' "/proc/$api_pid/exe" 2>/dev/null || true)
+  container_exe_identity=$(sudo stat -Lc '%d:%i' "/proc/$api_pid/root/proc/1/exe" 2>/dev/null || true)
+  [ -n "$api_exe_identity" ] && [ "$api_exe_identity" = "$container_exe_identity" ] || {{ echo "listener executable identity differs from container init on $port" >&2; exit 85; }}
+  cgroup=$(sudo cat "/proc/$api_pid/cgroup" 2>/dev/null || true)
+  [[ "$cgroup" =~ (^|/)${{container_id}}(/|$) ]] || {{ echo "listener cgroup does not bind the exact container" >&2; exit 85; }}
+  nspid=$(sudo awk '$1 == "NSpid:" {{print $2, $3; found=1}} END {{if (!found) exit 1}}' "/proc/$api_pid/status" 2>/dev/null || true)
+  [[ "$nspid" =~ ^${{api_pid}}\\ 1$ ]] || {{ echo "listener NSpid does not bind host PID to container PID 1" >&2; exit 85; }}
+  api_start_time=$(sudo awk '{{ line=$0; sub(/^.*\\) /, "", line); split(line, fields, /[[:space:]]+/); print fields[20] }}' "/proc/$api_pid/stat" 2>/dev/null || true)
+  [[ "$api_start_time" =~ ^[1-9][0-9]*$ ]] || {{ echo "listener start identity is unreadable on $port" >&2; exit 86; }}
   current_identity="$api_pid:$api_start_time"
   if [ -z "$listener_identity" ]; then listener_identity="$current_identity"; else [ "$listener_identity" = "$current_identity" ] || {{ echo "inference listener identity differs by port" >&2; exit 87; }}; fi
   curl -fsS -m 30 "http://127.0.0.1:$port/health" > "$tmp/health.$port" || exit 86
   curl -fsS -m 30 "http://127.0.0.1:$port/metrics" > "$tmp/metrics.$port" || exit 87
   curl -fsS -m 30 "http://127.0.0.1:$port/staging_status" > "$tmp/status.$port" || exit 88
+done
+inspect_after=$(sudo docker inspect --format '{{{{.Name}}}}|{{{{.Id}}}}|{{{{.State.StartedAt}}}}|{{{{.State.Running}}}}|{{{{.State.Pid}}}}' "$container" 2>/dev/null) || {{ echo unknown >&2; exit 89; }}
+if [[ "$inspect_after" == *$'\\n'* || "$inspect_after" == *$'\\r'* || ! "$inspect_after" =~ ^[^|]+\\|[0-9a-f]{{64}}\\|[^|]+\\|[^|]+\\|[1-9][0-9]*$ ]]; then
+  echo "engine identity changed after health checks" >&2
+  exit 89
+fi
+IFS='|' read -r name_after container_id_after container_started_at_after running_after container_pid_after <<< "$inspect_after"
+[ "$name_after" = "/$container" ] && [ "$container_id_after" = "$container_id" ] && [ "$container_started_at_after" = "$container_started_at" ] && [ "$running_after" = true ] && [ "$container_pid_after" = "$container_pid" ] || {{ echo "engine identity changed after health checks" >&2; exit 89; }}
+for port in {ports_text}; do
+  owner_after=$(sudo ss -H -ltnp "sport = :$port" 2>/dev/null || true)
+  pids_after=$(printf '%s\\n' "$owner_after" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+  [ "$(printf '%s\\n' "$pids_after" | sed '/^$/d' | wc -l)" = 1 ] || {{ echo "listener identity changed after health checks on $port" >&2; exit 90; }}
+  api_pid_after=$(printf '%s\\n' "$pids_after" | sed -n '1p')
+  [ "$api_pid_after" = "$container_pid_after" ] || {{ echo "listener PID changed after health checks on $port" >&2; exit 90; }}
+  api_start_time_after=$(sudo awk '{{ line=$0; sub(/^.*\\) /, "", line); split(line, fields, /[[:space:]]+/); print fields[20] }}' "/proc/$api_pid_after/stat" 2>/dev/null || true)
+  [[ "$api_start_time_after" =~ ^[1-9][0-9]*$ ]] || {{ echo "listener start identity changed after health checks on $port" >&2; exit 90; }}
+  [ "$api_pid_after:$api_start_time_after" = "$listener_identity" ] || {{ echo "listener start identity changed after health checks on $port" >&2; exit 90; }}
 done
 api_pid=${{listener_identity%%:*}}
 api_start_time=${{listener_identity#*:}}
