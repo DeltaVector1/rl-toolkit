@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 import time
 import tomllib
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -7039,75 +7040,405 @@ trap - EXIT
 
 
 def _policy0_transfer_reference_script(
-    source_path: str,
+    partial_path: str,
     target_path: str,
-    trainer_ssh_target: str,
+    source_sha256: str,
+    source_size: int,
+    expected_old_sha256: str | None = None,
+    expected_old_size: int | None = None,
 ) -> str:
-    source = shlex.quote(source_path)
-    target = shlex.quote(target_path)
-    remote_target = shlex.quote(trainer_ssh_target)
-    remote_dir = shlex.quote(str(PurePosixPath(target_path).parent))
-    remote_tmp = shlex.quote(target_path + ".tmp.policy0.reference")
+    """Install one verified partial reference with locked preservation."""
+    if not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+        raise Refused("reference source SHA256 is invalid")
+    if type(source_size) is not int or source_size < 0:
+        raise Refused("reference source size is invalid")
+    if (expected_old_sha256 is None) != (expected_old_size is None):
+        raise Refused("expected existing reference SHA256 and size are both required")
+    if expected_old_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", expected_old_sha256
+    ):
+        raise Refused("expected existing reference SHA256 is invalid")
+    if expected_old_size is not None and (type(expected_old_size) is not int or expected_old_size < 0):
+        raise Refused("expected existing reference size is invalid")
+    partial = shlex.quote(partial_path)
+    final = shlex.quote(target_path)
+    archive = shlex.quote(
+        target_path + ".preserved." + (expected_old_sha256 or "OLD_SHA256")
+    )
+    expected_sha = shlex.quote(source_sha256)
+    expected_old_sha = shlex.quote(expected_old_sha256 or "")
+    expected_old_size_text = str(expected_old_size) if expected_old_size is not None else ""
     return f"""set -euo pipefail
-source={source}
-final={target}
-trainer_target={remote_target}
-test -f "$source" && test ! -L "$source"
-source_sha=$(sha256sum -- "$source" | cut -d' ' -f1)
-source_size=$(stat -c '%s' -- "$source")
-remote_state=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
-  bash -s -- "$final" <<'REMOTE_STATE'
-set -e
-final=$1
-if [ -L "$final" ]; then
-  echo SYMLINK
-elif [ -f "$final" ]; then
-  printf 'FILE %s %s\\n' "$(sha256sum -- "$final" | cut -d' ' -f1)" "$(stat -c '%s' -- "$final")"
-else
-  echo MISSING
-fi
-REMOTE_STATE
-)
-case "$remote_state" in
-  "FILE $source_sha $source_size") exit 0 ;;
-  MISSING) ;;
-  *) echo "reference destination conflicts: $remote_state" >&2; exit 44 ;;
-esac
-tmp={remote_tmp}
-cleanup() {{ ssh -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
-  "rm -f -- {remote_tmp}" >/dev/null 2>&1 || true; }}
+partial={partial}
+final={final}
+archive={archive}
+new_sha={expected_sha}
+new_size={source_size}
+expected_old_sha={expected_old_sha}
+expected_old_size={expected_old_size_text}
+directory=$(dirname -- "$final")
+archive_tmp=
+preserved=none
+completed=0
+cleanup() {{
+  if [ "$completed" -ne 1 ]; then
+    rm -f -- "$partial" "$archive_tmp" 2>/dev/null || true
+  fi
+}}
 trap cleanup EXIT
-ssh -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
-  "mkdir -p -- {remote_dir}"
-scp -q -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 \
-  -- "$source" "$trainer_target:$tmp"
-ssh -o BatchMode=yes -o ConnectTimeout=15 "$trainer_target" \
-  bash -s -- "$source_sha" "$source_size" "$tmp" "$final" <<'REMOTE_MOVE'
-set -e
-source_sha=$1
-source_size=$2
-tmp=$3
-final=$4
-test ! -L "$tmp"
-test "$(sha256sum -- "$tmp" | cut -d' ' -f1)" = "$source_sha"
-test "$(stat -c '%s' -- "$tmp")" = "$source_size"
-if [ -L "$final" ]; then
-  echo "reference destination became a symlink" >&2
-  exit 45
+
+fsync_file() {{
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}}
+
+fsync_directory() {{
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+fd = os.open(sys.argv[1], flags)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}}
+
+fsync_file_and_directory() {{
+  fsync_file "$1"
+  fsync_directory "$2"
+}}
+
+verify_new_partial() {{
+  test -f "$partial" && test ! -L "$partial" || {{
+    echo "reference partial is not a regular file" >&2
+    return 52
+  }}
+  test "$(sha256sum -- "$partial" | cut -d' ' -f1)" = "$new_sha" || {{
+    echo "reference partial SHA256 differs" >&2
+    return 53
+  }}
+  test "$(stat -c '%s' -- "$partial")" = "$new_size" || {{
+    echo "reference partial size differs" >&2
+    return 54
+  }}
+}}
+
+verify_archive() {{
+    if [ -L "$archive" ] || {{ [ -e "$archive" ] && [ ! -f "$archive" ]; }}; then
+    echo "reference preservation archive is not a regular file" >&2
+    return 57
+  fi
+  test -f "$archive" || {{ echo "reference preservation archive is missing" >&2; return 58; }}
+  test "$(sha256sum -- "$archive" | cut -d' ' -f1)" = "$expected_old_sha" || {{
+    echo "reference preservation archive conflicts" >&2
+    return 59
+  }}
+  test "$(stat -c '%s' -- "$archive")" = "$expected_old_size" || {{
+    echo "reference preservation archive size conflicts" >&2
+    return 60
+  }}
+}}
+
+if [ -L "$directory" ] || {{ [ -e "$directory" ] && [ ! -d "$directory" ]; }}; then
+  echo "reference parent is not a directory: $directory" >&2
+  exit 61
+fi
+mkdir -p -- "$directory"
+if [ -L "$directory" ] || {{ [ -e "$directory" ] && [ ! -d "$directory" ]; }}; then
+  echo "reference parent is not a directory: $directory" >&2
+  exit 62
+fi
+if [ -L "$final.policy0.lock" ] || {{ [ -e "$final.policy0.lock" ] && [ ! -f "$final.policy0.lock" ]; }}; then
+  echo "reference lock is not a regular file: $final.policy0.lock" >&2
+  exit 63
+fi
+exec 9>"$final.policy0.lock"
+flock -n 9 || {{ echo "reference target is locked: $final" >&2; exit 64; }}
+verify_new_partial
+fsync_file "$partial"
+
+if [ -L "$final" ] || {{ [ -e "$final" ] && [ ! -f "$final" ]; }}; then
+  echo "reference destination is not a regular file: $final" >&2
+  exit 65
 fi
 if [ -f "$final" ]; then
-  if [ "$(sha256sum -- "$final" | cut -d' ' -f1)" = "$source_sha" ] \
-      && [ "$(stat -c '%s' -- "$final")" = "$source_size" ]; then
-    rm -f -- "$tmp"
+  current_sha=$(sha256sum -- "$final" | cut -d' ' -f1)
+  current_size=$(stat -c '%s' -- "$final")
+  if [ "$current_sha" = "$new_sha" ] && [ "$current_size" = "$new_size" ]; then
+    rm -f -- "$partial"
+    fsync_directory "$directory"
+    completed=1
+    printf 'REFERENCE_INSTALL status=idempotent old_sha=none old_size=none preserved=none new_sha=%s new_size=%s\\n' "$new_sha" "$new_size"
     exit 0
   fi
-  echo "reference destination appeared with a conflicting identity" >&2
-  exit 46
+  if [ -z "$expected_old_sha" ] || [ "$current_sha" != "$expected_old_sha" ] || [ "$current_size" != "$expected_old_size" ]; then
+    echo "reference destination conflict is not authorized" >&2
+    exit 66
+  fi
+  if [ -L "$archive" ] || {{ [ -e "$archive" ] && [ ! -f "$archive" ]; }}; then
+    echo "reference preservation archive is not a regular file" >&2
+    exit 67
+  fi
+  if [ -f "$archive" ]; then
+    verify_archive
+    fsync_file_and_directory "$archive" "$directory"
+  else
+    archive_tmp=$(mktemp --tmpdir="$directory" ".reference.json.preserved.$expected_old_sha.tmp.XXXXXX")
+    cp -- "$final" "$archive_tmp"
+    test "$(sha256sum -- "$archive_tmp" | cut -d' ' -f1)" = "$expected_old_sha" || {{
+      echo "reference archive temporary SHA256 differs" >&2
+      exit 68
+    }}
+    test "$(stat -c '%s' -- "$archive_tmp")" = "$expected_old_size" || {{
+      echo "reference archive temporary size differs" >&2
+      exit 69
+    }}
+    fsync_file "$archive_tmp"
+    if ln -- "$archive_tmp" "$archive" 2>/dev/null; then
+      fsync_file_and_directory "$archive" "$directory"
+      rm -f -- "$archive_tmp"
+      archive_tmp=
+      fsync_directory "$directory"
+    elif [ -e "$archive" ] || [ -L "$archive" ]; then
+      rm -f -- "$archive_tmp"
+      archive_tmp=
+      verify_archive
+    else
+      echo "reference preservation archive publish failed" >&2
+      exit 70
+    fi
+    verify_archive
+    preserved=$archive
+  fi
+  current_sha=$(sha256sum -- "$final" | cut -d' ' -f1)
+  current_size=$(stat -c '%s' -- "$final")
+  if [ "$current_sha" != "$expected_old_sha" ] || [ "$current_size" != "$expected_old_size" ]; then
+    echo "reference destination changed during preservation" >&2
+    exit 71
+  fi
+  verify_new_partial
+  mv -- "$partial" "$final"
+  partial=
+  fsync_file_and_directory "$final" "$directory"
+  old_sha=$current_sha
+  old_size=$current_size
+else
+  if [ -e "$archive" ] || [ -L "$archive" ]; then
+    echo "reference preservation archive exists while destination is missing" >&2
+    exit 72
+  fi
+  if ln -- "$partial" "$final" 2>/dev/null; then
+    rm -f -- "$partial"
+    partial=
+    fsync_file_and_directory "$final" "$directory"
+    old_sha=none
+    old_size=none
+  elif [ -f "$final" ] && [ ! -L "$final" ]; then
+    current_sha=$(sha256sum -- "$final" | cut -d' ' -f1)
+    current_size=$(stat -c '%s' -- "$final")
+    if [ "$current_sha" = "$new_sha" ] && [ "$current_size" = "$new_size" ]; then
+      rm -f -- "$partial"
+      partial=
+      fsync_directory "$directory"
+      completed=1
+      printf 'REFERENCE_INSTALL status=idempotent old_sha=none old_size=none preserved=none new_sha=%s new_size=%s\\n' "$new_sha" "$new_size"
+      exit 0
+    fi
+    echo "reference destination appeared with a conflicting identity" >&2
+    exit 73
+  else
+    echo "reference destination install failed" >&2
+    exit 74
+  fi
 fi
-mv -- "$tmp" "$final"
-REMOTE_MOVE
-trap - EXIT
+test "$(sha256sum -- "$final" | cut -d' ' -f1)" = "$new_sha" || {{
+  echo "reference final SHA256 differs after install" >&2
+  exit 75
+}}
+test "$(stat -c '%s' -- "$final")" = "$new_size" || {{
+  echo "reference final size differs after install" >&2
+  exit 76
+}}
+completed=1
+printf 'REFERENCE_INSTALL status=installed old_sha=%s old_size=%s preserved=%s new_sha=%s new_size=%s\\n' \\
+  "${{old_sha:-none}}" "${{old_size:-none}}" "$preserved" "$new_sha" "$new_size"
 """
+
+
+def _policy0_local_file_identity(path: Path) -> dict[str, int | str]:
+    """Read one regular local file identity without following symlinks."""
+    if path.is_symlink() or not path.is_file():
+        raise Refused(f"reference is not a regular local file: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return {"sha256": digest.hexdigest(), "size": path.stat().st_size}
+
+
+def _policy0_controller_transfer_reference(
+    source_reference_host: str,
+    source_reference_path: str,
+    target_path: str,
+    selected_nodes: list[str],
+    expected_manifest: dict[str, int | str],
+    expected_old_sha256: str | None,
+    expected_old_size: int | None,
+) -> dict[str, dict[str, object]]:
+    """Fetch one verified reference locally, then install it on each trainer."""
+    with tempfile.TemporaryDirectory(prefix="training-ops-policy0-reference-") as directory:
+        local_reference = Path(directory) / "reference.json"
+        _, source_scp_options, source_destination = _ssh_destination(source_reference_host)
+        source_url = f"{source_destination}:{source_reference_path}"
+        try:
+            fetched = _run_process(
+                scp_command + source_scp_options + [source_url, str(local_reference)],
+                stdin=subprocess.DEVNULL,
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise Refused("reference fetch from H200 timed out") from error
+        except OSError as error:
+            raise Refused(f"reference fetch from H200 failed: {error}") from error
+        if fetched.returncode:
+            detail = ((fetched.stdout or "") + (fetched.stderr or "")).strip()
+            raise Refused(f"reference fetch from H200 failed: {detail[:200]}")
+        identity = _policy0_local_file_identity(local_reference)
+        if identity != expected_manifest:
+            raise Refused(
+                "local H200 reference identity differs: "
+                f"expected {expected_manifest}, got {identity}"
+            )
+
+        if (
+            not isinstance(expected_manifest, dict)
+            or not re.fullmatch(r"[0-9a-f]{64}", str(expected_manifest.get("sha256", "")))
+            or type(expected_manifest.get("size")) is not int
+            or expected_manifest["size"] < 0
+        ):
+            raise Refused("reference source manifest is invalid")
+
+        def cleanup_partial(host: str, partial_path: str) -> tuple[bool, str]:
+            cleanup_script = f"""set -euo pipefail
+partial={shlex.quote(partial_path)}
+if [ -e "$partial" ] || [ -L "$partial" ]; then
+  rm -f -- "$partial"
+fi
+"""
+            try:
+                code, output = _ssh(host, cleanup_script, timeout=120)
+            except Exception as error:
+                return False, f"cleanup exception: {error}"
+            if code:
+                return False, output.strip() or f"exit {code}"
+            return True, ""
+
+        def install_one(host: str) -> dict[str, object]:
+            _, target_scp_options, target_destination = _ssh_destination(host)
+            partial_path = (
+                f"{target_path}.partial.policy0.{os.getpid()}.{uuid.uuid4().hex}"
+            )
+            target_directory = str(PurePosixPath(target_path).parent)
+            parent_script = f"""set -euo pipefail
+directory={shlex.quote(target_directory)}
+if [ -L "$directory" ] || {{ [ -e "$directory" ] && [ ! -d "$directory" ]; }}; then
+  echo "reference parent is not a directory: $directory" >&2
+  exit 81
+fi
+mkdir -p -- "$directory"
+test -d "$directory" && test ! -L "$directory"
+"""
+            try:
+                parent_code, parent_output = _ssh(host, parent_script, timeout=120)
+            except Exception as error:
+                parent_code, parent_output = 1, f"parent exception: {error}"
+            if parent_code:
+                cleaned, cleanup_output = cleanup_partial(host, partial_path)
+                detail = parent_output.strip() or f"exit {parent_code}"
+                if not cleaned:
+                    detail += f"; cleanup failed: {cleanup_output}"
+                return {
+                    "ok": False,
+                    "phase": "parent",
+                    "message": detail,
+                    "partial_path": partial_path,
+                }
+            upload = scp_command + target_scp_options + [
+                str(local_reference),
+                f"{target_destination}:{partial_path}",
+            ]
+            try:
+                uploaded = _run_process(
+                    upload,
+                    stdin=subprocess.DEVNULL,
+                    timeout=600,
+                )
+            except subprocess.TimeoutExpired:
+                upload_code, upload_output = 124, "timeout"
+            except OSError as error:
+                upload_code, upload_output = 1, str(error)
+            except Exception as error:
+                upload_code, upload_output = 1, f"upload exception: {error}"
+            else:
+                upload_code = uploaded.returncode
+                upload_output = ((uploaded.stdout or "") + (uploaded.stderr or "")).strip()
+            if upload_code:
+                cleaned, cleanup_output = cleanup_partial(host, partial_path)
+                detail = upload_output[:200] or f"exit {upload_code}"
+                if not cleaned:
+                    detail += f"; cleanup failed: {cleanup_output}"
+                return {
+                    "ok": False,
+                    "phase": "upload",
+                    "message": detail,
+                    "partial_path": partial_path,
+                }
+            install_script = _policy0_transfer_reference_script(
+                partial_path,
+                target_path,
+                str(expected_manifest["sha256"]),
+                int(expected_manifest["size"]),
+                expected_old_sha256,
+                expected_old_size,
+            )
+            try:
+                code, output = _ssh(host, install_script, timeout=600)
+            except Exception as error:
+                code, output = 1, f"install exception: {error}"
+            if code:
+                cleaned, cleanup_output = cleanup_partial(host, partial_path)
+                detail = output.strip() or f"exit {code}"
+                if not cleaned:
+                    detail += f"; cleanup failed: {cleanup_output}"
+                return {
+                    "ok": False,
+                    "phase": "install",
+                    "message": detail[-500:],
+                    "partial_path": partial_path,
+                }
+            return {
+                "ok": True,
+                "phase": "install",
+                "message": output.strip() or "reference installed",
+                "partial_path": partial_path,
+            }
+
+        results = _fan(selected_nodes, install_one)
+        failures = {host: result for host, result in results.items() if not result.get("ok")}
+        if failures:
+            raise RuntimeError(f"reference staging failed: {failures}")
+        return results
 
 
 def prepare_policy0_qualification(
@@ -7119,8 +7450,36 @@ def prepare_policy0_qualification(
     source_reference_path: str | None = None,
     source_adapter_host: str = trainer_head,
     source_reference_host: str = orchestrator_host,
+    expected_existing_reference_sha256: str | None = None,
+    expected_existing_reference_size: int | None = None,
+    expected_old_reference_sha256: str | None = None,
+    expected_old_reference_size: int | None = None,
+    expected_old_sha256: str | None = None,
+    expected_old_size: int | None = None,
 ) -> dict[str, object]:
     """Preflight or stage exact policy-0 files on every configured trainer."""
+    if expected_old_sha256 is not None:
+        if expected_old_reference_sha256 is not None and (
+            expected_old_reference_sha256 != expected_old_sha256
+        ):
+            raise Refused("expected old reference SHA256 was provided twice with different values")
+        expected_old_reference_sha256 = expected_old_sha256
+    if expected_old_size is not None:
+        if expected_old_reference_size is not None and expected_old_reference_size != expected_old_size:
+            raise Refused("expected old reference size was provided twice with different values")
+        expected_old_reference_size = expected_old_size
+    if expected_old_reference_sha256 is not None:
+        if expected_existing_reference_sha256 is not None and (
+            expected_existing_reference_sha256 != expected_old_reference_sha256
+        ):
+            raise Refused("expected old reference SHA256 was provided twice with different values")
+        expected_existing_reference_sha256 = expected_old_reference_sha256
+    if expected_old_reference_size is not None:
+        if expected_existing_reference_size is not None and (
+            expected_existing_reference_size != expected_old_reference_size
+        ):
+            raise Refused("expected old reference size was provided twice with different values")
+        expected_existing_reference_size = expected_old_reference_size
     selected = _config_dir(config_dir)
     if "orchestrator" in selected:
         raise Refused("policy-0 qualification staging accepts a trainer-only config")
@@ -7174,6 +7533,22 @@ def prepare_policy0_qualification(
         raise Refused(f"source adapter host must be configured trainer head {trainer_head}")
     if source_reference_host != orchestrator_host:
         raise Refused(f"source reference host must be configured H200 {orchestrator_host}")
+    if (expected_existing_reference_sha256 is None) != (
+        expected_existing_reference_size is None
+    ):
+        raise Refused(
+            "expected existing reference SHA256 and size are both required"
+        )
+    if expected_existing_reference_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", expected_existing_reference_sha256
+    ):
+        raise Refused("expected existing reference SHA256 is invalid")
+    if expected_existing_reference_size is not None and (
+        not isinstance(expected_existing_reference_size, int)
+        or isinstance(expected_existing_reference_size, bool)
+        or expected_existing_reference_size < 0
+    ):
+        raise Refused("expected existing reference size is invalid")
     _check_host(source_adapter_host)
     _check_host(source_reference_host)
     storage_prefix = f"{storage_root.rstrip('/')}/"
@@ -7202,9 +7577,12 @@ def prepare_policy0_qualification(
         {"sha256": "expected-after-source-check", "size": 0},
     )
     transfer_reference_script = _policy0_transfer_reference_script(
-        source_reference_path,
+        reference_path + ".partial.policy0.UNIQUE",
         reference_path,
-        hosts["trainer_ssh"],
+        "0" * 64,
+        0,
+        expected_existing_reference_sha256,
+        expected_existing_reference_size,
     )
     stage_adapter_script = _policy0_stage_head_file_script(source_adapter_path, adapter_path)
     stage_config_script = _policy0_stage_head_file_script(source_config_path, config_path)
@@ -7218,6 +7596,12 @@ def prepare_policy0_qualification(
         "source_adapter_dir": source_adapter_dir,
         "source_reference_host": source_reference_host,
         "source_reference_path": source_reference_path,
+        "expected_existing_reference_sha256": expected_existing_reference_sha256,
+        "expected_existing_reference_size": expected_existing_reference_size,
+        "expected_old_reference_sha256": expected_existing_reference_sha256,
+        "expected_old_reference_size": expected_existing_reference_size,
+        "expected_old_sha256": expected_existing_reference_sha256,
+        "expected_old_size": expected_existing_reference_size,
         "source_adapter_path": source_adapter_path,
         "source_config_path": source_config_path,
         "verify_script": verify_script,
@@ -7263,11 +7647,16 @@ def prepare_policy0_qualification(
                 reference_manifest[name] = {"sha256": digest, "size": int(size_text)}
     if set(reference_manifest) != {"reference.json"}:
         raise Refused("fresh H200 reference identity output is incomplete")
-    code, output = _ssh(source_reference_host, transfer_reference_script, timeout=600)
-    if code:
-        detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
-        raise Refused(f"fresh H200 reference staging failed: {detail}")
-    _copy_resume_adapter(reference_path, selected_nodes, allow_qualification=True)
+    transfer_results = _policy0_controller_transfer_reference(
+        source_reference_host,
+        source_reference_path,
+        reference_path,
+        selected_nodes,
+        reference_manifest["reference.json"],
+        expected_existing_reference_sha256,
+        expected_existing_reference_size,
+    )
+    plan["transfer_results"] = transfer_results
     for source, target in (
         (source_adapter_path, adapter_path),
         (source_config_path, config_path),
@@ -8890,6 +9279,8 @@ def _prepare_policy0_action(arguments: list[str]):
     source_reference_path = None
     source_adapter_host = trainer_head
     source_reference_host = orchestrator_host
+    expected_existing_reference_sha256 = None
+    expected_existing_reference_size = None
     positional = []
     index = 0
     options = {
@@ -8897,6 +9288,10 @@ def _prepare_policy0_action(arguments: list[str]):
         "--source-reference-path": "reference",
         "--source-adapter-host": "adapter_host",
         "--source-reference-host": "reference_host",
+        "--expected-old-reference-sha256": "expected_old_sha256",
+        "--expected-old-reference-size": "expected_old_size",
+        "--expected-existing-reference-sha256": "expected_old_sha256",
+        "--expected-existing-reference-size": "expected_old_size",
     }
     while index < len(arguments):
         argument = arguments[index]
@@ -8911,8 +9306,15 @@ def _prepare_policy0_action(arguments: list[str]):
                 source_reference_path = value
             elif options[argument] == "adapter_host":
                 source_adapter_host = value
-            else:
+            elif options[argument] == "reference_host":
                 source_reference_host = value
+            elif options[argument] == "expected_old_sha256":
+                expected_existing_reference_sha256 = value
+            else:
+                try:
+                    expected_existing_reference_size = int(value)
+                except ValueError as error:
+                    raise Refused(f"{argument} must be an integer") from error
         elif argument.startswith("--"):
             raise Refused(f"unknown prepare-policy0 option {argument}")
         else:
@@ -8933,6 +9335,8 @@ def _prepare_policy0_action(arguments: list[str]):
         source_reference_path=source_reference_path,
         source_adapter_host=source_adapter_host,
         source_reference_host=source_reference_host,
+        expected_existing_reference_sha256=expected_existing_reference_sha256,
+        expected_existing_reference_size=expected_existing_reference_size,
     )
     if mode == "plan":
         print(json.dumps({
@@ -9081,7 +9485,9 @@ usage = f"""training-ops <action> [args]
     --source-run RUN --source-adapter-dir DIR --qualification-slot NAME
                                   verify and load one exact step-0 adapter
   prepare-policy0 [config-dir] [plan|stage] \
-    --source-adapter-dir DIR --source-reference-path FILE  preflight or stage policy-0 files
+    --source-adapter-dir DIR --source-reference-path FILE \
+    [--expected-old-reference-sha256 SHA256 --expected-old-reference-size BYTES]
+                                  preflight or stage policy-0 files
   prepare-policy0-source [config-dir] [plan|apply] \
     --source-adapter-dir DIR --destination-adapter-dir DIR  correct one preserved adapter
   mounts                        list live-mounted source files

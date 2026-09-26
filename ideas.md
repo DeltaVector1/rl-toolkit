@@ -1,5 +1,11 @@
 # Difficulty ideas
 
+## Policy-0 reference staging repair
+
+- Route the small H200 reference file through the controller, verify its
+  manifest locally, upload unique partial files, and preserve each exact old
+  trainer reference before atomic replacement.
+
 ## Final failed-experiment audit
 
 - **Equal 1:1:1 difficulty — failed.** It did not show a per-difficulty reward
