@@ -392,3 +392,10 @@ only after measured learning.
   prompt tokens, and preserve the exact routed-expert payload. Use the
   `prefill_logprobs` contract in
   `prime-rl/src/prime_rl/utils/client.py`.
+
+- The corrected 32768-token `prompt_logprobs` request OOMed on H200 during
+  logits all-gather: it tried to allocate 24.44 GiB with 7.58 GiB free. No
+  reference file was changed. Next controlled qualification uses the first
+  exact 2048 token IDs, expects 2048 prompt logprobs and exact routes of shape
+  `[2048, 60, 4]`, and retains the 2047 non-leading tokens. This tests direct
+  numerical parity only; it does not prove production 32768-token capacity.

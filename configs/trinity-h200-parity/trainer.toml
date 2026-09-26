@@ -27,7 +27,7 @@ filename = "trainer-metrics.jsonl"
 [model]
 name = "/data/trinity-thinking-fp8"
 impl = "custom"
-seq_len = 32768
+seq_len = 2048
 attn = "flash_attention_2"
 cp = 8
 cp_style = "ulysses"
