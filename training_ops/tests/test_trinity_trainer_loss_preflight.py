@@ -25,7 +25,12 @@ class TrinityTrainerLossPreflightTest(unittest.TestCase):
         script = training_ops._trinity_trainer_loss_inspection_script(
             'prime-rl:bad"; echo INJECTED; #', IDENTITY
         )
-        self.assertIn("docker run --rm --pull=never --network none --gpus none", script)
+        self.assertIn(
+            "docker run --rm --pull=never --runtime runc --network none "
+            "--env NVIDIA_VISIBLE_DEVICES=void --env CUDA_VISIBLE_DEVICES=",
+            script,
+        )
+        self.assertNotIn("--gpus none", script)
         self.assertIn("--entrypoint /bin/bash", script)
         self.assertIn("/app/src/prime_rl/trainer/rl/loss.py", script)
         self.assertIn(APPROVED_SHA256, script)
@@ -35,6 +40,18 @@ class TrinityTrainerLossPreflightTest(unittest.TestCase):
         self.assertIn("setup_rl_loss_fn", script)
         self.assertIn("inspect.signature", script)
         self.assertIn("docker ps -aq", script)
+        self.assertIn("/dev/nvidia[0-9]*", script)
+        self.assertIn("/dev/nvidiactl", script)
+        self.assertIn("/dev/nvidia-uvm*", script)
+        self.assertIn("assert not torch.cuda.is_available()", script)
+        self.assertIn("exit 24", script)
+        self.assertIn("docker run --rm", script)
+        self.assertNotIn(" -v ", script)
+        self.assertLess(
+            script.index("image_id=$(sudo docker image inspect"),
+            script.index("docker run --rm"),
+        )
+        self.assertLess(script.index("docker run --rm"), script.index("leftover=$(sudo docker ps -aq"))
         self.assertIn("image='prime-rl:bad\"; echo INJECTED; #'", script)
 
     def test_preflight_checks_full_configured_set_not_launch_subset(self):
@@ -56,6 +73,9 @@ class TrinityTrainerLossPreflightTest(unittest.TestCase):
         script = training_ops._trinity_trainer_loss_inspection_script(
             training_ops.trainer_image, IDENTITY
         )
+        # Docker on the live host rejects the old `--gpus none` spelling with
+        # `invalid count "none"`; keep that invalid invocation out of probes.
+        self.assertNotIn("--gpus none", script)
         self.assertIn(
             '--entrypoint /bin/bash "$image_id" -c',
             script,

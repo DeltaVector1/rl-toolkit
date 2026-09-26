@@ -9424,16 +9424,29 @@ test "$(readlink -f -- "$module")" = "$module"
 test "$(sha256sum -- "$module" | awk '{{print $1}}')" = "$expected_sha256"
 test "$(stat -c '%s' -- "$module")" = "$expected_size"
 test "$(stat -c '%a' -- "$module")" = "$expected_mode"
+for device in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-uvm*; do
+    if [ -e "$device" ]; then
+        echo "GPU device is visible in no-GPU probe: $device" >&2
+        exit 24
+    fi
+done
+test "${{NVIDIA_VISIBLE_DEVICES:-}}" = void
+test -z "${{CUDA_VISIBLE_DEVICES:-}}"
 python3 - <<'PY'
 import importlib
 import importlib.metadata
 import inspect
+import os
 import pathlib
 import sys
 
 assert sys.version_info[:3] == (3, 12, 3), sys.version
 import torch
 assert torch.__version__ == "2.11.0+cu128", torch.__version__
+assert os.environ.get("NVIDIA_VISIBLE_DEVICES") == "void"
+assert os.environ.get("CUDA_VISIBLE_DEVICES", "") == ""
+assert not any(pathlib.Path("/dev").glob("nvidia*"))
+assert not torch.cuda.is_available()
 assert importlib.metadata.version("prime-rl") == "0.7.0"
 loss = importlib.import_module("prime_rl.trainer.rl.loss")
 assert pathlib.Path(loss.__file__).resolve() == pathlib.Path("/app/src/prime_rl/trainer/rl/loss.py")
@@ -9464,7 +9477,7 @@ printf '%s\\n' "TRINITY_TRAINER_LOSS_INSPECTION_OK sha256=$expected_sha256 size=
             'case "$image_id" in sha256:*) ;; *) echo "configured trainer image has invalid immutable id: $image_id" >&2; exit 22;; esac',
             'image_digest=${image_id#sha256:}; [ "${#image_digest}" -eq 64 ] && [[ "$image_digest" =~ ^[0-9a-f]+$ ]] || { echo "configured trainer image has invalid immutable id: $image_id" >&2; exit 22; }',
             'set +e',
-            f"result=$(sudo docker run --rm --pull=never --network none --gpus none --name \"$container_name\" --entrypoint /bin/bash \"$image_id\" -c {shlex.quote(inspection)})",
+            f"result=$(sudo docker run --rm --pull=never --runtime runc --network none --env NVIDIA_VISIBLE_DEVICES=void --env CUDA_VISIBLE_DEVICES= --name \"$container_name\" --entrypoint /bin/bash \"$image_id\" -c {shlex.quote(inspection)})",
             "run_code=$?",
             "set -e",
             'leftover=$(sudo docker ps -aq --filter "name=^/${container_name}$")',
