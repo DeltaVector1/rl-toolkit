@@ -589,3 +589,13 @@ only after measured learning.
   sequence, native FP8, and strict gates. Reject excessive exact 16-token
   window repetition after tokenization. Do not change thresholds, drop
   tokens, or use rollout data.
+- Diverse base result: the input had 8,192 tokens, 750 unique IDs, and an
+  exact-window repeat fraction of `0.00110065`. The reference SHA was
+  `ad0dc...`. The strict step passed in 74.15 seconds; its artifact KL proxy
+  was `0.00196996`, mean absolute difference was `0.02028694`, position
+  mismatches were zero, and all processes exited 0.
+- Next experiment: load a verified zero rank-32/alpha-64 Trinity policy-0
+  adapter through the supported H200 path, generate the same diverse
+  reference under its exact loaded model name, and rerun the unchanged strict
+  gate. The base pass does not qualify the adapter path. Do not change
+  thresholds or optimizer settings and do not transfer model weights.
