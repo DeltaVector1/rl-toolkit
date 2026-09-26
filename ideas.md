@@ -544,5 +544,8 @@ only after measured learning.
   transfer and probe processes and preserve partial files. Seed n82 directly
   from h200b using the configured peer identity and trainer LAN
   `10.92.20.82`, then use n82 LAN access to fan out the same small JSON to
-  n76, n77, n78, n80, n83, n84, and n85. Verify all eight SHA256 values begin
-  with `df7d` before the qualifier. No model transfer is involved.
+  n76, n77, n78, n80, n83, n84, and n85. Verify all eight SHA256 values match
+  `df7d7b0baf5aa646751fc1762fb7882e4266afda3df2017f92ba44a3758af589` before
+  the qualifier. No model transfer is involved.
+- Cleanup result: the owned processes were stopped at about 4m35s, all
+  matching local PIDs were confirmed gone, and partial files were preserved.
