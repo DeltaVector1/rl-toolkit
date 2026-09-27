@@ -951,30 +951,26 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
 
         def run_process(command, *, stdin, timeout):
             process_commands.append(command)
-            if ":" in command[-1]:
-                source = Path(command[-2])
-                destination = Path(command[-1].split(":", 1)[1])
-                if len(process_commands) == 2:
-                    compressed_uploads.append(source.read_bytes())
-            elif len(process_commands) == 1:
-                source = None
-                destination = Path(command[-1])
-            else:
-                source = Path(command[-2])
-                destination = Path(command[-1])
+            destination = Path(command[-1])
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if source is None:
-                destination.write_bytes(source_bytes)
-            else:
-                shutil.copyfile(source, destination)
+            destination.write_bytes(source_bytes)
             return subprocess.CompletedProcess(command, 0, "", "")
+
+        def copy_seed(local, host, remote):
+            compressed_uploads.append(Path(local).read_bytes())
+            return True
 
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.json"
             source.write_bytes(source_bytes)
-            with patch("training_ops._run_process", side_effect=run_process), patch(
-                "training_ops._ssh", return_value=(0, "REFERENCE_INSTALL status=installed")
-            ) as ssh:
+            with (
+                patch("training_ops._run_process", side_effect=run_process),
+                patch("training_ops.copy_file", side_effect=copy_seed),
+                patch(
+                    "training_ops._ssh",
+                    return_value=(0, "REFERENCE_INSTALL status=installed"),
+                ) as ssh,
+            ):
                 result = _policy0_controller_transfer_reference(
                     "h200b", str(source), str(Path(directory) / "qualification" / "reference.json"),
                     nodes, {"sha256": source_sha, "size": source_size}, OLD_SHA256, 2_838_023
@@ -982,11 +978,10 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertEqual(set(result), set(nodes))
         self.assertTrue(all(record["ok"] for record in result.values()))
         self.assertTrue(all(record["seed_cleanup"] == "cleaned" for record in result.values()))
-        self.assertEqual(len(process_commands), 2)
+        self.assertEqual(len(process_commands), 1)
         self.assertEqual(gzip.decompress(compressed_uploads[0]), source_bytes)
         self.assertGreaterEqual(ssh.call_count, 1 + 2 * len(nodes))
         self.assertTrue(process_commands[0][-2].startswith("root@38.255.28.19:"))
-        self.assertTrue(process_commands[1][-1].split(":", 1)[0].endswith("n82"))
         self.assertTrue(all("adapter_model" not in " ".join(command) for command in process_commands))
         self.assertTrue(all("china-trainer" not in " ".join(command) for command in process_commands))
         fanout_scripts = [call.args[1] for call in ssh.call_args_list if "scp -q" in call.args[1]]
@@ -999,6 +994,86 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 ))
         self.assertTrue(all("reference.json.partial.policy0." in script for script in fanout_scripts))
         self.assertTrue(all(call.args[0] != "h200b" for call in ssh.call_args_list))
+
+    def test_controller_seed_upload_uses_resumable_copy_and_continues(self):
+        payload = b"verified-reference"
+        source_sha, source_size = _identity_bytes(payload)
+        install_result = {
+            "n82": {
+                "ok": True,
+                "phase": "install",
+                "message": "installed",
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.json"
+            source.write_bytes(payload)
+            with (
+                patch("training_ops.copy_file", return_value=True) as copy,
+                patch(
+                    "training_ops._run_process",
+                    side_effect=AssertionError("seed upload must not use _run_process"),
+                ) as process,
+                patch(
+                    "training_ops._ssh",
+                    side_effect=[(0, "guard"), (0, "seed"), (0, "cleanup")],
+                ),
+                patch("training_ops._fan", return_value=install_result),
+            ):
+                result = _policy0_controller_transfer_reference(
+                    "h200b",
+                    "/data/glm52-rl/h200-step1/reference.json",
+                    "/data/glm52-rl/qualifications/reference.json",
+                    ["n82"],
+                    {"sha256": source_sha, "size": source_size},
+                    OLD_SHA256,
+                    OLD_SIZE,
+                    local_reference_path=source,
+                )
+
+        self.assertEqual(result["n82"]["seed_cleanup"], "cleaned")
+        copy.assert_called_once()
+        self.assertEqual(copy.call_args.args[1], "n82")
+        self.assertIn(".seed.json.gz", copy.call_args.args[2])
+        process.assert_not_called()
+
+    def test_controller_seed_upload_failure_keeps_phase_and_cleanup(self):
+        payload = b"verified-reference"
+        source_sha, source_size = _identity_bytes(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.json"
+            source.write_bytes(payload)
+            with (
+                patch(
+                    "training_ops.copy_file",
+                    side_effect=RuntimeError("copy timed out"),
+                ) as copy,
+                patch(
+                    "training_ops._run_process",
+                    side_effect=AssertionError("seed upload must not use _run_process"),
+                ) as process,
+                patch("training_ops._ssh", side_effect=[(0, "guard"), (0, "cleanup")]) as ssh,
+            ):
+                with self.assertRaises(training_ops._Policy0ReferenceTransferError) as raised:
+                    _policy0_controller_transfer_reference(
+                        "h200b",
+                        "/data/glm52-rl/h200-step1/reference.json",
+                        "/data/glm52-rl/qualifications/reference.json",
+                        ["n82"],
+                        {"sha256": source_sha, "size": source_size},
+                        OLD_SHA256,
+                        OLD_SIZE,
+                        local_reference_path=source,
+                    )
+
+        record = raised.exception.results["n82"]
+        self.assertEqual(record["phase"], "seed-upload")
+        self.assertIn("seed upload timed out", record["message"])
+        self.assertTrue(record["seed_compressed_path"].endswith(".seed.json.gz"))
+        self.assertIn(".n82", record["seed_partial_path"])
+        copy.assert_called_once()
+        process.assert_not_called()
+        self.assertEqual(ssh.call_count, 2)
 
     def _write_compressed_seed(self, path, payload):
         with path.open("wb") as stream:
@@ -1361,8 +1436,10 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                         (0, install_report),
                         cleanup_result,
                     ]
-                    with patch("training_ops._run_process", side_effect=process), patch(
-                        "training_ops._ssh", side_effect=ssh_results
+                    with (
+                        patch("training_ops._run_process", side_effect=process),
+                        patch("training_ops.copy_file", return_value=True),
+                        patch("training_ops._ssh", side_effect=ssh_results),
                     ):
                         with self.assertRaises(RuntimeError) as raised:
                             _policy0_controller_transfer_reference(
@@ -1399,6 +1476,12 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 remote_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(command[-2], remote_path)
             return subprocess.CompletedProcess(command, 0, "", "")
+
+        def copy_seed(local, host, remote):
+            destination = Path(remote)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(local, destination)
+            return True
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1446,8 +1529,10 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 )
                 return result.returncode, result.stdout + result.stderr
 
-            with patch("training_ops._run_process", side_effect=transfer), patch(
-                "training_ops._ssh", side_effect=remote
+            with (
+                patch("training_ops._run_process", side_effect=transfer),
+                patch("training_ops.copy_file", side_effect=copy_seed),
+                patch("training_ops._ssh", side_effect=remote),
             ):
                 with self.assertRaises(RuntimeError) as raised:
                     _policy0_controller_transfer_reference(
@@ -1491,9 +1576,15 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "source.json"
             source.write_bytes(source_bytes)
-            with patch("training_ops._run_process", side_effect=fetch), patch(
-                "training_ops._ssh", side_effect=[(0, "seed"), (0, "cleanup")]
-            ) as ssh, patch("training_ops._fan", return_value=all_results):
+            with (
+                patch("training_ops._run_process", side_effect=fetch),
+                patch("training_ops.copy_file", return_value=True),
+                patch(
+                    "training_ops._ssh",
+                    side_effect=[(0, "seed"), (0, "cleanup")],
+                ) as ssh,
+                patch("training_ops._fan", return_value=all_results),
+            ):
                 with self.assertRaises(RuntimeError) as raised:
                     _policy0_controller_transfer_reference(
                         "h200b", str(source), str(Path(directory) / "reference.json"),

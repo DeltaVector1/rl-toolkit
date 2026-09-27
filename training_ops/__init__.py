@@ -9292,27 +9292,18 @@ fi
                 cleanup=False,
             )
         try:
-            _, seed_scp_options, seed_destination = _ssh_destination(trainer_head)
-            seed_upload = scp_command + seed_scp_options + [
-                str(compressed_reference),
-                f"{seed_destination}:{compressed_path}",
-            ]
-            uploaded = _run_process(
-                seed_upload,
-                stdin=subprocess.DEVNULL,
-                timeout=600,
-            )
-        except subprocess.TimeoutExpired:
-            raise_preinstall_failure("seed-upload", "seed upload timed out")
+            copied = copy_file(compressed_reference, trainer_head, compressed_path)
+            if not copied:
+                raise RuntimeError("copy returned false")
+        except RuntimeError as error:
+            detail = str(error)
+            if "timed out" in detail:
+                raise_preinstall_failure("seed-upload", "seed upload timed out")
+            raise_preinstall_failure("seed-upload", f"seed upload failed: {detail}")
         except OSError as error:
             raise_preinstall_failure("seed-upload", f"seed upload failed: {error}")
         except Exception as error:
             raise_preinstall_failure("seed-upload", f"seed upload exception: {error}")
-        if uploaded.returncode:
-            detail = ((uploaded.stdout or "") + (uploaded.stderr or "")).strip()
-            raise_preinstall_failure(
-                "seed-upload", detail or f"seed upload exit {uploaded.returncode}"
-            )
 
         seed_script = _policy0_reference_seed_prepare_script(
             compressed_path,
