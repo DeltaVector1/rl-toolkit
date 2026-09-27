@@ -9,6 +9,7 @@ from decensor_experimental_v1.agentic_review import (
     TranscriptReview,
     aggregate_review,
     build_turn_review_sources,
+    log_task_review_failure,
     review_attempts_per_phase,
     review_phase_count,
     run_agentic_review,
@@ -297,6 +298,11 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
                 "failed_judges": failed_reviews,
                 "failed_judge_attempts": failed_judge_details,
             }
+            log_task_review_failure(
+                trace,
+                failed_reviews=failed_reviews,
+                failure_status=failure_status,
+            )
             trace.record_metric(
                 "decensor_judge_service_failure",
                 float(failure_status == "unscored_service_failure"),

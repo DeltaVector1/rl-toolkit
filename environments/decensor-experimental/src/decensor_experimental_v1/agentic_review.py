@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
@@ -15,6 +17,9 @@ from decensor_experimental_v1.text import (
     message_role,
     strip_think_tags,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 ReviewCriterion = Literal[
@@ -1062,8 +1067,16 @@ def _json_value(value: Any) -> Any:
     return str(value)
 
 
-def _safe_error(error: object) -> str:
+def _safe_error(error: object, *, redactions: tuple[str, ...] = ()) -> str:
     message = " ".join(str(error).split())
+    message = re.sub(
+        r"(?i)input_value=.*?(?=,\s*input_type=)",
+        "input_value=[removed]",
+        message,
+    )
+    for redaction in redactions:
+        if redaction:
+            message = message.replace(redaction, "[removed]")
     message = re.sub(
         r"(?i)(authorization|api[-_ ]?key|token)(\s*[:=]\s*)([^, }]+)",
         r"\1\2[removed]",
@@ -1071,6 +1084,130 @@ def _safe_error(error: object) -> str:
     )
     message = re.sub(r"(?i)\bbearer\s+\S+", "Bearer [removed]", message)
     return message[:400]
+
+
+def _argument_redactions(argument_bytes: bytes) -> tuple[str, ...]:
+    text = argument_bytes.decode("utf-8", errors="replace")
+    values: list[str] = [text]
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        payload = None
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            if len(value) >= 3:
+                values.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+
+    collect(payload)
+    return tuple(dict.fromkeys(values))
+
+
+def _safe_identifier(value: Any) -> str | int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (str, int, float)):
+        return value if not isinstance(value, str) else value[:128]
+    return None
+
+
+def _trace_identifier(trace: Any, names: tuple[str, ...]) -> str | int | float | None:
+    for name in names:
+        value = _safe_identifier(getattr(trace, name, None))
+        if value is not None:
+            return value
+    info = getattr(trace, "info", None)
+    if isinstance(info, dict):
+        for name in names:
+            value = _safe_identifier(info.get(name))
+            if value is not None:
+                return value
+    return None
+
+
+def log_review_failure(
+    *,
+    phase: str,
+    attempt: int | None,
+    error: BaseException | None,
+    raw_arguments: str | bytes | None,
+    failure_status: str,
+    finish_reason: str | None = None,
+    truncated: bool | None = None,
+    task_id: str | int | float | None = None,
+    group_id: str | int | float | None = None,
+    failed_reviews: list[str] | None = None,
+) -> dict[str, Any]:
+    if raw_arguments is None:
+        argument_bytes = b""
+        argument_chars = 0
+    elif isinstance(raw_arguments, bytes):
+        argument_bytes = raw_arguments
+        argument_chars = len(raw_arguments.decode("utf-8", errors="replace"))
+    else:
+        raw_text = str(raw_arguments)
+        argument_bytes = raw_text.encode("utf-8")
+        argument_chars = len(raw_text)
+    payload: dict[str, Any] = {
+        "phase": str(phase)[:80],
+        "attempt": attempt if isinstance(attempt, int) and not isinstance(attempt, bool) else None,
+        "exception_class": type(error).__name__ if error is not None else "ReviewFailure",
+        "exception_message": (
+            _safe_error(error, redactions=_argument_redactions(argument_bytes))
+            if error is not None
+            else "review failed"
+        ),
+        "raw_arguments_chars": argument_chars,
+        "raw_arguments_bytes": len(argument_bytes),
+        "raw_arguments_sha256": hashlib.sha256(argument_bytes).hexdigest(),
+        "finish_reason": str(finish_reason)[:80] if finish_reason is not None else None,
+        "truncated": truncated if isinstance(truncated, bool) else None,
+        "failure_status": str(failure_status)[:80],
+    }
+    if task_id is not None:
+        payload["task_id"] = _safe_identifier(task_id)
+    if group_id is not None:
+        payload["group_id"] = _safe_identifier(group_id)
+    if failed_reviews is not None:
+        payload["failed_reviews"] = [str(name)[:128] for name in failed_reviews[:32]]
+    logger.info(
+        "decensor_review_failure %s",
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+    )
+    return payload
+
+
+def log_task_review_failure(
+    trace: Any,
+    *,
+    failed_reviews: list[str],
+    failure_status: str,
+) -> dict[str, Any]:
+    return log_review_failure(
+        phase="task_review_failure",
+        attempt=None,
+        error=RuntimeError("one or more per-turn reviews failed"),
+        raw_arguments="",
+        failure_status=failure_status,
+        task_id=_trace_identifier(trace, ("task_id", "id")),
+        group_id=_trace_identifier(trace, ("group_id", "solution_group_id")),
+        failed_reviews=failed_reviews,
+    )
+
+
+def _completion_finish_metadata(completion: Any) -> tuple[str | None, bool | None]:
+    choices = getattr(completion, "choices", None) if completion is not None else None
+    choice = choices[0] if choices else None
+    finish_reason = getattr(choice, "finish_reason", None)
+    if not isinstance(finish_reason, str):
+        return None, None
+    return finish_reason, finish_reason in {"length", "max_tokens", "token_limit"}
 
 
 def _judge_call_event(
@@ -2137,6 +2274,13 @@ async def run_agentic_review(
                         request_settings=visible_request_settings,
                     )
                 )
+                log_review_failure(
+                    phase="visible_review",
+                    attempt=phase_attempt,
+                    error=error,
+                    raw_arguments="",
+                    failure_status="request_failed",
+                )
                 visible_messages.append(
                     {
                         "role": "user",
@@ -2198,6 +2342,20 @@ async def run_agentic_review(
                     "type": type(error).__name__,
                     "message": _safe_error(error) or type(error).__name__,
                 }
+                finish_reason, truncated = _completion_finish_metadata(
+                    visible_completion
+                )
+                log_review_failure(
+                    phase="visible_review",
+                    attempt=phase_attempt,
+                    error=error,
+                    raw_arguments=(
+                        visible_raw if visible_call is not None else ""
+                    ),
+                    finish_reason=finish_reason,
+                    truncated=truncated,
+                    failure_status="invalid_model_response",
+                )
                 visible_messages.append(
                     {
                         "role": "user",
@@ -2300,6 +2458,13 @@ async def run_agentic_review(
                         request_settings=reasoning_request_settings,
                     )
                 )
+                log_review_failure(
+                    phase="reasoning_review",
+                    attempt=phase_attempt,
+                    error=error,
+                    raw_arguments="",
+                    failure_status="request_failed",
+                )
                 reasoning_messages.append(
                     {
                         "role": "user",
@@ -2361,6 +2526,20 @@ async def run_agentic_review(
                     "type": type(error).__name__,
                     "message": _safe_error(error) or type(error).__name__,
                 }
+                finish_reason, truncated = _completion_finish_metadata(
+                    reasoning_completion
+                )
+                log_review_failure(
+                    phase="reasoning_review",
+                    attempt=phase_attempt,
+                    error=error,
+                    raw_arguments=(
+                        reasoning_raw if reasoning_call is not None else ""
+                    ),
+                    finish_reason=finish_reason,
+                    truncated=truncated,
+                    failure_status="invalid_model_response",
+                )
                 reasoning_messages.append(
                     {
                         "role": "user",
