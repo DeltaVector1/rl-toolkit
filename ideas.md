@@ -991,3 +991,32 @@ only after measured learning.
   start time, command, and run identity. If exact process ownership cannot be
   proved, it must skip that process action. The normal failure path must still
   remove its owned container and stop its owned publisher.
+
+## Exact unloaded adapter-cache cleanup
+
+- **Measured need.** The existing cold cleanup scans and removes every
+  64-hex cache entry. A fresh production start needs one stale unloaded entry
+  removed without changing another policy. The configured production profile
+  is `configs/trinity-decensor-experimental-fixed`; its exact source object is
+  `http://127.0.0.1:18100/trinity-decensor-experimental-fixed/broadcasts/step_0`.
+  SHA-256 of that exact URL is
+  `056ce0a30be48095dbd88b8c0e741146d5be162be82252eb2040ee1ec0cd9074`, so
+  the only allowed target is
+  `/data/glm52-rl/lora-cache/056ce0a30be48095dbd88b8c0e741146d5be162be82252eb2040ee1ec0cd9074`.
+  `configs/nodes.toml` selects `h200b` with port `8000` for inference.
+- **Acceptance criteria.** Add one supported `training_ops` API and CLI
+  operation that accepts an explicit run/config or an exact source URL and
+  LoRA name. Resolve the URL to one exact 64-hex key and never accept a
+  wildcard, cache-root path, or generic cleanup request. Before deletion,
+  query `/staging_status` and fail closed for running or waiting requests,
+  unknown status or contents, an active stage task for the target, any loaded
+  receipt (including another receipt pointing to the target path), invalid
+  server identity, a path or symlink mismatch, invalid or mismatched manifest
+  or key, or a held readers lock. Require a stable resolved directory identity
+  before and after checks. Delete only that immutable resolved directory and
+  preserve every other cache entry.
+- **Tests and limits.** Use disposable local fixtures and mocked remote
+  responses for success and every refusal boundary above, including the
+  production key. Do not change start settings or run a live action. Compile,
+  run focused tests, then run the broader training-ops suite and inspect the
+  final diff for any broad cache deletion.
