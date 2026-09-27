@@ -497,6 +497,39 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
             with self.subTest(stage_status=stage_status), self.assertRaisesRegex(Refused, "stage"):
                 training_ops_module._qualified_check_engine(plan, state, phase="preflight")
 
+    def test_preflight_reuses_exact_step1_ready_after_prior_stage_failure(self):
+        plan = self.apply_plan()
+        state = self.live_state({"policy0": self.policy0_receipt()})
+        state["engine"]["stage_status"] = "ready"
+        state["engine"]["stage_record"] = self.stage_record(
+            plan,
+            source_url=plan["source_url"],
+            model=receipt()["step1_adapter"],
+            config=receipt()["step1_config"],
+        )
+        self.assertIs(
+            training_ops_module._qualified_check_engine(plan, state, phase="preflight"),
+            state["engine"],
+        )
+        mutations = {
+            "url": lambda value: value["engine"]["stage_record"].update(
+                source_url="http://127.0.0.1:18100/qualified-adapters/" + "d" * 64 + "/step_1"
+            ),
+            "model_hash": lambda value: value["engine"]["stage_record"]["verified_files"]["adapter_model.safetensors"].update(sha256="1" * 64),
+            "config_hash": lambda value: value["engine"]["stage_record"]["verified_files"]["adapter_config.json"].update(sha256="2" * 64),
+            "cache_path": lambda value: value["engine"]["stage_record"].update(path="/data/glm52-rl/lora-cache/stale"),
+            "server": lambda value: value["engine"]["loaded_receipts"]["policy0"].update(server_instance="wrong"),
+            "occupied_slot": lambda value: value["engine"]["loaded_receipts"].update({plan["qualification_slot"]: {}}),
+            "unrelated_ready": lambda value: value["engine"]["stage_record"].update(
+                source_url="http://127.0.0.1:18100/qualified-adapters/" + "e" * 64 + "/step_1"
+            ),
+        }
+        for label, mutate in mutations.items():
+            mutated = json.loads(json.dumps(state))
+            mutate(mutated)
+            with self.subTest(label=label), self.assertRaises(Refused):
+                training_ops_module._qualified_check_engine(plan, mutated, phase="preflight")
+
     def test_qualified_load_ready_stage_binds_step1_after_stage(self):
         plan = self.apply_plan()
         model = receipt()["step1_adapter"]

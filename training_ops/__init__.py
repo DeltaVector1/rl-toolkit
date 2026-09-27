@@ -11456,8 +11456,23 @@ def _qualified_check_ready_stage(plan: Mapping[str, object], engine: Mapping[str
     if stage.get("status") != "ready" or not isinstance(stage.get("source_url"), str) or not isinstance(stage.get("path"), str) or type(stage.get("cache_hit")) is not bool or not isinstance(stage.get("stage_id"), str) or not stage["stage_id"] or type(stage.get("pid")) is not int or stage["pid"] <= 0:
         raise Refused("qualified adapter ready stage receipt identity is invalid")
     if phase == "preflight":
-        expected_source, _ = _qualified_check_loaded_policy0(plan, engine)
-        expected = plan.get("policy0_identity")
+        policy_source, _ = _qualified_check_loaded_policy0(plan, engine)
+        if stage.get("source_url") == plan.get("source_url"):
+            try:
+                _policy0_check_target_slot_free(plan, engine)
+            except Policy0LoadError as error:
+                raise Refused(str(error)) from error
+            expected_source = plan.get("source_url")
+            artifacts = plan.get("artifacts")
+            expected = {
+                "target_sha256": artifacts.get("adapter_model.safetensors", {}).get("sha256") if isinstance(artifacts, Mapping) else None,
+                "target_size": artifacts.get("adapter_model.safetensors", {}).get("size") if isinstance(artifacts, Mapping) else None,
+                "config_sha256": artifacts.get("adapter_config.json", {}).get("sha256") if isinstance(artifacts, Mapping) else None,
+                "config_size": artifacts.get("adapter_config.json", {}).get("size") if isinstance(artifacts, Mapping) else None,
+            }
+        else:
+            expected_source = policy_source
+            expected = plan.get("policy0_identity")
     elif phase in {"post-stage", "post-load"}:
         expected_source = plan.get("source_url")
         artifacts = plan.get("artifacts")
