@@ -1,6 +1,6 @@
 # Five padded individual synthetic Trinity parity microbatches.
 
-output_dir = "/data/glm52-rl/qualifications/trinity-h200-synthetic-packed-parity/individual-run"
+output_dir = "/data/glm52-rl/qualifications/trinity-h200-synthetic-individual-parity/individual-run"
 max_steps = 1
 dist_timeout_seconds = 5400
 enable_router_replay = true

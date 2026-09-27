@@ -8,6 +8,8 @@ from pathlib import Path
 
 import tomllib
 
+import training_ops
+
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILDER_PATH = ROOT / "training_ops/runtime/h200/build_trinity_synthetic_parity.py"
@@ -283,17 +285,34 @@ class SyntheticParityTest(unittest.TestCase):
                 )
 
     def test_configs_are_native_fp8_no_lora_and_keep_gates(self):
-        config_root = ROOT / "configs/trinity-h200-synthetic-packed-parity"
-        self.assertFalse((config_root / "trainer.toml").exists())
-        for filename, expected_seq_len, expected_batch in (
-            ("trainer-packed.toml", 32768, 1),
-            ("trainer-individual.toml", 8704, 5),
+        config_specs = (
+            (
+                ROOT / "configs/trinity-h200-synthetic-packed-parity",
+                32768,
+                1,
+                "packed-reference.json",
+                "packed-run",
+            ),
+            (
+                ROOT / "configs/trinity-h200-synthetic-individual-parity",
+                8704,
+                5,
+                "individual-reference.json",
+                "individual-run",
+            ),
+        )
+        for config_root, expected_seq_len, expected_batch, reference_name, output_name in (
+            config_specs
         ):
-            with (config_root / filename).open("rb") as stream:
+            config_path = config_root / "trainer.toml"
+            self.assertTrue(config_path.is_file())
+            with config_path.open("rb") as stream:
                 config = tomllib.load(stream)
             self.assertEqual(config["max_steps"], 1)
             self.assertTrue(config["enable_router_replay"])
             self.assertEqual(config["data"]["fake"]["batch_size"], expected_batch)
+            self.assertTrue(config["data"]["fake"]["reference_path"].endswith(reference_name))
+            self.assertTrue(config["output_dir"].endswith(output_name))
             self.assertEqual(config["model"]["seq_len"], expected_seq_len)
             self.assertEqual(config["model"]["name"], "/data/trinity-thinking-fp8")
             self.assertNotIn("lora", config["model"])
@@ -306,7 +325,22 @@ class SyntheticParityTest(unittest.TestCase):
                 "max_masked_mismatch_kl": 0.5,
                 "max_masked_fraction": 0.06,
             })
-        with (config_root / "inference.toml").open("rb") as stream:
+        selected_packed = training_ops._config_dir(
+            "configs/trinity-h200-synthetic-packed-parity",
+            require_inference=True,
+        )
+        selected_individual = training_ops._config_dir(
+            "configs/trinity-h200-synthetic-individual-parity"
+        )
+        self.assertEqual(
+            selected_packed["trainer"],
+            "configs/trinity-h200-synthetic-packed-parity/trainer.toml",
+        )
+        self.assertEqual(
+            selected_individual["trainer"],
+            "configs/trinity-h200-synthetic-individual-parity/trainer.toml",
+        )
+        with (ROOT / "configs/trinity-h200-synthetic-packed-parity/inference.toml").open("rb") as stream:
             inference = tomllib.load(stream)
         self.assertFalse(inference["enable_lora"])
         self.assertEqual(inference["model"]["max_model_len"], 32768)
