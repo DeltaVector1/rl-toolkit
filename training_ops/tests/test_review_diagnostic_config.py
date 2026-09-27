@@ -106,6 +106,10 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertEqual(diagnostic_orchestrator["group_size"], 16)
         self.assertEqual(diagnostic_orchestrator["max_inflight_rollouts"], 32)
         self.assertEqual(diagnostic_orchestrator["pool_size"], 4)
+        self.assertEqual(
+            diagnostic_orchestrator["train"]["env"][0]["env"]["taskset"]["id"],
+            "decensor-experimental-v1",
+        )
         self.assertEqual(diagnostic_orchestrator["train"]["env"][0]["pool"]["num_workers"], 16)
         self.assertEqual(diagnostic_orchestrator["train"]["env"][0]["env"]["taskset"]["task"]["judge"]["max_concurrent_requests"], 48)
         self.assertEqual(diagnostic_orchestrator["train"]["env"][0]["env"]["taskset"]["task"]["user"]["max_concurrent_requests"], 48)
@@ -159,6 +163,21 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertEqual(production_orchestrator["batch_size"], 1024)
         self.assertEqual(production_orchestrator["max_inflight_rollouts"], 256)
         self.assertEqual(production_inference["env_vars"]["PRIME_LORA_CACHE_DIR"], "/data/glm52-rl/lora-cache")
+
+    def test_training_ops_accepts_supported_environment_selector(self):
+        selected = training_ops._config_dir(
+            "configs/trinity-decensor-review-diagnostic",
+            require_orchestrator=True,
+            require_inference=True,
+        )
+        with mock.patch.object(training_ops, "mounted_files", return_value=[]):
+            inventory = dict(
+                training_ops._start_dependency_inventory(selected, ["n82"])
+            )
+        self.assertIn(
+            "environments/decensor-experimental/src/decensor_experimental_v1/scoring.py",
+            inventory,
+        )
 
     def test_file_monitors_and_swanlab_identities_are_resolved_and_unique(self):
         diagnostic_trainer = load_config(diagnostic, "trainer.toml")
