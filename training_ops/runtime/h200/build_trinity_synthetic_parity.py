@@ -837,8 +837,6 @@ def compare_packed_individual(
     expected_mask = []
     for length in SEQUENCE_LENGTHS:
         expected_mask.extend([False] + [True] * (length - 1))
-    if packed_mask is None:
-        packed_mask = expected_mask
     if (
         not isinstance(packed_ids, list)
         or packed_lengths != list(SEQUENCE_LENGTHS)

@@ -285,6 +285,10 @@ class SyntheticParityTest(unittest.TestCase):
                 del missing_packed[field]
                 with self.assertRaisesRegex(synthetic.SyntheticParityError, field):
                     synthetic.compare_packed_individual(missing_packed, clean_individual)
+            null_mask = copy.deepcopy(packed)
+            null_mask["loss_mask"] = None
+            with self.assertRaisesRegex(synthetic.SyntheticParityError, "mask"):
+                synthetic.compare_packed_individual(null_mask, clean_individual)
             for field in ("position_ids", "microbatch_index", "microbatch_count"):
                 missing_individual = copy.deepcopy(clean_individual)
                 del missing_individual["microbatches"][0][field]
