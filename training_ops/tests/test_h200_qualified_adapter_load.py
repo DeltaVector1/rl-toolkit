@@ -45,8 +45,8 @@ def receipt():
         "step1_config": config,
         "step1_manifest_sha256": manifest["sha256"],
         "trainer_config": {"sha256": "7" * 64, "size": 321},
-        "identities_before": {"policy0_adapter": {"sha256": "9" * 64, "size": 110}, "policy0_config": {"sha256": "8" * 64, "size": 200}, "step1_adapter": model, "step1_config": config, "step1_manifest": manifest, "artifacts": artifacts},
-        "identities_after": {"policy0_adapter": {"sha256": "9" * 64, "size": 110}, "policy0_config": {"sha256": "8" * 64, "size": 200}, "step1_adapter": model, "step1_config": config, "step1_manifest": manifest, "artifacts": artifacts},
+        "identities_before": {"policy0_adapter": {"sha256": "9" * 64, "size": 110}, "policy0_config": {"sha256": "8" * 64, "size": 200}, "step1_adapter": model, "step1_config": config, "step1_manifest": manifest, "step1_sidecar": artifacts["adapter_model.safetensors.sha256"], "step1_stable": stable, "artifacts": artifacts},
+        "identities_after": {"policy0_adapter": {"sha256": "9" * 64, "size": 110}, "policy0_config": {"sha256": "8" * 64, "size": 200}, "step1_adapter": model, "step1_config": config, "step1_manifest": manifest, "step1_sidecar": artifacts["adapter_model.safetensors.sha256"], "step1_stable": stable, "artifacts": artifacts},
         "expected_identity": {
             "run_id": "step1-run", "reference_sha256": "f" * 64,
             "trainer_config_sha256": "7" * 64, "trainer_config_size": 321,
@@ -126,6 +126,24 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         broken_raw = json.dumps(broken, sort_keys=True, separators=(",", ":")).encode() + b"\n"
         with self.assertRaisesRegex(QualifiedAdapterLoadError, "identity"):
             parse_delta_receipt(broken_raw, hashlib.sha256(broken_raw).hexdigest())
+
+    def test_receipt_binds_sidecar_and_stable_identity_across_validation(self):
+        valid = json.dumps(receipt(), sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        parsed = parse_delta_receipt(valid, hashlib.sha256(valid).hexdigest())
+        self.assertEqual(parsed["identities_before"]["step1_sidecar"], parsed["identities_after"]["step1_sidecar"])
+        self.assertEqual(parsed["identities_before"]["step1_stable"], parsed["identities_after"]["step1_stable"])
+        for field in ("step1_sidecar", "step1_stable"):
+            mutated = json.loads(json.dumps(receipt()))
+            mutated["identities_after"][field] = {"sha256": "1" * 64, "size": 1}
+            payload = json.dumps(mutated, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+            with self.subTest(field=field), self.assertRaisesRegex(QualifiedAdapterLoadError, "identity"):
+                parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
+        mutated = json.loads(json.dumps(receipt()))
+        mutated["identities_before"]["step1_sidecar_extra"] = True
+        mutated["identities_after"]["step1_sidecar_extra"] = True
+        payload = json.dumps(mutated, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "identity"):
+            parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
 
     def test_remote_receipt_framing_preserves_exact_terminal_newline(self):
         raw = json.dumps(receipt(), sort_keys=True, separators=(",", ":")).encode() + b"\n"

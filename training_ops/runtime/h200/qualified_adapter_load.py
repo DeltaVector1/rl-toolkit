@@ -48,7 +48,7 @@ _EVIDENCE_KEYS = frozenset(
         "trainer_config_size", "code_sha256", "code_size", "loss_identity",
     }
 )
-_IDENTITY_CHAIN_KEYS = frozenset({"policy0_adapter", "policy0_config", "step1_adapter", "step1_config", "step1_manifest", "artifacts"})
+_IDENTITY_CHAIN_KEYS = frozenset({"policy0_adapter", "policy0_config", "step1_adapter", "step1_config", "step1_manifest", "step1_sidecar", "step1_stable", "artifacts"})
 _RESULT_KEYS = frozenset(
     {
         "schema_version", "kind", "status", "qualification_slot", "source_url",
@@ -158,7 +158,7 @@ def parse_delta_receipt(payload: bytes | str, expected_sha256: str) -> dict[str,
     if manifest["sha256"] != manifest_sha:
         _fail("delta receipt manifest identity differs")
     artifacts = _artifacts(before.get("artifacts"))
-    if artifacts["adapter_model.safetensors"] != model or artifacts["adapter_config.json"] != config or artifacts["adapter_manifest.json"] != manifest:
+    if artifacts["adapter_model.safetensors"] != model or artifacts["adapter_config.json"] != config or artifacts["adapter_manifest.json"] != manifest or before.get("step1_sidecar") != artifacts["adapter_model.safetensors.sha256"] or before.get("step1_stable") != artifacts["STABLE"]:
         _fail("delta receipt artifact identity chain is inconsistent")
     if receipt.get("trainer_evidence", {}).get("export_completed") is not True:
         _fail("delta receipt does not prove export completion")
