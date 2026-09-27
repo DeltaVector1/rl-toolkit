@@ -20,6 +20,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+# Allow the supported direct file CLI as well as ``python -m`` execution.
+if __package__ in {None, ""}:
+    _repository_root = str(Path(__file__).resolve().parents[3])
+    if _repository_root not in sys.path:
+        sys.path.insert(0, _repository_root)
+
 from training_ops.runtime.h200.build_trinity_parity_reference import (
     _extract_policy_receipt,
     _json_sha256,
