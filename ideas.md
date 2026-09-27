@@ -74,6 +74,21 @@
   readiness identity. Any mismatch, nonfinite output, or startup/load failure
   fails the diagnostic; no production setting changes.
 
+## Packed sparse-MLA gpipe diagnostic correction
+
+- **Measured failure.** Packed qualification launched all 8 workers in
+  31.768s, but stopped after 10.329s with no outputs: step 0 had no forward
+  pass and 2,859 identical errors from 20:18:44 to 20:21:34. The packed
+  batch 1 was below the 1f1b PP8 minimum of 8.
+- **Diagnostic correction only.** Use `pp_schedule='gpipe'` for both packed
+  batch 1 and individual batch 5. Retain CP8/PP8/EP8, native FP8, the same
+  tokens and routes, no LoRA, lr0, the existing gates, and the 600s limit.
+  This tests the packed sparse-MLA numerical path under the full topology but
+  does not qualify production 1f1b scheduling. If it reproduces the mismatch,
+  it localizes packing independently of schedule; if green, next construct an
+  8-microbatch 1f1b discriminator without changing measurement limits. Do not
+  claim production readiness.
+
 ## Isolated decode256 to prefill-rescore parity qualification
 
 - **Planned, opt-in only.** Keep the existing policy-0 qualification unchanged
