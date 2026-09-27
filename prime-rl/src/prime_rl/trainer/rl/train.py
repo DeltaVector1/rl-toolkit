@@ -531,6 +531,100 @@ def _qualification_batch_sha256(micro_batches: list[dict]) -> str:
     return digest.hexdigest()
 
 
+def _capture_direct_parity_record(
+    records: dict[int, dict],
+    payload: dict,
+    *,
+    microbatch_index: int,
+    microbatch_count: int,
+) -> None:
+    """Collect one pipeline parity record without allowing loss or replacement."""
+    if type(microbatch_count) is not int or microbatch_count < 1:
+        raise RuntimeError("direct parity microbatch count is invalid")
+    if type(microbatch_index) is not int:
+        raise RuntimeError("direct parity microbatch index is invalid")
+    if not 0 <= microbatch_index < microbatch_count:
+        raise RuntimeError(
+            f"direct parity microbatch index {microbatch_index} is outside "
+            f"0..{microbatch_count - 1}"
+        )
+    if not isinstance(payload, dict):
+        raise RuntimeError("direct parity payload must be an object")
+    if "microbatch_index" in payload or "microbatch_count" in payload:
+        raise RuntimeError("direct parity payload already has microbatch identity")
+    if microbatch_index in records:
+        raise RuntimeError(
+            f"duplicate direct parity microbatch index {microbatch_index}"
+        )
+    if records and any(
+        record.get("microbatch_count") != microbatch_count
+        for record in records.values()
+    ):
+        raise RuntimeError("direct parity microbatch count changed during collection")
+    record = dict(payload)
+    record["microbatch_index"] = microbatch_index
+    record["microbatch_count"] = microbatch_count
+    records[microbatch_index] = record
+
+
+def _write_direct_parity_artifact(
+    output_dir: Path,
+    records: dict[int, dict],
+    *,
+    microbatch_count: int,
+) -> Path:
+    """Write a complete, ordered direct-parity artifact exactly once."""
+    if type(microbatch_count) is not int or microbatch_count < 1:
+        raise RuntimeError("direct parity microbatch count is invalid")
+    expected_indices = set(range(microbatch_count))
+    if set(records) != expected_indices:
+        missing = sorted(expected_indices - set(records))
+        extra = sorted(set(records) - expected_indices)
+        raise RuntimeError(
+            f"direct parity microbatch records are missing={missing} extra={extra}"
+        )
+    for index in range(microbatch_count):
+        record = records[index]
+        if (
+            not isinstance(record, dict)
+            or record.get("microbatch_index") != index
+            or record.get("microbatch_count") != microbatch_count
+        ):
+            raise RuntimeError(
+                f"direct parity microbatch record {index} has mismatched identity"
+            )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dump_path = output_dir / "direct-parity.json"
+    if dump_path.exists():
+        raise RuntimeError(f"direct parity artifact already exists: {dump_path}")
+    if microbatch_count == 1:
+        artifact = {
+            key: value
+            for key, value in records[0].items()
+            if key not in {"microbatch_index", "microbatch_count"}
+        }
+        serialized = json.dumps(artifact)
+    else:
+        serialized = json.dumps(
+            {
+                "schema_version": 2,
+                "microbatch_count": microbatch_count,
+                "microbatch_order": list(range(microbatch_count)),
+                "microbatches": [records[index] for index in range(microbatch_count)],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    temporary_path = output_dir / ".direct-parity.json.tmp"
+    if temporary_path.exists():
+        raise RuntimeError(f"direct parity temporary artifact already exists: {temporary_path}")
+    temporary_path.write_text(serialized)
+    temporary_path.replace(dump_path)
+    return dump_path
+
+
 def _verify_qualification_batch_sha256(value: str) -> None:
     encoded = torch.tensor(list(bytes.fromhex(value)), dtype=torch.uint8, device="cuda")
     gathered = [torch.empty_like(encoded) for _ in range(dist.get_world_size())]
@@ -1736,6 +1830,18 @@ def train(config: TrainerConfig):
             # logprobs, CP gather, right-shift, then the RL loss. Returns a scalar
             # so the schedule only backprops one value.
             direct_parity_dumped = False
+            direct_parity_records: dict[int, dict] = {}
+            direct_parity_count = len(pp_side_inputs)
+            qualification_dump = (
+                config.data.fake
+                and config.data.fake.reference_path is not None
+            )
+            production_dump = (
+                not config.data.fake
+                and config.parity_guard is not None
+                and progress.step == 1
+            )
+            dp_rank = parallel_dims.get_mesh("dp").get_local_rank()
 
             def _pp_loss(out, side):
                 nonlocal direct_parity_dumped
@@ -1764,23 +1870,16 @@ def train(config: TrainerConfig):
                     o["entropy"],
                     pad_value=torch.log(torch.tensor(float(vocab_size))).item(),
                 )
-                qualification_dump = (
-                    config.data.fake
-                    and config.data.fake.reference_path is not None
-                )
-                production_dump = (
-                    not config.data.fake
-                    and config.parity_guard is not None
-                    and progress.step == 1
-                )
-                if (qualification_dump or production_dump) and not direct_parity_dumped:
+                multi_direct_parity_dump = qualification_dump and direct_parity_count > 1
+                if multi_direct_parity_dump or (
+                    (qualification_dump or production_dump) and not direct_parity_dumped
+                ):
                     full_input_ids = gather_for_cp_wo_grad(
                         side["input_ids"], cp_size, cp_group
                     )
                     full_position_ids = gather_for_cp_wo_grad(
                         side["position_ids"], cp_size, cp_group
                     )
-                    dp_rank = parallel_dims.get_mesh("dp").get_local_rank()
                     if dp_rank == 0 and cp_rank == 0:
                         trainer_values = o["logprobs"].squeeze(0).detach().float().cpu()
                         reference_values = (
@@ -1807,20 +1906,28 @@ def train(config: TrainerConfig):
                             "valid_mean_abs_delta": float(delta[valid].abs().mean()),
                             "valid_max_abs_delta": float(delta[valid].abs().max()),
                         }
-                        dump_path = config.output_dir / (
-                            "direct-parity.json"
-                            if qualification_dump
-                            else "parity-step1.json"
-                        )
-                        dump_path.write_text(json.dumps(payload))
-                        logger.info(
-                            "Wrote direct trainer/reference parity data to %s "
-                            "(mean abs delta %.6f, max %.6f)",
-                            dump_path,
-                            payload["valid_mean_abs_delta"],
-                            payload["valid_max_abs_delta"],
-                        )
-                    direct_parity_dumped = True
+                        if multi_direct_parity_dump:
+                            _capture_direct_parity_record(
+                                direct_parity_records,
+                                payload,
+                                microbatch_index=side["micro_step"],
+                                microbatch_count=direct_parity_count,
+                            )
+                        else:
+                            dump_path = config.output_dir / (
+                                "direct-parity.json"
+                                if qualification_dump
+                                else "parity-step1.json"
+                            )
+                            dump_path.write_text(json.dumps(payload))
+                            logger.info(
+                                "Wrote direct trainer/reference parity data to %s "
+                                "(mean abs delta %.6f, max %.6f)",
+                                dump_path,
+                                payload["valid_mean_abs_delta"],
+                                payload["valid_max_abs_delta"],
+                            )
+                            direct_parity_dumped = True
                 sl = side["sequence_lengths"]
                 loss, loss_tensors = compute_loss(
                     trainer_logprobs=o["logprobs"].squeeze().split(sl),
@@ -1982,6 +2089,24 @@ def train(config: TrainerConfig):
                 )
             else:
                 pp_schedule.step(return_outputs=False)
+            if (
+                qualification_dump
+                and direct_parity_count > 1
+                and pp_rank == parallel_dims.pp - 1
+                and dp_rank == 0
+                and cp_rank == 0
+            ):
+                dump_path = _write_direct_parity_artifact(
+                    config.output_dir,
+                    direct_parity_records,
+                    microbatch_count=direct_parity_count,
+                )
+                logger.info(
+                    "Wrote direct trainer/reference parity data to %s "
+                    "(%d microbatches in microbatch order)",
+                    dump_path,
+                    direct_parity_count,
+                )
             for stage_module in pp_stage_modules:
                 stage_module.emit_profile_reports()
             local_schedule_ms = 0.0
