@@ -1124,3 +1124,29 @@ only after measured learning.
   differs, quarantine the stored rollout path. Run the router replay with
   router replay off and on only if the first comparison cannot distinguish
   these cases; do not change production settings before the result.
+
+## Exact policy-0 source binding
+
+- **Measured evidence.** The n82 artifact is `16,537,503,808` bytes with
+  SHA-256 prefix `192215f1...`; the H200 cache has the same size with SHA-256
+  prefix `3d365b82...`. Configs are identical with SHA-256 prefix
+  `4d4e48b0...`, and headers are identical with SHA-256 prefix
+  `446a9925...`. The artifact has `41,952` B-factor tensors and
+  `4,131,520,512` BF16 elements, all zero.
+- **Proposal.** Publish only with a fail-closed source manifest bound to the
+  target SHA, and reject a stale adapter that has the same shape but a
+  different source identity. Keep existing publication and qualification
+  gates unchanged.
+
+## Fresh synthetic packed sparse-MLA parity
+
+- **Measured evidence.** Production packed parity reported unmasked KL
+  `1.147836`, masked KL `2.193980`, and masked fraction `0.213119`. Fresh
+  H200 versus stored logprobs had mean absolute error `0.05346337`; fresh
+  H200 versus trainer had `1.15468605`, about `21.6x` larger.
+- **Proposal.** Generate five new deterministic nonuniform sequences totaling
+  `32768` tokens from the native FP8 base with no LoRA. Compare individual and
+  packed requests under CP8/PP8/EP8 using the same routes. Do not use cached
+  rollouts or a full rollout batch. Only if the result is red, toggle
+  `pp_transfer_sparse_indices=false`, then isolate CP and PP and assert
+  `ks`/`ke` and index ranges. Keep existing parity gates unchanged.
