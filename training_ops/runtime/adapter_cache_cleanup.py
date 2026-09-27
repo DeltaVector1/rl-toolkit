@@ -42,6 +42,15 @@ OPTIONAL_FILES = frozenset(
 
 def exact_source_url(source_url: str) -> str:
     """Return the exact source object URL used to derive the cache key."""
+    parsed = _validated_loopback_url(source_url)
+    if parsed.path.endswith(SOURCE_SUFFIX):
+        return source_url
+    if "/broadcasts/" in parsed.path:
+        raise ValueError("adapter cache source URL must name the exact step_0 object")
+    return source_url + SOURCE_SUFFIX
+
+
+def _validated_loopback_url(source_url: str):
     if (
         not isinstance(source_url, str)
         or not source_url
@@ -62,6 +71,56 @@ def exact_source_url(source_url: str) -> str:
         or parsed.path.endswith("/")
     ):
         raise ValueError("adapter cache source URL must be an exact loopback URL")
+    return parsed
+
+
+def configured_source_url(
+    source_url: str,
+    *,
+    run: str,
+    service_name: str,
+) -> str:
+    """Derive the exact nested runtime source URL for one configured run."""
+    if not isinstance(run, str) or re.fullmatch(r"[A-Za-z0-9_-]+", run) is None:
+        raise ValueError("adapter cache run name is invalid")
+    if service_name != f"run_{run}" or re.fullmatch(r"[A-Za-z0-9_-]+", service_name) is None:
+        raise ValueError("adapter cache service identity is invalid")
+    if not isinstance(source_url, str) or not source_url:
+        raise ValueError("adapter cache source URL is invalid")
+    base = source_url.rstrip("/")
+    parsed = _validated_loopback_url(base)
+    if parsed.path != f"/{run}":
+        raise ValueError("adapter cache configured source URL does not match the run")
+    return f"{base}/{service_name}{SOURCE_SUFFIX}"
+
+
+def canonical_receipt_source_url(source_url: str, *, target_source_url: str) -> str:
+    """Map safe config and legacy aliases to the exact nested target URL."""
+    target = exact_source_url(target_source_url)
+    target_parts = _validated_loopback_url(target)
+    if not target_parts.path.endswith(SOURCE_SUFFIX):
+        raise ValueError("adapter cache target source URL is invalid")
+    service_path = target_parts.path[: -len(SOURCE_SUFFIX)]
+    if not service_path.startswith("/") or not service_path.strip("/"):
+        raise ValueError("adapter cache target source URL is invalid")
+    if service_path.count("/") >= 2:
+        base_path, service_name = service_path.rsplit("/", 1)
+    else:
+        base_path, service_name = service_path, ""
+    parsed = _validated_loopback_url(source_url)
+    if parsed.scheme != target_parts.scheme or parsed.netloc != target_parts.netloc:
+        raise ValueError("adapter cache source URL does not match the target")
+    allowed_paths = {
+        target_parts.path,
+        base_path,
+        base_path + SOURCE_SUFFIX,
+    }
+    if service_name:
+        if re.fullmatch(r"run_[A-Za-z0-9_-]+", service_name) is None:
+            raise ValueError("adapter cache target source URL is invalid")
+        allowed_paths.add(service_path)
+    if parsed.path in allowed_paths:
+        return target
     if parsed.path.endswith(SOURCE_SUFFIX):
         return source_url
     if "/broadcasts/" in parsed.path:
@@ -116,7 +175,10 @@ def validate_status(
         if not isinstance(receipt_source, str):
             raise ValueError("adapter cache cleanup loaded receipt source is invalid")
         try:
-            receipt_source = exact_source_url(receipt_source)
+            receipt_source = canonical_receipt_source_url(
+                receipt_source,
+                target_source_url=source_url,
+            )
         except ValueError as error:
             raise ValueError("adapter cache cleanup loaded receipt source is invalid") from error
         for field in ("target_sha256", "config_sha256"):
@@ -256,6 +318,14 @@ expected_key = hashlib.sha256(source_url.encode()).hexdigest()
 target = Path(cache_path)
 
 def exact_source_url(value):
+    parsed = _validated_loopback_url(value)
+    if parsed.path.endswith(source_suffix):
+        return value
+    if "/broadcasts/" in parsed.path:
+        raise ValueError("adapter cache source URL must name the exact step_0 object")
+    return value + source_suffix
+
+def _validated_loopback_url(value):
     if (
         not isinstance(value, str)
         or not value
@@ -276,6 +346,30 @@ def exact_source_url(value):
         or parsed.path.endswith("/")
     ):
         raise ValueError("adapter cache source URL must be an exact loopback URL")
+    return parsed
+
+def canonical_receipt_source_url(value):
+    target = exact_source_url(source_url)
+    target_parts = _validated_loopback_url(target)
+    if not target_parts.path.endswith(source_suffix):
+        raise ValueError("adapter cache target source URL is invalid")
+    service_path = target_parts.path[:-len(source_suffix)]
+    if not service_path.startswith("/") or not service_path.strip("/"):
+        raise ValueError("adapter cache target source URL is invalid")
+    if service_path.count("/") >= 2:
+        base_path, service_name = service_path.rsplit("/", 1)
+    else:
+        base_path, service_name = service_path, ""
+    parsed = _validated_loopback_url(value)
+    if parsed.scheme != target_parts.scheme or parsed.netloc != target_parts.netloc:
+        raise ValueError("adapter cache source URL does not match the target")
+    allowed_paths = {target_parts.path, base_path, base_path + source_suffix}
+    if service_name:
+        if re.fullmatch(r"run_[A-Za-z0-9_-]+", service_name) is None:
+            raise ValueError("adapter cache target source URL is invalid")
+        allowed_paths.add(service_path)
+    if parsed.path in allowed_paths:
+        return target
     if parsed.path.endswith(source_suffix):
         return value
     if "/broadcasts/" in parsed.path:
@@ -306,7 +400,7 @@ def validate_status(status):
             raise RuntimeError("adapter cache cleanup loaded receipt name is invalid")
         receipt_source = receipt.get("source_url")
         try:
-            receipt_source = exact_source_url(receipt_source)
+            receipt_source = canonical_receipt_source_url(receipt_source)
         except ValueError as error:
             raise RuntimeError("adapter cache cleanup loaded receipt source is invalid") from error
         if not re.fullmatch(r"[0-9a-f]{64}", receipt.get("target_sha256", "")) or not re.fullmatch(r"[0-9a-f]{64}", receipt.get("config_sha256", "")):

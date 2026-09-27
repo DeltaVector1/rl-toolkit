@@ -11,8 +11,11 @@ import training_ops
 from training_ops.runtime import adapter_cache_cleanup
 
 
-SOURCE = "http://127.0.0.1:18100/trinity-decensor-experimental-fixed/broadcasts/step_0"
-KEY = "056ce0a30be48095dbd88b8c0e741146d5be162be82252eb2040ee1ec0cd9074"
+CONFIG_BASE = "http://127.0.0.1:18100/trinity-decensor-experimental-fixed"
+SOURCE = f"{CONFIG_BASE}/run_trinity-decensor-experimental-fixed/broadcasts/step_0"
+LEGACY_SOURCE = f"{CONFIG_BASE}/broadcasts/step_0"
+KEY = "f72c3222b63fe4faf9e482d6b36fb6887521aac5a76f96655e2b94a18a630f8a"
+LEGACY_KEY = "056ce0a30be48095dbd88b8c0e741146d5be162be82252eb2040ee1ec0cd9074"
 LORA = "trinity-decensor-experimental-fixed-r32-node-local"
 
 
@@ -67,6 +70,14 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
             lora_name=LORA,
         )
         self.assertEqual(plan["cache_key"], KEY)
+
+    def test_explicit_legacy_exact_url_remains_raw(self):
+        plan = training_ops._exact_adapter_cache_cleanup_plan(
+            source_url=LEGACY_SOURCE,
+            lora_name=LORA,
+        )
+        self.assertEqual(plan["source_url"], LEGACY_SOURCE)
+        self.assertEqual(plan["cache_key"], LEGACY_KEY)
 
     def test_source_url_and_name_are_required_and_exact(self):
         with self.assertRaisesRegex(training_ops.Refused, "exact source URL"):
@@ -140,7 +151,7 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
                 )
 
     def test_receipt_urls_use_exact_source_canonicalization(self):
-        base = SOURCE.removesuffix("/broadcasts/step_0")
+        base = CONFIG_BASE
         with self.assertRaisesRegex(ValueError, "exact adapter receipt is still loaded"):
             adapter_cache_cleanup.validate_status(
                 {"status": "idle", "loaded_receipts": {"other": receipt(base, "other")}},
@@ -151,6 +162,7 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
             )
         malformed = (
             f"{base}/",
+            f"{CONFIG_BASE}/run_trinity-decensor-experimental-fixed/",
             f"{SOURCE}/",
             f"{SOURCE}?query=1",
             f"{SOURCE}#fragment",
@@ -185,7 +197,7 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = write_cache(root)
-            other = root / ("b" * 64)
+            other = root / LEGACY_KEY
             other.mkdir()
             identity = adapter_cache_cleanup.validate_directory(
                 target, source_url=SOURCE, expected_key=KEY
@@ -197,6 +209,9 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
             (target / "unknown").write_text("x")
             cases.append("unknown contents")
             (target / "unknown").unlink()
+            (target / "transport-manifest.json").write_text("{}")
+            cases.append("unknown transport manifest")
+            (target / "transport-manifest.json").unlink()
             (target / "manifest.json").write_text(
                 json.dumps({"version": 1, "source_url": "http://wrong", "files": {}})
             )
@@ -209,6 +224,33 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
                     adapter_cache_cleanup.validate_directory(
                         target, source_url=SOURCE, expected_key=KEY
                     )
+
+    def test_fresh_preflight_uses_nested_production_cache_key(self):
+        selected = {
+            "trainer": "configs/trinity-decensor-experimental-fixed/trainer.toml",
+            "orchestrator": "configs/trinity-decensor-experimental-fixed/orchestrator.toml",
+            "inference": "configs/trinity-decensor-experimental-fixed/inference.toml",
+        }
+        with mock.patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(0, "FRESH_START_PRECHECK_OK"),
+        ) as ssh, mock.patch.object(
+            training_ops,
+            "_fan",
+            side_effect=lambda hosts, function: {
+                host: function(host) for host in hosts
+            },
+        ):
+            training_ops._fresh_start_preflight(
+                "trinity-decensor-experimental-fixed",
+                selected,
+                ["n82"],
+                "/data/glm52-rl/runs/trinity-decensor-experimental-fixed/run_trinity-decensor-experimental-fixed",
+            )
+        scripts = {call.args[0]: call.args[1] for call in ssh.call_args_list}
+        self.assertIn(KEY, scripts["h200b"])
+        self.assertNotIn(LEGACY_KEY, scripts["h200b"])
 
     def test_directory_refuses_root_target_and_file_symlinks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -300,7 +342,12 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
         )
         base = SOURCE.removesuffix("/broadcasts/step_0")
         cases = (
-            (base, "exact adapter receipt is still loaded"),
+            (CONFIG_BASE, "exact adapter receipt is still loaded"),
+            (LEGACY_SOURCE, "exact adapter receipt is still loaded"),
+            (
+                f"{CONFIG_BASE}/run_trinity-decensor-experimental-fixed",
+                "exact adapter receipt is still loaded",
+            ),
             (f"{base}/", "loaded receipt source is invalid"),
             (f"{SOURCE}/", "loaded receipt source is invalid"),
             (f"{SOURCE}?query=1", "loaded receipt source is invalid"),

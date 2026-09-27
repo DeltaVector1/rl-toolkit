@@ -69,6 +69,7 @@ from training_ops.runtime.h200.qualified_adapter_load import (
 )
 from training_ops.runtime.adapter_cache_cleanup import (
     build_script as _build_adapter_cache_cleanup_script,
+    configured_source_url as _configured_adapter_cache_source_url,
     exact_source_url as _exact_adapter_cache_source_url,
     validate_directory as _validate_adapter_cache_directory,
     validate_metrics as _validate_adapter_cache_metrics,
@@ -10259,6 +10260,7 @@ def _exact_adapter_cache_cleanup_plan(
     lora_name: str | None = None,
 ) -> dict[str, object]:
     """Resolve one exact source URL and its immutable cache key."""
+    configured_mode = run is not None or config_dir is not None
     if run is not None and not isinstance(run, str):
         raise Refused("adapter cache run must be a string")
     if config_dir is not None and not isinstance(config_dir, str):
@@ -10293,7 +10295,15 @@ def _exact_adapter_cache_cleanup_plan(
     if not isinstance(source_url, str) or not isinstance(lora_name, str) or not lora_name:
         raise Refused("adapter cache cleanup requires an exact source URL and LoRA name")
     try:
-        exact_source = _exact_adapter_cache_source_url(source_url)
+        if configured_mode:
+            _runs_path, _run_parent, service_dir = _cold_run_paths(run)
+            exact_source = _configured_adapter_cache_source_url(
+                source_url,
+                run=run,
+                service_name=Path(service_dir).name,
+            )
+        else:
+            exact_source = _exact_adapter_cache_source_url(source_url)
     except ValueError as error:
         raise Refused(str(error)) from error
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", lora_name):
@@ -10516,17 +10526,14 @@ def _fresh_start_preflight(
     )
     if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
         raise Refused("fresh start config has no adapter source URL")
-    source_url = source_url.rstrip("/")
-    parsed_source_url = urlsplit(source_url)
-    if (
-        parsed_source_url.hostname not in {"127.0.0.1", "localhost"}
-        or parsed_source_url.username
-        or parsed_source_url.password
-        or parsed_source_url.query
-        or parsed_source_url.fragment
-        or parsed_source_url.path.rstrip("/") != f"/{run}"
-    ):
-        raise Refused("fresh start adapter source URL does not match the active run")
+    try:
+        cache_source_url = _configured_adapter_cache_source_url(
+            source_url,
+            run=run,
+            service_name=Path(service_run_dir).name,
+        )
+    except ValueError as error:
+        raise Refused("fresh start adapter source URL does not match the active run") from error
     cache_root = paths.get("adapter_cache")
     if (
         not isinstance(cache_root, str)
@@ -10535,7 +10542,6 @@ def _fresh_start_preflight(
         or any(part in {"", ".", ".."} for part in PurePosixPath(cache_root).parts)
     ):
         raise Refused("configured adapter cache path is unsafe")
-    cache_source_url = f"{source_url}/broadcasts/step_0"
     cache_path = (
         f"{cache_root.rstrip('/')}/"
         f"{hashlib.sha256(cache_source_url.encode('utf-8')).hexdigest()}"

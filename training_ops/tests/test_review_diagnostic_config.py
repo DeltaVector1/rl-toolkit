@@ -347,8 +347,8 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         failures = (
             "FRESH_START_PATH_PRESENT path=/data/glm52-rl/runs/example",
             "FRESH_START_PATH_SYMLINK path=/data/glm52-rl/runs/example",
-            "FRESH_START_CACHE_PRESENT path=/data/glm52-rl/lora-cache/f81b26589e09c5c655d8778664fcc641ce8be39bb19ac7f75f2a6fa9a3f28928",
-            "FRESH_START_CACHE_SYMLINK path=/data/glm52-rl/lora-cache/f81b26589e09c5c655d8778664fcc641ce8be39bb19ac7f75f2a6fa9a3f28928",
+            "FRESH_START_CACHE_PRESENT path=/data/glm52-rl/lora-cache/b499fb3ffef17ff46bcf073897ebb5b8d113531361ff6536a0f00c18de5ae474",
+            "FRESH_START_CACHE_SYMLINK path=/data/glm52-rl/lora-cache/b499fb3ffef17ff46bcf073897ebb5b8d113531361ff6536a0f00c18de5ae474",
             "FRESH_START_CONTAINER_ACTIVE name=glm52-decensor-trainer",
         )
         for failure in failures:
@@ -405,10 +405,11 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertIn(training_ops.adapter_container, script)
         self.assertIn("FRESH_START_PRECHECK_OK", script)
         source_url = "http://127.0.0.1:18100/trinity-decensor-experimental-fixed-diag-d29a5958"
-        cache_source = source_url + "/broadcasts/step_0"
+        diagnostic_run = "trinity-decensor-experimental-fixed-diag-d29a5958"
+        cache_source = f"{source_url}/run_{diagnostic_run}/broadcasts/step_0"
         self.assertEqual(
             hashlib.sha256(cache_source.encode()).hexdigest(),
-            "f81b26589e09c5c655d8778664fcc641ce8be39bb19ac7f75f2a6fa9a3f28928",
+            "b499fb3ffef17ff46bcf073897ebb5b8d113531361ff6536a0f00c18de5ae474",
         )
         self.assertIn(hashlib.sha256(cache_source.encode()).hexdigest(), script)
         self.assertNotIn(hashlib.sha256(source_url.encode()).hexdigest(), script)
