@@ -25,7 +25,7 @@ from training_ops import _qualified_receipt_from_output, _qualified_result_recei
 
 def receipt():
     model = {"sha256": "a" * 64, "size": 100}
-    config = {"sha256": "b" * 64, "size": 200}
+    config = {"sha256": "8" * 64, "size": 200}
     manifest = {"sha256": "c" * 64, "size": 900}
     stable = {"sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "size": 0}
     artifacts = {
@@ -73,7 +73,7 @@ def result_receipt():
     source_url = "http://127.0.0.1:18100/qualified-adapters/" + "c" * 64 + "/step_1"
     source_dir = "/data/glm52-rl/runs/qualified-adapters/" + "c" * 64 + "/step_1"
     artifacts = receipt()["identities_after"]["artifacts"]
-    adapter = {"source_url": source_url, "target_sha256": "a" * 64, "target_size": 100, "config_sha256": "b" * 64, "config_size": 200}
+    adapter = {"source_url": source_url, "target_sha256": "a" * 64, "target_size": 100, "config_sha256": "8" * 64, "config_size": 200}
     return {
         "schema_version": 1,
         "kind": "h200_qualified_adapter_load",
@@ -86,7 +86,7 @@ def result_receipt():
         "adapter_identity": adapter,
         "published": {"status": "published", "source_url": source_url, "source_adapter_dir": source_dir, "manifest_sha256": "c" * 64, "owner_token": "8:99:123:456", "parent_token": "1:2", "final_token": "3:4", "files": artifacts},
         "stage_result": {"status": "ok", "adapter_identity": adapter},
-        "load_result": [{"lora_name": "trinity-h200-post-update-qualification-slot1", "source_url": source_url, "target_sha256": "a" * 64, "target_size": 100, "config_sha256": "b" * 64, "config_size": 200, "server_instance": "instance-a"}],
+        "load_result": [{"lora_name": "trinity-h200-post-update-qualification-slot1", "source_url": source_url, "target_sha256": "a" * 64, "target_size": 100, "config_sha256": "8" * 64, "config_size": 200, "server_instance": "instance-a"}],
         "server_instances": ["instance-a"],
         "engine_identity_before": {"container_id": "container-a", "container_started_at": "2026-09-27T00:00:00Z", "api_pid": 321, "api_start_time": "1001"},
         "engine_identity_after": {"container_id": "container-a", "container_started_at": "2026-09-27T00:00:00Z", "api_pid": 321, "api_start_time": "1001"},
@@ -143,6 +143,30 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         mutated["identities_after"]["step1_sidecar_extra"] = True
         payload = json.dumps(mutated, sort_keys=True, separators=(",", ":")).encode() + b"\n"
         with self.assertRaisesRegex(QualifiedAdapterLoadError, "identity"):
+            parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
+
+    def test_changed_model_with_shared_config_is_valid_but_config_drift_is_not(self):
+        valid = receipt()
+        valid_raw = json.dumps(valid, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        self.assertEqual(parse_delta_receipt(valid_raw, hashlib.sha256(valid_raw).hexdigest())["step1_adapter"]["sha256"], "a" * 64)
+
+        unchanged_model = json.loads(json.dumps(valid))
+        unchanged_model["step1_adapter"] = unchanged_model["policy0_adapter"]
+        for identity in (unchanged_model["identities_before"], unchanged_model["identities_after"]):
+            identity["step1_adapter"] = unchanged_model["policy0_adapter"]
+            identity["artifacts"]["adapter_model.safetensors"] = unchanged_model["policy0_adapter"]
+        payload = json.dumps(unchanged_model, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "policy-0"):
+            parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
+
+        config_drift = json.loads(json.dumps(valid))
+        drift = {"sha256": "b" * 64, "size": 200}
+        config_drift["step1_config"] = drift
+        for identity in (config_drift["identities_before"], config_drift["identities_after"]):
+            identity["step1_config"] = drift
+            identity["artifacts"]["adapter_config.json"] = drift
+        payload = json.dumps(config_drift, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "config"):
             parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
 
     def test_remote_receipt_framing_preserves_exact_terminal_newline(self):
@@ -398,7 +422,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
             "source_url": plan["source_url"],
             "target_sha256": "a" * 64,
             "target_size": 100,
-            "config_sha256": "b" * 64,
+            "config_sha256": "8" * 64,
             "config_size": 200,
         }
         old = {"source_url": "http://old/step_0", "target_sha256": "1" * 64, "target_size": 10, "config_sha256": "2" * 64, "config_size": 20, "lora_name": "policy0", "server_instance": "instance-a"}
@@ -434,7 +458,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
 
     def test_boundary_swap_fails_closed_and_rolls_back_owned_publication(self):
         plan = self.apply_plan()
-        expected = {"source_url": plan["source_url"], "target_sha256": "a" * 64, "target_size": 100, "config_sha256": "b" * 64, "config_size": 200}
+        expected = {"source_url": plan["source_url"], "target_sha256": "a" * 64, "target_size": 100, "config_sha256": "8" * 64, "config_size": 200}
         states = [self.live_state({})]
         publish = f"QUALIFIED_PUBLISH status=published source_url={plan['source_url']} source_adapter_dir={plan['source_adapter_dir']} manifest_sha256={plan['manifest_sha256']} owner_token=8:99:123:456 parent_token=1:2 final_token=3:4\n"
         boundaries = []

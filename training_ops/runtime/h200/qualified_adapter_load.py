@@ -150,8 +150,10 @@ def parse_delta_receipt(payload: bytes | str, expected_sha256: str) -> dict[str,
         _fail("delta receipt step-1 identity chain is inconsistent")
     policy_model = _identity(receipt.get("policy0_adapter"), "policy-0 adapter")
     policy_config = _identity(receipt.get("policy0_config"), "policy-0 config")
-    if model == policy_model or config == policy_config:
-        _fail("step-1 identity must differ from policy-0")
+    if model == policy_model:
+        _fail("step-1 adapter identity must differ from policy-0")
+    if config != policy_config:
+        _fail("step-1 config identity must equal policy-0")
     if before.get("policy0_adapter") != policy_model or before.get("policy0_config") != policy_config:
         _fail("delta receipt policy-0 identity chain is inconsistent")
     manifest = _identity(before.get("step1_manifest"), "step-1 manifest")
