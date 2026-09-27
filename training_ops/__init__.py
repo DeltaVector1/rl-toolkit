@@ -12097,7 +12097,7 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
             raise Refused(f"qualified H200 source route probe failed: {output.strip()}")
         expected = _qualified_adapter_receipt_identity(plan)
         stage_start = time.monotonic()
-        staged = _policy0_remote_client_op(plan, "stage")
+        staged = _policy0_remote_client_op(plan, "stage", expected)
         if not isinstance(staged, Mapping) or staged.get("adapter_identity") != expected:
             raise Refused("qualified adapter stage identity differs from the delta receipt")
         _qualified_verify_publication(plan, published_result, "after-stage")
@@ -12493,7 +12493,9 @@ def _policy0_load_apply(plan: dict[str, object]) -> dict[str, object]:
         plan,
         read_state=lambda: _policy0_load_live_state(plan),
         read_source=lambda: source,
-        stage=lambda source_url, **kwargs: _policy0_remote_client_op(plan, "stage"),
+        stage=lambda source_url, **kwargs: _policy0_remote_client_op(
+            plan, "stage", source["identity"]
+        ),
         load=lambda slot, source_url, **kwargs: _policy0_remote_client_op(
             plan, "load", kwargs.get("expected_identity")
         ),

@@ -148,7 +148,7 @@ def test_stage_http_and_json_failures_are_structured(response, category):
         response.request = request
         return response
 
-    result = run_remote(handler, request("stage"))
+    result = run_remote(handler, request("stage", expected_identity=IDENTITY))
     assert result["ok"] is False
     assert result["category"] == category
 
@@ -157,7 +157,7 @@ def test_http_status_preserves_status_and_response_body():
     def handler(request):
         return httpx.Response(504, text="server restart required", request=request)
 
-    result = run_remote(handler, request("stage"))
+    result = run_remote(handler, request("stage", expected_identity=IDENTITY))
     assert result["ok"] is False
     assert result["category"] == "http"
     assert "HTTP 504" in result["error"]
@@ -168,7 +168,7 @@ def test_timeout_is_reported_as_tunnel_failure():
     def handler(request):
         raise httpx.ReadTimeout("server did not answer", request=request)
 
-    result = run_remote(handler, request("stage"))
+    result = run_remote(handler, request("stage", expected_identity=IDENTITY))
     assert result["ok"] is False
     assert result["category"] == "tunnel"
 
@@ -228,7 +228,7 @@ def test_identity_and_receipt_mismatch_fail_closed():
     def stage_handler(request):
         return httpx.Response(200, json={"status": "ok", "adapter_identity": bad}, request=request)
 
-    result = run_remote(stage_handler, request("stage"))
+    result = run_remote(stage_handler, request("stage", expected_identity=IDENTITY))
     assert result["ok"] is False
     assert result["category"] == "identity"
 

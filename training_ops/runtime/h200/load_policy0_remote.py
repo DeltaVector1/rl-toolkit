@@ -246,11 +246,9 @@ async def _run(request: dict[str, object]) -> dict[str, object]:
     try:
         admin_urls, source_url, slot, operation = _validate_request(request)
         expected_value = request.get("expected_identity")
-        expected = None
-        if operation == "load":
-            if not isinstance(expected_value, Mapping):
-                raise ValueError("load requires the expected adapter identity")
-            expected = _identity(expected_value, source_url, "expected adapter")
+        if not isinstance(expected_value, Mapping):
+            raise ValueError(f"{operation} requires the expected adapter identity")
+        expected = _identity(expected_value, source_url, "expected adapter")
         async with httpx.AsyncClient() as client:
             if operation == "stage":
                 payload = {"lora_path": source_url, "require_delta": False}
@@ -266,7 +264,16 @@ async def _run(request: dict[str, object]) -> dict[str, object]:
                 for index, response in enumerate(responses):
                     if response.get("status") != "ok":
                         raise ValueError(f"endpoint {index} adapter stage failed")
-                    identities.append(_identity(response.get("adapter_identity"), source_url, f"endpoint {index} staged adapter"))
+                    identity = _identity(
+                        response.get("adapter_identity"),
+                        source_url,
+                        f"endpoint {index} staged adapter",
+                    )
+                    if identity != expected:
+                        raise ValueError(
+                            f"endpoint {index} staged adapter differs from expected adapter identity"
+                        )
+                    identities.append(identity)
                 if not identities or any(identity != identities[0] for identity in identities[1:]):
                     raise ValueError("inference endpoints reported different staged adapter identities")
                 return {"ok": True, "result": {"status": "ok", "adapter_identity": identities[0]}}
