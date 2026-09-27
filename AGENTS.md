@@ -47,6 +47,11 @@ conclusions. Keep reports short.
   change a measurement limit to make a run pass.
 - Do not download or copy model weights through SSH when a direct Hugging Face
   or ModelScope download is available.
+- Download model weights independently on each model or training node from
+  Hugging Face, ModelScope, or another source appropriate to the node location.
+  Never copy or stream weights between model or training nodes over SSH unless
+  the user explicitly requires it, or a direct download is impossible and the
+  user approves after receiving size and time measurements.
 - Follow the skill's task-specific approval and measurement rules for live
   work. Do not silently replace a requested method, setting, or metric;
   report the code and metric source.
