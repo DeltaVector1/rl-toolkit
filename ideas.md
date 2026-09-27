@@ -791,10 +791,20 @@ only after measured learning.
   identifier when the task runtime provides one. Never include raw prompts,
   model output, or raw tool arguments. Keep reward, group, retry, and timeout
   semantics unchanged.
-- **Follow-up measurement.** After the bounded record is verified, run a
-  controlled A/B timing and failure-rate comparison for review concurrency 2
-  versus a higher value, and judge client `pool_size=4` versus `pool_size=16`.
-  Keep batch size 1024, group size 16, context length 32768, output length
-  16384, reward settings, and timing limits fixed. Use the new phase-level
-  failure counts to separate provider argument failures from timeout or service
-  failures before changing concurrency.
+- The no-raw-content rule applies to the new INFO records. Existing
+  `trace.info["judge"]` event storage is unchanged by this experiment and may
+  still contain the provider request and response fields for the existing
+  trace contract; this is not a claim that every persisted trace is globally
+  free of raw content.
+- **Follow-up measurement.** After the bounded record is verified, measure the
+  current baseline first: the judge service has
+  `max_concurrent_requests=48`, while each worker's review semaphore is 2.
+  Then run one-variable A/B comparisons in order: per-worker review semaphore
+  2 versus a higher value, followed separately by the renderer/tokenizer
+  `pool_size=4` versus `pool_size=16`. `pool_size` is not the judge client
+  concurrency. Keep the judge limit at 48 while measuring the worker semaphore,
+  and change only one limit in each comparison. Keep batch size 1024, group
+  size 16, context length 32768, output length 16384, reward settings, and
+  timing limits fixed. Use the new phase-level failure counts to separate
+  provider argument failures from timeout or service failures before changing
+  concurrency.

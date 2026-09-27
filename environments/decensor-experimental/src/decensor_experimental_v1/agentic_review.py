@@ -1054,6 +1054,14 @@ def _tool_name(call: Any) -> str | None:
     return getattr(function, "name", None)
 
 
+def _tool_arguments(call: Any) -> str:
+    function = getattr(call, "function", None)
+    arguments = getattr(function, "arguments", None)
+    if isinstance(arguments, bytes):
+        return arguments.decode("utf-8", errors="replace")
+    return arguments if isinstance(arguments, str) else ""
+
+
 def _json_value(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -2307,12 +2315,11 @@ async def run_agentic_review(
             events.append(visible_event)
             try:
                 visible_call = visible_calls[0] if len(visible_calls) == 1 else None
+                visible_raw = _tool_arguments(visible_call)
                 if _tool_name(visible_call) != "submit_visible_review":
-                    visible_raw = str(visible_message.content or "")
                     raise ValueError(
                         "judge returned no single visible review tool call"
                     )
-                visible_raw = str(visible_call.function.arguments)
                 normalized_visible = normalize_evidence_id_fields(
                     visible_raw,
                     visible_evidence_id_fields,
@@ -2493,12 +2500,11 @@ async def run_agentic_review(
                 reasoning_call = (
                     reasoning_calls[0] if len(reasoning_calls) == 1 else None
                 )
+                reasoning_raw = _tool_arguments(reasoning_call)
                 if _tool_name(reasoning_call) != "submit_reasoning_review":
-                    reasoning_raw = str(reasoning_message.content or "")
                     raise ValueError(
                         "judge returned no single reasoning review tool call"
                     )
-                reasoning_raw = str(reasoning_call.function.arguments)
                 normalized_reasoning = normalize_evidence_id_fields(
                     reasoning_raw,
                     reasoning_evidence_id_fields,

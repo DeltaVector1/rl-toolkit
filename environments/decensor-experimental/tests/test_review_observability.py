@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from decensor_experimental_v1 import agentic_review
+from decensor_experimental_v1 import taskset
+from decensor_experimental_v1.service import EvaluationResult
 
 
 def _logged_payloads(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
@@ -56,14 +58,16 @@ def _review_source() -> agentic_review.ReviewSource:
     )
 
 
-def _completion(tool_name: str, arguments: str) -> SimpleNamespace:
+def _completion(
+    tool_name: str, arguments: str, *, content: str | None = None
+) -> SimpleNamespace:
     message = SimpleNamespace(
         tool_calls=[
             SimpleNamespace(
                 function=SimpleNamespace(name=tool_name, arguments=arguments)
             )
         ],
-        content=None,
+        content=content,
     )
     return SimpleNamespace(
         choices=[SimpleNamespace(message=message, finish_reason="length")],
@@ -83,7 +87,10 @@ class _FakeClient:
         return SimpleNamespace(completions=self)
 
     async def create(self, **_kwargs):
-        return next(self._responses)
+        response = next(self._responses)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
     async def close(self):
         return None
@@ -235,3 +242,270 @@ def test_invalid_reasoning_arguments_are_logged_by_review_runner(
     assert {payload["phase"] for payload in payloads} == {"reasoning_review"}
     assert all(payload["raw_arguments_chars"] == len(raw_arguments) for payload in payloads)
     assert all("reasoning-secret" not in record.message for record in caplog.records)
+
+
+def test_wrong_visible_tool_name_hashes_arguments_not_message_content(
+    caplog: pytest.LogCaptureFixture,
+):
+    import verifiers.v1.clients.base as client_base
+
+    raw_arguments = '{"secret":"visible-tool-argument"}'
+    raw_message = "visible prompt output must not be logged"
+    client = _FakeClient(
+        [
+            _completion(
+                "wrong_visible_tool",
+                raw_arguments,
+                content=raw_message,
+            )
+            for _ in range(3)
+        ]
+    )
+    with (
+        mock.patch.object(client_base, "build_async_openai", return_value=client),
+        caplog.at_level(logging.INFO, logger=agentic_review.__name__),
+    ):
+        response = asyncio.run(
+            agentic_review.run_agentic_review(_review_config(), _review_source())
+        )
+
+    assert response.failure_status == "invalid_model_response"
+    payloads = _logged_payloads(caplog)
+    assert len(payloads) == 3
+    assert all(payload["raw_arguments_chars"] == len(raw_arguments) for payload in payloads)
+    assert all(
+        payload["raw_arguments_sha256"]
+        == hashlib.sha256(raw_arguments.encode()).hexdigest()
+        for payload in payloads
+    )
+    serialized = " ".join(record.message for record in caplog.records)
+    assert raw_message not in serialized
+    assert "visible-tool-argument" not in serialized
+
+
+def test_wrong_reasoning_tool_name_hashes_arguments_not_message_content(
+    caplog: pytest.LogCaptureFixture,
+):
+    import verifiers.v1.clients.base as client_base
+
+    visible_arguments = json.dumps(
+        {
+            "turn": 1,
+            "refusal_level": 1,
+            "refusal_reason": "The answer fulfills the core request.",
+            "request_outcome": "fulfilled",
+            "fulfilled_separate_requested_part": False,
+            "exact_measurement_or_quote_requested": False,
+            "exact_measurement_or_quote_provided": False,
+            "explicitly_refused_original_request": False,
+            "silently_replaced_original_request": False,
+            "silent_replacement_reason": "",
+            "refusal_answer_evidence_ids": [],
+            "visible_answer_is_clear": "pass",
+            "visible_answer_is_clear_reason": "",
+            "visible_answer_is_clear_evidence_ids": [],
+            "meta_commentary": "absent",
+            "meta_commentary_reason": "",
+            "meta_commentary_evidence_ids": [],
+            "markdown_quality": "not_applicable",
+            "markdown_quality_reason": "",
+            "markdown_quality_evidence_ids": [],
+        }
+    )
+    raw_arguments = '{"secret":"reasoning-tool-argument"}'
+    raw_message = "reasoning prompt output must not be logged"
+    client = _FakeClient(
+        [_completion("submit_visible_review", visible_arguments)]
+        + [
+            _completion(
+                "wrong_reasoning_tool",
+                raw_arguments,
+                content=raw_message,
+            )
+            for _ in range(3)
+        ]
+    )
+    with (
+        mock.patch.object(client_base, "build_async_openai", return_value=client),
+        caplog.at_level(logging.INFO, logger=agentic_review.__name__),
+    ):
+        response = asyncio.run(
+            agentic_review.run_agentic_review(_review_config(), _review_source())
+        )
+
+    assert response.failure_status == "invalid_model_response"
+    payloads = _logged_payloads(caplog)
+    assert len(payloads) == 3
+    assert all(payload["phase"] == "reasoning_review" for payload in payloads)
+    assert all(payload["raw_arguments_chars"] == len(raw_arguments) for payload in payloads)
+    assert all(
+        payload["raw_arguments_sha256"]
+        == hashlib.sha256(raw_arguments.encode()).hexdigest()
+        for payload in payloads
+    )
+    serialized = " ".join(record.message for record in caplog.records)
+    assert raw_message not in serialized
+    assert "reasoning-tool-argument" not in serialized
+
+
+def test_visible_request_errors_emit_failure_records(
+    caplog: pytest.LogCaptureFixture,
+):
+    import verifiers.v1.clients.base as client_base
+
+    client = _FakeClient(
+        [RuntimeError("provider token=not-a-log-value") for _ in range(3)]
+    )
+    with (
+        mock.patch.object(client_base, "build_async_openai", return_value=client),
+        caplog.at_level(logging.INFO, logger=agentic_review.__name__),
+    ):
+        response = asyncio.run(
+            agentic_review.run_agentic_review(_review_config(), _review_source())
+        )
+
+    assert response.failure_status == "unscored_service_failure"
+    payloads = _logged_payloads(caplog)
+    assert len(payloads) == 3
+    assert all(payload["phase"] == "visible_review" for payload in payloads)
+    assert all(payload["failure_status"] == "request_failed" for payload in payloads)
+    assert all(payload["raw_arguments_chars"] == 0 for payload in payloads)
+
+
+def test_reasoning_request_errors_emit_failure_records(
+    caplog: pytest.LogCaptureFixture,
+):
+    import verifiers.v1.clients.base as client_base
+
+    visible_arguments = json.dumps(
+        {
+            "turn": 1,
+            "refusal_level": 1,
+            "refusal_reason": "The answer fulfills the core request.",
+            "request_outcome": "fulfilled",
+            "fulfilled_separate_requested_part": False,
+            "exact_measurement_or_quote_requested": False,
+            "exact_measurement_or_quote_provided": False,
+            "explicitly_refused_original_request": False,
+            "silently_replaced_original_request": False,
+            "silent_replacement_reason": "",
+            "refusal_answer_evidence_ids": [],
+            "visible_answer_is_clear": "pass",
+            "visible_answer_is_clear_reason": "",
+            "visible_answer_is_clear_evidence_ids": [],
+            "meta_commentary": "absent",
+            "meta_commentary_reason": "",
+            "meta_commentary_evidence_ids": [],
+            "markdown_quality": "not_applicable",
+            "markdown_quality_reason": "",
+            "markdown_quality_evidence_ids": [],
+        }
+    )
+    client = _FakeClient(
+        [_completion("submit_visible_review", visible_arguments)]
+        + [RuntimeError("provider token=not-a-log-value") for _ in range(3)]
+    )
+    with (
+        mock.patch.object(client_base, "build_async_openai", return_value=client),
+        caplog.at_level(logging.INFO, logger=agentic_review.__name__),
+    ):
+        response = asyncio.run(
+            agentic_review.run_agentic_review(_review_config(), _review_source())
+        )
+
+    assert response.failure_status == "unscored_service_failure"
+    payloads = _logged_payloads(caplog)
+    assert len(payloads) == 3
+    assert all(payload["phase"] == "reasoning_review" for payload in payloads)
+    assert all(payload["failure_status"] == "request_failed" for payload in payloads)
+    assert all(payload["raw_arguments_chars"] == 0 for payload in payloads)
+
+
+def test_taskset_failed_reviews_branch_logs_task_failure(
+    caplog: pytest.LogCaptureFixture,
+):
+    data = taskset.DecensorData(
+        system_prompt="",
+        target_turns=1,
+        response_format="plaintext",
+    )
+    task = taskset.DecensorTask(data, taskset.DecensorTaskConfig())
+    user_message = SimpleNamespace(role="user", content="request")
+    assistant_message = SimpleNamespace(
+        role="assistant", content="answer", reasoning="reason"
+    )
+
+    class State:
+        follow_up_strategies: list[str] = []
+        follow_up_attempts: list[dict[str, object]] = []
+        user_sim_failed = False
+        user_sim_error = ""
+
+    class Trace:
+        branches = [SimpleNamespace(messages=[user_message, assistant_message])]
+        is_truncated = False
+        state = State()
+        info: dict[str, object] = {}
+        task_id = "task-42"
+        group_id = "group-7"
+
+        def record_metrics(self, _metrics):
+            return None
+
+        def record_metric(self, _name, _value):
+            return None
+
+    source = SimpleNamespace(turns=(SimpleNamespace(turn=1),))
+
+    async def failed_review(*_args, **_kwargs):
+        return EvaluationResult(
+            status="unscored_service_failure",
+            details={"attempts": []},
+        )
+
+    trace = Trace()
+    with (
+        mock.patch.object(
+            taskset,
+            "find_model_response_failure",
+            return_value=(None, {}),
+        ),
+        mock.patch.object(
+            taskset,
+            "build_turn_review_sources",
+            return_value=[source],
+        ),
+        mock.patch.object(taskset, "request_judge_score", side_effect=failed_review),
+        caplog.at_level(logging.INFO, logger=agentic_review.__name__),
+        pytest.raises(RuntimeError, match="one or more per-turn reviews failed"),
+    ):
+        asyncio.run(task.decensor_reward(trace))
+
+    payload = _logged_payload(caplog)
+    assert payload["phase"] == "task_review_failure"
+    assert payload["failure_status"] == "unscored_service_failure"
+    assert payload["task_id"] == "task-42"
+    assert payload["group_id"] == "group-7"
+    assert trace.info["decensor"]["failed_judges"] == ["turn_1_review"]
+
+
+def test_exception_message_is_redacted_and_bounded(caplog: pytest.LogCaptureFixture):
+    raw_arguments = '{"secret":"argument-secret"}'
+    with pytest.raises(ValueError) as error_info:
+        agentic_review.VisibleReviewSubmission.model_validate(
+            {"secret": "argument-secret"}
+        )
+    error = error_info.value
+    with caplog.at_level(logging.INFO, logger=agentic_review.__name__):
+        agentic_review.log_review_failure(
+            phase="visible_review",
+            attempt=1,
+            error=error,
+            raw_arguments=raw_arguments,
+            failure_status="invalid_model_response",
+        )
+
+    payload = _logged_payload(caplog)
+    assert len(payload["exception_message"]) <= 400
+    assert "argument-secret" not in caplog.records[0].message
+    assert "input_value=[removed]" in payload["exception_message"]
