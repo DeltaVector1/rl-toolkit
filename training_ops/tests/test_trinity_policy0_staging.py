@@ -36,6 +36,15 @@ EXPECTED_LORA = {
 }
 OLD_SHA256 = "ad0dc097157b516e1a5ddc19124dbf10241c0245ce7a9a712c2e0ea78dbb42c4"
 OLD_SIZE = 2_838_023
+POST_UPDATE_IDENTITY = {
+    "final_reference_sha256": "c" * 64,
+    "final_reference_size": 123456,
+    "server_instance": "h200b-instance-1",
+    "adapter_sha256": "a" * 64,
+    "adapter_size": 100,
+    "config_sha256": "b" * 64,
+    "config_size": 200,
+}
 
 
 def reference_payload():
@@ -141,6 +150,46 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         self.assertIn("fsync", plan["transfer_reference_script"])
         self.assertIn("preserved.", plan["transfer_reference_script"])
         self.assertIn("sha256sum", plan["verify_script"])
+
+    def test_post_update_plan_requires_pinned_identity_and_uses_collection_validator(self):
+        kwargs = {
+            "source_adapter_dir": "/data/glm52-rl/preserved-step0",
+            "source_reference_path": "/data/glm52-rl/fresh-h200/reference.json",
+            "expected_old_reference_sha256": OLD_SHA256,
+            "expected_old_reference_size": OLD_SIZE,
+        }
+        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(
+            Refused, "post-update reference identity is not configured"
+        ):
+            prepare_policy0_qualification(
+                "configs/trinity-h200-post-update-qualification", **kwargs
+            )
+        with patch.dict(
+            os.environ,
+            {"PRIME_RL_POST_UPDATE_REFERENCE_IDENTITY": json.dumps(POST_UPDATE_IDENTITY)},
+            clear=True,
+        ):
+            plan = prepare_policy0_qualification(
+                "configs/trinity-h200-post-update-qualification", **kwargs
+            )
+        self.assertEqual(plan["post_update_reference_identity"], POST_UPDATE_IDENTITY)
+        self.assertIn("exactly eight microbatches", plan["source_reference_script"])
+        self.assertIn("request_without_id", plan["source_reference_script"])
+        self.assertNotIn("reference is not a policy-0 reference", plan["source_reference_script"])
+
+    def test_old_parity_plan_does_not_require_post_update_identity(self):
+        kwargs = {
+            "source_adapter_dir": "/data/glm52-rl/preserved-step0",
+            "source_reference_path": "/data/glm52-rl/fresh-h200/reference.json",
+            "expected_old_reference_sha256": OLD_SHA256,
+            "expected_old_reference_size": OLD_SIZE,
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            plan = prepare_policy0_qualification(
+                "configs/trinity-h200-parity-production", **kwargs
+            )
+        self.assertNotIn("post_update_reference_identity", plan)
+        self.assertIn("reference is not policy-0", plan["source_reference_script"])
 
     def test_api_requires_expected_old_pair(self):
         kwargs = {

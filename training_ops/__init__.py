@@ -7647,6 +7647,152 @@ printf 'QUAL_FILE reference.json %s %s\\n' \\
 """
 
 
+def _post_update_reference_source_verify_script(
+    reference_path: str,
+    adapter_identity: dict[str, int | str],
+    config_identity: dict[str, int | str],
+    expected_identity: dict[str, str | int],
+) -> str:
+    """Verify the strict eight-reference post-update collection on H200."""
+    identity_json = shlex.quote(
+        json.dumps(
+            {
+                "adapter": adapter_identity,
+                "config": config_identity,
+                "expected": expected_identity,
+            },
+            separators=(",", ":"),
+        )
+    )
+    return (
+        "set -euo pipefail\n"
+        f"reference={shlex.quote(reference_path)}\n"
+        "test -f \"$reference\" && test ! -L \"$reference\"\n"
+        "python3 - \"$reference\" " + identity_json + " <<'PY'\n"
+        "import base64\n"
+        "import hashlib\n"
+        "import json\n"
+        "import math\n"
+        "import sys\n"
+        "\n"
+        "reference_path, identity_path = sys.argv[1:]\n"
+        "identity = json.loads(identity_path)\n"
+        "expected = identity['expected']\n"
+        "adapter = identity['adapter']\n"
+        "config = identity['config']\n"
+        "\n"
+        "def fail(message):\n"
+        "    raise SystemExit(message)\n"
+        "\n"
+        "def digest(value):\n"
+        "    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
+        "\n"
+        "def valid_sha(value):\n"
+        "    return isinstance(value, str) and len(value) == 64 and all(item in '0123456789abcdef' for item in value)\n"
+        "\n"
+        "def check_route(canonical, raw, label):\n"
+        "    if not isinstance(canonical, dict) or set(canonical) != {'schema_version', 'encoding', 'dtype', 'shape', 'dense_layers', 'experts', 'sha256', 'data'}:\n"
+        "        fail(label + ' route schema is invalid')\n"
+        "    if canonical.get('schema_version') != 1 or canonical.get('encoding') != 'base64' or canonical.get('dtype') != 'uint8' or canonical.get('shape') != [8191, 60, 4] or canonical.get('dense_layers') != 6 or canonical.get('experts') != 256 or not valid_sha(canonical.get('sha256')):\n"
+        "        fail(label + ' route metadata is invalid')\n"
+        "    try:\n"
+        "        canonical_bytes = base64.b64decode(canonical['data'], validate=True)\n"
+        "    except Exception:\n"
+        "        fail(label + ' route data is invalid')\n"
+        "    if len(canonical_bytes) != 8191 * 60 * 4 or hashlib.sha256(canonical_bytes).hexdigest() != canonical['sha256']:\n"
+        "        fail(label + ' route checksum is invalid')\n"
+        "    if not isinstance(raw, dict) or set(raw) != {'data', 'dtype', 'shape', 'start'} or raw.get('dtype') != 'uint8' or raw.get('shape') != [8191, 60, 4] or raw.get('start') != 0:\n"
+        "        fail(label + ' response route is invalid')\n"
+        "    try:\n"
+        "        raw_bytes = base64.b64decode(raw['data'], validate=True)\n"
+        "    except Exception:\n"
+        "        fail(label + ' response route data is invalid')\n"
+        "    if len(raw_bytes) != 8191 * 60 * 4 or raw_bytes != canonical_bytes:\n"
+        "        fail(label + ' response route differs')\n"
+        "\n"
+        "try:\n"
+        "    raw_bytes = open(reference_path, 'rb').read()\n"
+        "    reference = json.loads(raw_bytes)\n"
+        "except Exception as error:\n"
+        "    fail('post-update reference is unreadable: ' + str(error))\n"
+        "if hashlib.sha256(raw_bytes).hexdigest() != expected['final_reference_sha256'] or len(raw_bytes) != expected['final_reference_size']:\n"
+        "    fail('post-update final reference identity differs from caller contract')\n"
+        "if not isinstance(reference, dict) or reference.get('schema_version') != 1 or not isinstance(reference.get('microbatches'), list) or len(reference['microbatches']) != 8:\n"
+        "    fail('post-update reference must contain exactly eight microbatches')\n"
+        "if expected.get('server_instance') == '' or expected.get('adapter_sha256') != adapter.get('sha256') or expected.get('adapter_size') != adapter.get('size') or expected.get('config_sha256') != config.get('sha256') or expected.get('config_size') != config.get('size'):\n"
+        "    fail('caller reference identity does not match staged adapter/config')\n"
+        "\n"
+        "input_ids = []\n"
+        "response_hashes = []\n"
+        "client_ids = []\n"
+        "server_ids = []\n"
+        "salts = []\n"
+        "for index, item in enumerate(reference['microbatches']):\n"
+        "    label = 'microbatch ' + str(index)\n"
+        "    if not isinstance(item, dict) or item.get('policy') != 'policy-0' or item.get('request_mode') != 'serialized_generate_completion_logprobs' or item.get('source_kind') in {'rollout_batch', 'cached_rollout_batch'}:\n"
+        "        fail(label + ' is not a strict completion reference')\n"
+        "    ids = item.get('input_ids')\n"
+        "    mask = item.get('loss_mask')\n"
+        "    advantages = item.get('advantages')\n"
+        "    logs = item.get('inference_logprobs')\n"
+        "    if not isinstance(ids, list) or len(ids) != 8192 or any(type(token) is not int for token in ids) or item.get('sequence_lengths') != [8192] or mask != [False] * 8160 + [True] * 32 or not isinstance(advantages, list) or len(advantages) != 8192 or not isinstance(logs, list) or len(logs) != 8192:\n"
+        "        fail(label + ' token alignment is invalid')\n"
+        "    if any(value != 0.0 for value in advantages[:8160]) or any(value != 1.0 for value in advantages[8160:]):\n"
+        "        fail(label + ' advantages are not strict prompt-zero completion-one values')\n"
+        "    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in logs):\n"
+        "        fail(label + ' inference logprobs are invalid')\n"
+        "    before = item.get('policy_identity_before')\n"
+        "    after = item.get('policy_identity_after')\n"
+        "    if not isinstance(before, dict) or before != after or before.get('server_instance') != expected['server_instance'] or before.get('target_sha256') != expected['adapter_sha256'] or before.get('target_size') != expected['adapter_size'] or before.get('config_sha256') != expected['config_sha256'] or before.get('config_size') != expected['config_size']:\n"
+        "        fail(label + ' policy receipt is stale or differs from caller contract')\n"
+        "    if not isinstance(item.get('cache_salt'), str) or not item['cache_salt']:\n"
+        "        fail(label + ' cache salt is missing')\n"
+        "    requests = item.get('request_bodies')\n"
+        "    responses = item.get('responses')\n"
+        "    request = requests.get('decode') if isinstance(requests, dict) else None\n"
+        "    response = responses.get('decode') if isinstance(responses, dict) else None\n"
+        "    if not isinstance(request, dict) or not isinstance(response, dict):\n"
+        "        fail(label + ' raw request or response is missing')\n"
+        "    client_id = request.get('request_id')\n"
+        "    server_id = response.get('request_id')\n"
+        "    request_without_id = dict(request)\n"
+        "    request_without_id.pop('request_id', None)\n"
+        "    if not isinstance(client_id, str) or not client_id or client_id != digest(request_without_id) or not isinstance(server_id, str) or not server_id:\n"
+        "        fail(label + ' request or response ID is invalid')\n"
+        "    if item.get('request_sha256', {}).get('decode') != digest(request) or item.get('response_sha256', {}).get('decode') != digest(response):\n"
+        "        fail(label + ' stored request or response hash differs')\n"
+        "    sampling = {'max_tokens': 32, 'temperature': 0.0, 'top_p': 1.0, 'logprobs': 1, 'min_tokens': 32}\n"
+        "    if request.get('sampling_params') != sampling or request.get('token_ids') != ids[:8160] or request.get('cache_salt') != item.get('cache_salt'):\n"
+        "        fail(label + ' request parameters are not deterministic')\n"
+        "    choices = response.get('choices')\n"
+        "    generated = item.get('generated_token_ids')\n"
+        "    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict) or choices[0].get('token_ids') != generated or not isinstance(generated, list) or len(generated) != 32:\n"
+        "        fail(label + ' generated response tokens differ')\n"
+        "    content = choices[0].get('logprobs', {}).get('content') if isinstance(choices[0].get('logprobs'), dict) else None\n"
+        "    if not isinstance(content, list) or len(content) != 32 or any(entry.get('token') != 'token_id:' + str(token) or not isinstance(entry.get('logprob'), (int, float)) or not math.isfinite(float(entry.get('logprob'))) for entry, token in zip(content, generated)):\n"
+        "        fail(label + ' generated response logprobs differ')\n"
+        "    if [float(entry['logprob']) for entry in content] != [float(value) for value in logs[8160:]]:\n"
+        "        fail(label + ' generated response logprobs are not bound')\n"
+        "    check_route(item.get('routed_experts'), choices[0].get('routed_experts'), label)\n"
+        "    binding = item.get('qualification_binding')\n"
+        "    if (not isinstance(binding, dict) or binding.get('client_request_id') != client_id or binding.get('server_response_id') != server_id or binding.get('request_sha256') != item['request_sha256']['decode'] or binding.get('response_sha256') != item['response_sha256']['decode'] or binding.get('input_sha256') != hashlib.sha256(json.dumps(ids[:8160], separators=(',', ':')).encode()).hexdigest() or binding.get('server_instance') != expected['server_instance'] or binding.get('adapter_sha256') != expected['adapter_sha256'] or binding.get('adapter_size') != expected['adapter_size'] or binding.get('config_sha256') != expected['config_sha256'] or binding.get('config_size') != expected['config_size']):\n"
+        "        fail(label + ' qualification binding differs')\n"
+        "    if item.get('client_request_id') != client_id or item.get('server_response_id') != server_id:\n"
+        "        fail(label + ' top-level request or response ID differs')\n"
+        "    input_ids.append(binding['input_sha256'])\n"
+        "    response_hashes.append(binding['response_sha256'])\n"
+        "    client_ids.append(client_id)\n"
+        "    server_ids.append(server_id)\n"
+        "    salts.append(item['cache_salt'])\n"
+        "if any(len(set(values)) != 8 for values in (input_ids, response_hashes, client_ids, server_ids, salts)):\n"
+        "    fail('post-update collection reuses input, response, ID, or cache-salt evidence')\n"
+        "print('QUAL_FILE reference.json %s %s' % (hashlib.sha256(raw_bytes).hexdigest(), len(raw_bytes)))\n"
+        "PY\n"
+        "sha256sum -- \"$reference\"\n"
+        "stat -c '%s' -- \"$reference\"\n"
+    )
+
+
 def _policy0_stage_head_file_script(source_path: str, target_path: str) -> str:
     return f"""set -euo pipefail
 source={shlex.quote(source_path)}
@@ -8776,6 +8922,9 @@ def prepare_policy0_qualification(
             config = tomllib.load(stream)
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise Refused(f"cannot read qualification config {trainer_path}: {error}") from error
+    post_update_identity = None
+    if selected.get("trainer") == "configs/trinity-h200-post-update-qualification/trainer.toml":
+        post_update_identity = _post_update_reference_identity()
     data = config.get("data", {}).get("fake", {})
     reference_path = data.get("reference_path")
     lora = config.get("model", {}).get("lora", {})
@@ -8858,10 +9007,19 @@ def prepare_policy0_qualification(
     source_adapter_script = _policy0_adapter_source_manifest_script(
         source_adapter_path, source_config_path, expected_lora
     )
-    source_reference_script = _policy0_reference_source_verify_script(
-        source_reference_path,
-        {"sha256": "expected-after-source-check", "size": 0},
-        {"sha256": "expected-after-source-check", "size": 0},
+    source_reference_script = (
+        _post_update_reference_source_verify_script(
+            source_reference_path,
+            {"sha256": "expected-after-source-check", "size": 0},
+            {"sha256": "expected-after-source-check", "size": 0},
+            post_update_identity,
+        )
+        if post_update_identity is not None
+        else _policy0_reference_source_verify_script(
+            source_reference_path,
+            {"sha256": "expected-after-source-check", "size": 0},
+            {"sha256": "expected-after-source-check", "size": 0},
+        )
     )
     transfer_reference_script = _policy0_transfer_reference_script(
         reference_path + ".partial.policy0.UNIQUE",
@@ -8896,6 +9054,8 @@ def prepare_policy0_qualification(
         "stage_config_script": stage_config_script,
         "apply": apply,
     }
+    if post_update_identity is not None:
+        plan["post_update_reference_identity"] = post_update_identity
     if not apply:
         return plan
     code, output = _ssh(source_adapter_host, source_adapter_script, timeout=180)
@@ -8911,10 +9071,19 @@ def prepare_policy0_qualification(
                 source_manifest[name] = {"sha256": digest, "size": int(size_text)}
     if set(source_manifest) != {"adapter_model.safetensors", "adapter_config.json"}:
         raise Refused("source step-0 adapter identity output is incomplete")
-    reference_verify = _policy0_reference_source_verify_script(
-        source_reference_path,
-        source_manifest["adapter_model.safetensors"],
-        source_manifest["adapter_config.json"],
+    reference_verify = (
+        _post_update_reference_source_verify_script(
+            source_reference_path,
+            source_manifest["adapter_model.safetensors"],
+            source_manifest["adapter_config.json"],
+            post_update_identity,
+        )
+        if post_update_identity is not None
+        else _policy0_reference_source_verify_script(
+            source_reference_path,
+            source_manifest["adapter_model.safetensors"],
+            source_manifest["adapter_config.json"],
+        )
     )
     plan["source_reference_script"] = reference_verify
     code, output = _ssh(source_reference_host, reference_verify, timeout=180)
