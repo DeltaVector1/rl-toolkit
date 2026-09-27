@@ -13,6 +13,13 @@ except ImportError:  # pragma: no cover - the runtime image supplies these packa
     np = None
     save_file = None
 
+try:
+    import torch
+    from safetensors.torch import save_file as save_torch_file
+except ImportError:  # pragma: no cover - the runtime image supplies these packages.
+    torch = None
+    save_torch_file = None
+
 import training_ops.runtime.h200.post_update_delta as delta
 from training_ops.runtime.h200.post_update_delta import (
     Step1DeltaError,
@@ -569,6 +576,74 @@ class H200PostUpdateDeltaTest(unittest.TestCase):
                         self._evidence(policy, step, target_sha, target_size),
                         root / "receipt.json",
                     )
+
+    @unittest.skipUnless(torch is not None and save_torch_file is not None, "torch and safetensors are required")
+    def test_bfloat16_delta_uses_cpu_torch_slices_and_bounded_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy, step, target_sha, target_size = self._write_adapter(
+                root,
+                {"a": np.array([1.0, 2.0], dtype=np.float32)},
+                {"a": np.array([1.0, 2.5], dtype=np.float32)},
+            )
+            save_torch_file({"a": torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.bfloat16)}, str(policy))
+            model = step / "adapter_model.safetensors"
+            save_torch_file({"a": torch.tensor([1.0, 2.5, 3.0, 4.0], dtype=torch.bfloat16)}, str(model))
+            target_sha = hashlib.sha256(model.read_bytes()).hexdigest()
+            target_size = model.stat().st_size
+            sidecar = step / "adapter_model.safetensors.sha256"
+            sidecar.write_text(target_sha + "\n")
+            manifest = json.loads((step / "adapter_manifest.json").read_text())
+            manifest["target_sha256"] = manifest["full_sha256"] = target_sha
+            manifest["target_size"] = manifest["full_size"] = target_size
+            for record in manifest["files"]:
+                if record["name"] == "adapter_model.safetensors":
+                    record.update(sha256=target_sha, size=target_size)
+            (step / "adapter_manifest.json").write_text(json.dumps(manifest, sort_keys=True))
+            calls = {"tensor": 0, "slice": 0, "max": 0}
+            delta._tensor_backend()
+            original = delta.safe_open
+
+            def instrumented(*args, **kwargs):
+                handle = original(*args, **kwargs)
+                # The production implementation must use the PT slice API for
+                # non-scalars.  Proxy objects record the bounded calls below.
+                class Handle:
+                    def __enter__(self_inner):
+                        opened = handle.__enter__()
+                        class Reader:
+                            def keys(self):
+                                return opened.keys()
+                            def get_tensor(self, key):
+                                calls["tensor"] += 1
+                                return opened.get_tensor(key)
+                            def get_slice(self, key):
+                                calls["slice"] += 1
+                                sliced = opened.get_slice(key)
+                                class Slice:
+                                    def get_shape(self):
+                                        return sliced.get_shape()
+                                    def get_dtype(self):
+                                        return sliced.get_dtype()
+                                    def __getitem__(self, index):
+                                        value = sliced[index]
+                                        calls["max"] = max(calls["max"], int(value.numel()))
+                                        return value
+                                return Slice()
+                        return Reader()
+                    def __exit__(self_inner, *exit_args):
+                        return handle.__exit__(*exit_args)
+                return Handle()
+
+            with mock.patch.object(delta, "safe_open", side_effect=instrumented):
+                result = validate_step1_adapter_delta(
+                    policy, step, self.expected, self._evidence(policy, step, target_sha, target_size),
+                    root / "receipt.json", chunk_elements=2,
+                )
+            self.assertEqual(result["changed_element_count"], 1)
+            self.assertEqual(calls["tensor"], 0)
+            self.assertEqual(calls["slice"], 2)
+            self.assertLessEqual(calls["max"], 2)
 
 
 if __name__ == "__main__":

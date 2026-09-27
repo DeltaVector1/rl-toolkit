@@ -11,15 +11,27 @@ import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
-try:
-    import numpy as np
-except ImportError:  # pragma: no cover - the trainer image supplies numpy.
-    np = None
+# These are loaded only when the validator reaches tensor comparison.  The
+# controller and its unit tests do not need the trainer image dependencies.
+safe_open = None
+torch = None
 
-try:
-    from safetensors import safe_open
-except ImportError:  # pragma: no cover - the trainer image supplies safetensors.
-    safe_open = None
+
+def _tensor_backend():
+    global safe_open, torch
+    if safe_open is None:
+        try:
+            from safetensors import safe_open as _safe_open
+        except ImportError as error:  # pragma: no cover - trainer image only.
+            raise Step1DeltaError("safetensors is required") from error
+        safe_open = _safe_open
+    if torch is None:
+        try:
+            import torch as _torch
+        except ImportError as error:  # pragma: no cover - trainer image only.
+            raise Step1DeltaError("torch is required") from error
+        torch = _torch
+    return safe_open, torch
 
 
 STEP1 = 1
@@ -435,13 +447,12 @@ def _tensor_blocks(shape: tuple[int, ...], chunk_elements: int):
 
 
 def _compare_tensors(policy_path: Path, step_path: Path, chunk_elements: int) -> dict[str, Any]:
-    if np is None or safe_open is None:
-        raise Step1DeltaError("numpy and safetensors are required")
     if type(chunk_elements) is not int or chunk_elements <= 0:
         raise Step1DeltaError("chunk size must be a positive integer")
+    open_safetensors, torch_module = _tensor_backend()
     try:
-        policy_handle = safe_open(str(policy_path), framework="numpy", device="cpu")
-        step_handle = safe_open(str(step_path), framework="numpy", device="cpu")
+        policy_handle = open_safetensors(str(policy_path), framework="pt", device="cpu")
+        step_handle = open_safetensors(str(step_path), framework="pt", device="cpu")
     except Exception as error:
         raise Step1DeltaError("cannot open safetensors adapter") from error
     changed_elements = 0
@@ -463,26 +474,29 @@ def _compare_tensors(policy_path: Path, step_path: Path, chunk_elements: int) ->
                     raise Step1DeltaError(f"safetensors tensor metadata differs: {key}")
                 tensor_changed = False
                 for indexes in _tensor_blocks(policy_shape, chunk_elements):
-                    policy_values = np.asarray(policy.get_tensor(key) if not indexes else policy_slice[indexes])
-                    step_values = np.asarray(step.get_tensor(key) if not indexes else step_slice[indexes])
-                    if not np.all(np.isfinite(policy_values)) or not np.all(np.isfinite(step_values)):
+                    # Only scalar tensors use get_tensor.  Every non-scalar
+                    # read is a bounded slice, which also supports BF16.
+                    policy_values = policy.get_tensor(key) if not indexes else policy_slice[indexes]
+                    step_values = step.get_tensor(key) if not indexes else step_slice[indexes]
+                    if policy_values.device.type != "cpu" or step_values.device.type != "cpu":
+                        raise Step1DeltaError("safetensors tensor was not read on CPU")
+                    if not bool(torch_module.isfinite(policy_values).all()) or not bool(torch_module.isfinite(step_values).all()):
                         raise Step1DeltaError(f"safetensors tensor {key} contains non-finite values")
-                    policy_float = policy_values.astype(np.float64, copy=False)
-                    step_float = step_values.astype(np.float64, copy=False)
+                    policy_float = policy_values.to(dtype=torch_module.float64)
+                    step_float = step_values.to(dtype=torch_module.float64)
                     difference = step_float - policy_float
-                    if not np.all(np.isfinite(difference)):
+                    if not bool(torch_module.isfinite(difference).all()):
                         raise Step1DeltaError(f"safetensors tensor {key} has a non-finite delta")
-                    nonzero = np.not_equal(policy_values, step_values)
-                    count = int(np.count_nonzero(nonzero))
+                    nonzero = policy_values != step_values
+                    count = int(torch_module.count_nonzero(nonzero).item())
                     if count:
                         tensor_changed = True
                         changed_elements += count
-                        max_abs = max(max_abs, float(np.max(np.abs(difference[nonzero]))))
-                    with np.errstate(over="raise", invalid="raise"):
-                        try:
-                            sum_squares += float(np.sum(difference * difference, dtype=np.float64))
-                        except FloatingPointError as error:
-                            raise Step1DeltaError("safetensors delta norm is not finite") from error
+                        max_abs = max(max_abs, float(torch_module.abs(difference[nonzero]).max().item()))
+                    try:
+                        sum_squares += float(torch_module.sum(difference * difference, dtype=torch_module.float64).item())
+                    except (RuntimeError, OverflowError) as error:
+                        raise Step1DeltaError("safetensors delta norm is not finite") from error
                     if not math.isfinite(sum_squares):
                         raise Step1DeltaError("safetensors delta norm is not finite")
                 if tensor_changed:
