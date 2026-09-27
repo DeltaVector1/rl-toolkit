@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -398,6 +399,169 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(training_ops.Refused):
                 training_ops._validate_post_update_qualification_reference(config, path)
 
+    def test_remote_reference_validation_does_not_require_controller_path_and_cleans_temp(self):
+        payload = b"remote-reference"
+        digest = hashlib.sha256(payload).hexdigest()
+        expected = {
+            "final_reference_sha256": digest,
+            "final_reference_size": len(payload),
+            "server_instance": self.receipt()["server_instance"],
+            "adapter_sha256": self.receipt()["target_sha256"],
+            "adapter_size": self.receipt()["target_size"],
+            "config_sha256": self.receipt()["config_sha256"],
+            "config_size": self.receipt()["config_size"],
+        }
+        identity_output = f"QUAL_FILE reference.json {digest} {len(payload)}\n"
+        copied = []
+
+        def fake_scp(command, **kwargs):
+            target = Path(command[-1])
+            target.write_bytes(payload)
+            copied.append(target)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, identity_output)), mock.patch.object(
+            training_ops, "_run_process", side_effect=fake_scp
+        ), mock.patch.object(
+            training_ops,
+            "_policy0_post_update_reference_copy",
+            return_value={"sha256": digest, "size": len(payload)},
+        ) as strict:
+            result = training_ops._validate_post_update_remote_reference(
+                {"data": {"fake": {"batch_size": 8}}, "model": {"seq_len": 8192}},
+                "/data/qualifications/post-update/reference.json",
+                expected,
+            )
+        self.assertEqual(result, {"sha256": digest, "size": len(payload)})
+        strict.assert_called_once()
+        self.assertEqual(len(copied), 1)
+        self.assertFalse(copied[0].exists())
+
+    def test_remote_reference_rejects_identity_mismatch_or_source_change_before_strict_validation(self):
+        payload = b"remote-reference"
+        digest = hashlib.sha256(payload).hexdigest()
+        expected = {
+            "final_reference_sha256": digest,
+            "final_reference_size": len(payload),
+            "server_instance": self.receipt()["server_instance"],
+            "adapter_sha256": self.receipt()["target_sha256"],
+            "adapter_size": self.receipt()["target_size"],
+            "config_sha256": self.receipt()["config_sha256"],
+            "config_size": self.receipt()["config_size"],
+        }
+        wrong = "QUAL_FILE reference.json " + "f" * 64 + " 99\n"
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, wrong)), mock.patch.object(
+            training_ops, "_run_process"
+        ) as scp, mock.patch.object(training_ops, "_policy0_post_update_reference_copy") as strict:
+            with self.assertRaisesRegex(training_ops.Refused, "identity"):
+                training_ops._validate_post_update_remote_reference(
+                    {}, "/data/qualifications/post-update/reference.json", expected
+                )
+        scp.assert_not_called()
+        strict.assert_not_called()
+
+        changed = b"changed-reference"
+        changed_digest = hashlib.sha256(changed).hexdigest()
+        outputs = iter([
+            f"QUAL_FILE reference.json {digest} {len(payload)}\n",
+            f"QUAL_FILE reference.json {changed_digest} {len(changed)}\n",
+        ])
+
+        def fake_scp_change(command, **kwargs):
+            Path(command[-1]).write_bytes(payload)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(training_ops, "_ssh", side_effect=lambda *args, **kwargs: (0, next(outputs))), mock.patch.object(
+            training_ops, "_run_process", side_effect=fake_scp_change
+        ), mock.patch.object(training_ops, "_policy0_post_update_reference_copy") as strict:
+            with self.assertRaisesRegex(training_ops.Refused, "changed"):
+                training_ops._validate_post_update_remote_reference(
+                    {}, "/data/qualifications/post-update/reference.json", expected
+                )
+        strict.assert_not_called()
+
+    def test_remote_identity_script_rejects_missing_and_symlink_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing = root / "missing-reference.json"
+            result = subprocess.run(
+                ["bash", "-c", training_ops._policy0_reference_source_identity_script(str(missing))],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            target = root / "target-reference.json"
+            target.write_bytes(b"reference")
+            alias = root / "reference.json"
+            alias.symlink_to(target)
+            result = subprocess.run(
+                ["bash", "-c", training_ops._policy0_reference_source_identity_script(str(alias))],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_remote_fetch_and_strict_failure_cleanup_temporary_copy(self):
+        payload = b"remote-reference"
+        digest = hashlib.sha256(payload).hexdigest()
+        expected = {
+            "final_reference_sha256": digest,
+            "final_reference_size": len(payload),
+            "server_instance": self.receipt()["server_instance"],
+            "adapter_sha256": self.receipt()["target_sha256"],
+            "adapter_size": self.receipt()["target_size"],
+            "config_sha256": self.receipt()["config_sha256"],
+            "config_size": self.receipt()["config_size"],
+        }
+        identity_output = f"QUAL_FILE reference.json {digest} {len(payload)}\n"
+        for fetch_result, strict_error in ((1, None), (0, "strict mutation")):
+            paths = []
+
+            def fake_fetch(command, **kwargs):
+                target = Path(command[-1])
+                target.write_bytes(payload)
+                paths.append(target)
+                return mock.Mock(returncode=fetch_result, stdout="", stderr="fetch failed")
+
+            strict_side_effect = (
+                mock.Mock(side_effect=training_ops.Refused(strict_error))
+                if strict_error
+                else mock.Mock(return_value={"sha256": digest, "size": len(payload)})
+            )
+            with self.subTest(fetch_result=fetch_result, strict_error=strict_error), mock.patch.object(
+                training_ops, "_ssh", return_value=(0, identity_output)
+            ), mock.patch.object(training_ops, "_run_process", side_effect=fake_fetch), mock.patch.object(
+                training_ops, "_policy0_post_update_reference_copy", strict_side_effect
+            ):
+                if fetch_result:
+                    message = "fetch failed"
+                else:
+                    message = "strict mutation"
+                with self.assertRaisesRegex(training_ops.Refused, message):
+                    training_ops._validate_post_update_remote_reference(
+                        {}, "/data/qualifications/post-update/reference.json", expected
+                    )
+            self.assertEqual(len(paths), 1)
+            self.assertFalse(paths[0].exists())
+
+    def test_qualify_stops_before_loss_or_launch_when_remote_reference_fails(self):
+        events = []
+        with mock.patch.object(
+            training_ops,
+            "_validate_post_update_remote_reference",
+            side_effect=lambda *args: events.append("reference") or (_ for _ in ()).throw(training_ops.Refused("remote reference")),
+        ), mock.patch.object(training_ops, "_trinity_trainer_loss_preflight", side_effect=lambda *args: events.append("loss")), mock.patch.object(
+            training_ops, "_deploy_dependencies", side_effect=lambda *args: events.append("deploy")
+        ), mock.patch.object(training_ops, "_ssh") as ssh:
+            with self.assertRaisesRegex(training_ops.Refused, "remote reference"):
+                training_ops.qualify(
+                    "remote-reference-failure",
+                    nodes=["n82"],
+                    config_dir="configs/trinity-h200-post-update-qualification",
+                )
+        self.assertEqual(events, ["reference"])
+        ssh.assert_not_called()
+
     def test_export_mode_rejects_singleton_reference_cycling(self):
         source = (ROOT / "prime-rl/src/prime_rl/trainer/rl/data.py").read_text()
         self.assertIn(
@@ -543,7 +707,7 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
         events = []
         with mock.patch.object(
             training_ops,
-            "_validate_post_update_qualification_reference",
+            "_validate_post_update_remote_reference",
             side_effect=lambda config, path: events.append("reference"),
         ), mock.patch.object(
             training_ops,

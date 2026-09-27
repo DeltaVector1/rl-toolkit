@@ -164,7 +164,7 @@ class TrinityTrainerLossPreflightTest(unittest.TestCase):
             side_effect=lambda nodes: events.append("loss"),
         ), mock.patch.object(
             training_ops,
-            "_validate_post_update_qualification_reference",
+            "_validate_post_update_remote_reference",
             side_effect=lambda config, path: events.append("reference"),
         ), mock.patch.object(
             training_ops,

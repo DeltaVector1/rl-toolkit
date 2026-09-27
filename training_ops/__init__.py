@@ -8354,14 +8354,25 @@ def _policy0_post_update_source_identity(
     source_reference_path: str,
 ) -> dict[str, int | str]:
     """Read only the H200 source identity, without semantic remote checks."""
-    code, output = _ssh(
+    return _policy0_remote_reference_identity(
         source_reference_host,
-        _policy0_reference_source_identity_script(source_reference_path),
+        source_reference_path,
+    )
+
+
+def _policy0_remote_reference_identity(
+    host: str,
+    reference_path: str,
+) -> dict[str, int | str]:
+    """Read one exact remote reference identity without changing remote state."""
+    code, output = _ssh(
+        host,
+        _policy0_reference_source_identity_script(reference_path),
         timeout=180,
     )
     if code:
         detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
-        raise Refused(f"H200 source reference identity failed: {detail}")
+        raise Refused(f"remote reference identity failed: {detail}")
     return _policy0_parse_reference_identity(output)
 
 
@@ -8432,6 +8443,82 @@ def _policy0_fetch_and_validate_post_update_reference(
     except BaseException:
         directory.cleanup()
         raise
+
+
+def _validate_post_update_remote_reference(
+    trainer_config: dict,
+    reference_path: str,
+    expected_identity: dict[str, str | int] | None = None,
+) -> dict[str, int | str]:
+    """Validate the staged trainer reference through a read-only local copy."""
+    if not isinstance(reference_path, str):
+        raise Refused("post-update remote reference path is invalid")
+    parsed = PurePosixPath(reference_path)
+    if (
+        not parsed.is_absolute()
+        or any(part in {"", ".", ".."} for part in parsed.parts)
+        or parsed.as_posix() != reference_path
+    ):
+        raise Refused("post-update remote reference path is not canonical")
+    expected = (
+        _post_update_reference_identity()
+        if expected_identity is None
+        else _validate_post_update_reference_identity(expected_identity)
+    )
+    remote_before = _policy0_remote_reference_identity(trainer_head, reference_path)
+    expected_file = {
+        "sha256": expected["final_reference_sha256"],
+        "size": expected["final_reference_size"],
+    }
+    if remote_before != expected_file:
+        raise Refused(
+            "remote post-update reference identity differs: "
+            f"expected {expected_file}, got {remote_before}"
+        )
+    with tempfile.TemporaryDirectory(prefix="training-ops-post-update-qualify-") as directory:
+        local_reference = Path(directory) / "reference.json"
+        _, source_scp_options, source_destination = _ssh_destination(trainer_head)
+        source_url = f"{source_destination}:{reference_path}"
+        try:
+            fetched = _run_process(
+                scp_command + source_scp_options + [source_url, str(local_reference)],
+                stdin=subprocess.DEVNULL,
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise Refused("remote post-update reference fetch timed out") from error
+        except OSError as error:
+            raise Refused(f"remote post-update reference fetch failed: {error}") from error
+        if fetched.returncode:
+            detail = ((fetched.stdout or "") + (fetched.stderr or "")).strip()
+            raise Refused(f"remote post-update reference fetch failed: {detail[:200]}")
+        local_identity = _policy0_local_file_identity(local_reference)
+        if local_identity != remote_before:
+            raise Refused(
+                "remote post-update reference changed during fetch: "
+                f"expected {remote_before}, got {local_identity}"
+            )
+        remote_after_fetch = _policy0_remote_reference_identity(trainer_head, reference_path)
+        if remote_after_fetch != remote_before:
+            raise Refused(
+                "remote post-update reference changed between identity and fetch: "
+                f"before {remote_before}, after {remote_after_fetch}"
+            )
+        validated_identity = _policy0_post_update_reference_copy(
+            trainer_config,
+            local_reference,
+            expected,
+        )
+        remote_after_validation = _policy0_remote_reference_identity(
+            trainer_head,
+            reference_path,
+        )
+        if remote_after_validation != remote_before:
+            raise Refused(
+                "remote post-update reference changed during validation: "
+                f"before {remote_before}, after {remote_after_validation}"
+            )
+        return validated_identity
 
 
 class _Policy0ReferenceTransferError(RuntimeError):
@@ -10456,9 +10543,7 @@ def qualify(
         configured_reference = config["data"]["fake"].get("reference_path")
         if not isinstance(configured_reference, str):
             raise Refused("post-update qualification reference_path is missing")
-        _validate_post_update_qualification_reference(
-            config, Path(configured_reference)
-        )
+        _validate_post_update_remote_reference(config, configured_reference)
     if selected.get("kind") == "trinity":
         _trinity_trainer_loss_preflight(nodes)
     rc, out = _ssh(
