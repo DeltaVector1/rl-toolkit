@@ -844,21 +844,50 @@ only after measured learning.
 - Start this disposable profile with `training_ops.start(..., mode="restart")`
   and no resume adapter or resume step. This launches fresh diagnostic
   components without cold-start cleanup or the inference engine start script.
+- **Measured H200 capacity.** The same H200 server instance previously held
+  production and qualification receipts concurrently while its inference
+  config had `max_loras=1` and `max_cpu_loras=2`. `max_loras` limits active GPU
+  concurrency; this server has measured capacity for two receipts. The
+  diagnostic is the second receipt. Do not unload production before the run.
 - Before any live start, snapshot the full production staging receipt and
   server identity: exact source URL, model/config hashes and sizes, verified
   files, LoRA name and ID, status, container, listener, and start identity.
-- H200 `max_loras=1` means coexistence is uncertain. Do not assume that a
-  production adapter can remain loaded. If the live snapshot cannot prove the
-  exact slot and receipt state, fail closed.
-- Before restart, a no-clobber gate must check every configured
-  trainer/orchestrator/H200 host. The exact diagnostic run, service, output,
-  broadcast, control, and rollout paths must be absent; abort if any exists.
+  Require the same server instance and engine identity, `max_loras=1`,
+  `max_cpu_loras=2`, exactly one verified production receipt, no second receipt,
+  and `running=0`; fail closed if any check differs.
+- Before restart, execute the no-clobber gate on every configured
+  trainer/orchestrator/H200 host. This is an executable gate, not only text:
+  use `test ! -e` for the exact run parent, service, output, broadcast,
+  control, rollout, and checkpoint paths, and archive the absent results before
+  start. Abort if any path exists.
+
+  ```sh
+  gate_archive=/operator-artifacts/trinity-decensor-experimental-fixed-diag-d29a5958-no-clobber.tsv
+  run_parent=/data/glm52-rl/runs/trinity-decensor-experimental-fixed-diag-d29a5958
+  service_dir="$run_parent/run_trinity-decensor-experimental-fixed-diag-d29a5958"
+  trainer_output="$run_parent"
+  : > "$gate_archive"
+  for path in "$run_parent" "$service_dir" "$trainer_output" \
+      "$service_dir/broadcasts" "$service_dir/control" "$service_dir/rollouts" \
+      "$run_parent/checkpoints" "$service_dir/checkpoints"; do
+    if test ! -e "$path"; then
+      printf '%s\tabsent\n' "$path" >> "$gate_archive"
+    else
+      printf '%s\tpresent\n' "$path" >> "$gate_archive"
+      exit 1
+    fi
+  done
+  ```
+
+  Run this exact gate on every host selected from `configs/nodes.toml` and
+  preserve the archive before invoking restart.
 - After the diagnostic stops, POST to the root `/remove_lora_adapter` endpoint
   with the exact diagnostic LoRA name. Validate response status, name, and ID,
   then validate `/staging_status`. Never run raw `rm` or manually remove
-  shared-cache files; cache files remain engine-managed.
-- If the snapshotted production receipt is not active and ready, reload only
-  the snapshotted exact production name and source identity. Then verify full
-  staging-receipt and server-identity equality; fail closed on any mismatch.
+  shared-cache files; cache files remain engine-managed. Require the
+  production receipt and server identity to be byte-for-byte unchanged.
+- If production disappears or drifts, fail closed and use only the reviewed
+  production start/restore path with the snapshotted exact production name and
+  source identity. Do not improvise a raw API restore.
 - The diagnostic paths contain no resume adapter, cached rollout, or stale
   rollout-batch input. This plan must be reviewed before any live execution.

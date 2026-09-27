@@ -138,6 +138,7 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
             production_inference["env_vars"]["PRIME_LORA_CACHE_DIR"],
         )
         self.assertEqual(diagnostic_inference["max_loras"], 1)
+        self.assertEqual(diagnostic_inference["max_cpu_loras"], 2)
         self.assertIn(
             "production receipt",
             (diagnostic / "inference.toml").read_text(encoding="utf-8"),
@@ -270,17 +271,29 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
             "snapshot the full production staging receipt",
             "server identity",
             "max_loras=1",
-            "coexistence is uncertain",
+            "max_cpu_loras=2",
+            "same server instance and engine identity",
+            "exactly one verified production receipt",
+            "no second receipt",
+            "running=0",
             "fail closed",
             "no-clobber gate",
-            "every configured\n  trainer/orchestrator/H200 host",
-            "abort if any exists",
+            "executable gate, not only text",
+            "use `test ! -e`",
+            'test ! -e "$path"',
+            "run parent, service, output, broadcast",
+            "control, rollout, and checkpoint paths",
+            "archive the absent results before",
+            "Abort if any path exists",
+            "Do not unload production before the run",
             "POST to the root `/remove_lora_adapter` endpoint",
             "status, name, and ID",
             "`/staging_status`",
             "Never run raw `rm`",
             "cache files remain engine-managed",
-            "server-identity equality",
+            "byte-for-byte unchanged",
+            "production start/restore path",
+            "Do not improvise a raw API restore",
         ):
             self.assertIn(marker, plan)
 

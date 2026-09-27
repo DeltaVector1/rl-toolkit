@@ -31,8 +31,9 @@ filename = "rollout-metrics.jsonl"
 name = "/data/trinity-thinking-fp8"
 
 [model.lora]
-# H200 has one LoRA slot. Use the live production snapshot to restore it after
-# this diagnostic; do not assume diagnostic and production can coexist.
+# The same H200 server previously held production and qualification receipts
+# concurrently. Require that same server/engine identity and live snapshot;
+# fail closed if the receipt state differs.
 # The source URL and this name make a distinct hashed engine-managed cache
 # identity.
 name = "trinity-decensor-experimental-fixed-diag-d29a5958-r32-node-local"

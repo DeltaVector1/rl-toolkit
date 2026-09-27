@@ -3,6 +3,8 @@
 enable_lora = true
 router = "None"
 max_loras = 1
+# The measured server held two receipts concurrently; max_cpu_loras is the
+# receipt-capacity setting while max_loras limits active GPU concurrency.
 max_cpu_loras = 2
 max_lora_rank = 32
 lora_target_modules = [
@@ -48,10 +50,10 @@ type = "filesystem"
 [env_vars]
 # Shared H200 cache. The adapter service keys entries by the exact diagnostic
 # source and LoRA identity; do not cold-clean or raw-delete shared files. H200
-# has one LoRA slot: use the live production snapshot, POST the exact
-# diagnostic name to root `/remove_lora_adapter`, validate status/name/ID and
-# `/staging_status`, then restore the production receipt only after full
-# identity checks.
+# The measured server held production and qualification receipts concurrently.
+# Use the live production snapshot, POST the exact diagnostic name to root
+# `/remove_lora_adapter`, validate status/name/ID and `/staging_status`, then
+# require the production receipt/server bytes to remain unchanged.
 PRIME_LORA_CACHE_DIR = "/data/glm52-rl/lora-cache"
 VLLM_WORKER_MULTIPROC_METHOD = "spawn"
 NCCL_SOCKET_IFNAME = "eth0"
