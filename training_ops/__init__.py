@@ -2752,6 +2752,37 @@ fi
             "unavailable_hosts": unavailable,
         }
     _, parity_host, path = max(candidates, key=lambda item: item[0])
+    aggregate_host = None
+    aggregate_path = None
+    aggregate_unavailable = []
+    if trainer_only and aggregate_guard_config is not None:
+        aggregate_find_script = f"""
+candidate=$(find {shlex.quote(aggregate_guard_config['path'])} -maxdepth 0 -type f -printf '%T@ %p\\n' 2>/dev/null | sort -nr | head -1)
+if [ -n \"$candidate\" ]; then
+  printf 'AGGREGATE %s\\n' \"$candidate\"
+else
+  printf 'NO_AGGREGATE\\n'
+fi
+"""
+        aggregate_candidates = []
+        for host, (code, output) in _fan(
+            metric_hosts,
+            lambda host: _ssh(host, aggregate_find_script, timeout=180),
+        ).items():
+            if code:
+                aggregate_unavailable.append(host)
+                continue
+            match = re.search(
+                r"^AGGREGATE ([0-9]+(?:\.[0-9]+)?) (.+)$", output, re.M
+            )
+            if match:
+                aggregate_candidates.append(
+                    (float(match.group(1)), host, match.group(2).strip())
+                )
+        if aggregate_candidates:
+            _, aggregate_host, aggregate_path = max(
+                aggregate_candidates, key=lambda item: item[0]
+            )
     script = _parity_reader_script(path)
     code, output = _ssh(parity_host, script, timeout=180)
     if code:
@@ -2774,45 +2805,60 @@ fi
             "available": False,
             "scope": "full_training_step",
             "batch_size": None,
+            "status": "unavailable",
         }
         if aggregate_guard_config is not None:
             aggregate_guard["batch_size"] = aggregate_guard_config["batch_size"]
-            aggregate_script = _parity_aggregate_guard_reader_script(
-                aggregate_guard_config["path"],
-                batch_size=aggregate_guard_config["batch_size"],
-                max_unmasked_mismatch_kl=aggregate_guard_config[
-                    "max_unmasked_mismatch_kl"
-                ],
-                max_masked_mismatch_kl=aggregate_guard_config[
-                    "max_masked_mismatch_kl"
-                ],
-                max_masked_fraction=aggregate_guard_config["max_masked_fraction"],
-            )
-            aggregate_code, aggregate_output = _ssh(
-                parity_host, aggregate_script, timeout=180
-            )
-            if aggregate_code:
-                aggregate_guard["reason"] = "full-step metrics reader failed"
+            aggregate_guard["unavailable_hosts"] = aggregate_unavailable
+            if aggregate_host is None or aggregate_path is None:
+                aggregate_guard["reason"] = (
+                    "no full-step metrics found on configured metric hosts"
+                )
             else:
-                try:
-                    aggregate_result = json.loads(
-                        aggregate_output.strip().splitlines()[-1]
-                    )
-                except (ValueError, IndexError):
-                    aggregate_result = {
-                        "available": False,
-                        "reason": "full-step metrics output is invalid",
-                    }
-                if isinstance(aggregate_result, dict):
-                    aggregate_guard.update(aggregate_result)
-                    aggregate_guard["scope"] = "full_training_step"
-                    aggregate_guard["batch_size"] = aggregate_guard_config["batch_size"]
-                    if aggregate_guard.get("available") is True:
-                        aggregate_guard.pop("reason", None)
+                aggregate_guard["host"] = aggregate_host
+                aggregate_script = _parity_aggregate_guard_reader_script(
+                    aggregate_path,
+                    batch_size=aggregate_guard_config["batch_size"],
+                    max_unmasked_mismatch_kl=aggregate_guard_config[
+                        "max_unmasked_mismatch_kl"
+                    ],
+                    max_masked_mismatch_kl=aggregate_guard_config[
+                        "max_masked_mismatch_kl"
+                    ],
+                    max_masked_fraction=aggregate_guard_config[
+                        "max_masked_fraction"
+                    ],
+                )
+                aggregate_code, aggregate_output = _ssh(
+                    aggregate_host, aggregate_script, timeout=180
+                )
+                if aggregate_code:
+                    aggregate_guard["reason"] = "full-step metrics reader failed"
                 else:
-                    aggregate_guard["reason"] = (
-                        "full-step metrics output is not an object"
-                    )
+                    try:
+                        aggregate_result = json.loads(
+                            aggregate_output.strip().splitlines()[-1]
+                        )
+                    except (ValueError, IndexError):
+                        aggregate_result = {
+                            "available": False,
+                            "reason": "full-step metrics output is invalid",
+                        }
+                    if isinstance(aggregate_result, dict):
+                        aggregate_guard.update(aggregate_result)
+                        aggregate_guard["scope"] = "full_training_step"
+                        aggregate_guard["batch_size"] = aggregate_guard_config[
+                            "batch_size"
+                        ]
+                        aggregate_guard["host"] = aggregate_host
+                        if aggregate_guard.get("available") is True:
+                            aggregate_guard.pop("reason", None)
+                        else:
+                            aggregate_guard["status"] = "unavailable"
+                    else:
+                        aggregate_guard["reason"] = (
+                            "full-step metrics output is not an object"
+                        )
         else:
             aggregate_guard["reason"] = "full-step metrics are not configured"
         summary["aggregate_guard"] = aggregate_guard

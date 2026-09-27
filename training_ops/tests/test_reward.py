@@ -619,9 +619,16 @@ class ParityReaderTest(unittest.TestCase):
 
             def fake_ssh(host, script, timeout=180):
                 calls.append(script)
+                if "trainer-metrics.jsonl" in script and not script.startswith("python3 - "):
+                    return 0, (
+                        "AGGREGATE 100.0 "
+                        "/data/glm52-rl/qualifications/trinity-h200-step1-parity/"
+                        "trainer-metrics.jsonl\n"
+                    )
                 if "trainer-metrics.jsonl" in script and script.startswith("python3 - "):
                     return 0, json.dumps(
                         {
+                            "available": True,
                             "step": 1,
                             "status": "passed",
                             "unmasked_mismatch_kl": 0.02,
@@ -674,6 +681,91 @@ class ParityReaderTest(unittest.TestCase):
             "full_training_step",
         )
         self.assertIn("trainer-metrics.jsonl", "\n".join(calls))
+
+    def test_parity_reads_direct_and_aggregate_artifacts_from_separate_hosts(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            trainer_path = Path(directory) / "trainer.toml"
+            trainer_path.write_text(
+                'output_dir = "/data/glm52-rl/qualifications/trinity-h200-step1-parity"\n'
+                '[data.fake]\n'
+                'batch_size = 8\n'
+                'reference_path = "/tmp/reference"\n'
+                '[parity_guard]\n'
+                'max_unmasked_mismatch_kl = 0.1\n'
+                'max_masked_mismatch_kl = 0.5\n'
+                'max_masked_fraction = 0.06\n'
+                '[file_monitor]\n'
+                'filename = "trainer-metrics.jsonl"\n',
+                encoding="utf-8",
+            )
+
+            def fake_ssh(host, script, timeout=180):
+                calls.append((host, script))
+                if "direct-parity.json" in script and not script.startswith("python3 - "):
+                    if host == "n85":
+                        return 0, (
+                            "PARITY 100.0 "
+                            "/data/glm52-rl/qualifications/trinity-h200-step1-parity/"
+                            "direct-parity.json\n"
+                        )
+                    return 0, "NO_PARITY\n"
+                if "trainer-metrics.jsonl" in script and not script.startswith("python3 - "):
+                    if host == "n82":
+                        return 0, (
+                            "AGGREGATE 100.0 "
+                            "/data/glm52-rl/qualifications/trinity-h200-step1-parity/"
+                            "trainer-metrics.jsonl\n"
+                        )
+                    return 0, "NO_AGGREGATE\n"
+                if script.startswith("python3 - ") and "trainer-metrics.jsonl" in script:
+                    return 0, json.dumps(
+                        {
+                            "available": True,
+                            "scope": "full_training_step",
+                            "batch_size": 8,
+                            "step": 1,
+                            "status": "passed",
+                            "unmasked_mismatch_kl": 0.02,
+                            "masked_mismatch_kl": 0.03,
+                            "masked_fraction": 0.01,
+                        }
+                    )
+                if script.startswith("python3 - "):
+                    return 0, json.dumps(
+                        {
+                            "record_tokens": 3,
+                            "selected_tokens": 2,
+                            "mean_abs_delta": 0.4,
+                        }
+                    )
+                raise AssertionError(f"unexpected parity probe on {host}")
+
+            def fake_fan(hosts, function, workers=None):
+                return {host: function(host) for host in hosts}
+
+            with (
+                mock.patch.object(
+                    training_ops,
+                    "_config_for_run",
+                    return_value={"trainer": str(trainer_path)},
+                ),
+                mock.patch.object(training_ops, "trainer_hosts", ["n82", "n85"]),
+                mock.patch.object(training_ops, "metric_hosts", ["h200b", "n82"]),
+                mock.patch.object(training_ops, "_fan", side_effect=fake_fan),
+                mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                redirect_stdout(StringIO()),
+            ):
+                report = training_ops.parity("trinity-h200-step1-parity")
+
+        self.assertEqual(report["host"], "n85")
+        self.assertEqual(report["aggregate_guard"]["host"], "n82")
+        aggregate_reader_hosts = [
+            host
+            for host, script in calls
+            if script.startswith("python3 - ") and "trainer-metrics.jsonl" in script
+        ]
+        self.assertEqual(aggregate_reader_hosts, ["n82"])
 
     def test_aggregate_guard_reader_uses_latest_full_step_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
