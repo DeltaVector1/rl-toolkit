@@ -1020,3 +1020,28 @@ only after measured learning.
   production key. Do not change start settings or run a live action. Compile,
   run focused tests, then run the broader training-ops suite and inspect the
   final diff for any broad cache deletion.
+
+## Exact broadcast service URL identity correction
+
+- **Measured discrepancy (2026-09-27).** The configured production base URL is
+  `http://127.0.0.1:18100/trinity-decensor-experimental-fixed`, but the runtime
+  filesystem service publishes the object below the run-specific service
+  directory `run_trinity-decensor-experimental-fixed/broadcasts/step_0`.
+  The actual source URL is therefore
+  `http://127.0.0.1:18100/trinity-decensor-experimental-fixed/run_trinity-decensor-experimental-fixed/broadcasts/step_0`.
+  Its SHA-256 cache key is
+  `f72c3222b63fe4faf9e482d6b36fb6887521aac5a76f96655e2b94a18a630f8a`.
+  The current exact-cache helper and fresh preflight append only
+  `/broadcasts/step_0`, producing the incorrect key
+  `056ce0a30be48095dbd88b8c0e741146d5be162be82252eb2040ee1ec0cd9074`.
+- **Acceptance criteria.** Before implementation, record this discrepancy in
+  this file. Then use one shared derivation for config/run mode in fresh
+  preflight and `remove-adapter-cache`: configured base URL plus exact run and
+  service identity must produce the nested runtime URL and `f72c...` key.
+  Explicit raw exact URL/name mode may remain exact. Tests must prove the
+  archived nested URL/key, prove fresh preflight checks `f72c...` and not
+  `056ce...`, and prove cleanup removes only `f72c...` while preserving other
+  entries. Loaded-receipt checks must canonicalize base, nested actual, and
+  safe aliases consistently without allowing the target receipt to evade
+  detection. Add `transport-manifest.json` only if its schema is fully
+  validated as a known legacy member; unknown members must still refuse.
