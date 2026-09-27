@@ -244,14 +244,43 @@ import subprocess
 import sys
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 cache_root, cache_path, source_url, lora_name, container, identity_before, *port_values = sys.argv[1:]
 ports = [int(value) for value in port_values]
+source_suffix = "/broadcasts/step_0"
 receipt_keys = {"source_url", "target_sha256", "target_size", "config_sha256", "config_size", "lora_name", "server_instance"}
 required_files = {"READY", "manifest.json", "adapter_config.json", "adapter_model.safetensors", "adapter_model.safetensors.sha256"}
 optional_files = {"transport.json", "adapter_manifest.json", "relay_manifest.json", "transport-chunks"}
 expected_key = hashlib.sha256(source_url.encode()).hexdigest()
 target = Path(cache_path)
+
+def exact_source_url(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\n" in value
+        or "\r" in value
+    ):
+        raise ValueError("adapter cache source URL is invalid")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname not in {"127.0.0.1", "localhost"}
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path
+        or parsed.path.endswith("/")
+    ):
+        raise ValueError("adapter cache source URL must be an exact loopback URL")
+    if parsed.path.endswith(source_suffix):
+        return value
+    if "/broadcasts/" in parsed.path:
+        raise ValueError("adapter cache source URL must name the exact step_0 object")
+    return value + source_suffix
 
 def fetch_json(port, suffix):
     with urllib.request.urlopen(f"http://127.0.0.1:{port}{suffix}", timeout=30) as response:
@@ -276,8 +305,10 @@ def validate_status(status):
         if receipt.get("lora_name") != name:
             raise RuntimeError("adapter cache cleanup loaded receipt name is invalid")
         receipt_source = receipt.get("source_url")
-        if not isinstance(receipt_source, str) or not receipt_source.startswith(("http://", "https://")):
-            raise RuntimeError("adapter cache cleanup loaded receipt source is invalid")
+        try:
+            receipt_source = exact_source_url(receipt_source)
+        except ValueError as error:
+            raise RuntimeError("adapter cache cleanup loaded receipt source is invalid") from error
         if not re.fullmatch(r"[0-9a-f]{64}", receipt.get("target_sha256", "")) or not re.fullmatch(r"[0-9a-f]{64}", receipt.get("config_sha256", "")):
             raise RuntimeError("adapter cache cleanup loaded receipt key is invalid")
         if type(receipt.get("target_size")) is not int or receipt["target_size"] <= 0 or type(receipt.get("config_size")) is not int or receipt["config_size"] < 0:

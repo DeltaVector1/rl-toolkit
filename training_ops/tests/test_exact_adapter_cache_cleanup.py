@@ -139,6 +139,37 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
                     cache_root="/cache",
                 )
 
+    def test_receipt_urls_use_exact_source_canonicalization(self):
+        base = SOURCE.removesuffix("/broadcasts/step_0")
+        with self.assertRaisesRegex(ValueError, "exact adapter receipt is still loaded"):
+            adapter_cache_cleanup.validate_status(
+                {"status": "idle", "loaded_receipts": {"other": receipt(base, "other")}},
+                source_url=SOURCE,
+                lora_name=LORA,
+                cache_path=f"/cache/{KEY}",
+                cache_root="/cache",
+            )
+        malformed = (
+            f"{base}/",
+            f"{SOURCE}/",
+            f"{SOURCE}?query=1",
+            f"{SOURCE}#fragment",
+            SOURCE.replace("http://127.0.0.1", "http://user@127.0.0.1"),
+            SOURCE.replace("127.0.0.1", "192.0.2.1"),
+            SOURCE.replace("step_0", "step_1"),
+        )
+        for value in malformed:
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "loaded receipt source is invalid"
+            ):
+                adapter_cache_cleanup.validate_status(
+                    {"status": "idle", "loaded_receipts": {"other": receipt(value, "other")}},
+                    source_url=SOURCE,
+                    lora_name=LORA,
+                    cache_path=f"/cache/{KEY}",
+                    cache_root="/cache",
+                )
+
     def test_running_and_waiting_metrics_fail_closed(self):
         valid = "vllm:num_requests_running 0\nvllm:num_requests_waiting 0\n"
         adapter_cache_cleanup.validate_metrics(valid)
@@ -262,6 +293,95 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
                         fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 finally:
                     probe.close()
+
+    def test_remote_receipt_urls_are_canonicalized_and_fail_closed(self):
+        plan = training_ops._exact_adapter_cache_cleanup_plan(
+            config_dir="configs/trinity-decensor-experimental-fixed"
+        )
+        base = SOURCE.removesuffix("/broadcasts/step_0")
+        cases = (
+            (base, "exact adapter receipt is still loaded"),
+            (f"{base}/", "loaded receipt source is invalid"),
+            (f"{SOURCE}/", "loaded receipt source is invalid"),
+            (f"{SOURCE}?query=1", "loaded receipt source is invalid"),
+            (f"{SOURCE}#fragment", "loaded receipt source is invalid"),
+            (
+                SOURCE.replace("http://127.0.0.1", "http://user@127.0.0.1"),
+                "loaded receipt source is invalid",
+            ),
+            (SOURCE.replace("127.0.0.1", "192.0.2.1"), "loaded receipt source is invalid"),
+            (SOURCE.replace("step_0", "step_1"), "loaded receipt source is invalid"),
+        )
+        for receipt_source, message in cases:
+            with self.subTest(receipt_source=receipt_source):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    cache_root = root / "cache"
+                    cache_root.mkdir()
+                    target = write_cache(cache_root)
+                    fake_bin = root / "bin"
+                    fake_bin.mkdir()
+                    (fake_bin / "sudo").write_text(
+                        '#!/bin/sh\nexec "$@"\n', encoding="utf-8"
+                    )
+                    (fake_bin / "ss").write_text(
+                        "#!/bin/sh\nprintf 'LISTEN 0 0 127.0.0.1:8000 0.0.0.0:* users:((\\\"server\\\",pid=123,fd=1))\\n'\n",
+                        encoding="utf-8",
+                    )
+                    (fake_bin / "docker").write_text(
+                        "#!/bin/sh\n"
+                        "printf '/glm52-decensor-h200|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|2026-09-27T00:00:00Z|true|123\\n'\n",
+                        encoding="utf-8",
+                    )
+                    for command in fake_bin.iterdir():
+                        command.chmod(0o755)
+                    status_body = json.dumps(
+                        {
+                            "status": "idle",
+                            "loaded_receipts": {"other": receipt(receipt_source, "other")},
+                        }
+                    ).encode()
+                    (root / "sitecustomize.py").write_text(
+                        "import urllib.request\n"
+                        "class Response:\n"
+                        "    status = 200\n"
+                        "    def __init__(self, body): self.body = body\n"
+                        "    def __enter__(self): return self\n"
+                        "    def __exit__(self, *_args): return False\n"
+                        "    def read(self): return self.body\n"
+                        "def fake_urlopen(request, timeout=30):\n"
+                        "    url = request.full_url if hasattr(request, 'full_url') else str(request)\n"
+                        "    if url.endswith('/health'): return Response(b'ok')\n"
+                        "    if url.endswith('/metrics'): return Response(b'vllm:num_requests_running 0\\nvllm:num_requests_waiting 0\\n')\n"
+                        "    if url.endswith('/staging_status'): return Response("
+                        + repr(status_body)
+                        + ")\n"
+                        "    raise RuntimeError(url)\n"
+                        "urllib.request.urlopen = fake_urlopen\n",
+                        encoding="utf-8",
+                    )
+                    script = training_ops._build_adapter_cache_cleanup_script(
+                        {
+                            **plan,
+                            "cache_root": str(cache_root),
+                            "cache_path": str(target),
+                            "ports": [8000],
+                        }
+                    )
+                    environment = os.environ.copy()
+                    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+                    environment["PYTHONPATH"] = str(root)
+                    result = subprocess.run(
+                        ["bash", "-c", script],
+                        cwd=root,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message, result.stderr)
+                    self.assertTrue(target.exists())
 
     def test_remote_identity_change_inside_lock_preserves_target(self):
         plan = training_ops._exact_adapter_cache_cleanup_plan(
