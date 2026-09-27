@@ -20,7 +20,7 @@ level = "info"
 [model]
 name = "/data/trinity-thinking-fp8"
 dtype = "bfloat16"
-max_model_len = 8704
+max_model_len = 32768
 enforce_eager = false
 reasoning_parser = "deepseek_r1"
 

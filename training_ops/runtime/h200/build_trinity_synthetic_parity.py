@@ -14,6 +14,8 @@ import binascii
 import hashlib
 import json
 import math
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
@@ -38,10 +40,25 @@ PARITY_GATES = {
     "max_masked_mismatch_kl": 0.5,
     "max_masked_fraction": 0.06,
 }
+DIAGNOSTIC_NAME = "trinity_h200_synthetic_packed_individual_parity"
+ROUTE_CONSTRUCTION = "byte_concat(individual_routes)"
+PP_TRANSFER_SPARSE_INDICES = False
 VOCAB_SIZE = 151936
 PADDING_TOKEN_ID = 0
 MAX_ROUTE_BYTES = 512 * 1024 * 1024
+DENSE_LAYERS = 6
+EXPERTS = 256
 _ROUTE_FIELDS = {"data", "dtype", "shape", "start"}
+_REFERENCE_ROUTE_FIELDS = {
+    "schema_version",
+    "encoding",
+    "dtype",
+    "shape",
+    "dense_layers",
+    "experts",
+    "sha256",
+    "data",
+}
 
 
 class SyntheticParityError(ValueError):
@@ -186,7 +203,10 @@ def _flatten_prompt_logprobs(raw: Any, input_ids: Sequence[int]) -> list[float]:
 
 
 def _route_raw(route: Mapping[str, Any], token_count: int | None = None) -> tuple[dict[str, Any], bytes]:
-    if not isinstance(route, Mapping) or not _ROUTE_FIELDS.issubset(route):
+    is_reference_route = isinstance(route, Mapping) and set(route) == _REFERENCE_ROUTE_FIELDS
+    if not isinstance(route, Mapping) or not (
+        _ROUTE_FIELDS.issubset(route) or set(route) == _REFERENCE_ROUTE_FIELDS
+    ):
         raise SyntheticParityError("response is missing routed experts")
     shape = route.get("shape")
     if (
@@ -196,7 +216,7 @@ def _route_raw(route: Mapping[str, Any], token_count: int | None = None) -> tupl
         or (token_count is not None and shape[0] != token_count)
     ):
         raise SyntheticParityError("routed experts have an invalid token/route shape")
-    if route.get("dtype") != "uint8" or route.get("start") != 0:
+    if route.get("dtype") != "uint8" or route.get("start", 0) != 0:
         raise SyntheticParityError("routed experts have invalid dtype or start")
     expected_bytes = math.prod(shape)
     if expected_bytes > MAX_ROUTE_BYTES:
@@ -210,12 +230,35 @@ def _route_raw(route: Mapping[str, Any], token_count: int | None = None) -> tupl
         raise SyntheticParityError("routed experts data is not valid base64") from error
     if len(raw) != expected_bytes:
         raise SyntheticParityError("routed experts data length does not match shape")
+    if is_reference_route and (
+        route.get("schema_version") != 1
+        or route.get("encoding") != "base64"
+        or route.get("dense_layers") != DENSE_LAYERS
+        or route.get("experts") != EXPERTS
+        or route.get("sha256") != hashlib.sha256(raw).hexdigest()
+    ):
+        raise SyntheticParityError("routed experts reference metadata is invalid")
+    row_width = shape[1] * shape[2]
+    dense_width = DENSE_LAYERS * shape[2]
+    if DENSE_LAYERS >= shape[1]:
+        raise SyntheticParityError("routed experts have too few layers")
+    for offset in range(0, len(raw), row_width):
+        row = raw[offset : offset + row_width]
+        if any(row[:dense_width]):
+            raise SyntheticParityError("dense-layer router IDs must be zero")
+        for layer in range(DENSE_LAYERS, shape[1]):
+            selected = row[layer * shape[2] : (layer + 1) * shape[2]]
+            if any(expert >= EXPERTS for expert in selected):
+                raise SyntheticParityError("sparse router IDs are out of range")
+            if len(selected) > 1 and len(set(selected)) != len(selected):
+                raise SyntheticParityError("sparse router IDs are not distinct")
     normalised = {
         "schema_version": 1,
         "encoding": "base64",
         "dtype": "uint8",
         "shape": list(shape),
-        "start": 0,
+        "dense_layers": DENSE_LAYERS,
+        "experts": EXPERTS,
         "sha256": hashlib.sha256(raw).hexdigest(),
         "data": encoded,
     }
@@ -229,7 +272,8 @@ def _route_from_raw(raw: bytes, shape_tail: Sequence[int]) -> dict[str, Any]:
         "encoding": "base64",
         "dtype": "uint8",
         "shape": shape,
-        "start": 0,
+        "dense_layers": DENSE_LAYERS,
+        "experts": EXPERTS,
         "sha256": hashlib.sha256(raw).hexdigest(),
         "data": base64.b64encode(raw).decode(),
     }
@@ -242,8 +286,11 @@ def _parse_response(response: Mapping[str, Any], input_ids: Sequence[int]) -> tu
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], Mapping):
         raise SyntheticParityError("H200 response must contain one choice")
     choice = choices[0]
-    prompt = choice.get("prompt_logprobs", response.get("prompt_logprobs"))
-    logprobs = _flatten_prompt_logprobs(prompt, input_ids)
+    # The H200 serialized endpoint places prompt_logprobs at response level.
+    # Keep this strict so a mock choice-level field cannot hide a schema error.
+    if "prompt_logprobs" not in response:
+        raise SyntheticParityError("H200 response is missing top-level prompt logprobs")
+    logprobs = _flatten_prompt_logprobs(response["prompt_logprobs"], input_ids)
     route, raw = _route_raw(choice.get("routed_experts"), len(input_ids))
     return logprobs, route, raw
 
@@ -252,6 +299,7 @@ def _hash_packed(packed: Mapping[str, Any]) -> dict[str, str]:
     return {
         "input_ids": json_sha256(packed["input_ids"]),
         "inference_logprobs": json_sha256(packed["inference_logprobs"]),
+        "position_ids": json_sha256(packed["position_ids"]),
         "loss_mask": json_sha256(packed["loss_mask"]),
         "sequence_lengths": json_sha256(packed["sequence_lengths"]),
         "routed_experts": packed["routed_experts"]["sha256"],
@@ -288,7 +336,7 @@ def _build_individual(
         last_row = raw[-width:]
         padded_raw = raw + last_row * pad_count
         padded_route = _route_from_raw(padded_raw, tail)
-        mask = [True] * length + [False] * pad_count
+        mask = [False] + [True] * (length - 1) + [False] * pad_count
         microbatches.append(
             {
                 "microbatch_index": index,
@@ -298,6 +346,7 @@ def _build_individual(
                 "padding_count": pad_count,
                 "input_ids": list(record["input_ids"]) + [PADDING_TOKEN_ID] * pad_count,
                 "inference_logprobs": list(values) + [0.0] * pad_count,
+                "position_ids": list(range(max_length)),
                 "loss_mask": mask,
                 "padding_mask": [not flag for flag in mask],
                 "route_mask": mask,
@@ -319,19 +368,22 @@ def _manifest(
     base_model: str,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "diagnostic_name": DIAGNOSTIC_NAME,
         "source_kind": SOURCE_KIND,
         "base_model": base_model,
         "topology": dict(TOPOLOGY),
         "sequence_count": len(records),
         "total_tokens": sum(int(item["length"]) for item in records),
         "sequence_lengths": [int(item["length"]) for item in records],
-        "sequence_counts": [int(item["length"]) for item in records],
+        "token_count": TOTAL_TOKENS,
         "sequence_sha256": [str(item["sha256"]) for item in records],
         "request_sha256": [json_sha256(item) for item in requests],
         "response_sha256": [json_sha256(item) for item in responses],
         "route_shapes": [list(route["shape"]) for route in routes],
         "route_sha256": [str(route["sha256"]) for route in routes],
+        "route_construction": ROUTE_CONSTRUCTION,
+        "pp_transfer_sparse_indices": PP_TRANSFER_SPARSE_INDICES,
         "packed_hashes": _hash_packed(packed),
         "individual_hashes": [
             json_sha256(item)
@@ -341,19 +393,114 @@ def _manifest(
     }
 
 
+def _packed_reference(packed: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the one direct-parity reference accepted by FakeDataLoader."""
+    return {
+        "schema_version": 1,
+        "diagnostic_name": DIAGNOSTIC_NAME,
+        "source_kind": SOURCE_KIND,
+        "input_ids": list(packed["input_ids"]),
+        "inference_logprobs": list(packed["inference_logprobs"]),
+        "position_ids": list(packed["position_ids"]),
+        "loss_mask": list(packed["loss_mask"]),
+        "sequence_lengths": list(packed["sequence_lengths"]),
+        "routed_experts": dict(packed["routed_experts"]),
+    }
+
+
+def _individual_reference(
+    individual: Mapping[str, Any],
+    base_model: str,
+) -> dict[str, Any]:
+    """Return schema-v2 all-microbatch input for five trainer steps."""
+    return {
+        "schema_version": 2,
+        "diagnostic_name": DIAGNOSTIC_NAME,
+        "source_kind": SOURCE_KIND,
+        "base_model": base_model,
+        "sequence_lengths": list(SEQUENCE_LENGTHS),
+        "token_count": TOTAL_TOKENS,
+        "microbatches": [dict(item) for item in individual["microbatches"]],
+    }
+
+
+def _artifact_paths(output_dir: Path) -> dict[str, Path]:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "manifest": output_dir / "manifest.json",
+        "packed": output_dir / "packed-reference.json",
+        "individual": output_dir / "individual-reference.json",
+    }
+    if any(path.exists() or path.is_symlink() for path in paths.values()):
+        raise SyntheticParityError("synthetic parity output already exists; refusing to clobber")
+    return paths
+
+
+def _write_json_bundle_no_clobber(
+    payloads: Mapping[Path, Mapping[str, Any]],
+) -> None:
+    """Install a complete bundle with exclusive, same-directory links."""
+    temporary: dict[Path, Path] = {}
+    linked: list[Path] = []
+    try:
+        for destination, payload in payloads.items():
+            handle = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=destination.parent,
+                prefix=f".{destination.name}.partial-",
+                delete=False,
+            )
+            temporary_path = Path(handle.name)
+            temporary[destination] = temporary_path
+            with handle:
+                json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        for destination, temporary_path in temporary.items():
+            try:
+                os.link(temporary_path, destination)
+            except FileExistsError as error:
+                raise SyntheticParityError(
+                    "synthetic parity output appeared during install; refusing to clobber"
+                ) from error
+            linked.append(destination)
+    except Exception:
+        for destination in linked:
+            try:
+                destination.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        for temporary_path in temporary.values():
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def build_artifact(
     *,
     endpoint: str,
-    output_path: Path,
+    output_dir: Path | None = None,
+    output_path: Path | None = None,
     base_model: str = DEFAULT_BASE_MODEL,
     seed: str = DEFAULT_SEED,
     sequences: Sequence[Any] | None = None,
     timeout: float = 120.0,
     post_json: Callable[[str, Mapping[str, Any], float], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Request and write one deterministic packed/individual artifact."""
+    """Request and write one deterministic packed/individual artifact bundle."""
     if not isinstance(endpoint, str) or not endpoint:
         raise SyntheticParityError("H200 generate endpoint is required")
+    if output_dir is None:
+        if output_path is None:
+            raise SyntheticParityError("synthetic parity output_dir is required")
+        output_dir = Path(output_path).parent
+    paths = _artifact_paths(Path(output_dir))
     if sequences is None:
         records = make_synthetic_sequences(seed)
     else:
@@ -380,17 +527,30 @@ def build_artifact(
     all_ids = [token for record in records for token in record["input_ids"]]
     all_logs = [value for values in logs for value in values]
     all_raw = b"".join(route_raw)
+    packed_mask = []
+    for length in (int(record["length"]) for record in records):
+        packed_mask.extend([False] + [True] * (length - 1))
     packed = {
         "source_kind": SOURCE_KIND,
         "input_ids": all_ids,
         "inference_logprobs": all_logs,
-        "loss_mask": [True] * len(all_ids),
+        "position_ids": [
+            position
+            for length in (int(record["length"]) for record in records)
+            for position in range(length)
+        ],
+        "loss_mask": packed_mask,
         "padding_mask": [False] * len(all_ids),
         "route_mask": [True] * len(all_ids),
         "sequence_lengths": [int(record["length"]) for record in records],
         "routed_experts": _route_from_raw(all_raw, route_tail),
     }
     individual = _build_individual(records, logs, routes, route_raw)
+    packed_reference = _packed_reference(packed)
+    individual_reference = _individual_reference(individual, base_model)
+    manifest = _manifest(
+        records, requests, responses, routes, packed, individual, base_model
+    )
     artifact = {
         "schema_version": 1,
         "artifact_kind": "trinity_synthetic_packed_individual_parity",
@@ -409,13 +569,17 @@ def build_artifact(
         "packed": packed,
         "individual": individual,
     }
-    artifact["manifest"] = _manifest(
-        records, requests, responses, routes, packed, individual, base_model
-    )
+    artifact["manifest"] = manifest
+    artifact["packed_reference"] = packed_reference
+    artifact["individual_reference"] = individual_reference
     validate_artifact(artifact)
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(artifact, sort_keys=True, separators=(",", ":")) + "\n")
+    _write_json_bundle_no_clobber(
+        {
+            paths["manifest"]: manifest,
+            paths["packed"]: packed_reference,
+            paths["individual"]: individual_reference,
+        }
+    )
     return artifact
 
 
@@ -445,6 +609,14 @@ def validate_artifact(value: Mapping[str, Any]) -> dict[str, Any]:
         raise SyntheticParityError("artifact sequence lengths differ")
     if value.get("sequence_count") != SEQUENCE_COUNT or value.get("total_tokens") != TOTAL_TOKENS:
         raise SyntheticParityError("artifact sequence counts differ")
+    if (
+        manifest.get("schema_version") != 2
+        or manifest.get("diagnostic_name") != DIAGNOSTIC_NAME
+        or manifest.get("token_count") != TOTAL_TOKENS
+        or manifest.get("route_construction") != ROUTE_CONSTRUCTION
+        or manifest.get("pp_transfer_sparse_indices") is not PP_TRANSFER_SPARSE_INDICES
+    ):
+        raise SyntheticParityError("manifest diagnostic binding differs")
     normalised_records = []
     for index, record in enumerate(records):
         if not isinstance(record, Mapping) or record.get("index") != index or record.get("length") != lengths[index]:
@@ -478,9 +650,20 @@ def validate_artifact(value: Mapping[str, Any]) -> dict[str, Any]:
     all_ids = [token for record in normalised_records for token in record["input_ids"]]
     all_logs = [value for logs in parsed_logs for value in logs]
     all_raw = b"".join(parsed_raw)
-    if packed.get("input_ids") != all_ids or packed.get("inference_logprobs") != all_logs or packed.get("sequence_lengths") != lengths:
+    expected_packed_mask = []
+    for length in lengths:
+        expected_packed_mask.extend([False] + [True] * (length - 1))
+    expected_positions = [
+        position for length in lengths for position in range(length)
+    ]
+    if (
+        packed.get("input_ids") != all_ids
+        or packed.get("inference_logprobs") != all_logs
+        or packed.get("position_ids") != expected_positions
+        or packed.get("sequence_lengths") != lengths
+    ):
         raise SyntheticParityError("packed token or logprob concatenation differs")
-    if packed.get("loss_mask") != [True] * TOTAL_TOKENS or packed.get("padding_mask") != [False] * TOTAL_TOKENS or packed.get("route_mask") != [True] * TOTAL_TOKENS:
+    if packed.get("loss_mask") != expected_packed_mask or packed.get("padding_mask") != [False] * TOTAL_TOKENS or packed.get("route_mask") != [True] * TOTAL_TOKENS:
         raise SyntheticParityError("packed masks are not exact")
     try:
         packed_route, packed_bytes = _route_raw(
@@ -504,10 +687,11 @@ def validate_artifact(value: Mapping[str, Any]) -> dict[str, Any]:
         length = lengths[index]
         pad_count = max_length - length
         expected_ids = list(normalised_records[index]["input_ids"]) + [PADDING_TOKEN_ID] * pad_count
-        expected_mask = [True] * length + [False] * pad_count
+        expected_mask = [False] + [True] * (length - 1) + [False] * pad_count
         if (
             microbatch.get("input_ids") != expected_ids
             or microbatch.get("inference_logprobs") != parsed_logs[index] + [0.0] * pad_count
+            or microbatch.get("position_ids") != list(range(max_length))
             or microbatch.get("loss_mask") != expected_mask
             or microbatch.get("padding_mask") != [not flag for flag in expected_mask]
             or microbatch.get("route_mask") != expected_mask
@@ -524,7 +708,204 @@ def validate_artifact(value: Mapping[str, Any]) -> dict[str, Any]:
         raise SyntheticParityError("individual hash binding differs")
     if manifest.get("parity_gates") != PARITY_GATES:
         raise SyntheticParityError("parity gates changed")
+    packed_reference = value.get("packed_reference")
+    individual_reference = value.get("individual_reference")
+    if packed_reference != _packed_reference(packed):
+        raise SyntheticParityError("packed FakeDataLoader reference differs")
+    if individual_reference != _individual_reference(individual, value["base_model"]):
+        raise SyntheticParityError("individual FakeDataLoader reference differs")
     return dict(value)
+
+
+def _load_mapping(value: Path | Mapping[str, Any], label: str) -> dict[str, Any]:
+    if isinstance(value, Path):
+        try:
+            value = json.loads(value.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise SyntheticParityError(f"cannot read {label}") from error
+    if not isinstance(value, Mapping):
+        raise SyntheticParityError(f"{label} must be an object")
+    return dict(value)
+
+
+def _as_reference(value: Path | Mapping[str, Any], label: str) -> dict[str, Any]:
+    value = _load_mapping(value, label)
+    if label == "packed reference" and isinstance(value.get("packed_reference"), Mapping):
+        value = dict(value["packed_reference"])
+    elif label == "packed reference" and isinstance(value.get("packed"), Mapping):
+        value = dict(value["packed"])
+    if label == "individual reference" and isinstance(value.get("individual_reference"), Mapping):
+        value = dict(value["individual_reference"])
+    elif label == "individual reference" and isinstance(value.get("individual"), Mapping):
+        value = dict(value["individual"])
+    return value
+
+
+def _numeric_array(value: Any, label: str, count: int) -> list[float]:
+    if not isinstance(value, list) or len(value) != count:
+        raise SyntheticParityError(f"{label} must contain {count} values")
+    result = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise SyntheticParityError(f"{label} contains a non-numeric value")
+        item = float(item)
+        if not math.isfinite(item):
+            raise SyntheticParityError(f"{label} contains a non-finite value")
+        result.append(item)
+    return result
+
+
+def _stats(left: Sequence[float], right: Sequence[float]) -> dict[str, float | int]:
+    if len(left) != len(right) or not left:
+        raise SyntheticParityError("comparison arrays are not aligned")
+    differences = sorted(abs(float(a) - float(b)) for a, b in zip(left, right))
+    mismatch_count = sum(delta != 0.0 for delta in differences)
+    p95_index = min(len(differences) - 1, math.ceil(len(differences) * 0.95) - 1)
+    return {
+        "mean_abs": sum(differences) / len(differences),
+        "p95_abs": differences[p95_index],
+        "max_abs": differences[-1],
+        "mismatch_count": mismatch_count,
+        "count": len(differences),
+    }
+
+
+def compare_packed_individual(
+    packed: Path | Mapping[str, Any],
+    individual: Path | Mapping[str, Any],
+    reference: Path | Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compare trainer deltas from direct packed and schema-v2 microbatches.
+
+    The function binds token IDs, position IDs, sequence lengths, and masks
+    before comparing.  It accepts either the emitted reference files or the
+    in-memory aggregate returned by :func:`build_artifact`.
+    """
+    packed_ref = _as_reference(packed, "packed reference")
+    individual_ref = _as_reference(individual, "individual reference")
+    reference_ref = (
+        _as_reference(reference, "packed reference")
+        if reference is not None
+        else packed_ref
+    )
+    if individual_ref.get("schema_version") != 2:
+        raise SyntheticParityError("individual reference must use schema version 2")
+    packed_ids = packed_ref.get("input_ids")
+    packed_lengths = packed_ref.get("sequence_lengths")
+    expected_positions = [
+        position for length in SEQUENCE_LENGTHS for position in range(length)
+    ]
+    packed_positions = packed_ref.get("position_ids", expected_positions)
+    packed_mask = packed_ref.get("loss_mask")
+    expected_mask = []
+    for length in SEQUENCE_LENGTHS:
+        expected_mask.extend([False] + [True] * (length - 1))
+    if packed_mask is None:
+        packed_mask = expected_mask
+    if (
+        not isinstance(packed_ids, list)
+        or packed_lengths != list(SEQUENCE_LENGTHS)
+        or not isinstance(packed_positions, list)
+        or packed_positions != expected_positions
+        or not isinstance(packed_mask, list)
+        or len(packed_mask) != TOTAL_TOKENS
+    ):
+        raise SyntheticParityError("packed IDs, positions, sequence lengths, or mask are invalid")
+    packed_reference = _numeric_array(
+        reference_ref.get(
+            "reference_logprobs", reference_ref.get("inference_logprobs")
+        ),
+        "packed reference logprobs",
+        TOTAL_TOKENS,
+    )
+    if (
+        reference_ref.get("input_ids", packed_ids) != packed_ids
+        or reference_ref.get("sequence_lengths", packed_lengths) != packed_lengths
+    ):
+        raise SyntheticParityError("packed and reference token bindings differ")
+    packed_trainer = _numeric_array(
+        packed_ref.get("trainer_logprobs", packed_reference),
+        "packed trainer logprobs",
+        TOTAL_TOKENS,
+    )
+    if packed_mask != expected_mask:
+        raise SyntheticParityError("packed loss mask is not sequence aligned")
+    microbatches = individual_ref.get("microbatches")
+    if not isinstance(microbatches, list) or len(microbatches) != SEQUENCE_COUNT:
+        raise SyntheticParityError("individual reference does not contain five microbatches")
+    individual_ids: list[int] = []
+    individual_reference: list[float] = []
+    individual_trainer: list[float] = []
+    offsets = []
+    offset = 0
+    for index, (length, microbatch) in enumerate(zip(SEQUENCE_LENGTHS, microbatches)):
+        if not isinstance(microbatch, Mapping):
+            raise SyntheticParityError("individual microbatch is invalid")
+        padded_ids = microbatch.get("input_ids")
+        if not isinstance(padded_ids, list) or len(padded_ids) != max(SEQUENCE_LENGTHS):
+            raise SyntheticParityError("individual input IDs are not padded to max length")
+        sequence_length = microbatch.get(
+            "original_sequence_length",
+            microbatch.get("sequence_length", length),
+        )
+        if sequence_length != length or microbatch.get("sequence_lengths") != [max(SEQUENCE_LENGTHS)]:
+            raise SyntheticParityError("individual sequence lengths are not bound")
+        positions = microbatch.get("position_ids", list(range(max(SEQUENCE_LENGTHS))))
+        if positions != list(range(max(SEQUENCE_LENGTHS))):
+            raise SyntheticParityError("individual positions are not bound")
+        mask = microbatch.get("loss_mask")
+        expected_micro_mask = [False] + [True] * (length - 1) + [False] * (max(SEQUENCE_LENGTHS) - length)
+        if mask != expected_micro_mask:
+            raise SyntheticParityError("individual loss mask is not bound")
+        actual_ids = padded_ids[:length]
+        if actual_ids != packed_ids[offset : offset + length]:
+            raise SyntheticParityError(f"individual input IDs differ at sequence {index}")
+        ref_values = _numeric_array(
+            microbatch.get("inference_logprobs"),
+            f"individual reference logprobs {index}",
+            max(SEQUENCE_LENGTHS),
+        )
+        trainer_values = _numeric_array(
+            microbatch.get("trainer_logprobs", ref_values),
+            f"individual trainer logprobs {index}",
+            max(SEQUENCE_LENGTHS),
+        )
+        individual_ids.extend(actual_ids)
+        individual_reference.extend(ref_values[:length])
+        individual_trainer.extend(trainer_values[:length])
+        offsets.append({"index": index, "start": offset, "end": offset + length, "length": length})
+        offset += length
+    if individual_ids != packed_ids or individual_reference != packed_reference:
+        raise SyntheticParityError("packed and individual reference bindings differ")
+    sequence_reports = []
+    for item in offsets:
+        start, end = item["start"], item["end"]
+        sequence_reports.append(
+            {
+                **item,
+                "packed_vs_individual": _stats(
+                    packed_trainer[start:end], individual_trainer[start:end]
+                ),
+                "packed_vs_reference": _stats(
+                    packed_trainer[start:end], packed_reference[start:end]
+                ),
+                "individual_vs_reference": _stats(
+                    individual_trainer[start:end], individual_reference[start:end]
+                ),
+            }
+        )
+    return {
+        "schema_version": 1,
+        "diagnostic_name": DIAGNOSTIC_NAME,
+        "sequence_lengths": list(SEQUENCE_LENGTHS),
+        "token_count": TOTAL_TOKENS,
+        "sequences": sequence_reports,
+        "totals": {
+            "packed_vs_individual": _stats(packed_trainer, individual_trainer),
+            "packed_vs_reference": _stats(packed_trainer, packed_reference),
+            "individual_vs_reference": _stats(individual_trainer, individual_reference),
+        },
+    }
 
 
 def _post_json(endpoint: str, body: Mapping[str, Any], timeout: float) -> dict[str, Any]:
@@ -547,14 +928,14 @@ def _post_json(endpoint: str, body: Mapping[str, Any], timeout: float) -> dict[s
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", required=True)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--base-model", default=DEFAULT_BASE_MODEL)
     parser.add_argument("--seed", default=DEFAULT_SEED)
     parser.add_argument("--timeout", default=120.0, type=float)
     args = parser.parse_args(argv)
     build_artifact(
         endpoint=args.endpoint,
-        output_path=args.output,
+        output_dir=args.output_dir,
         base_model=args.base_model,
         seed=args.seed,
         timeout=args.timeout,

@@ -21,9 +21,10 @@ def route_for(token_count: int, *, layers: int = 8, top_k: int = 2) -> dict:
     raw = bytearray()
     for index in range(token_count):
         for layer in range(layers):
-            raw.extend(
-                ((layer + index) % 256, (layer + index + 1) % 256)[:top_k]
-            )
+            if layer < 6:
+                raw.extend((0,) * top_k)
+            else:
+                raw.extend((layer + 1, layer + 2)[:top_k])
     return {
         "data": base64.b64encode(raw).decode(),
         "dtype": "uint8",
@@ -34,15 +35,15 @@ def route_for(token_count: int, *, layers: int = 8, top_k: int = 2) -> dict:
 
 def response_for(tokens: list[int]) -> dict:
     return {
+        "prompt_logprobs": [
+            None,
+            *[
+                {str(token): {"logprob": -0.01 * index}}
+                for index, token in enumerate(tokens[1:], 1)
+            ],
+        ],
         "choices": [
             {
-                "prompt_logprobs": [
-                    None,
-                    *[
-                        {str(token): {"logprob": -0.01 * index}}
-                        for index, token in enumerate(tokens[1:], 1)
-                    ],
-                ],
                 "routed_experts": route_for(len(tokens)),
             }
         ]
@@ -104,14 +105,23 @@ class SyntheticParityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             artifact = synthetic.build_artifact(
                 endpoint="http://h200/inference/v1/generate",
-                output_path=Path(directory) / "synthetic.json",
+                output_dir=Path(directory),
                 base_model="base-model",
                 post_json=post,
                 sequences=sequences,
             )
-            written = json.loads((Path(directory) / "synthetic.json").read_text())
+            written = {
+                "manifest": json.loads((Path(directory) / "manifest.json").read_text()),
+                "packed_reference": json.loads((Path(directory) / "packed-reference.json").read_text()),
+                "individual_reference": json.loads((Path(directory) / "individual-reference.json").read_text()),
+            }
+            self.assertTrue((Path(directory) / "manifest.json").is_file())
+            self.assertTrue((Path(directory) / "packed-reference.json").is_file())
+            self.assertTrue((Path(directory) / "individual-reference.json").is_file())
         self.assertEqual(len(calls), 5)
-        self.assertEqual(artifact, written)
+        self.assertEqual(artifact["manifest"], written["manifest"])
+        self.assertEqual(artifact["packed_reference"], written["packed_reference"])
+        self.assertEqual(artifact["individual_reference"], written["individual_reference"])
         self.assertEqual(artifact["source_kind"], "synthetic")
         self.assertEqual(artifact["sequence_lengths"], [4096, 5632, 6656, 7680, 8704])
         self.assertEqual(artifact["total_tokens"], 32768)
@@ -128,80 +138,155 @@ class SyntheticParityTest(unittest.TestCase):
             len(packed["input_ids"]),
         )
         self.assertEqual(len(artifact["individual"]["microbatches"]), 5)
+        self.assertEqual(artifact["manifest"]["route_construction"], "byte_concat(individual_routes)")
+        self.assertEqual(artifact["manifest"]["diagnostic_name"], synthetic.DIAGNOSTIC_NAME)
+        self.assertEqual(artifact["manifest"]["token_count"], 32768)
+        self.assertEqual(artifact["manifest"]["pp_transfer_sparse_indices"], False)
+        route_fields = {"schema_version", "encoding", "dtype", "shape", "dense_layers", "experts", "sha256", "data"}
+        packed_reference = written["packed_reference"]
+        self.assertEqual(sum(packed_reference["sequence_lengths"]), len(packed_reference["input_ids"]))
+        self.assertEqual(len(packed_reference["inference_logprobs"]), len(packed_reference["input_ids"]))
+        self.assertEqual(set(packed_reference["routed_experts"]), route_fields)
+        individual_reference = written["individual_reference"]
+        self.assertEqual(individual_reference["schema_version"], 2)
+        self.assertEqual(len(individual_reference["microbatches"]), 5)
         for sequence, microbatch in zip(sequences, artifact["individual"]["microbatches"]):
             self.assertEqual(len(microbatch["input_ids"]), 8704)
             self.assertEqual(
                 microbatch["loss_mask"],
-                [True] * len(sequence["input_ids"])
+                [False] + [True] * (len(sequence["input_ids"]) - 1)
                 + [False] * (8704 - len(sequence["input_ids"])),
             )
             self.assertEqual(microbatch["route_mask"], microbatch["loss_mask"])
             self.assertEqual(microbatch["routed_experts"]["shape"][0], 8704)
+            self.assertEqual(sum(microbatch["sequence_lengths"]), len(microbatch["input_ids"]))
+            self.assertEqual(set(microbatch["routed_experts"]), route_fields)
         synthetic.validate_artifact(artifact)
+
 
     def test_prompt_logprob_alignment_and_route_tamper_rejection(self):
         sequences = synthetic.make_synthetic_sequences()
 
         def bad_prompt(_endpoint, request, _timeout):
             response = response_for(request["token_ids"])
-            response["choices"][0]["prompt_logprobs"][2] = {"999": {"logprob": -1}}
+            response["prompt_logprobs"][2] = {"999": {"logprob": -1}}
             return response
 
-        with self.assertRaisesRegex(synthetic.SyntheticParityError, "prompt logprob"):
-            synthetic.build_artifact(
-                endpoint="http://h200/inference/v1/generate",
-                output_path=Path("unused.json"),
-                base_model="base-model",
-                post_json=bad_prompt,
-                sequences=sequences,
-            )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(synthetic.SyntheticParityError, "prompt logprob"):
+                synthetic.build_artifact(
+                    endpoint="http://h200/inference/v1/generate",
+                    output_dir=Path(directory),
+                    base_model="base-model",
+                    post_json=bad_prompt,
+                    sequences=sequences,
+                )
 
         def no_route(_endpoint, request, _timeout):
             response = response_for(request["token_ids"])
             del response["choices"][0]["routed_experts"]
             return response
 
-        with self.assertRaisesRegex(synthetic.SyntheticParityError, "routed experts"):
-            synthetic.build_artifact(
-                endpoint="http://h200/inference/v1/generate",
-                output_path=Path("unused.json"),
-                base_model="base-model",
-                post_json=no_route,
-                sequences=sequences,
-            )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(synthetic.SyntheticParityError, "routed experts"):
+                synthetic.build_artifact(
+                    endpoint="http://h200/inference/v1/generate",
+                    output_dir=Path(directory),
+                    base_model="base-model",
+                    post_json=no_route,
+                    sequences=sequences,
+                )
 
         def post(_endpoint, request, _timeout):
             return response_for(request["token_ids"])
 
-        artifact = synthetic.build_artifact(
-            endpoint="http://h200/inference/v1/generate",
-            output_path=Path("unused.json"),
-            base_model="base-model",
-            post_json=post,
-            sequences=sequences,
-        )
-        changed = copy.deepcopy(artifact)
-        changed["packed"]["routed_experts"]["data"] = base64.b64encode(b"bad").decode()
-        with self.assertRaisesRegex(synthetic.SyntheticParityError, "packed route"):
-            synthetic.validate_artifact(changed)
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = synthetic.build_artifact(
+                endpoint="http://h200/inference/v1/generate",
+                output_dir=Path(directory),
+                base_model="base-model",
+                post_json=post,
+                sequences=sequences,
+            )
+            changed = copy.deepcopy(artifact)
+            changed["packed"]["routed_experts"]["data"] = base64.b64encode(b"bad").decode()
+            with self.assertRaisesRegex(synthetic.SyntheticParityError, "packed route"):
+                synthetic.validate_artifact(changed)
+            with self.assertRaisesRegex(synthetic.SyntheticParityError, "already exists"):
+                synthetic.build_artifact(
+                    endpoint="http://h200/inference/v1/generate",
+                    output_dir=Path(directory),
+                    base_model="base-model",
+                    post_json=post,
+                    sequences=sequences,
+                )
+
+    def test_top_level_prompt_logprobs_are_required(self):
+        def choice_only(_endpoint, request, _timeout):
+            response = response_for(request["token_ids"])
+            response["choices"][0]["prompt_logprobs"] = response.pop("prompt_logprobs")
+            return response
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(synthetic.SyntheticParityError, "top-level"):
+                synthetic.build_artifact(
+                    endpoint="http://h200/inference/v1/generate",
+                    output_dir=Path(directory),
+                    base_model="base-model",
+                    post_json=choice_only,
+                )
+
+    def test_comparison_binds_positions_and_detects_tamper(self):
+        def post(_endpoint, request, _timeout):
+            return response_for(request["token_ids"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = synthetic.build_artifact(
+                endpoint="http://h200/inference/v1/generate",
+                output_dir=Path(directory),
+                base_model="base-model",
+                post_json=post,
+            )
+            packed = copy.deepcopy(artifact["packed_reference"])
+            individual = copy.deepcopy(artifact["individual_reference"])
+            packed["trainer_logprobs"] = list(packed["inference_logprobs"])
+            for microbatch in individual["microbatches"]:
+                microbatch["trainer_logprobs"] = list(microbatch["inference_logprobs"])
+            report = synthetic.compare_packed_individual(packed, individual)
+            self.assertEqual(report["token_count"], 32768)
+            self.assertEqual(report["totals"]["packed_vs_individual"]["mismatch_count"], 0)
+            individual["microbatches"][0]["input_ids"][1] += 1
+            with self.assertRaisesRegex(synthetic.SyntheticParityError, "input IDs"):
+                synthetic.compare_packed_individual(packed, individual)
 
     def test_configs_are_native_fp8_no_lora_and_keep_gates(self):
-        config_path = ROOT / "configs/trinity-h200-synthetic-packed-parity/trainer.toml"
-        with config_path.open("rb") as stream:
-            config = tomllib.load(stream)
-        self.assertEqual(config["max_steps"], 1)
-        self.assertTrue(config["enable_router_replay"])
-        self.assertEqual(config["model"]["name"], "/data/trinity-thinking-fp8")
-        self.assertNotIn("lora", config["model"])
-        self.assertEqual((config["model"]["cp"], config["model"]["pp"], config["model"]["ep"]), (8, 8, 8))
-        self.assertEqual(config["model"]["pp_transfer_sparse_indices"], False)
-        self.assertEqual(config["model"]["quantization"]["type"], "fp8")
-        self.assertEqual(config["optim"]["lr"], 0.0)
-        self.assertEqual(config["parity_guard"], {
-            "max_unmasked_mismatch_kl": 0.1,
-            "max_masked_mismatch_kl": 0.5,
-            "max_masked_fraction": 0.06,
-        })
+        config_root = ROOT / "configs/trinity-h200-synthetic-packed-parity"
+        self.assertFalse((config_root / "trainer.toml").exists())
+        for filename, expected_seq_len, expected_batch in (
+            ("trainer-packed.toml", 32768, 1),
+            ("trainer-individual.toml", 8704, 5),
+        ):
+            with (config_root / filename).open("rb") as stream:
+                config = tomllib.load(stream)
+            self.assertEqual(config["max_steps"], 1)
+            self.assertTrue(config["enable_router_replay"])
+            self.assertEqual(config["data"]["fake"]["batch_size"], expected_batch)
+            self.assertEqual(config["model"]["seq_len"], expected_seq_len)
+            self.assertEqual(config["model"]["name"], "/data/trinity-thinking-fp8")
+            self.assertNotIn("lora", config["model"])
+            self.assertEqual((config["model"]["cp"], config["model"]["pp"], config["model"]["ep"]), (8, 8, 8))
+            self.assertEqual(config["model"]["pp_transfer_sparse_indices"], False)
+            self.assertEqual(config["model"]["quantization"]["type"], "fp8")
+            self.assertEqual(config["optim"]["lr"], 0.0)
+            self.assertEqual(config["parity_guard"], {
+                "max_unmasked_mismatch_kl": 0.1,
+                "max_masked_mismatch_kl": 0.5,
+                "max_masked_fraction": 0.06,
+            })
+        with (config_root / "inference.toml").open("rb") as stream:
+            inference = tomllib.load(stream)
+        self.assertFalse(inference["enable_lora"])
+        self.assertEqual(inference["model"]["max_model_len"], 32768)
 
 
 if __name__ == "__main__":

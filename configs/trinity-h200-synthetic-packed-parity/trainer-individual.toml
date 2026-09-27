@@ -1,8 +1,6 @@
-# Fresh synthetic Trinity packed-versus-individual parity.
-# The reference is built by build_trinity_synthetic_parity.py from the native
-# FP8 base model before this one-step trainer qualification.
+# Five padded individual synthetic Trinity parity microbatches.
 
-output_dir = "/data/glm52-rl/qualifications/trinity-h200-synthetic-packed-parity"
+output_dir = "/data/glm52-rl/qualifications/trinity-h200-synthetic-packed-parity/individual-run"
 max_steps = 1
 dist_timeout_seconds = 5400
 enable_router_replay = true
@@ -10,7 +8,7 @@ enable_router_replay = true
 [data.fake]
 batch_size = 5
 generate_samples = false
-reference_path = "/data/glm52-rl/qualifications/trinity-h200-synthetic-packed-parity/synthetic-parity.json"
+reference_path = "/data/glm52-rl/qualifications/trinity-h200-synthetic-packed-parity/individual-reference.json"
 
 [parity_guard]
 max_unmasked_mismatch_kl = 0.1
