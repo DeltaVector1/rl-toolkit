@@ -217,11 +217,24 @@ def _guard_post_update_config_dir(config_dir: str) -> None:
     path = Path(config_dir)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         return
+    canonical_trainer = repo_root / _POST_UPDATE_CONFIG_DIR / "trainer.toml"
+    candidate_trainer = repo_root / path / "trainer.toml"
+    if config_dir != _POST_UPDATE_CONFIG_DIR and candidate_trainer.is_file():
+        try:
+            copied_bytes = candidate_trainer.read_bytes()
+            canonical_bytes = canonical_trainer.read_bytes()
+            with candidate_trainer.open("rb") as stream:
+                candidate_config = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError):
+            candidate_config = None
+        fake = candidate_config.get("data", {}).get("fake", {}) if isinstance(candidate_config, dict) else {}
+        if copied_bytes == canonical_bytes or fake.get("export_final_adapter") is True:
+            raise Refused(
+                "post-update qualification requires the canonical config directory"
+            )
     try:
         resolved_trainer = (repo_root / path / "trainer.toml").resolve()
-        canonical_trainer = (
-            repo_root / _POST_UPDATE_CONFIG_DIR / "trainer.toml"
-        ).resolve()
+        canonical_trainer = canonical_trainer.resolve()
     except OSError:
         return
     if resolved_trainer != canonical_trainer:
@@ -8225,6 +8238,7 @@ def _policy0_post_update_reference_copy(
     trainer_config: dict,
     reference_path: Path,
     expected_identity: dict[str, str | int],
+    source_adapter_identity: dict[str, dict[str, int | str]] | None = None,
 ) -> dict[str, int | str]:
     """Validate one exact local post-update reference byte copy.
 
@@ -8244,7 +8258,7 @@ def _policy0_post_update_reference_copy(
             f"expected {expected_file}, got {before}"
         )
     try:
-        _validate_post_update_qualification_reference(
+        validated_reference = _validate_post_update_qualification_reference(
             trainer_config,
             reference_path,
             expected,
@@ -8257,6 +8271,26 @@ def _policy0_post_update_reference_copy(
             "post-update local reference changed during validation: "
             f"before {before}, after {after}"
         )
+    if source_adapter_identity is not None:
+        _policy0_validate_post_update_source_manifest(
+            source_adapter_identity,
+            expected,
+        )
+        for item in validated_reference["microbatches"]:
+            receipt = item.get("policy_identity_before")
+            if not isinstance(receipt, dict):
+                raise Refused("post-update reference policy identity is missing")
+            adapter = source_adapter_identity["adapter_model.safetensors"]
+            config = source_adapter_identity["adapter_config.json"]
+            if (
+                receipt.get("target_sha256") != adapter["sha256"]
+                or receipt.get("target_size") != adapter["size"]
+                or receipt.get("config_sha256") != config["sha256"]
+                or receipt.get("config_size") != config["size"]
+            ):
+                raise Refused(
+                    "post-update reference policy identity differs from source adapter"
+                )
     return after
 
 
@@ -8272,6 +8306,47 @@ def _policy0_parse_reference_identity(output: str) -> dict[str, int | str]:
     if len(records) != 1:
         raise Refused("H200 source reference identity output is incomplete")
     return records[0]
+
+
+def _policy0_parse_adapter_manifest(output: str) -> dict[str, dict[str, int | str]]:
+    """Parse exact source adapter and config identities."""
+    records: dict[str, dict[str, int | str]] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[0] == "QUAL_FILE":
+            name, digest, size_text = parts[1:]
+            if (
+                name in {"adapter_model.safetensors", "adapter_config.json"}
+                and re.fullmatch(r"[0-9a-f]{64}", digest)
+                and size_text.isdigit()
+            ):
+                records[name] = {"sha256": digest, "size": int(size_text)}
+    if set(records) != {"adapter_model.safetensors", "adapter_config.json"}:
+        raise Refused("source step-0 adapter identity output is incomplete")
+    return records
+
+
+def _policy0_validate_post_update_source_manifest(
+    manifest: dict[str, dict[str, int | str]],
+    expected_identity: dict[str, str | int],
+) -> None:
+    """Bind source adapter and config to the pinned post-update receipt."""
+    expected = _validate_post_update_reference_identity(expected_identity)
+    expected_files = {
+        "adapter_model.safetensors": {
+            "sha256": expected["adapter_sha256"],
+            "size": expected["adapter_size"],
+        },
+        "adapter_config.json": {
+            "sha256": expected["config_sha256"],
+            "size": expected["config_size"],
+        },
+    }
+    if manifest != expected_files:
+        raise Refused(
+            "source adapter identity differs from pinned post-update identity: "
+            f"expected {expected_files}, got {manifest}"
+        )
 
 
 def _policy0_post_update_source_identity(
@@ -8295,6 +8370,7 @@ def _policy0_fetch_and_validate_post_update_reference(
     source_reference_host: str,
     source_reference_path: str,
     expected_identity: dict[str, str | int],
+    source_adapter_identity: dict[str, dict[str, int | str]],
 ) -> tuple[Path, tempfile.TemporaryDirectory[str], dict[str, int | str]]:
     """Fetch, validate, and retain one local H200 reference copy."""
     expected = _validate_post_update_reference_identity(expected_identity)
@@ -8339,6 +8415,7 @@ def _policy0_fetch_and_validate_post_update_reference(
             trainer_config,
             local_reference,
             expected,
+            source_adapter_identity,
         )
         source_after = _policy0_post_update_source_identity(
             source_reference_host,
@@ -9190,7 +9267,16 @@ def prepare_policy0_qualification(
     post_update_reference_directory: tempfile.TemporaryDirectory[str] | None = None
     reference_manifest: dict[str, dict[str, int | str]] = {}
     transfer_results: dict[str, dict[str, object]]
+    code, output = _ssh(source_adapter_host, source_adapter_script, timeout=180)
+    if code:
+        detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
+        raise Refused(f"source step-0 adapter failed validation: {detail}")
+    source_manifest = _policy0_parse_adapter_manifest(output)
     if post_update_identity is not None:
+        _policy0_validate_post_update_source_manifest(
+            source_manifest,
+            post_update_identity,
+        )
         (
             post_update_local_reference,
             post_update_reference_directory,
@@ -9200,6 +9286,7 @@ def prepare_policy0_qualification(
             source_reference_host,
             source_reference_path,
             post_update_identity,
+            source_manifest,
         )
         reference_manifest["reference.json"] = local_reference_identity
         transfer_results = _policy0_controller_transfer_reference(
@@ -9214,19 +9301,6 @@ def prepare_policy0_qualification(
         )
         post_update_reference_directory.cleanup()
         post_update_reference_directory = None
-    code, output = _ssh(source_adapter_host, source_adapter_script, timeout=180)
-    if code:
-        detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
-        raise Refused(f"source step-0 adapter failed validation: {detail}")
-    source_manifest: dict[str, dict[str, int | str]] = {}
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) == 4 and parts[0] == "QUAL_FILE":
-            name, digest, size_text = parts[1:]
-            if re.fullmatch(r"[0-9a-f]{64}", digest) and size_text.isdigit():
-                source_manifest[name] = {"sha256": digest, "size": int(size_text)}
-    if set(source_manifest) != {"adapter_model.safetensors", "adapter_config.json"}:
-        raise Refused("source step-0 adapter identity output is incomplete")
     if post_update_identity is None:
         reference_verify = _policy0_reference_source_verify_script(
             source_reference_path,
@@ -10359,6 +10433,7 @@ def qualify(
         raise Refused('qualification mode must be "cold" or "restart"')
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise Refused("qualification name can contain only letters, digits, '_' and '-'")
+    _guard_post_update_config_dir(config_dir)
     nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
     if trainer_head in nodes:
         nodes = [trainer_head] + [host for host in nodes if host != trainer_head]

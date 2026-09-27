@@ -213,6 +213,24 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             with patch.object(training_ops, "repo_root", root):
                 with self.assertRaisesRegex(Refused, "canonical config directory"):
                     _guard_post_update_config_dir("configs/post-update-alias")
+            copied = root / "configs" / "post-update-copy"
+            copied.mkdir()
+            shutil.copy2(canonical / "trainer.toml", copied / "trainer.toml")
+            with patch.object(training_ops, "repo_root", root):
+                with self.assertRaisesRegex(Refused, "canonical config directory"):
+                    _guard_post_update_config_dir("configs/post-update-copy")
+
+    def test_qualify_calls_canonical_post_update_guard_before_ssh(self):
+        with patch("training_ops._guard_post_update_config_dir", side_effect=Refused("canonical config directory")) as guard, patch(
+            "training_ops._ssh"
+        ) as ssh:
+            with self.assertRaisesRegex(Refused, "canonical config directory"):
+                training_ops.qualify(
+                    "post-update-alias-test",
+                    config_dir="configs/trinity-h200-post-update-qualification",
+                )
+        guard.assert_called_once_with("configs/trinity-h200-post-update-qualification")
+        ssh.assert_not_called()
 
     def test_post_update_mutations_fail_local_before_trainer_ssh(self):
         case = H200PostUpdateReferenceTest()
@@ -262,6 +280,27 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 item["response_sha256"]["decode"] = response_hash
                 item["qualification_binding"]["request_sha256"] = request_hash
                 item["qualification_binding"]["response_sha256"] = response_hash
+
+            source_identity = {
+                "adapter_model.safetensors": {"sha256": "a" * 64, "size": 100},
+                "adapter_config.json": {"sha256": "b" * 64, "size": 200},
+            }
+            _policy0_post_update_reference_copy(
+                config,
+                output,
+                expected,
+                source_identity,
+            )
+            with self.assertRaisesRegex(Refused, "pinned post-update identity"):
+                _policy0_post_update_reference_copy(
+                    config,
+                    output,
+                    expected,
+                    {
+                        "adapter_model.safetensors": {"sha256": "c" * 64, "size": 300},
+                        "adapter_config.json": {"sha256": "d" * 64, "size": 400},
+                    },
+                )
 
             mutations = {
                 "minus-9999": lambda item: item["responses"]["decode"]["choices"][0]["logprobs"]["content"][0].__setitem__("logprob", -9999.0),
@@ -348,8 +387,8 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
         }
         nodes = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
         source_manifest = "\n".join([
-            "QUAL_FILE adapter_model.safetensors " + "a" * 64 + " 10",
-            "QUAL_FILE adapter_config.json " + "b" * 64 + " 20",
+            "QUAL_FILE adapter_model.safetensors " + "a" * 64 + " 100",
+            "QUAL_FILE adapter_config.json " + "b" * 64 + " 200",
         ])
         transfer_result = {host: {"ok": True, "message": "installed"} for host in nodes}
         events = []
@@ -388,10 +427,42 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 self.assertTrue(result["staged"])
                 fetch_mock.assert_called_once()
                 transfer_mock.assert_called_once()
-                self.assertEqual(events[:3], ["fetch", "transfer", "ssh"])
+                self.assertEqual(events[:3], ["ssh", "fetch", "transfer"])
                 self.assertNotIn("exactly eight microbatches", result["source_reference_script"])
             finally:
                 retained_directory.cleanup()
+
+    def test_post_update_source_identity_mismatch_fails_before_reference_transfer(self):
+        kwargs = {
+            "source_adapter_dir": "/data/glm52-rl/preserved-step0",
+            "source_reference_path": "/data/glm52-rl/fresh-h200/reference.json",
+            "expected_old_reference_sha256": OLD_SHA256,
+            "expected_old_reference_size": OLD_SIZE,
+        }
+        source_manifest = "\n".join([
+            "QUAL_FILE adapter_model.safetensors " + "c" * 64 + " 300",
+            "QUAL_FILE adapter_config.json " + "d" * 64 + " 400",
+        ])
+        retained_directory = tempfile.TemporaryDirectory()
+        try:
+            with patch.dict(
+                os.environ,
+                {"PRIME_RL_POST_UPDATE_REFERENCE_IDENTITY": json.dumps(POST_UPDATE_IDENTITY)},
+                clear=True,
+            ), patch("training_ops._ssh", return_value=(0, source_manifest)) as ssh, patch(
+                "training_ops._policy0_fetch_and_validate_post_update_reference"
+            ) as fetch, patch("training_ops._policy0_controller_transfer_reference") as transfer:
+                with self.assertRaisesRegex(Refused, "source adapter identity"):
+                    prepare_policy0_qualification(
+                        "configs/trinity-h200-post-update-qualification",
+                        apply=True,
+                        **kwargs,
+                    )
+            self.assertEqual(ssh.call_count, 1)
+            fetch.assert_not_called()
+            transfer.assert_not_called()
+        finally:
+            retained_directory.cleanup()
 
     def test_api_requires_expected_old_pair(self):
         kwargs = {
