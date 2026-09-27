@@ -1,6 +1,8 @@
 import ast
+from concurrent.futures import ThreadPoolExecutor
 import math
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
@@ -36,7 +38,7 @@ class Dist:
 
 def load_helpers(dist):
     tree = ast.parse(source_path.read_text())
-    names = {"initialize_fresh_lora_policy", "verify_fresh_trainer_only_lora"}
+    names = {"initialize_fresh_lora_policy", "agree_fresh_trainer_only_lora", "verify_fresh_trainer_only_lora"}
     nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     namespace = {"torch": torch, "dist": dist, "math": math}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source_path), "exec"), namespace)
@@ -56,10 +58,11 @@ class FreshLoraPolicyTest(unittest.TestCase):
 
     def verify(self, dist=None, checkpoint_step=None, resume_adapter=None):
         namespace = load_helpers(dist or Dist())
-        self.assertIn("verify_fresh_trainer_only_lora", list(namespace))
-        return namespace["verify_fresh_trainer_only_lora"](
-            self.manager, self.config, checkpoint_step, resume_adapter
-        )
+        self.assertIn("agree_fresh_trainer_only_lora", list(namespace))
+        fresh = namespace["agree_fresh_trainer_only_lora"](self.config, checkpoint_step, resume_adapter)
+        if fresh:
+            return namespace["verify_fresh_trainer_only_lora"](self.manager, self.config)
+        return None
 
     def test_zero_finite_policy_passes_without_mutation(self):
         evidence = self.verify()
@@ -143,6 +146,54 @@ class FreshLoraPolicyTest(unittest.TestCase):
 
 
 class TrainerOnlyFreshPolicyTest(unittest.TestCase):
+    def test_two_rank_collective_sequence_is_bounded_and_agreed_before_load(self):
+        for adapters in ((None, None), ("/resume", "/resume"), (None, "/resume")):
+            with self.subTest(adapters=adapters):
+                barrier = Barrier(2, timeout=2)
+                records = [None, None]
+                traces = [[], []]
+
+                class PairedDist(Dist):
+                    def __init__(self, rank):
+                        self.rank = rank
+
+                    def get_rank(self):
+                        return self.rank
+
+                    def all_gather_object(self, output, local):
+                        kind = "eligibility" if "eligible" in local else "load" if "load" in local else "evidence"
+                        traces[self.rank].append(kind)
+                        records[self.rank] = local.copy()
+                        barrier.wait()
+                        output[:] = records
+                        barrier.wait()
+
+                def rank_worker(rank):
+                    dist = PairedDist(rank)
+                    helpers = load_helpers(dist)
+                    config = SimpleNamespace(alpha=64, rank=32, initial_adapter_path=None)
+                    try:
+                        fresh = helpers["agree_fresh_trainer_only_lora"](config, None, adapters[rank])
+                    except RuntimeError as error:
+                        return str(error)
+                    if adapters[rank]:
+                        dist.all_gather_object([None, None], {"load": True})
+                    if fresh:
+                        manager = SimpleNamespace(scaling_factors=[2], get_named_parameters_for_run=
+                                                  lambda idx: [("lora_B", torch.zeros(2))])
+                        return helpers["verify_fresh_trainer_only_lora"](manager, config)
+                    return None
+
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    results = list(pool.map(rank_worker, (0, 1)))
+                if adapters == (None, "/resume"):
+                    self.assertEqual(traces, [["eligibility"], ["eligibility"]])
+                    self.assertEqual(results[0], results[1])
+                    self.assertIn("eligibility", results[0])
+                else:
+                    second = "load" if adapters[0] else "evidence"
+                    self.assertEqual(traces, [["eligibility", second]] * 2)
+
     def test_verifier_runs_on_all_trainer_only_lora_ranks_after_load_before_data(self):
         tree = ast.parse(source_path.read_text())
         train = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "train")
@@ -151,15 +202,24 @@ class TrainerOnlyFreshPolicyTest(unittest.TestCase):
                           for call in ast.walk(node))]
         self.assertEqual(len(blocks), 1)
         block = blocks[0]
-        self.assertEqual(ast.unparse(block.test), "trainer_only and config.model.lora is not None")
+        self.assertEqual(ast.unparse(block.test), "fresh_trainer_only_lora")
+        agreement = next(node for node in train.body if isinstance(node, ast.If)
+                         and any(isinstance(call, ast.Call) and ast.unparse(call.func) == "agree_fresh_trainer_only_lora"
+                                 for call in ast.walk(node)))
+        self.assertEqual(ast.unparse(agreement.test), "trainer_only and config.model.lora is not None")
+        resume = next(node for node in train.body if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "resume_adapter" for target in node.targets))
+        self.assertLess(resume.lineno, agreement.lineno)
         calls = [node for node in ast.walk(train) if isinstance(node, ast.Call)]
         for call in calls:
             name = ast.unparse(call.func)
             if name in {"load_initial_lora_adapter", "ckpt_manager.load", "multi_run_manager.create_trainer_only_run"}:
                 self.assertLess(call.lineno, block.lineno)
+            if name in {"load_initial_lora_adapter", "ckpt_manager.load", "multi_run_manager.create_trainer_only_run", "setup_model"}:
+                self.assertLess(agreement.end_lineno, call.lineno)
             if name in {"DataLoader", "FakeDataLoader", "model", "model.forward"}:
                 self.assertLess(block.end_lineno, call.lineno)
-        namespace = {"trainer_only": True, "config": SimpleNamespace(model=SimpleNamespace(lora=object())),
+        namespace = {"fresh_trainer_only_lora": True, "config": SimpleNamespace(model=SimpleNamespace(lora=object())),
                      "multi_run_manager": object(), "checkpoint_step": None, "resume_adapter": None,
                      "verify_fresh_trainer_only_lora": Mock(return_value={"rank_count": 2, "local_b_count": 1,
                           "global_b_count": 2, "nonzero_b_shards": 0, "scale": 2.0}),
@@ -175,7 +235,7 @@ class TrainerOnlyFreshPolicyTest(unittest.TestCase):
                                  "pre-reset nonzero B shards=0", "finite", "scale=2"):
                     self.assertIn(evidence, message)
         namespace["verify_fresh_trainer_only_lora"].reset_mock()
-        namespace["trainer_only"] = False
+        namespace["fresh_trainer_only_lora"] = False
         exec(compile(ast.Module(body=[block], type_ignores=[]), str(source_path), "exec"), namespace)
         namespace["verify_fresh_trainer_only_lora"].assert_not_called()
         self.assertIn("if fresh_lora_policy and progress.step == 1:", source_path.read_text())
