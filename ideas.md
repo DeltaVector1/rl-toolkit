@@ -1,5 +1,27 @@
 # Difficulty ideas
 
+## Pre-batch group progress telemetry
+
+- **Measured production baseline.** The `h200b` snapshot contained 849 trace
+  records (189,742,608 bytes) in 59 groups: 43 complete and 16 partial
+  groups (161 partial rollouts). Of the complete groups, 26 were clean (416
+  possible accepted rollouts) and 17 were invalid and rejected (272
+  rollouts); 70 records were policy-invalid. Policy phase mean was 219.72s /
+  90,434.85, judge mean was 12.65s, and user mean was 3.38s. Rollout metrics
+  stayed at zero until the accepted batch reached 1,024, so status/watch could
+  report no progress while collection was active.
+- **Acceptance.** Add bounded structured INFO telemetry at group finalization
+  or sink accumulation. Expose clean and rejected group totals, accepted
+  buffer count toward 1,024, rejection reason counts, authoritative partial or
+  inflight counts, oldest partial age when available, and already-measured
+  per-stage latency only. Never log prompts, responses, provider text, or infer
+  accepted groups from request counts. Keep reward and training semantics and
+  measurement limits unchanged. Extend `training_ops status` and `watch` to
+  show these counters as pre-batch progress, distinct from accepted batches and
+  steps. Tests must reproduce the 43/26/17 snapshot with empty rollout metrics,
+  verify bounded output and sensitive-content exclusion, and cover parser/sink,
+  reward, status, and dispatcher behavior.
+
 ## vLLM prompt-logprob row chunking
 
 - **Measured failure.** An 8,192-row prompt-logprob request allocates about
