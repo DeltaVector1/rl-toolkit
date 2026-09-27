@@ -96,7 +96,8 @@ class FixedSequenceRescoreTest(unittest.TestCase):
             return self._response(values, body["token_ids"])
 
         if get_json is None:
-            get_json = lambda *_: {"loaded_receipts": {self.model: self.receipt}}
+            def get_json(*_):
+                return {"loaded_receipts": {self.model: self.receipt}}
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "result.json"
             result = fixed.run_rescore(
