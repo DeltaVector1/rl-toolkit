@@ -1211,11 +1211,19 @@ for proc_dir in /proc/[0-9]*; do
 done
 echo "TRAINER_FAIL_WD $trainer_fail_wd"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
-echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
+echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | strip | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
+pipeline_telemetry=$(sudo docker logs --tail 200 __ORCH__ 2>&1 | strip | grep -a 'PIPELINE_TELEMETRY ' | tail -1 || true)
+if [ -n "$pipeline_telemetry" ]; then
+  pipeline_telemetry_value=${pipeline_telemetry##*PIPELINE_TELEMETRY }
+  pipeline_telemetry_value=${pipeline_telemetry_value%%;*}
+  echo "PIPELINE_TELEMETRY $pipeline_telemetry_value"
+fi
+pipeline_telemetry_ts=$(sudo docker logs -t --tail 200 __ORCH__ 2>&1 | strip | grep -a 'PIPELINE_TELEMETRY ' | tail -1 | cut -d' ' -f1 || true)
+echo "PIPELINE_TELEMETRY_AGE $pipeline_telemetry_ts"
 recent_rollouts=$(sudo docker logs --since 5m __ORCH__ 2>&1 || true)
 echo "FAILS5M $(printf '%s\n' "$recent_rollouts" | grep -ai 'Rollout failed' | grep -avi 'rollout is unscored' | wc -l)"
 echo "UNSCORED5M $(printf '%s\n' "$recent_rollouts" | grep -ai 'rollout is unscored' | wc -l)"
-echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | tail -1 | cut -d' ' -f1)"
+echo "ORCH_LOGAGE $(sudo docker logs -t --tail 1 __ORCH__ 2>&1 | strip | tail -1 | cut -d' ' -f1)"
 echo "JUDGE $(curl -s -o /dev/null -m 10 -w '%{http_code}' __JUDGE_URL__/models)"
 if [ "__SECONDARY_JUDGE_ENABLED__" = 1 ]; then
   echo "SECONDARY_JUDGE $(curl -s -o /dev/null -m 10 -w '%{http_code}' __SECONDARY_JUDGE_URL__/models)"
