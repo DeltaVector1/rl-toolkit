@@ -60,7 +60,14 @@ class TrainerComputeProbeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return training_ops._kv(result.stdout)
 
-    def run_trainer_probe(self, log, running="false", exit_code="137"):
+    def run_trainer_probe(
+        self,
+        log,
+        running="false",
+        exit_code="137",
+        orchestrator_log=None,
+        orchestrator_timestamped_log=None,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "sudo").write_text(
@@ -74,6 +81,11 @@ class TrainerComputeProbeTest(unittest.TestCase):
                 "  *adapter*State.Running*) printf '/adapter false exited 0\\n' ;;\n"
                 "  *State.Running*) printf '/orch false exited\\n' ;;\n"
                 "  *State.ExitCode*) printf '%s\\n' \"$TRAINER_EXIT_CODE\" ;;\n"
+                "  *logs*orch*)\n"
+                "    case \"$*\" in\n"
+                "      *-t*) printf '%s\\n' \"$ORCHESTRATOR_TIMESTAMPED_LOG\" ;;\n"
+                "      *) printf '%s\\n' \"$ORCHESTRATOR_LOG\" ;;\n"
+                "    esac ;;\n"
                 "  *logs*) printf '%s\\n' \"$TRAINER_LOG\" ;;\n"
                 "  inspect*) printf '\\n' ;;\n"
                 "esac\n",
@@ -99,6 +111,12 @@ class TrainerComputeProbeTest(unittest.TestCase):
                 "TRAINER_STARTED_AT": "2026-09-08T22:00:00.000000000Z",
                 "TRAINER_RUNNING": running,
                 "TRAINER_EXIT_CODE": exit_code,
+                "ORCHESTRATOR_LOG": log if orchestrator_log is None else orchestrator_log,
+                "ORCHESTRATOR_TIMESTAMPED_LOG": (
+                    log
+                    if orchestrator_timestamped_log is None
+                    else orchestrator_timestamped_log
+                ),
             }
             result = subprocess.run(
                 ["bash", "-c", script],
@@ -186,6 +204,37 @@ class TrainerComputeProbeTest(unittest.TestCase):
         )
         self.assertEqual(report["TRAINER_UP"], "down")
         self.assertEqual(report["TRAINER_FAILED"], "1")
+
+    def test_pipeline_telemetry_strips_ansi_from_marker_and_docker_timestamp(self):
+        telemetry = (
+            "complete_groups=43 clean_groups=26 rejected_groups=17 "
+            "accepted_buffer=624 accepted_target=1024 accepted_unit=rollouts "
+            "partial_groups=16 partial_rollouts=161"
+        )
+        log = (
+            "\x1b[2m2026-09-08T22:00:01.000000000Z\x1b[0m "
+            "\x1b[32mINFO\x1b[0m "
+            f"\x1b[36mPIPELINE_TELEMETRY {telemetry}\x1b[0m"
+        )
+
+        report = self.run_trainer_probe(
+            "2026-09-08T22:00:01Z TRAINER_FORWARD_BACKWARD_START step=2\n",
+            orchestrator_log=log,
+            orchestrator_timestamped_log=log,
+        )
+
+        self.assertEqual(report["PIPELINE_TELEMETRY"], telemetry)
+        self.assertEqual(
+            report["PIPELINE_TELEMETRY_AGE"], "2026-09-08T22:00:01.000000000Z"
+        )
+        progress = training_ops._parse_pipeline_telemetry(
+            report["PIPELINE_TELEMETRY"], report["PIPELINE_TELEMETRY_AGE"]
+        )
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertEqual(progress.accepted_buffer, 624)
+        self.assertNotIn("prompt", report["PIPELINE_TELEMETRY"].lower())
+        self.assertNotIn("provider", report["PIPELINE_TELEMETRY"].lower())
 
     def test_matching_completion_ignores_later_adapter_work(self):
         report = self.run_probe(
