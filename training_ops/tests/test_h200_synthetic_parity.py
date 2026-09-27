@@ -249,15 +249,38 @@ class SyntheticParityTest(unittest.TestCase):
             )
             packed = copy.deepcopy(artifact["packed_reference"])
             individual = copy.deepcopy(artifact["individual_reference"])
-            packed["trainer_logprobs"] = list(packed["inference_logprobs"])
-            for microbatch in individual["microbatches"]:
-                microbatch["trainer_logprobs"] = list(microbatch["inference_logprobs"])
+            packed_reference = packed.pop("inference_logprobs")
+            packed["reference_logprobs"] = packed_reference
+            packed["trainer_logprobs"] = [
+                value + (0.0002 if flag else 5.0)
+                for value, flag in zip(packed_reference, packed["loss_mask"])
+            ]
+            for index, microbatch in enumerate(individual["microbatches"]):
+                microbatch["microbatch_index"] = index
+                microbatch["microbatch_count"] = 5
+                reference_values = microbatch.pop("inference_logprobs")
+                microbatch["reference_logprobs"] = reference_values
+                microbatch["trainer_logprobs"] = [
+                    value + (0.0002 if flag else 5.0)
+                    for value, flag in zip(reference_values, microbatch["loss_mask"])
+                ]
             report = synthetic.compare_packed_individual(packed, individual)
             self.assertEqual(report["token_count"], 32768)
-            self.assertEqual(report["totals"]["packed_vs_individual"]["mismatch_count"], 0)
+            self.assertEqual(report["totals"]["packed_vs_individual"]["count"], 32763)
+            self.assertEqual(report["totals"]["packed_vs_reference"]["count"], 32763)
+            self.assertEqual(report["totals"]["packed_vs_reference"]["mismatch_count"], 32763)
+            self.assertGreater(report["totals"]["packed_vs_reference"]["mean_kl"], 0.0)
             individual["microbatches"][0]["input_ids"][1] += 1
             with self.assertRaisesRegex(synthetic.SyntheticParityError, "input IDs"):
                 synthetic.compare_packed_individual(packed, individual)
+
+    def test_endpoint_requires_exact_serialized_generate_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(synthetic.SyntheticParityError, "inference/v1/generate"):
+                synthetic.build_artifact(
+                    endpoint="http://h200/v1/generate",
+                    output_dir=Path(directory),
+                )
 
     def test_configs_are_native_fp8_no_lora_and_keep_gates(self):
         config_root = ROOT / "configs/trinity-h200-synthetic-packed-parity"

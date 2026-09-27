@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -424,6 +425,25 @@ def _individual_reference(
     }
 
 
+def _endpoint_url(endpoint: str) -> str:
+    """Require the exact serialized H200 generate endpoint path."""
+    if not isinstance(endpoint, str) or not endpoint:
+        raise SyntheticParityError("H200 generate endpoint is required")
+    value = endpoint.rstrip("/")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.path != "/inference/v1/generate"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise SyntheticParityError(
+            "endpoint must be the serialized /inference/v1/generate URL"
+        )
+    return value
+
+
 def _artifact_paths(output_dir: Path) -> dict[str, Path]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -494,8 +514,7 @@ def build_artifact(
     post_json: Callable[[str, Mapping[str, Any], float], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Request and write one deterministic packed/individual artifact bundle."""
-    if not isinstance(endpoint, str) or not endpoint:
-        raise SyntheticParityError("H200 generate endpoint is required")
+    endpoint = _endpoint_url(endpoint)
     if output_dir is None:
         if output_path is None:
             raise SyntheticParityError("synthetic parity output_dir is required")
@@ -755,19 +774,34 @@ def _numeric_array(value: Any, label: str, count: int) -> list[float]:
     return result
 
 
-def _stats(left: Sequence[float], right: Sequence[float]) -> dict[str, float | int]:
+def _stats(
+    left: Sequence[float],
+    right: Sequence[float],
+    *,
+    include_kl: bool = False,
+) -> dict[str, float | int]:
     if len(left) != len(right) or not left:
         raise SyntheticParityError("comparison arrays are not aligned")
     differences = sorted(abs(float(a) - float(b)) for a, b in zip(left, right))
-    mismatch_count = sum(delta != 0.0 for delta in differences)
+    mismatch_count = sum(delta > 1e-4 for delta in differences)
     p95_index = min(len(differences) - 1, math.ceil(len(differences) * 0.95) - 1)
-    return {
+    result: dict[str, float | int] = {
         "mean_abs": sum(differences) / len(differences),
         "p95_abs": differences[p95_index],
         "max_abs": differences[-1],
         "mismatch_count": mismatch_count,
         "count": len(differences),
     }
+    if include_kl:
+        kl_values = []
+        for actual, reference in zip(left, right):
+            delta = float(actual) - float(reference)
+            try:
+                kl_values.append(math.exp(delta) - delta - 1.0)
+            except OverflowError:
+                kl_values.append(float("inf"))
+        result["mean_kl"] = sum(kl_values) / len(kl_values)
+    return result
 
 
 def compare_packed_individual(
@@ -860,8 +894,15 @@ def compare_packed_individual(
         actual_ids = padded_ids[:length]
         if actual_ids != packed_ids[offset : offset + length]:
             raise SyntheticParityError(f"individual input IDs differ at sequence {index}")
+        if (
+            microbatch.get("microbatch_index", index) != index
+            or microbatch.get("microbatch_count", SEQUENCE_COUNT) != SEQUENCE_COUNT
+        ):
+            raise SyntheticParityError("individual microbatch index/count is not bound")
         ref_values = _numeric_array(
-            microbatch.get("inference_logprobs"),
+            microbatch.get(
+                "reference_logprobs", microbatch.get("inference_logprobs")
+            ),
             f"individual reference logprobs {index}",
             max(SEQUENCE_LENGTHS),
         )
@@ -880,20 +921,44 @@ def compare_packed_individual(
     sequence_reports = []
     for item in offsets:
         start, end = item["start"], item["end"]
+        valid_start = start + 1
         sequence_reports.append(
             {
                 **item,
                 "packed_vs_individual": _stats(
-                    packed_trainer[start:end], individual_trainer[start:end]
+                    packed_trainer[valid_start:end], individual_trainer[valid_start:end]
                 ),
                 "packed_vs_reference": _stats(
-                    packed_trainer[start:end], packed_reference[start:end]
+                    packed_trainer[valid_start:end],
+                    packed_reference[valid_start:end],
+                    include_kl=True,
                 ),
                 "individual_vs_reference": _stats(
-                    individual_trainer[start:end], individual_reference[start:end]
+                    individual_trainer[valid_start:end],
+                    individual_reference[valid_start:end],
+                    include_kl=True,
                 ),
             }
         )
+    packed_valid = [value for value, flag in zip(packed_trainer, packed_mask) if flag]
+    packed_reference_valid = [value for value, flag in zip(packed_reference, packed_mask) if flag]
+    individual_valid = []
+    individual_reference_valid = []
+    for index, length in enumerate(SEQUENCE_LENGTHS):
+        microbatch = microbatches[index]
+        mask = microbatch["loss_mask"]
+        trainer_values = _numeric_array(
+            microbatch.get("trainer_logprobs", microbatch.get("reference_logprobs")),
+            f"individual trainer logprobs {index}",
+            max(SEQUENCE_LENGTHS),
+        )
+        reference_values = _numeric_array(
+            microbatch.get("reference_logprobs", microbatch.get("inference_logprobs")),
+            f"individual reference logprobs {index}",
+            max(SEQUENCE_LENGTHS),
+        )
+        individual_valid.extend(value for value, flag in zip(trainer_values, mask) if flag)
+        individual_reference_valid.extend(value for value, flag in zip(reference_values, mask) if flag)
     return {
         "schema_version": 1,
         "diagnostic_name": DIAGNOSTIC_NAME,
@@ -901,9 +966,13 @@ def compare_packed_individual(
         "token_count": TOTAL_TOKENS,
         "sequences": sequence_reports,
         "totals": {
-            "packed_vs_individual": _stats(packed_trainer, individual_trainer),
-            "packed_vs_reference": _stats(packed_trainer, packed_reference),
-            "individual_vs_reference": _stats(individual_trainer, individual_reference),
+            "packed_vs_individual": _stats(packed_valid, individual_valid),
+            "packed_vs_reference": _stats(
+                packed_valid, packed_reference_valid, include_kl=True
+            ),
+            "individual_vs_reference": _stats(
+                individual_valid, individual_reference_valid, include_kl=True
+            ),
         },
     }
 
