@@ -67,9 +67,51 @@ def test_stage_uses_h200_admin_root_contract_and_exact_identity():
             request=request,
         )
 
-    result = run_remote(handler, request("stage"))
+    result = run_remote(handler, request("stage", expected_identity=IDENTITY))
     assert result == {"ok": True, "result": {"status": "ok", "adapter_identity": IDENTITY}}
     assert len(seen) == 1
+
+
+def test_stage_rejects_same_source_and_size_with_different_sha_before_load():
+    seen = []
+    stale = dict(IDENTITY, target_sha256="c" * 64)
+
+    def handler(request):
+        seen.append(request.url.path)
+        if request.url.path == "/stage_lora_adapter":
+            return httpx.Response(
+                200,
+                json={"status": "ok", "adapter_identity": stale},
+                request=request,
+            )
+        pytest.fail("load request issued after staged identity mismatch")
+
+    result = run_remote(handler, request("stage", expected_identity=IDENTITY))
+    assert result["ok"] is False
+    assert result["category"] == "identity"
+    assert seen == ["/stage_lora_adapter"]
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["stage", "load"],
+)
+@pytest.mark.parametrize(
+    "expected_identity",
+    [None, {**IDENTITY, "target_sha256": "not-a-sha"}],
+)
+def test_stage_and_load_require_valid_expected_identity(operation, expected_identity):
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(200, json={}, request=request)
+
+    extra = {} if expected_identity is None else {"expected_identity": expected_identity}
+    result = run_remote(handler, request(operation, **extra))
+    assert result["ok"] is False
+    assert result["category"] == "identity"
+    assert seen == []
 
 
 def test_load_uses_exact_payload_and_checks_staging_status_receipt():
