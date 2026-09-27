@@ -1,4 +1,5 @@
 import gzip
+import copy
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import training_ops
 from training_ops import (
     Refused,
     _policy0_controller_transfer_reference,
@@ -16,6 +18,7 @@ from training_ops import (
     _policy0_reference_seed_prepare_script,
     _policy0_qualification_verify_script,
     _policy0_transfer_reference_script,
+    _guard_post_update_config_dir,
     prepare_policy0_qualification,
 )
 from training_ops.runtime.h200.prepare_trinity_policy0_qualification import (
@@ -23,6 +26,8 @@ from training_ops.runtime.h200.prepare_trinity_policy0_qualification import (
     validate_lora_config,
     validate_reference,
 )
+from training_ops.runtime.h200.post_update_qualification import build_post_update_references
+from training_ops.tests.test_h200_post_update_reference import H200PostUpdateReferenceTest
 
 
 EXPECTED_LORA = {
@@ -190,6 +195,82 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
             )
         self.assertNotIn("post_update_reference_identity", plan)
         self.assertIn("reference is not policy-0", plan["source_reference_script"])
+
+    def test_post_update_config_alias_and_symlink_components_are_rejected(self):
+        with self.assertRaisesRegex(Refused, "canonical config directory"):
+            _guard_post_update_config_dir(
+                "configs/trinity-h200-post-update-qualification/"
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            canonical = root / "configs" / "trinity-h200-post-update-qualification"
+            canonical.mkdir(parents=True)
+            (canonical / "trainer.toml").write_text("[data.fake]\n")
+            alias = root / "configs" / "post-update-alias"
+            alias.symlink_to(canonical, target_is_directory=True)
+            with patch.object(training_ops, "repo_root", root):
+                with self.assertRaisesRegex(Refused, "canonical config directory"):
+                    _guard_post_update_config_dir("configs/post-update-alias")
+
+    def test_remote_collection_validator_rejects_recalculated_mutations(self):
+        case = H200PostUpdateReferenceTest()
+        receipt = case.receipt()
+        records = []
+        responses = []
+        for index in range(8):
+            record = case.input_record()
+            record["input_ids"] = [token + index * 10000 for token in record["input_ids"]]
+            records.append(record)
+            response = case.response()
+            response["request_id"] = f"server-response-{index}"
+            response["choices"][0]["token_ids"] = [10000 + index * 100 + token for token in range(32)]
+            response["choices"][0]["logprobs"]["content"] = [
+                {"token": f"token_id:{token}", "logprob": -0.25}
+                for token in response["choices"][0]["token_ids"]
+            ]
+            responses.append(response)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "reference.json"
+            build_post_update_references(
+                endpoint="http://h200b:18100/inference/v1/generate",
+                input_records=records,
+                output_path=output,
+                base_model="/data/trinity-thinking-fp8",
+                policy_model="policy-0-slot0",
+                expected_policy_identity=receipt,
+                policy_receipt=receipt,
+                cache_salt="fresh-post-update-decode",
+                readiness_endpoint="http://h200b:18100/inference/v1/staging-status",
+                post_json=lambda *_: responses.pop(0),
+                get_json=lambda *_: receipt,
+            )
+            original = json.loads(output.read_text(encoding="utf-8"))
+            for label, mutate in (
+                ("receipt", lambda item: item["policy_identity"]["server_instance"] == "stale"),
+                ("binding", lambda item: item["qualification_binding"].__setitem__("receipt_sha256", "0" * 64)),
+                ("advantage", lambda item: item["advantages"].__setitem__(0, False)),
+                ("prompt_logprob", lambda item: item["inference_logprobs"].__setitem__(0, 0.5)),
+            ):
+                changed = copy.deepcopy(original)
+                if label == "receipt":
+                    changed["microbatches"][0]["policy_identity"]["server_instance"] = "stale"
+                    changed["microbatches"][0]["policy_identity_before"]["server_instance"] = "stale"
+                    changed["microbatches"][0]["policy_identity_after"]["server_instance"] = "stale"
+                else:
+                    mutate(changed["microbatches"][0])
+                output.write_text(json.dumps(changed, separators=(",", ":")) + "\n")
+                expected = dict(POST_UPDATE_IDENTITY)
+                expected["final_reference_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
+                expected["final_reference_size"] = output.stat().st_size
+                script = training_ops._post_update_reference_source_verify_script(
+                    str(output),
+                    {"sha256": receipt["target_sha256"], "size": receipt["target_size"]},
+                    {"sha256": receipt["config_sha256"], "size": receipt["config_size"]},
+                    expected,
+                )
+                result = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0, label)
 
     def test_api_requires_expected_old_pair(self):
         kwargs = {

@@ -207,6 +207,38 @@ def _config_dir(
     return selected
 
 
+_POST_UPDATE_CONFIG_DIR = "configs/trinity-h200-post-update-qualification"
+
+
+def _guard_post_update_config_dir(config_dir: str) -> None:
+    """Reject aliases and symlink components for the strict post-update config."""
+    if not isinstance(config_dir, str):
+        return
+    path = Path(config_dir)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return
+    try:
+        resolved_trainer = (repo_root / path / "trainer.toml").resolve()
+        canonical_trainer = (
+            repo_root / _POST_UPDATE_CONFIG_DIR / "trainer.toml"
+        ).resolve()
+    except OSError:
+        return
+    if resolved_trainer != canonical_trainer:
+        return
+    if config_dir != _POST_UPDATE_CONFIG_DIR:
+        raise Refused(
+            "post-update qualification requires the canonical config directory"
+        )
+    current = repo_root
+    for component in Path(_POST_UPDATE_CONFIG_DIR).parts:
+        current /= component
+        if current.is_symlink():
+            raise Refused(
+                "post-update qualification config path contains a symlink component"
+            )
+
+
 def _selected_inference_config(selected: dict) -> str:
     inference = selected.get("inference")
     if not isinstance(inference, str) or not (repo_root / inference).is_file():
@@ -7701,6 +7733,15 @@ def _post_update_reference_source_verify_script(
         "        fail(label + ' route data is invalid')\n"
         "    if len(canonical_bytes) != 8191 * 60 * 4 or hashlib.sha256(canonical_bytes).hexdigest() != canonical['sha256']:\n"
         "        fail(label + ' route checksum is invalid')\n"
+        "    row_width = 60 * 4\n"
+        "    for offset in range(0, len(canonical_bytes), row_width):\n"
+        "        row = canonical_bytes[offset:offset + row_width]\n"
+        "        if any(row[:6 * 4]):\n"
+        "            fail(label + ' dense route IDs are invalid')\n"
+        "        for layer in range(6, 60):\n"
+        "            selected = row[layer * 4:(layer + 1) * 4]\n"
+        "            if len(set(selected)) != len(selected) or any(value >= 256 for value in selected):\n"
+        "                fail(label + ' sparse route IDs are invalid')\n"
         "    if not isinstance(raw, dict) or set(raw) != {'data', 'dtype', 'shape', 'start'} or raw.get('dtype') != 'uint8' or raw.get('shape') != [8191, 60, 4] or raw.get('start') != 0:\n"
         "        fail(label + ' response route is invalid')\n"
         "    try:\n"
@@ -7737,13 +7778,20 @@ def _post_update_reference_source_verify_script(
         "    logs = item.get('inference_logprobs')\n"
         "    if not isinstance(ids, list) or len(ids) != 8192 or any(type(token) is not int for token in ids) or item.get('sequence_lengths') != [8192] or mask != [False] * 8160 + [True] * 32 or not isinstance(advantages, list) or len(advantages) != 8192 or not isinstance(logs, list) or len(logs) != 8192:\n"
         "        fail(label + ' token alignment is invalid')\n"
+        "    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in advantages):\n"
+        "        fail(label + ' advantages are not finite numeric values')\n"
         "    if any(value != 0.0 for value in advantages[:8160]) or any(value != 1.0 for value in advantages[8160:]):\n"
         "        fail(label + ' advantages are not strict prompt-zero completion-one values')\n"
         "    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in logs):\n"
         "        fail(label + ' inference logprobs are invalid')\n"
+        "    if any(value != 0.0 for value in logs[:8160]):\n"
+        "        fail(label + ' prompt inference logprobs are not zero')\n"
+        "    source_hash = hashlib.sha256(json.dumps(ids[:8160], separators=(',', ':')).encode()).hexdigest()\n"
+        "    if item.get('source_input_sha256') != source_hash:\n"
+        "        fail(label + ' source input hash differs')\n"
         "    before = item.get('policy_identity_before')\n"
         "    after = item.get('policy_identity_after')\n"
-        "    if not isinstance(before, dict) or before != after or before.get('server_instance') != expected['server_instance'] or before.get('target_sha256') != expected['adapter_sha256'] or before.get('target_size') != expected['adapter_size'] or before.get('config_sha256') != expected['config_sha256'] or before.get('config_size') != expected['config_size']:\n"
+        "    if not isinstance(before, dict) or before != after or item.get('policy_identity') != before or before.get('server_instance') != expected['server_instance'] or before.get('target_sha256') != expected['adapter_sha256'] or before.get('target_size') != expected['adapter_size'] or before.get('config_sha256') != expected['config_sha256'] or before.get('config_size') != expected['config_size']:\n"
         "        fail(label + ' policy receipt is stale or differs from caller contract')\n"
         "    if not isinstance(item.get('cache_salt'), str) or not item['cache_salt']:\n"
         "        fail(label + ' cache salt is missing')\n"
@@ -7775,7 +7823,7 @@ def _post_update_reference_source_verify_script(
         "        fail(label + ' generated response logprobs are not bound')\n"
         "    check_route(item.get('routed_experts'), choices[0].get('routed_experts'), label)\n"
         "    binding = item.get('qualification_binding')\n"
-        "    if (not isinstance(binding, dict) or binding.get('client_request_id') != client_id or binding.get('server_response_id') != server_id or binding.get('request_sha256') != item['request_sha256']['decode'] or binding.get('response_sha256') != item['response_sha256']['decode'] or binding.get('input_sha256') != hashlib.sha256(json.dumps(ids[:8160], separators=(',', ':')).encode()).hexdigest() or binding.get('server_instance') != expected['server_instance'] or binding.get('adapter_sha256') != expected['adapter_sha256'] or binding.get('adapter_size') != expected['adapter_size'] or binding.get('config_sha256') != expected['config_sha256'] or binding.get('config_size') != expected['config_size']):\n"
+        "    if (not isinstance(binding, dict) or binding.get('seq_len') != 8192 or binding.get('prompt_tokens') != 8160 or binding.get('completion_tokens') != 32 or binding.get('mask_false') != 8160 or binding.get('mask_true') != 32 or binding.get('request_mode') != 'serialized_generate_completion_logprobs' or binding.get('client_request_id') != client_id or binding.get('server_response_id') != server_id or binding.get('request_sha256') != item['request_sha256']['decode'] or binding.get('response_sha256') != item['response_sha256']['decode'] or binding.get('input_sha256') != hashlib.sha256(json.dumps(ids[:8160], separators=(',', ':')).encode()).hexdigest() or binding.get('full_input_sha256') != digest(ids) or binding.get('policy_receipt') != before or binding.get('receipt_sha256') != digest(before) or binding.get('server_instance') != expected['server_instance'] or binding.get('server_instance_sha256') != hashlib.sha256(expected['server_instance'].encode()).hexdigest() or binding.get('adapter_sha256') != expected['adapter_sha256'] or binding.get('adapter_size') != expected['adapter_size'] or binding.get('config_sha256') != expected['config_sha256'] or binding.get('config_size') != expected['config_size'] or binding.get('route_shape') != [8191, 60, 4] or binding.get('route_sha256') != item.get('routed_experts', {}).get('sha256') or binding.get('advantage_value') != 1.0):\n"
         "        fail(label + ' qualification binding differs')\n"
         "    if item.get('client_request_id') != client_id or item.get('server_response_id') != server_id:\n"
         "        fail(label + ' top-level request or response ID differs')\n"
@@ -8913,6 +8961,7 @@ def prepare_policy0_qualification(
     expected_old_reference_size: int | None = None,
 ) -> dict[str, object]:
     """Preflight or stage exact policy-0 files on every configured trainer."""
+    _guard_post_update_config_dir(config_dir)
     selected = _config_dir(config_dir)
     if "orchestrator" in selected:
         raise Refused("policy-0 qualification staging accepts a trainer-only config")
@@ -8923,7 +8972,7 @@ def prepare_policy0_qualification(
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise Refused(f"cannot read qualification config {trainer_path}: {error}") from error
     post_update_identity = None
-    if selected.get("trainer") == "configs/trinity-h200-post-update-qualification/trainer.toml":
+    if selected.get("trainer") == f"{_POST_UPDATE_CONFIG_DIR}/trainer.toml":
         post_update_identity = _post_update_reference_identity()
     data = config.get("data", {}).get("fake", {})
     reference_path = data.get("reference_path")
