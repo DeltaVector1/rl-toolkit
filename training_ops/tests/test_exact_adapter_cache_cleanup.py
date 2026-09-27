@@ -69,7 +69,7 @@ def write_cache(
                     "raw_sha256": chunk_hash,
                     "raw_size": 1,
                     "wire_sha256": chunk_hash,
-                    "wire_size": 1 if index < 985 else 6382335838 - 985,
+                    "wire_size": 1 if index < 985 else 6382288128 - 985,
                 }
             )
         transport = {
@@ -313,6 +313,14 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
                 adapter_cache_cleanup.validate_directory(
                     target, source_url=SOURCE, expected_key=KEY
                 )
+
+    def test_measured_transport_wire_total_is_6382288128(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = write_cache(Path(directory), transport_manifest=True)
+            identity = adapter_cache_cleanup.validate_directory(
+                target, source_url=SOURCE, expected_key=KEY
+            )
+            self.assertEqual(identity, (target.stat().st_dev, target.stat().st_ino))
 
     def test_fresh_preflight_uses_nested_production_cache_key(self):
         selected = {
