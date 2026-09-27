@@ -631,11 +631,18 @@ class FakeDataLoaderConfig(BaseConfig):
     reference_path: Path | None = None
     """Use deterministic token IDs and aligned reference log probabilities from this JSON file."""
 
+    allow_variable_length: StrictBool = False
+    """Allow bounded schema-v2 reference lengths for pipeline padding diagnostics."""
+
     export_final_adapter: bool = False
     """Write the final LoRA adapter for an inference qualification."""
 
     @model_validator(mode="after")
     def validate_grouped_samples(self):
+        if self.allow_variable_length and (
+            self.reference_path is None or self.generate_samples or self.ce_only
+        ):
+            raise ValueError("variable-length fake data requires a reference and no generated or CE-only samples")
         if (self.samples_per_micro_batch is None) != (self.group_size is None):
             raise ValueError(
                 "samples_per_micro_batch and group_size must be set together"
@@ -856,6 +863,13 @@ class TrainerConfig(BaseConfig):
                 raise ValueError(
                     "Tracing more than 10 steps is not recommended as your trace will be massive. Remove this line if you really want to trace more steps."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_variable_length_fake_data(self):
+        if self.data.fake and self.data.fake.allow_variable_length:
+            if self.model.pp <= 1 or self.model.seq_len % self.model.cp:
+                raise ValueError("variable-length fake references require PP and a CP-divisible seq_len")
         return self
 
     @model_validator(mode="after")

@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TypedDict
@@ -185,6 +186,47 @@ class FakeDataLoader:
             if config.reference_path is not None
             else None
         )
+        variable_length = getattr(config, "allow_variable_length", False)
+        if variable_length:
+            if (
+                not isinstance(reference_payload, dict)
+                or type(reference_payload.get("schema_version")) is not int
+                or reference_payload.get("schema_version") != 2
+                or self.generate_samples
+                or self.ce_only
+            ):
+                raise ValueError("variable-length fake references require schema-v2 and reference-only data")
+            records = reference_payload.get("microbatches")
+            if (
+                not isinstance(records, list)
+                or len(records) != self.num_micro_batches
+                or not all(isinstance(record, dict) for record in records)
+            ):
+                raise ValueError("variable-length references require one object per microbatch")
+            lengths = [len(record.get("input_ids", [])) for record in records]
+            if any(not 0 < length <= self.seq_len for length in lengths) or self.seq_len not in lengths:
+                raise ValueError("variable-length references require positive bounded lengths and a full-length record")
+            for record, length in zip(records, lengths):
+                segments = record.get("sequence_lengths")
+                if (
+                    not isinstance(segments, list)
+                    or any(type(item) is not int or item <= 0 for item in segments)
+                    or sum(segments) != length
+                ):
+                    raise ValueError("variable-length reference sequence lengths are invalid")
+                if not isinstance(record.get("input_ids"), list) or any(
+                    type(item) is not int or item < 0 for item in record["input_ids"]
+                ):
+                    raise ValueError("variable-length reference token IDs are invalid")
+                mask = record.get("loss_mask")
+                scores = record.get("inference_logprobs")
+                if (
+                    not isinstance(mask, list) or len(mask) != length
+                    or any(type(item) is not bool for item in mask)
+                    or not isinstance(scores, list) or len(scores) != length
+                    or any(type(item) not in (int, float) or not math.isfinite(item) for item in scores)
+                ):
+                    raise ValueError("variable-length reference mask or scores are invalid")
         self.references = None
         if reference_payload is not None:
             self.references = reference_payload.get("microbatches", [reference_payload])
@@ -203,7 +245,7 @@ class FakeDataLoader:
             raise ValueError("fake reference_path and ce_only are mutually exclusive")
         for reference in self.references or ():
             token_count = len(reference["input_ids"])
-            if token_count != self.seq_len:
+            if not variable_length and token_count != self.seq_len:
                 raise ValueError(
                     f"fake reference has {token_count} tokens, expected seq_len={self.seq_len}"
                 )
