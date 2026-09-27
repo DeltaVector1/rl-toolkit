@@ -23,7 +23,7 @@ import tomllib
 import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlsplit
 
@@ -865,6 +865,96 @@ def _parse_seconds(value: str) -> float | None:
     return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
+_PREBATCH_INT_FIELDS = frozenset(
+    {
+        "complete_groups",
+        "clean_groups",
+        "rejected_groups",
+        "rejected_rollouts",
+        "policy_invalid_rollouts",
+        "accepted_buffer",
+        "accepted_target",
+        "accepted_buffer_tokens",
+        "partial_groups",
+        "partial_rollouts",
+        "inflight_train",
+        "reject_stale_policy",
+        "reject_errored_group",
+        "reject_trainer_seq_len_group",
+        "reject_untrainable_group",
+        "reject_zero_advantage_group",
+    }
+)
+
+
+def _parse_pipeline_telemetry(
+    value: str,
+    progress_timestamp: str = "",
+) -> "PreBatchProgress | None":
+    """Parse only the fixed numeric pipeline telemetry schema."""
+    parsed: dict[str, int] = {}
+    unit: str | None = None
+    partial_age: float | None = None
+    for token in value.split():
+        key, separator, raw = token.partition("=")
+        if not separator or not key or not raw:
+            return None
+        if key in _PREBATCH_INT_FIELDS:
+            if key in parsed or not re.fullmatch(r"[0-9]+", raw):
+                return None
+            parsed[key] = int(raw)
+        elif key == "accepted_unit":
+            if raw not in {"rollouts", "tokens"} or unit is not None:
+                return None
+            unit = raw
+        elif key == "oldest_partial_age_seconds":
+            if partial_age is not None:
+                return None
+            try:
+                partial_age = float(raw)
+            except ValueError:
+                return None
+            if not math.isfinite(partial_age) or partial_age < 0:
+                return None
+        else:
+            return None
+    required = {
+        "complete_groups",
+        "clean_groups",
+        "rejected_groups",
+        "accepted_buffer",
+        "accepted_target",
+        "partial_groups",
+        "partial_rollouts",
+    }
+    if not required.issubset(parsed) or unit is None:
+        return None
+    if any(parsed.get(name, 0) < 0 for name in parsed):
+        return None
+    return PreBatchProgress(
+        available=True,
+        complete_groups=parsed["complete_groups"],
+        clean_groups=parsed["clean_groups"],
+        rejected_groups=parsed["rejected_groups"],
+        rejected_rollouts=parsed.get("rejected_rollouts", 0),
+        policy_invalid_rollouts=parsed.get("policy_invalid_rollouts", 0),
+        accepted_buffer=parsed["accepted_buffer"],
+        accepted_target=parsed["accepted_target"],
+        accepted_unit=unit,
+        accepted_buffer_tokens=parsed.get("accepted_buffer_tokens", 0),
+        partial_groups=parsed["partial_groups"],
+        partial_rollouts=parsed["partial_rollouts"],
+        inflight_train=parsed.get("inflight_train"),
+        oldest_partial_age_seconds=partial_age,
+        progress_age_seconds=_age(progress_timestamp),
+        rejection_reasons={
+            key.removeprefix("reject_"): value
+            for key, value in parsed.items()
+            if key.startswith("reject_")
+        },
+    )
+
+
 def _select_active_reward_rows(
     rows: list[dict],
     requested_run: str,
@@ -991,6 +1081,14 @@ esac
 echo "TRAINER_FAILED $trainer_failed"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
+pipeline_telemetry=$(sudo docker logs --tail 200 __ORCH__ 2>&1 | grep -a 'PIPELINE_TELEMETRY ' | tail -1 || true)
+if [ -n "$pipeline_telemetry" ]; then
+  pipeline_telemetry_value=${pipeline_telemetry##*PIPELINE_TELEMETRY }
+  pipeline_telemetry_value=${pipeline_telemetry_value%%;*}
+  echo "PIPELINE_TELEMETRY $pipeline_telemetry_value"
+fi
+pipeline_telemetry_ts=$(sudo docker logs -t --tail 200 __ORCH__ 2>&1 | grep -a 'PIPELINE_TELEMETRY ' | tail -1 | cut -d' ' -f1 || true)
+echo "PIPELINE_TELEMETRY_AGE $pipeline_telemetry_ts"
 recent_rollouts=$(sudo docker logs --since 5m __ORCH__ 2>&1 || true)
 echo "FAILS5M $(printf '%s\n' "$recent_rollouts" | grep -ai 'Rollout failed' | grep -avi 'rollout is unscored' | wc -l)"
 echo "UNSCORED5M $(printf '%s\n' "$recent_rollouts" | grep -ai 'rollout is unscored' | wc -l)"
@@ -1431,8 +1529,8 @@ class AcceptanceReport:
     batch_size: int | None = None
     group_size: int | None = None
     context_length: int | None = None
-    max_output_lengths: list[int] = field(default_factory=list)
-    learning_rates: list[float] = field(default_factory=list)
+    max_output_lengths: list[int] = dataclass_field(default_factory=list)
+    learning_rates: list[float] = dataclass_field(default_factory=list)
     max_norm: float | None = None
     weight_decay: float | None = None
     native_fp8: bool | None = None
@@ -1442,11 +1540,11 @@ class AcceptanceReport:
     trainer_compute_seconds: float | None = None
     rollout_generation_step: int | None = None
     rollout_generation_seconds: float | None = None
-    rollout_generation_startup_steps: list[int] = field(default_factory=list)
+    rollout_generation_startup_steps: list[int] = dataclass_field(default_factory=list)
     large_batch_evidence: bool = False
     reward_verdict: str = "no data"
-    failures: dict[str, int] = field(default_factory=dict)
-    alarms: list[str] = field(default_factory=list)
+    failures: dict[str, int] = dataclass_field(default_factory=dict)
+    alarms: list[str] = dataclass_field(default_factory=list)
 
     @property
     def passed(self) -> bool:
@@ -1527,6 +1625,55 @@ class AcceptanceReport:
 
 
 @dataclass
+class PreBatchProgress:
+    """Prompt-free collection progress before a trainer batch is accepted."""
+
+    available: bool = False
+    complete_groups: int = 0
+    clean_groups: int = 0
+    rejected_groups: int = 0
+    rejected_rollouts: int = 0
+    policy_invalid_rollouts: int = 0
+    accepted_buffer: int = 0
+    accepted_target: int = 0
+    accepted_unit: str = "rollouts"
+    accepted_buffer_tokens: int = 0
+    partial_groups: int = 0
+    partial_rollouts: int = 0
+    inflight_train: int | None = None
+    oldest_partial_age_seconds: float | None = None
+    progress_age_seconds: float | None = None
+    rejection_reasons: dict[str, int] = dataclass_field(default_factory=dict)
+
+    def report(self) -> str:
+        if not self.available:
+            return "  pre-batch progress: no telemetry"
+        target = self.accepted_target or "?"
+        reasons = ", ".join(
+            f"{name}={count}"
+            for name, count in sorted(self.rejection_reasons.items())
+            if count
+        ) or "none"
+        partial_age = (
+            f", oldest partial {_hms(self.oldest_partial_age_seconds)}"
+            if self.oldest_partial_age_seconds is not None
+            else ""
+        )
+        last_age = _hms(self.progress_age_seconds)
+        return (
+            "  pre-batch progress: "
+            f"groups complete={self.complete_groups} clean={self.clean_groups} "
+            f"rejected={self.rejected_groups} "
+            f"accepted buffer={self.accepted_buffer}/{target} {self.accepted_unit} "
+            f"({self.accepted_buffer_tokens} tokens), "
+            f"partial={self.partial_groups} groups/{self.partial_rollouts} rollouts"
+            f"{f', inflight train={self.inflight_train}' if self.inflight_train is not None else ''}"
+            f"{partial_age}, policy-invalid={self.policy_invalid_rollouts}, "
+            f"rejection reasons: {reasons}; last progress {last_age} ago"
+        )
+
+
+@dataclass
 class Status:
     when: str = ""
     run: str = ""
@@ -1551,6 +1698,7 @@ class Status:
     trainer_current: str = ""
     orch_last: str = ""
     batch: str = ""
+    prebatch: PreBatchProgress = dataclass_field(default_factory=PreBatchProgress)
     fails_5m: int = 0
     unscored_5m: int = 0
     trainer_log_age: float | None = None
@@ -1560,10 +1708,10 @@ class Status:
     adapter: str = "000"
     direct_route: str = "unknown"
     zmq_tunnel: bool = False
-    nodes: list[NodeState] = field(default_factory=list)
-    engines: list[EngineState] = field(default_factory=list)
-    warnings: list[str] = field(default_factory=list)
-    acceptance_alarms: list[str] = field(default_factory=list)
+    nodes: list[NodeState] = dataclass_field(default_factory=list)
+    engines: list[EngineState] = dataclass_field(default_factory=list)
+    warnings: list[str] = dataclass_field(default_factory=list)
+    acceptance_alarms: list[str] = dataclass_field(default_factory=list)
 
     def report(self) -> str:
         L = [f"{self.when} UTC | run {self.run}"]
@@ -1602,6 +1750,7 @@ class Status:
             f"run steps {self.trainer_steps} | rollout failures in 5m {self.fails_5m} | "
             f"unscored rollouts in 5m {self.unscored_5m} | {self.batch or 'no batch line'}"
         )
+        L.append(self.prebatch.report())
         if self.trainer_compute_state == "unknown":
             compute = "unknown"
         elif (
@@ -2986,6 +3135,8 @@ def status(run: str = "", quiet: bool = False) -> Status:
         "TRAINER_FAIL_WD",
         "ORCH_LAST",
         "BATCH",
+        "PIPELINE_TELEMETRY",
+        "PIPELINE_TELEMETRY_AGE",
         "FAILS5M",
         "UNSCORED5M",
         "ORCH_LOGAGE",
@@ -3031,6 +3182,12 @@ def status(run: str = "", quiet: bool = False) -> Status:
     s.trainer_failed = int(h.get("TRAINER_FAILED", 0) or 0) > 0
     s.orch_last = h.get("ORCH_LAST", "")
     s.batch = h.get("BATCH", "")
+    if h.get("PIPELINE_TELEMETRY"):
+        parsed_prebatch = _parse_pipeline_telemetry(
+            h["PIPELINE_TELEMETRY"], h.get("PIPELINE_TELEMETRY_AGE", "")
+        )
+        if parsed_prebatch is not None:
+            s.prebatch = parsed_prebatch
     s.fails_5m = int(h.get("FAILS5M", 0) or 0)
     s.unscored_5m = int(h.get("UNSCORED5M", 0) or 0)
     s.trainer_log_age = _age(h.get("TRAINER_LOGAGE", ""))
@@ -3980,13 +4137,13 @@ done
 @dataclass
 class RewardReport:
     run: str = ""
-    steps: list[int] = field(default_factory=list)
-    effective: list[float] = field(default_factory=list)
-    all_scope: list[float] = field(default_factory=list)
-    p10: list[float] = field(default_factory=list)
-    p90: list[float] = field(default_factory=list)
-    error_rate: list[float] = field(default_factory=list)
-    step_seconds: list[float] = field(default_factory=list)
+    steps: list[int] = dataclass_field(default_factory=list)
+    effective: list[float] = dataclass_field(default_factory=list)
+    all_scope: list[float] = dataclass_field(default_factory=list)
+    p10: list[float] = dataclass_field(default_factory=list)
+    p90: list[float] = dataclass_field(default_factory=list)
+    error_rate: list[float] = dataclass_field(default_factory=list)
+    step_seconds: list[float] = dataclass_field(default_factory=list)
     mean: float = 0.0
     std: float = 0.0
     slope: float = 0.0
@@ -4245,6 +4402,13 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
             s.trainer_compute_step,
             s.trainer_compute_seconds,
             s.trainer_compute_active,
+            s.prebatch.complete_groups,
+            s.prebatch.clean_groups,
+            s.prebatch.rejected_groups,
+            s.prebatch.accepted_buffer,
+            s.prebatch.partial_groups,
+            s.prebatch.partial_rollouts,
+            s.prebatch.inflight_train,
         )
         if key != last_key:
             last_key, last_change = key, time.time()

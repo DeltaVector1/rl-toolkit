@@ -19,8 +19,10 @@ orchestrator.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.envs import TrainEnvs
@@ -38,6 +40,79 @@ from prime_rl.utils.logger import get_logger
 # batch on unusable groups. The arrival traces are already persisted by the
 # orchestrator, so the failure remains diagnosable after this trips.
 MAX_CONSECUTIVE_ERRORED_GROUPS = 8
+
+
+_PRE_BATCH_REJECTION_REASONS = (
+    "stale_policy",
+    "errored_group",
+    "trainer_seq_len_group",
+    "untrainable_group",
+    "zero_advantage_group",
+)
+
+
+@dataclass
+class PreBatchProgress:
+    """Bounded, prompt-free collection counters for the next train batch."""
+
+    complete_groups: int = 0
+    clean_groups: int = 0
+    rejected_groups: int = 0
+    rejected_rollouts: int = 0
+    policy_invalid_rollouts: int = 0
+    rejection_reasons: dict[str, int] = field(
+        default_factory=lambda: {name: 0 for name in _PRE_BATCH_REJECTION_REASONS}
+    )
+
+    def record_group(
+        self,
+        group: list[Rollout],
+        *,
+        rejection_reason: str | None = None,
+    ) -> None:
+        self.complete_groups += 1
+        if rejection_reason is None:
+            self.clean_groups += 1
+            return
+        self.rejected_groups += 1
+        self.rejected_rollouts += len(group)
+        if rejection_reason not in self.rejection_reasons:
+            # Keep the schema bounded if a future caller adds a reason.
+            rejection_reason = "unknown"
+            self.rejection_reasons.setdefault(rejection_reason, 0)
+        self.rejection_reasons[rejection_reason] += 1
+
+    def log_fields(
+        self,
+        *,
+        accepted_buffer: int,
+        accepted_target: int,
+        accepted_unit: str,
+        accepted_buffer_tokens: int,
+        partial_groups: int,
+        partial_rollouts: int,
+        oldest_partial_age_seconds: float | None,
+    ) -> str:
+        fields = [
+            f"complete_groups={self.complete_groups}",
+            f"clean_groups={self.clean_groups}",
+            f"rejected_groups={self.rejected_groups}",
+            f"rejected_rollouts={self.rejected_rollouts}",
+            f"policy_invalid_rollouts={self.policy_invalid_rollouts}",
+            f"accepted_buffer={accepted_buffer}",
+            f"accepted_target={accepted_target}",
+            f"accepted_unit={accepted_unit}",
+            f"accepted_buffer_tokens={accepted_buffer_tokens}",
+            f"partial_groups={partial_groups}",
+            f"partial_rollouts={partial_rollouts}",
+        ]
+        if oldest_partial_age_seconds is not None:
+            fields.append(f"oldest_partial_age_seconds={oldest_partial_age_seconds:.3f}")
+        fields.extend(
+            f"reject_{reason}={self.rejection_reasons.get(reason, 0)}"
+            for reason in _PRE_BATCH_REJECTION_REASONS
+        )
+        return " ".join(fields)
 
 
 def payload_tokens(rollout: Rollout) -> int:
@@ -95,6 +170,9 @@ class TrainSink:
         # Episodes arrived per group — the finalization count (an episode may
         # add several traces to ``pending_groups`` but counts once here).
         self.pending_group_episodes: dict[uuid.UUID, int] = defaultdict(int)
+        # Monotonic first-arrival times make the oldest partial-group age
+        # authoritative without scanning trace files or retaining content.
+        self.pending_group_started_at: dict[uuid.UUID, float] = {}
         self.abandoned_groups: set[uuid.UUID] = set()
         self.pending_batch: list[Rollout] = []
         # Running payload-token total of ``pending_batch`` (token-batched
@@ -102,6 +180,7 @@ class TrainSink:
         # re-sums per arrival.
         self.pending_tokens: int = 0
         self.consecutive_errored_groups: int = 0
+        self.pre_batch_progress = PreBatchProgress()
 
         # Reset by the orchestrator after each ship via ``reset_pre_filter_stats``
         self.pre_filter_seen = 0
@@ -186,6 +265,71 @@ class TrainSink:
             counts[r.env_name] += 1
         return dict(counts)
 
+    def _partial_progress(self) -> tuple[int, int, float | None]:
+        partial_groups = sum(bool(rollouts) for rollouts in self.pending_groups.values())
+        partial_rollouts = sum(len(rollouts) for rollouts in self.pending_groups.values())
+        started = [
+            self.pending_group_started_at[group_id]
+            for group_id, rollouts in self.pending_groups.items()
+            if rollouts and group_id in self.pending_group_started_at
+        ]
+        oldest_age = max(0.0, time.monotonic() - min(started)) if started else None
+        return partial_groups, partial_rollouts, oldest_age
+
+    def pre_batch_telemetry_fields(self, *, inflight_train: int | None = None) -> str:
+        """Return bounded numeric fields for group and batch accumulation."""
+        if self.batch_size is not None:
+            accepted_buffer = len(self.pending_batch)
+            accepted_target = self.batch_size
+            accepted_unit = "rollouts"
+        else:
+            accepted_buffer = self.pending_tokens
+            accepted_target = self.token_batch_size or 0
+            accepted_unit = "tokens"
+        partial_groups, partial_rollouts, oldest_age = self._partial_progress()
+        fields = self.pre_batch_progress.log_fields(
+            accepted_buffer=accepted_buffer,
+            accepted_target=accepted_target,
+            accepted_unit=accepted_unit,
+            accepted_buffer_tokens=self.pending_tokens,
+            partial_groups=partial_groups,
+            partial_rollouts=partial_rollouts,
+            oldest_partial_age_seconds=oldest_age,
+        )
+        if inflight_train is not None:
+            fields += f" inflight_train={max(0, int(inflight_train))}"
+        return fields
+
+    def _pre_batch_log(self) -> None:
+        """Emit one numeric-only INFO record for one finalized group."""
+        fields = self.pre_batch_telemetry_fields()
+        get_logger().info(f"PIPELINE_TELEMETRY {fields}")
+
+    @staticmethod
+    def _policy_invalid_rollouts(group: list[Rollout]) -> int:
+        """Count only fixed error-type labels; never log provider messages."""
+        count = 0
+        for rollout in group:
+            errors = getattr(rollout, "errors", ()) or ()
+            for error in errors:
+                error_type = str(getattr(error, "type", "")).casefold().replace("-", "_")
+                if error_type in {
+                    "policy_invalid",
+                    "invalid_policy",
+                    "policyinvalid",
+                    "invalidpolicy",
+                    "policy_validation",
+                    "policyvalidation",
+                }:
+                    count += 1
+                    break
+        return count
+
+    def _record_group(self, group: list[Rollout], rejection_reason: str | None = None) -> None:
+        self.pre_batch_progress.record_group(group, rejection_reason=rejection_reason)
+        self.pre_batch_progress.policy_invalid_rollouts += self._policy_invalid_rollouts(group)
+        self._pre_batch_log()
+
     async def add(self, episode: list[Rollout]) -> TrainBatch | None:
         """Process one episode arrival; finalize the group on the
         ``group_size``-th episode; return a ``TrainBatch`` if the finalization
@@ -195,6 +339,7 @@ class TrainSink:
         if group_id in self.abandoned_groups:
             return None
         env_name = episode[0].env_name
+        self.pending_group_started_at.setdefault(group_id, time.monotonic())
         for rollout in episode:
             await self.process_rollout(rollout)
         # A policy boundary can invalidate this group while tokenization runs
@@ -229,6 +374,7 @@ class TrainSink:
         for group_id in group_ids:
             discarded += self.pending_group_episodes.pop(group_id, 0)
             self.pending_groups.pop(group_id, None)
+            self.pending_group_started_at.pop(group_id, None)
         return discarded
 
     async def process_rollout(self, rollout: Rollout) -> None:
@@ -256,6 +402,7 @@ class TrainSink:
         run pre-batch filters; append clean survivors to ``pending_batch``."""
         group = self.pending_groups.pop(group_id, [])
         self.pending_group_episodes.pop(group_id, None)
+        self.pending_group_started_at.pop(group_id, None)
         if not group:
             return
         # Window membership follows group finalization, not arrival: a rollout
@@ -268,6 +415,7 @@ class TrainSink:
         task_idx = group[0].task.data.idx
         if any(self._is_stale(r) for r in group):
             self._mark_off_policy(group)
+            self._record_group(group, "stale_policy")
             get_logger().warning(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"dropped {len(group)} rollout(s) past max_off_policy_steps="
@@ -287,6 +435,7 @@ class TrainSink:
                 r.is_filtered = True
                 r.filter_results = {"errored_group": True}
             self.consecutive_errored_groups += 1
+            self._record_group(group, "errored_group")
             get_logger().warning(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} (errored={num_errored}) | dropped complete group; "
@@ -324,6 +473,7 @@ class TrainSink:
                 r.samples = []
                 r.is_filtered = True
                 r.filter_results = {"trainer_seq_len_group": True}
+            self._record_group(group, "trainer_seq_len_group")
             return
 
         # Untrainable traces carry no samples and must not skew the group baseline.
@@ -332,6 +482,7 @@ class TrainSink:
                 r.samples = []
                 r.is_filtered = True
                 r.filter_results = {"untrainable_group": True}
+            self._record_group(group, "untrainable_group")
             get_logger().debug(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} | dropped complete group: untrainable member"
@@ -352,6 +503,7 @@ class TrainSink:
                 r.samples = []
                 r.is_filtered = True
                 r.filter_results = {"zero_advantage_group": True}
+            self._record_group(group, "zero_advantage_group")
             get_logger().warning(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} | dropped complete zero-advantage group"
@@ -395,6 +547,7 @@ class TrainSink:
             f"rollouts={len(group)} (errored={num_errored}, filtered={num_filtered}) | "
             f"reward={avg_reward:.4f} | filters: {filter_str}"
         )
+        self._record_group(group)
 
     def process_batch(self) -> TrainBatch | None:
         """Pop a cohort off ``pending_batch`` (by rollout count when

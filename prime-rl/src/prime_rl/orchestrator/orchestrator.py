@@ -1787,7 +1787,15 @@ class Orchestrator:
             inflight_part += " | " + ", ".join(f"{n}={v}" for n, v in env_pairs)
         inflight_part += ")"
 
-        body = train_batch_part + eval_batch_part + "; " + inflight_part
+        pipeline_telemetry = self.train_sink.pre_batch_telemetry_fields(
+            inflight_train=inflight_train
+        )
+        body = (
+            train_batch_part
+            + eval_batch_part
+            + f"; PIPELINE_TELEMETRY {pipeline_telemetry}; "
+            + inflight_part
+        )
 
         payload: dict[str, float] = {**disp_gauges, **disp_drain, **watcher_gauges}
         for env_name, values in train_ratio_state.items():
