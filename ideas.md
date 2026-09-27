@@ -1359,3 +1359,18 @@ only after measured learning.
   the control selects `32767`. Report these groups separately. Direct dumps
   do not expose routes; route padding is checked through loader/pad tests.
   Keep prior gates, run name, and diagnostic-only qualification status.
+
+### Production-shape H200 response contract correction
+
+- **Review measurements.** The first implementation checked equal route
+  dimensions across six requests but accepted the test shape `[tokens,8,2]`.
+  Trinity requires `[tokens,60,4]`. The shared score parser also accepted a
+  numeric score at position zero, where no preceding token exists.
+- **Correction.** Require every H200 route shape to be exactly
+  `[request_token_count,60,4]`. Require the first prompt-logprob entry to be
+  null and every later entry to contain the exact token-key numeric finite
+  score. Apply these checks during both reference construction and replay
+  validation. Change fixtures to the Trinity shape and add rejection tests
+  for `[tokens,8,2]` routes and numeric position-zero entries. Keep all token
+  lengths, padding, masks, settings, and parity gates unchanged. No live
+  action is part of this correction.
