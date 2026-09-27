@@ -1293,3 +1293,44 @@ only after measured learning.
   rollouts or a full rollout batch. Only if the result is red, toggle
   `pp_transfer_sparse_indices=false`, then isolate CP and PP and assert
   `ks`/`ke` and index ranges. Keep existing parity gates unchanged.
+
+## Fresh production-shape synthetic parity
+
+- **Measurements.** The production-density mask diagnostic took
+  `109.279052s` forward/backward, with PP `105.46s`. The trainer delta from
+  the dense reference was exactly zero on `235360` selected positions.
+  H200 KL was `0.005689727327266585`. The direct artifact SHA-256 was
+  `a3634e11d9ad0daf037fa44f0349890278abce184c393b990ae3c3de513c139b`;
+  the comparison SHA-256 was
+  `63128fee00cfa51621594bfc683a01067dc9f87bfabc64dd4351dfe7110314cd`.
+  Production unmasked KL remains `1.147836`.
+- **Experiment.** Generate fresh deterministic native-FP8 H200 base requests
+  with lengths `[8187,7006,6543,6436,4530]`, unique cache salts, and no LoRA.
+  Use no cached reference or rollout. Append `66` padding tokens to the last
+  sequence for packed lengths `[8187,7006,6543,6436,4596]` and total `32768`.
+  Preserve the exact production tokens, positions, logprobs, loss mask,
+  route rows, and route mask for padding. Bind new artifacts to exact source
+  and model identities, and refuse to overwrite outputs. Compare eight
+  ordered schema-v2 trainer records to H200 on selected positions, per
+  sequence and in total. A dense baseline is not required.
+- **Planned settings.** Use fresh zero LoRA, batch `8`, 1f1b, CP8/PP8/EP8,
+  native FP8, lr `0`, and sparse-index transfer `false`. Keep the `600s`
+  forward/backward limit and gates `0.1` unmasked KL, `0.5` masked KL, and
+  `0.06` masked fraction. Reserve config
+  `trinity-h200-synthetic-production-shape-parity` and output run
+  `production-shape-run`. No live action is part of this proposal.
+- **Blocked before implementation.** At commit
+  `3045045bc73a4b6b4336d75be3145b83e3ca5b4c`, the requested production
+  `_pad_packed_micro_batch` function is absent from checked-in sources.
+  The available `pad_micro_batch_to_length` in
+  `prime-rl/src/prime_rl/trainer/rl/train.py` pads token IDs with `1`,
+  positions with `0`, inference logprobs with `0`, loss mask with `false`,
+  and route rows with zeros, then extends the final sequence length.
+  `FakeDataLoader._get_reference_micro_batch` instead rebuilds positions
+  with `arange(length)` and ignores supplied position IDs. Its route decoder
+  permits one zero final route row, but rejects repeated zero expert IDs in
+  the preceding padding rows. Thus the allowed runtime/config changes cannot
+  reproduce even this available padding contract for `66` tail positions.
+  The exact production padding and route-mask contract must be supplied and
+  loader support must be resolved before implementation. No trainer edits,
+  config, generator, or live test were made for this blocked proposal.
