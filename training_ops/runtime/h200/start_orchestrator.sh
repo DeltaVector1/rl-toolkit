@@ -4413,7 +4413,11 @@ start_orchestrator_container() {
     state=$(sudo docker inspect "$container_id" --format '{{.State.Status}}' 2>/dev/null || true)
     if [ "$container_name" = "/$ORCH_CT" ] && [ "$running" = true ]; then
       running_checks=$((running_checks + 1))
-      [ "$running_checks" -ge 21 ] && return 0
+      if [ "$running_checks" -ge 21 ]; then
+        orchestrator_container_id=$container_id
+        orchestrator_launch_identity=$launch_label
+        return 0
+      fi
     elif [ "$running_checks" -gt 0 ]; then
       break
     elif [ "$container_name" = "/$ORCH_CT" ] && [ "$state" != created ]; then
@@ -4471,6 +4475,8 @@ if [ "$rollout_transfer_direction" = orchestrator_push ]; then
   nohup setsid env RUN="$RUN" RUN_NAME="$RUN_NAME" \
     TRAINER_ADDRESSES="$TRAINER_ADDRESSES" \
     TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
+    ORCH_CONTAINER_ID="$orchestrator_container_id" \
+    ORCH_LAUNCH_IDENTITY="$orchestrator_launch_identity" \
     WAIT_FOR_INITIAL_HEALTH="$trainer_watchdog_wait_for_initial_health" \
     bash "$deployment/training_ops/runtime/h200/trainer_failure_watchdog.sh" \
     >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
@@ -4491,6 +4497,8 @@ else
   nohup setsid env MODE=lease RUN="$RUN" RUN_NAME="$RUN_NAME" \
     LEASE_FILE="/data/glm52-rl/runs/$RUN/$RUN_NAME/.trainer-health-lease" \
     TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
+    ORCH_CONTAINER_ID="$orchestrator_container_id" \
+    ORCH_LAUNCH_IDENTITY="$orchestrator_launch_identity" \
     WAIT_FOR_INITIAL_HEALTH="$trainer_watchdog_wait_for_initial_health" \
     bash "$deployment/training_ops/runtime/h200/trainer_failure_watchdog.sh" \
     >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &

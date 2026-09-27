@@ -414,6 +414,34 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertNotIn(hashlib.sha256(source_url.encode()).hexdigest(), script)
         self.assertNotIn(hashlib.sha256(cache_source.encode()).hexdigest(), scripts["n82"])
 
+    def test_fresh_preflight_checks_implicit_adapter_host_for_custom_nodes(self):
+        selected = {
+            "trainer": "configs/trinity-decensor-review-diagnostic/trainer.toml",
+            "orchestrator": "configs/trinity-decensor-review-diagnostic/orchestrator.toml",
+            "inference": "configs/trinity-decensor-review-diagnostic/inference.toml",
+        }
+        with mock.patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(0, "FRESH_START_PRECHECK_OK"),
+        ) as ssh, mock.patch.object(
+            training_ops,
+            "_fan",
+            side_effect=lambda hosts, function: {
+                host: function(host) for host in hosts
+            },
+        ):
+            training_ops._fresh_start_preflight(
+                "trinity-decensor-experimental-fixed-diag-d29a5958",
+                selected,
+                ["n76"],
+                "/data/glm52-rl/runs/trinity-decensor-experimental-fixed-diag-d29a5958/run_trinity-decensor-experimental-fixed-diag-d29a5958",
+            )
+        checked_hosts = {call.args[0] for call in ssh.call_args_list}
+        self.assertIn("n76", checked_hosts)
+        self.assertIn(training_ops.trainer_head, checked_hosts)
+        self.assertIn(training_ops.orchestrator_host, checked_hosts)
+
     def test_fresh_launchers_have_fail_closed_no_replace_guards(self):
         cluster = (root / "training_ops/runtime/china/cluster.sh").read_text()
         orchestrator = (root / "training_ops/runtime/h200/start_orchestrator.sh").read_text()
@@ -423,6 +451,8 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertIn('fresh start refuses existing adapter container', cluster)
         self.assertIn('fresh_no_replace_container "$relay_container"', orchestrator)
         self.assertIn('fresh_no_replace_container "$ORCH_CT"', orchestrator)
+        self.assertIn('ORCH_CONTAINER_ID="$orchestrator_container_id"', orchestrator)
+        self.assertIn('ORCH_LAUNCH_IDENTITY="$orchestrator_launch_identity"', orchestrator)
         self.assertIn('if [ "$fresh_start_no_replace" = 0 ]; then', cluster)
         self.assertIn('if [ "$fresh_start_no_replace" = 0 ]; then', orchestrator)
         self.assertIn("pkill -f '[t]rainer_failure_watchdog.sh'", orchestrator)

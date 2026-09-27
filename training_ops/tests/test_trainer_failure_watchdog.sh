@@ -14,7 +14,14 @@ EOF
 cat >"$tmp/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-  inspect) printf '/orchestrator\n' ;;
+  inspect)
+    case "${3:-}" in
+      *'.Id'*) printf 'orchestrator-id\n' ;;
+      *'.Name'*) printf '/orchestrator\n' ;;
+      *'Config.Labels'*) printf 'launch-id\n' ;;
+      *) exit 1 ;;
+    esac
+    ;;
   rm) : >"${DOCKER_STOP:?}" ;;
   *) exit 1 ;;
 esac
@@ -39,7 +46,8 @@ write_status() {
 
 start_watchdog() {
   RUN=fixture RUN_NAME=run MODE=lease LEASE_FILE="$lease_file" STATUS_FILE="$status_file" \
-    TRAINER_CT=trainer ORCH_CT=orchestrator INTERVAL="${INTERVAL:-0.5}" LEASE_MAX_AGE=30 MAX_MISSES=2 \
+    TRAINER_CT=trainer ORCH_CT=orchestrator ORCH_CONTAINER_ID=orchestrator-id \
+    ORCH_LAUNCH_IDENTITY=launch-id INTERVAL="${INTERVAL:-0.5}" LEASE_MAX_AGE=30 MAX_MISSES=2 \
     STARTUP_GRACE="${STARTUP_GRACE:-900}" WAIT_FOR_INITIAL_HEALTH="${WAIT_FOR_INITIAL_HEALTH:-0}" \
     bash "$watchdog" >"$log_file" 2>&1 &
   watchdog_pid=$!

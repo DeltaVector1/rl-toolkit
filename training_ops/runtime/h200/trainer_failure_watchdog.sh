@@ -11,6 +11,8 @@ STARTUP_GRACE=${STARTUP_GRACE:-900}
 MAX_MISSES=${MAX_MISSES:-2}
 TRAINER_CT=${TRAINER_CT:?set TRAINER_CT}
 ORCH_CT=${ORCH_CT:?set ORCH_CT}
+ORCH_CONTAINER_ID=${ORCH_CONTAINER_ID:-}
+ORCH_LAUNCH_IDENTITY=${ORCH_LAUNCH_IDENTITY:-}
 run_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"
 LEASE_FILE=${LEASE_FILE:-"$run_dir/.trainer-health-lease"}
 STATUS_FILE=${STATUS_FILE:-"$run_dir/.trainer-health-status"}
@@ -48,7 +50,22 @@ trainer_failures() {
 }
 
 stop_edge() {
-  local publisher_pid=""
+  local current_id current_name current_launch_identity publisher_pid=""
+  if [ -z "$ORCH_CONTAINER_ID" ] || [ -z "$ORCH_LAUNCH_IDENTITY" ]; then
+    log "refusing orchestrator stop: watchdog launch identity is unavailable"
+    return 1
+  fi
+  current_id=$(sudo docker inspect --format '{{.Id}}' "$ORCH_CT" 2>/dev/null || true)
+  current_name=$(sudo docker inspect --format '{{.Name}}' "$ORCH_CT" 2>/dev/null || true)
+  current_launch_identity=$(sudo docker inspect \
+    --format '{{index .Config.Labels "com.glm52.orchestrator.launch"}}' \
+    "$ORCH_CT" 2>/dev/null || true)
+  if [ "$current_id" != "$ORCH_CONTAINER_ID" ] || \
+     [ "$current_name" != "/$ORCH_CT" ] || \
+     [ "$current_launch_identity" != "$ORCH_LAUNCH_IDENTITY" ]; then
+    log "refusing orchestrator stop: container ownership changed"
+    return 1
+  fi
   if [ -r "$run_dir/.batch-sync.pid" ]; then
     publisher_pid=$(cat "$run_dir/.batch-sync.pid")
   fi
@@ -57,9 +74,19 @@ stop_edge() {
     *) kill -- "-$publisher_pid" 2>/dev/null || kill "$publisher_pid" 2>/dev/null || true ;;
   esac
   pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null || true
-  name=$(sudo docker inspect --format '{{.Name}}' "$ORCH_CT" 2>/dev/null || true)
-  [ -z "$name" ] || [ "$name" = "/$ORCH_CT" ] || return 1
-  [ -z "$name" ] || sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+  current_id=$(sudo docker inspect --format '{{.Id}}' "$ORCH_CT" 2>/dev/null || true)
+  current_name=$(sudo docker inspect --format '{{.Name}}' "$ORCH_CT" 2>/dev/null || true)
+  current_launch_identity=$(sudo docker inspect \
+    --format '{{index .Config.Labels "com.glm52.orchestrator.launch"}}' \
+    "$ORCH_CT" 2>/dev/null || true)
+  if [ "$current_id" != "$ORCH_CONTAINER_ID" ] || \
+     [ "$current_name" != "/$ORCH_CT" ] || \
+     [ "$current_launch_identity" != "$ORCH_LAUNCH_IDENTITY" ]; then
+    log "refusing orchestrator removal: container ownership changed"
+    return 1
+  fi
+  # Remove by the verified immutable ID, not the reusable fixed name.
+  [ -z "$current_name" ] || sudo docker rm -f "$ORCH_CONTAINER_ID" >/dev/null 2>&1 || true
 }
 
 lease_fresh() {

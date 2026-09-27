@@ -10416,7 +10416,11 @@ def _fresh_start_preflight(
             )
         )
     )
-    selected_hosts = list(dict.fromkeys([*nodes, orchestrator_host, *inference_hosts]))
+    # The adapter is launched on the configured trainer head even when a
+    # custom trainer list omits that host. Include it in the no-mutation gate.
+    selected_hosts = list(
+        dict.fromkeys([*nodes, trainer_head, orchestrator_host, *inference_hosts])
+    )
     selected_hosts = [_check_host(host) for host in selected_hosts]
     cache_hosts = set(inference_hosts) | {orchestrator_host}
     results = _fan(

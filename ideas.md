@@ -937,3 +937,18 @@ only after measured learning.
   A failed fresh launch can leave its own failed container for the next
   preflight to report; do not manually remove it as part of this mode. Fresh
   does not invoke a trainer-side orchestrator launcher.
+
+## Fresh watchdog ownership and adapter-host gate
+
+- **Confirmed risk.** The failure watchdog currently identifies the
+  orchestrator by its fixed container name only. A stale watchdog can therefore
+  see a fresh container that reused that name and remove it after a later
+  trainer failure. Fresh preflight also uses the selected trainer list, while
+  the adapter runs on the configured `trainer_head`; a custom list can omit
+  that implicit host and leave it unchecked before mutation.
+- **Acceptance criteria.** Persist the exact launched orchestrator container ID
+  and launch identity, and require both to match before the watchdog performs
+  any stop or removal. A mismatch must fail closed. Keep the normal launch path
+  compatible. Fresh preflight must include the configured adapter host even
+  when custom trainer nodes omit `trainer_head`; a test must prove this host is
+  checked before deployment or launch mutation.
