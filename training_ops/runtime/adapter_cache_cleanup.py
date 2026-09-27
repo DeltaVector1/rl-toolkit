@@ -36,8 +36,54 @@ REQUIRED_FILES = frozenset(
     }
 )
 OPTIONAL_FILES = frozenset(
-    {"transport.json", "adapter_manifest.json", "relay_manifest.json", "transport-chunks"}
+    {
+        "transport.json",
+        "adapter_manifest.json",
+        "relay_manifest.json",
+        "transport-manifest.json",
+        "transport-chunks",
+    }
 )
+TRANSPORT_MANIFEST_KEYS = frozenset(
+    {
+        "base2_config_sha256",
+        "base2_config_size",
+        "base2_sha256",
+        "base2_size",
+        "base2_url",
+        "base_config_sha256",
+        "base_config_size",
+        "base_sha256",
+        "base_size",
+        "base_url",
+        "chunks",
+        "config_sha256",
+        "config_size",
+        "data_offset",
+        "mode",
+        "resume_identity_version",
+        "source_url",
+        "target_sha256",
+        "target_size",
+        "transport",
+        "version",
+    }
+)
+TRANSPORT_CHUNK_KEYS = frozenset(
+    {
+        "codec",
+        "data_offset",
+        "file",
+        "offset",
+        "raw_sha256",
+        "raw_size",
+        "wire_sha256",
+        "wire_size",
+    }
+)
+TRANSPORT_CHUNK_COUNT = 986
+TRANSPORT_CHUNK_PREFIX = "adapter_model.safetensors.transport-full-zstd-"
+TRANSPORT_WIRE_SIZE = 6382335838
 
 
 def exact_source_url(source_url: str) -> str:
@@ -211,6 +257,114 @@ def validate_status(
             raise ValueError("adapter cache cleanup stage path and source URL differ")
 
 
+def _validate_transport_manifest(
+    target: Path,
+    *,
+    source_url: str,
+    files: dict[str, object],
+) -> None:
+    """Validate the measured full-transport manifest without its chunks."""
+    path = target / "transport-manifest.json"
+    try:
+        info = path.lstat()
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("adapter cache transport manifest is invalid") from error
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError("adapter cache transport manifest permissions are invalid")
+    if not isinstance(value, dict) or set(value) != TRANSPORT_MANIFEST_KEYS:
+        raise ValueError("adapter cache transport manifest schema is invalid")
+    if type(value["version"]) is not int or value["version"] != 1:
+        raise ValueError("adapter cache transport manifest version is invalid")
+    if (
+        type(value["resume_identity_version"]) is not int
+        or value["resume_identity_version"] != 1
+        or value["mode"] != "full"
+        or value["transport"] != "chunked-full-zstd"
+        or value["source_url"] != source_url
+    ):
+        raise ValueError("adapter cache transport manifest identity is invalid")
+    for name in (
+        "base2_config_sha256",
+        "base2_config_size",
+        "base2_sha256",
+        "base2_size",
+        "base2_url",
+        "base_config_sha256",
+        "base_config_size",
+        "base_sha256",
+        "base_size",
+        "base_url",
+        "data_offset",
+    ):
+        if value[name] is not None:
+            raise ValueError("adapter cache transport manifest legacy fields are invalid")
+    config = files["adapter_config.json"]
+    model = files["adapter_model.safetensors"]
+    if not isinstance(config, dict) or not isinstance(model, dict):
+        raise ValueError("adapter cache transport manifest file identity is invalid")
+    for name, record in (("config", config), ("target", model)):
+        digest = value[f"{name}_sha256"]
+        size = value[f"{name}_size"]
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or type(size) is not int
+            or size < 0
+            or digest != record["sha256"]
+            or size != record["size"]
+        ):
+            raise ValueError("adapter cache transport manifest file identity is invalid")
+    chunks = value["chunks"]
+    if not isinstance(chunks, list) or len(chunks) != TRANSPORT_CHUNK_COUNT:
+        raise ValueError("adapter cache transport manifest chunks are invalid")
+    expected_offset = 0
+    expected_names = {
+        f"{TRANSPORT_CHUNK_PREFIX}{index:06d}" for index in range(TRANSPORT_CHUNK_COUNT)
+    }
+    seen_names: set[str] = set()
+    wire_size = 0
+    for index, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict) or set(chunk) != TRANSPORT_CHUNK_KEYS:
+            raise ValueError("adapter cache transport manifest chunk schema is invalid")
+        name = chunk["file"]
+        if (
+            not isinstance(name, str)
+            or name != f"{TRANSPORT_CHUNK_PREFIX}{index:06d}"
+            or name in seen_names
+            or "/" in name
+            or "\\" in name
+            or not name
+        ):
+            raise ValueError("adapter cache transport manifest chunk file is invalid")
+        seen_names.add(name)
+        if (
+            chunk["codec"] is not None
+            or chunk["data_offset"] is not None
+            or type(chunk["offset"]) is not int
+            or chunk["offset"] != expected_offset
+            or type(chunk["raw_size"]) is not int
+            or chunk["raw_size"] <= 0
+            or type(chunk["wire_size"]) is not int
+            or chunk["wire_size"] <= 0
+            or not isinstance(chunk["raw_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", chunk["raw_sha256"]) is None
+            or not isinstance(chunk["wire_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", chunk["wire_sha256"]) is None
+        ):
+            raise ValueError("adapter cache transport manifest chunk identity is invalid")
+        wire_size += chunk["wire_size"]
+        expected_offset += chunk["raw_size"]
+    if type(value["target_size"]) is not int or value["target_size"] <= 0:
+        raise ValueError("adapter cache transport manifest target size is invalid")
+    if (
+        expected_offset != value["target_size"]
+        or seen_names != expected_names
+        or wire_size != TRANSPORT_WIRE_SIZE
+    ):
+        raise ValueError("adapter cache transport manifest chunk coverage is invalid")
+
+
 def validate_directory(
     target: Path,
     *,
@@ -293,6 +447,8 @@ def validate_directory(
             raise ValueError(f"adapter cache {name} is invalid") from error
         if isinstance(value, dict) and "source_url" in value and value["source_url"] != source_url:
             raise ValueError(f"adapter cache {name} source identity differs")
+    if "transport-manifest.json" in entries:
+        _validate_transport_manifest(target, source_url=source_url, files=files)
     return target_info.st_dev, target_info.st_ino
 
 
@@ -313,7 +469,17 @@ ports = [int(value) for value in port_values]
 source_suffix = "/broadcasts/step_0"
 receipt_keys = {"source_url", "target_sha256", "target_size", "config_sha256", "config_size", "lora_name", "server_instance"}
 required_files = {"READY", "manifest.json", "adapter_config.json", "adapter_model.safetensors", "adapter_model.safetensors.sha256"}
-optional_files = {"transport.json", "adapter_manifest.json", "relay_manifest.json", "transport-chunks"}
+optional_files = {"transport.json", "adapter_manifest.json", "relay_manifest.json", "transport-manifest.json", "transport-chunks"}
+transport_manifest_keys = {
+    "base2_config_sha256", "base2_config_size", "base2_sha256", "base2_size", "base2_url",
+    "base_config_sha256", "base_config_size", "base_sha256", "base_size", "base_url",
+    "chunks", "config_sha256", "config_size", "data_offset", "mode",
+    "resume_identity_version", "source_url", "target_sha256", "target_size", "transport", "version",
+}
+transport_chunk_keys = {"codec", "data_offset", "file", "offset", "raw_sha256", "raw_size", "wire_sha256", "wire_size"}
+transport_chunk_count = 986
+transport_chunk_prefix = "adapter_model.safetensors.transport-full-zstd-"
+transport_wire_size = 6382335838
 expected_key = hashlib.sha256(source_url.encode()).hexdigest()
 target = Path(cache_path)
 
@@ -435,6 +601,92 @@ def validate_metrics(metrics):
     if any(any(value != 0 for value in samples) for samples in values.values()):
         raise RuntimeError("adapter cache cleanup requires no running or waiting requests")
 
+def validate_transport_manifest(files):
+    path = target / "transport-manifest.json"
+    try:
+        info = path.lstat()
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("adapter cache transport manifest is invalid") from error
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise RuntimeError("adapter cache transport manifest permissions are invalid")
+    if not isinstance(value, dict) or set(value) != transport_manifest_keys:
+        raise RuntimeError("adapter cache transport manifest schema is invalid")
+    if type(value["version"]) is not int or value["version"] != 1:
+        raise RuntimeError("adapter cache transport manifest version is invalid")
+    if (
+        type(value["resume_identity_version"]) is not int
+        or value["resume_identity_version"] != 1
+        or value["mode"] != "full"
+        or value["transport"] != "chunked-full-zstd"
+        or value["source_url"] != source_url
+    ):
+        raise RuntimeError("adapter cache transport manifest identity is invalid")
+    for name in (
+        "base2_config_sha256", "base2_config_size", "base2_sha256", "base2_size", "base2_url",
+        "base_config_sha256", "base_config_size", "base_sha256", "base_size", "base_url", "data_offset",
+    ):
+        if value[name] is not None:
+            raise RuntimeError("adapter cache transport manifest legacy fields are invalid")
+    config = files["adapter_config.json"]
+    model = files["adapter_model.safetensors"]
+    if not isinstance(config, dict) or not isinstance(model, dict):
+        raise RuntimeError("adapter cache transport manifest file identity is invalid")
+    for name, record in (("config", config), ("target", model)):
+        digest = value[f"{name}_sha256"]
+        size = value[f"{name}_size"]
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or type(size) is not int
+            or size < 0
+            or digest != record["sha256"]
+            or size != record["size"]
+        ):
+            raise RuntimeError("adapter cache transport manifest file identity is invalid")
+    chunks = value["chunks"]
+    if not isinstance(chunks, list) or len(chunks) != transport_chunk_count:
+        raise RuntimeError("adapter cache transport manifest chunks are invalid")
+    expected_offset = 0
+    expected_names = {f"{transport_chunk_prefix}{index:06d}" for index in range(transport_chunk_count)}
+    seen_names = set()
+    wire_size = 0
+    for index, chunk in enumerate(chunks):
+        if not isinstance(chunk, dict) or set(chunk) != transport_chunk_keys:
+            raise RuntimeError("adapter cache transport manifest chunk schema is invalid")
+        name = chunk["file"]
+        if (
+            not isinstance(name, str)
+            or name != f"{transport_chunk_prefix}{index:06d}"
+            or name in seen_names
+            or "/" in name
+            or "\\" in name
+            or not name
+        ):
+            raise RuntimeError("adapter cache transport manifest chunk file is invalid")
+        if (
+            chunk["codec"] is not None
+            or chunk["data_offset"] is not None
+            or type(chunk["offset"]) is not int
+            or chunk["offset"] != expected_offset
+            or type(chunk["raw_size"]) is not int
+            or chunk["raw_size"] <= 0
+            or type(chunk["wire_size"]) is not int
+            or chunk["wire_size"] <= 0
+            or not isinstance(chunk["raw_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", chunk["raw_sha256"]) is None
+            or not isinstance(chunk["wire_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", chunk["wire_sha256"]) is None
+        ):
+            raise RuntimeError("adapter cache transport manifest chunk identity is invalid")
+        wire_size += chunk["wire_size"]
+        seen_names.add(name)
+        expected_offset += chunk["raw_size"]
+    if type(value["target_size"]) is not int or value["target_size"] <= 0:
+        raise RuntimeError("adapter cache transport manifest target size is invalid")
+    if expected_offset != value["target_size"] or seen_names != expected_names or wire_size != transport_wire_size:
+        raise RuntimeError("adapter cache transport manifest chunk coverage is invalid")
+
 def observe():
     observed = []
     for port in ports:
@@ -499,6 +751,8 @@ def validate_cache():
             value = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(value, dict) and "source_url" in value and value["source_url"] != source_url:
                 raise RuntimeError(f"adapter cache {name} source identity differs")
+    if "transport-manifest.json" in entries:
+        validate_transport_manifest(files)
     return (target_info.st_dev, target_info.st_ino)
 
 def check_identity():

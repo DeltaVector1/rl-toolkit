@@ -31,11 +31,17 @@ def receipt(source: str, name: str, instance: str = "a" * 32) -> dict:
     }
 
 
-def write_cache(root: Path, source: str = SOURCE, key: str = KEY) -> Path:
+def write_cache(
+    root: Path,
+    source: str = SOURCE,
+    key: str = KEY,
+    *,
+    transport_manifest: bool = False,
+) -> Path:
     target = root / key
     target.mkdir()
     config = b"{}\n"
-    model = b"model"
+    model = bytes(index % 256 for index in range(986)) if transport_manifest else b"model"
     files = {
         "adapter_config.json": {"size": len(config), "sha256": hashlib.sha256(config).hexdigest()},
         "adapter_model.safetensors": {"size": len(model), "sha256": hashlib.sha256(model).hexdigest()},
@@ -50,6 +56,48 @@ def write_cache(root: Path, source: str = SOURCE, key: str = KEY) -> Path:
     (target / "adapter_model.safetensors.sha256").write_text(
         files["adapter_model.safetensors"]["sha256"] + "\n", encoding="ascii"
     )
+    if transport_manifest:
+        chunks = []
+        for index, value in enumerate(model):
+            chunk_hash = hashlib.sha256(bytes([value])).hexdigest()
+            chunks.append(
+                {
+                    "codec": None,
+                    "data_offset": None,
+                    "file": f"adapter_model.safetensors.transport-full-zstd-{index:06d}",
+                    "offset": index,
+                    "raw_sha256": chunk_hash,
+                    "raw_size": 1,
+                    "wire_sha256": chunk_hash,
+                    "wire_size": 1 if index < 985 else 6382335838 - 985,
+                }
+            )
+        transport = {
+            "base2_config_sha256": None,
+            "base2_config_size": None,
+            "base2_sha256": None,
+            "base2_size": None,
+            "base2_url": None,
+            "base_config_sha256": None,
+            "base_config_size": None,
+            "base_sha256": None,
+            "base_size": None,
+            "base_url": None,
+            "chunks": chunks,
+            "config_sha256": files["adapter_config.json"]["sha256"],
+            "config_size": files["adapter_config.json"]["size"],
+            "data_offset": None,
+            "mode": "full",
+            "resume_identity_version": 1,
+            "source_url": source,
+            "target_sha256": files["adapter_model.safetensors"]["sha256"],
+            "target_size": files["adapter_model.safetensors"]["size"],
+            "transport": "chunked-full-zstd",
+            "version": 1,
+        }
+        transport_path = target / "transport-manifest.json"
+        transport_path.write_text(json.dumps(transport), encoding="utf-8")
+        transport_path.chmod(0o600)
     return target
 
 
@@ -210,7 +258,7 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
             cases.append("unknown contents")
             (target / "unknown").unlink()
             (target / "transport-manifest.json").write_text("{}")
-            cases.append("unknown transport manifest")
+            cases.append("transport manifest schema")
             (target / "transport-manifest.json").unlink()
             (target / "manifest.json").write_text(
                 json.dumps({"version": 1, "source_url": "http://wrong", "files": {}})
@@ -224,6 +272,47 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
                     adapter_cache_cleanup.validate_directory(
                         target, source_url=SOURCE, expected_key=KEY
                     )
+
+    def test_measured_transport_manifest_is_strict_and_chunks_may_be_absent(self):
+        def invalid(mutator):
+            with tempfile.TemporaryDirectory() as directory:
+                target = write_cache(Path(directory), transport_manifest=True)
+                path = target / "transport-manifest.json"
+                value = json.loads(path.read_text())
+                mutator(value, path)
+                if path.exists():
+                    path.write_text(json.dumps(value))
+                with self.assertRaises(ValueError):
+                    adapter_cache_cleanup.validate_directory(
+                        target, source_url=SOURCE, expected_key=KEY
+                    )
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = write_cache(Path(directory), transport_manifest=True)
+            self.assertFalse((target / "transport-chunks").exists())
+            identity = adapter_cache_cleanup.validate_directory(
+                target, source_url=SOURCE, expected_key=KEY
+            )
+            self.assertEqual(identity, (target.stat().st_dev, target.stat().st_ino))
+
+        invalid(lambda value, _path: value.update({"extra": None}))
+        invalid(lambda value, _path: value.pop("transport"))
+        invalid(lambda value, _path: value.update({"source_url": LEGACY_SOURCE}))
+        invalid(lambda value, _path: value.update({"target_sha256": "f" * 64}))
+        invalid(lambda value, _path: value.update({"base_url": SOURCE}))
+        invalid(lambda value, _path: value["chunks"][0].update({"extra": None}))
+        invalid(lambda value, _path: value["chunks"][1].update({"offset": 0}))
+        invalid(lambda value, _path: value["chunks"][0].update({"file": "../escape"}))
+        invalid(lambda value, _path: value["chunks"][0].update({"raw_sha256": "F" * 64}))
+        invalid(lambda value, _path: value.update({"target_size": 985}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = write_cache(Path(directory), transport_manifest=True)
+            (target / "transport-manifest.json").chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "permissions"):
+                adapter_cache_cleanup.validate_directory(
+                    target, source_url=SOURCE, expected_key=KEY
+                )
 
     def test_fresh_preflight_uses_nested_production_cache_key(self):
         selected = {
@@ -438,7 +527,7 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
             root = Path(directory)
             cache_root = root / "cache"
             cache_root.mkdir()
-            target = write_cache(cache_root)
+            target = write_cache(cache_root, transport_manifest=True)
             other = cache_root / ("b" * 64)
             other.mkdir()
             fake_bin = root / "bin"
