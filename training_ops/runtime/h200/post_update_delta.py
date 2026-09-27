@@ -53,6 +53,20 @@ _EXPECTED_TARGET_MODULES = (
     "shared_expert",
     "experts",
 )
+_EXPECTED_TARGET_MODULE_SET = frozenset(_EXPECTED_TARGET_MODULES)
+_EXPECTED_CONFIG_KEYS = frozenset(
+    {
+        "peft_type",
+        "task_type",
+        "base_model_name_or_path",
+        "r",
+        "lora_alpha",
+        "lora_dropout",
+        "bias",
+        "modules_to_save",
+        "target_modules",
+    }
+)
 _BASE_CONFIG_FIELDS = (
     "peft_type",
     "task_type",
@@ -60,6 +74,7 @@ _BASE_CONFIG_FIELDS = (
     "bias",
     "modules_to_save",
 )
+_EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
 class Step1DeltaError(ValueError):
@@ -126,6 +141,37 @@ def _regular_directory(path: Path, label: str) -> None:
         os.close(fd)
 
 
+def _stable_identity(path: Path) -> dict[str, int | str]:
+    """Verify the atomic export marker is the exact empty 0644 regular file."""
+    _regular(path, "step-1 STABLE marker")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    digest = hashlib.sha256()
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise Step1DeltaError("step-1 STABLE marker cannot be opened") from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise Step1DeltaError("step-1 STABLE marker is not regular")
+        if stat.S_IMODE(info.st_mode) != 0o644:
+            raise Step1DeltaError("step-1 STABLE marker mode is not 644")
+        if info.st_size != 0:
+            raise Step1DeltaError("step-1 STABLE marker is not empty")
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        if digest.hexdigest() != _EMPTY_SHA256:
+            raise Step1DeltaError("step-1 STABLE marker hash is not empty-file SHA256")
+        return {"sha256": _EMPTY_SHA256, "size": 0}
+    except OSError as error:
+        raise Step1DeltaError("step-1 STABLE marker cannot be read") from error
+    finally:
+        os.close(fd)
+
+
 def _validate_qualification_layout(policy_path: Path, step_dir: Path) -> Path:
     if (
         step_dir.name != "step_1"
@@ -161,11 +207,20 @@ def _validate_qualification_layout(policy_path: Path, step_dir: Path) -> Path:
 def _read_json_object(path: Path, label: str) -> dict[str, Any]:
     _regular(path, label)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_unique_json_object)
+    except (OSError, UnicodeError, ValueError) as error:
         raise Step1DeltaError(f"{label} is invalid") from error
     if not isinstance(value, dict):
         raise Step1DeltaError(f"{label} is not an object")
+    return value
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
     return value
 
 
@@ -173,6 +228,18 @@ def _validate_adapter_config(step_config_path: Path, policy_config_path: Path) -
     step_config = _read_json_object(step_config_path, "step-1 adapter config")
     policy_config = _read_json_object(policy_config_path, "policy-0 adapter config")
     for label, config in (("policy-0", policy_config), ("step-1", step_config)):
+        if set(config) != _EXPECTED_CONFIG_KEYS:
+            raise Step1DeltaError(f"{label} adapter config key set differs")
+        if config.get("peft_type") != "LORA":
+            raise Step1DeltaError(f"{label} adapter config peft_type differs")
+        if config.get("task_type") != "CAUSAL_LM":
+            raise Step1DeltaError(f"{label} adapter config task_type differs")
+        if config.get("base_model_name_or_path") != "/data/trinity-thinking-fp8":
+            raise Step1DeltaError(f"{label} adapter config base model differs")
+        if config.get("bias") != "none":
+            raise Step1DeltaError(f"{label} adapter config bias differs")
+        if config.get("modules_to_save") is not None:
+            raise Step1DeltaError(f"{label} adapter config modules_to_save differs")
         if type(config.get("r")) is not int or config["r"] != 32:
             raise Step1DeltaError(f"{label} adapter config rank is not 32")
         alpha = config.get("lora_alpha")
@@ -182,7 +249,12 @@ def _validate_adapter_config(step_config_path: Path, policy_config_path: Path) -
         if isinstance(dropout, bool) or not isinstance(dropout, (int, float)) or not math.isfinite(float(dropout)) or float(dropout) != 0.0:
             raise Step1DeltaError(f"{label} adapter config dropout is not zero")
         targets = config.get("target_modules")
-        if not isinstance(targets, list) or tuple(targets) != _EXPECTED_TARGET_MODULES:
+        if (
+            not isinstance(targets, list)
+            or any(not isinstance(target, str) for target in targets)
+            or len(targets) != len(set(targets))
+            or set(targets) != _EXPECTED_TARGET_MODULE_SET
+        ):
             raise Step1DeltaError(f"{label} adapter config target_modules differ")
     for field in _BASE_CONFIG_FIELDS:
         if field not in policy_config or field not in step_config:
@@ -294,6 +366,7 @@ def _validate_step1_files(step_dir: Path) -> tuple[dict[str, Any], dict[str, Any
         _regular(path, f"step-1 {name}")
     model_identity = _identity(model, "step-1 adapter")
     config_identity = _identity(config, "step-1 config")
+    stable_identity = _stable_identity(stable)
     try:
         sidecar_value = sidecar.read_text(encoding="ascii").strip()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -335,10 +408,12 @@ def _validate_step1_files(step_dir: Path) -> tuple[dict[str, Any], dict[str, Any
         for name, identity in expected_files.items()
     ):
         raise Step1DeltaError("step-1 manifest file identities differ")
-    return model_identity, config_identity, {
+    artifact_identities = {
         name: _identity(path, f"step-1 {name}")
         for name, path in paths.items()
     }
+    artifact_identities["STABLE"] = stable_identity
+    return model_identity, config_identity, artifact_identities
 
 
 def _tensor_blocks(shape: tuple[int, ...], chunk_elements: int):
@@ -470,6 +545,8 @@ def validate_step1_adapter_delta(
         policy_identity = _identity(policy_path, "policy-0 adapter")
         policy_config_identity = _identity(policy_config_path, "policy-0 adapter config")
         model_identity, config_identity, artifact_identities = _validate_step1_files(step_path)
+        if policy_config_identity != config_identity:
+            raise Step1DeltaError("policy-0 and step-1 adapter config bytes differ")
         _validate_adapter_config(step_path / "adapter_config.json", policy_config_path)
         before = {
             "policy0_adapter": policy_identity,

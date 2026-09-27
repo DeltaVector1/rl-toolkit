@@ -47,8 +47,8 @@ class H200PostUpdateDeltaTest(unittest.TestCase):
             "lora_dropout": 0.0,
             "bias": "none",
             "target_modules": [
-                "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj",
-                "up_proj", "down_proj", "shared_expert", "experts",
+                "down_proj", "experts", "gate_proj", "k_proj", "o_proj",
+                "q_proj", "shared_expert", "up_proj", "v_proj",
             ],
             "modules_to_save": None,
         }
@@ -394,6 +394,138 @@ class H200PostUpdateDeltaTest(unittest.TestCase):
                         self._evidence(policy, step, target_sha, target_size),
                         root / "receipt.json",
                     )
+
+    def test_adapter_config_requires_exact_pinned_schema_and_sorted_targets(self):
+        mutations = {
+            "missing": lambda config: config.pop("bias"),
+            "extra": lambda config: config.update(evil="same-on-policy-and-step"),
+            "wrong_r_type": lambda config: config.update(r=True),
+            "wrong_alpha_type": lambda config: config.update(lora_alpha="64"),
+            "wrong_dropout_type": lambda config: config.update(lora_dropout=True),
+            "duplicate_target": lambda config: config["target_modules"].append("q_proj"),
+            "evil_base": lambda config: config.update(base_model_name_or_path="evil"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                policy, step, target_sha, target_size = self._write_adapter(
+                    root,
+                    {"a": np.array([1.0, 2.0], dtype=np.float32)},
+                    {"a": np.array([1.0, 2.5], dtype=np.float32)},
+                )
+                policy_config_path = root / "adapter_config.json"
+                step_config_path = step / "adapter_config.json"
+                policy_config = json.loads(policy_config_path.read_text())
+                step_config = json.loads(step_config_path.read_text())
+                mutate(policy_config)
+                mutate(step_config)
+                policy_config_path.write_text(json.dumps(policy_config, sort_keys=True))
+                step_config_path.write_text(json.dumps(step_config, sort_keys=True))
+                manifest_path = step / "adapter_manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                config_sha = hashlib.sha256(step_config_path.read_bytes()).hexdigest()
+                manifest["config_sha256"] = config_sha
+                manifest["config_size"] = step_config_path.stat().st_size
+                for record in manifest["files"]:
+                    if record["name"] == "adapter_config.json":
+                        record.update(sha256=config_sha, size=step_config_path.stat().st_size)
+                manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+                with self.assertRaisesRegex(Step1DeltaError, "adapter config"):
+                    validate_step1_adapter_delta(
+                        policy,
+                        step,
+                        self.expected,
+                        self._evidence(policy, step, target_sha, target_size),
+                        root / "receipt.json",
+                    )
+
+    def test_stable_marker_requires_empty_644_file(self):
+        mutations = {
+            "bytes": lambda stable: stable.write_bytes(b"not-empty"),
+            "mode": lambda stable: stable.chmod(0o600),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                policy, step, target_sha, target_size = self._write_adapter(
+                    root,
+                    {"a": np.array([1.0, 2.0], dtype=np.float32)},
+                    {"a": np.array([1.0, 2.5], dtype=np.float32)},
+                )
+                mutate(step / "STABLE")
+                with self.assertRaisesRegex(Step1DeltaError, "STABLE"):
+                    validate_step1_adapter_delta(
+                        policy,
+                        step,
+                        self.expected,
+                        self._evidence(policy, step, target_sha, target_size),
+                        root / "receipt.json",
+                    )
+
+    def test_adapter_config_rejects_duplicate_json_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy, step, target_sha, target_size = self._write_adapter(
+                root,
+                {"a": np.array([1.0, 2.0], dtype=np.float32)},
+                {"a": np.array([1.0, 2.5], dtype=np.float32)},
+            )
+            duplicate = (
+                '{"peft_type":"LORA","task_type":"CAUSAL_LM",'
+                '"base_model_name_or_path":"/data/trinity-thinking-fp8",'
+                '"r":32,"r":32,"lora_alpha":64,"lora_dropout":0.0,'
+                '"bias":"none","modules_to_save":null,"target_modules":['
+                '"down_proj","experts","gate_proj","k_proj","o_proj",'
+                '"q_proj","shared_expert","up_proj","v_proj"]}'
+            )
+            config_path = step / "adapter_config.json"
+            config_path.write_text(duplicate)
+            manifest_path = step / "adapter_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
+            manifest["config_sha256"] = config_sha
+            manifest["config_size"] = config_path.stat().st_size
+            for record in manifest["files"]:
+                if record["name"] == "adapter_config.json":
+                    record.update(sha256=config_sha, size=config_path.stat().st_size)
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+            with self.assertRaisesRegex(Step1DeltaError, "adapter config"):
+                validate_step1_adapter_delta(
+                    policy,
+                    step,
+                    self.expected,
+                    self._evidence(policy, step, target_sha, target_size),
+                    root / "receipt.json",
+                )
+
+    def test_policy_and_step_adapter_config_bytes_must_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy, step, target_sha, target_size = self._write_adapter(
+                root,
+                {"a": np.array([1.0, 2.0], dtype=np.float32)},
+                {"a": np.array([1.0, 2.5], dtype=np.float32)},
+            )
+            config_path = step / "adapter_config.json"
+            config = json.loads(config_path.read_text())
+            config_path.write_text(json.dumps(config, indent=2, sort_keys=True))
+            manifest_path = step / "adapter_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
+            manifest["config_sha256"] = config_sha
+            manifest["config_size"] = config_path.stat().st_size
+            for record in manifest["files"]:
+                if record["name"] == "adapter_config.json":
+                    record.update(sha256=config_sha, size=config_path.stat().st_size)
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+            with self.assertRaisesRegex(Step1DeltaError, "bytes differ"):
+                validate_step1_adapter_delta(
+                    policy,
+                    step,
+                    self.expected,
+                    self._evidence(policy, step, target_sha, target_size),
+                    root / "receipt.json",
+                )
 
     def test_export_and_gradient_signals_must_be_positive(self):
         with tempfile.TemporaryDirectory() as directory:
