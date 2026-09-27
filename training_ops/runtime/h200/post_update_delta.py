@@ -1,0 +1,433 @@
+"""Bounded-memory validation of the exported step-1 adapter delta."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import stat
+import uuid
+from pathlib import Path
+from typing import Any, Mapping
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover - the trainer image supplies numpy.
+    np = None
+
+try:
+    from safetensors import safe_open
+except ImportError:  # pragma: no cover - the trainer image supplies safetensors.
+    safe_open = None
+
+
+STEP1 = 1
+FORWARD_BACKWARD_LIMIT_SECONDS = 600.0
+DEFAULT_CHUNK_ELEMENTS = 1 << 20
+_DIGEST_FIELDS = (
+    "reference_sha256",
+    "trainer_config_sha256",
+    "code_sha256",
+    "loss_sha256",
+)
+_EXPECTED_IDENTITY_FIELDS = {
+    "run_id",
+    "reference_sha256",
+    "trainer_config_sha256",
+    "trainer_config_size",
+    "code_sha256",
+    "code_size",
+    "loss_sha256",
+    "loss_size",
+    "loss_mode",
+}
+
+
+class Step1DeltaError(ValueError):
+    """The exported step-1 adapter or its evidence is unsafe."""
+
+
+def _valid_digest(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _regular(path: Path, label: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise Step1DeltaError(f"{label} is missing or not regular: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise Step1DeltaError(f"{label} cannot be opened: {path}") from error
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Step1DeltaError(f"{label} is not regular: {path}")
+    finally:
+        os.close(fd)
+
+
+def _identity(path: Path, label: str) -> dict[str, int | str]:
+    _regular(path, label)
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise Step1DeltaError(f"{label} cannot be read: {path}") from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise Step1DeltaError(f"{label} is not regular: {path}")
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        return {"sha256": digest.hexdigest(), "size": info.st_size}
+    except OSError as error:
+        raise Step1DeltaError(f"{label} cannot be hashed: {path}") from error
+    finally:
+        os.close(fd)
+
+
+def _validate_expected_identity(expected: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(expected, Mapping) or set(expected) != _EXPECTED_IDENTITY_FIELDS:
+        raise Step1DeltaError("expected run/reference/trainer-config/code identity is incomplete")
+    result = dict(expected)
+    if not isinstance(result["run_id"], str) or not result["run_id"]:
+        raise Step1DeltaError("expected run identity is invalid")
+    for field in _DIGEST_FIELDS:
+        if not _valid_digest(result[field]):
+            raise Step1DeltaError(f"expected {field} is invalid")
+    for field in ("trainer_config_size", "code_size", "loss_size"):
+        if type(result[field]) is not int or result[field] <= 0:
+            raise Step1DeltaError(f"expected {field} is invalid")
+    if not isinstance(result["loss_mode"], str) or result["loss_mode"] != "644":
+        raise Step1DeltaError("expected loss mode is invalid")
+    return result
+
+
+def _finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise Step1DeltaError(f"{label} is not numeric")
+    value = float(value)
+    if not math.isfinite(value):
+        raise Step1DeltaError(f"{label} is not finite")
+    return value
+
+
+def _validate_evidence(
+    policy_identity: Mapping[str, Any],
+    step_identity: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> None:
+    if not isinstance(evidence, Mapping):
+        raise Step1DeltaError("trainer success evidence is missing")
+    if evidence.get("run_id") != expected["run_id"]:
+        raise Step1DeltaError("trainer run identity differs")
+    if type(evidence.get("completed_optimizer_steps")) is not int or evidence["completed_optimizer_steps"] != 1:
+        raise Step1DeltaError("exactly one completed optimizer step is required")
+    if _finite_number(evidence.get("learning_rate"), "learning rate") != 8e-6:
+        raise Step1DeltaError("learning rate must be 8e-6")
+    _finite_number(evidence.get("loss"), "loss")
+    grad_norm = _finite_number(evidence.get("grad_norm"), "grad norm")
+    if grad_norm <= 0:
+        raise Step1DeltaError("grad norm must be positive")
+    forward_backward_seconds = _finite_number(
+        evidence.get("forward_backward_seconds"), "forward/backward time"
+    )
+    if forward_backward_seconds < 0 or forward_backward_seconds > FORWARD_BACKWARD_LIMIT_SECONDS:
+        raise Step1DeltaError("forward/backward time exceeds 600 seconds")
+    export_seconds = _finite_number(evidence.get("export_seconds"), "export seconds")
+    if export_seconds <= 0:
+        raise Step1DeltaError("export seconds must be positive")
+    if evidence.get("export_completed") is not True:
+        raise Step1DeltaError("step-1 export is not complete")
+    if evidence.get("initial_adapter_sha256") != policy_identity["sha256"] or evidence.get("initial_adapter_size") != policy_identity["size"]:
+        raise Step1DeltaError("initial adapter identity differs")
+    if evidence.get("final_adapter_sha256") != step_identity["sha256"] or evidence.get("final_adapter_size") != step_identity["size"]:
+        raise Step1DeltaError("final adapter identity differs")
+    for field in ("reference_sha256", "code_sha256"):
+        if evidence.get(field) != expected[field]:
+            raise Step1DeltaError(f"trainer evidence {field} differs")
+    if evidence.get("trainer_config_sha256") != expected["trainer_config_sha256"]:
+        raise Step1DeltaError("trainer config identity differs")
+    if evidence.get("trainer_config_size") != expected["trainer_config_size"]:
+        raise Step1DeltaError("trainer config size differs")
+    if evidence.get("code_size") != expected["code_size"]:
+        raise Step1DeltaError("trainer evidence code size differs")
+    loss_identity = evidence.get("loss_identity")
+    expected_loss = {
+        "sha256": expected["loss_sha256"],
+        "size": expected["loss_size"],
+        "mode": expected["loss_mode"],
+    }
+    if loss_identity != expected_loss:
+        raise Step1DeltaError("trainer loss identity differs")
+
+
+def _validate_step1_files(step_dir: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if step_dir.is_symlink() or not step_dir.is_dir():
+        raise Step1DeltaError("step-1 adapter directory is missing or not regular")
+    if step_dir.name != "step_1" or step_dir.parent.name != "broadcasts" or step_dir.parent.parent.name != "run_trainer_only":
+        raise Step1DeltaError("step-1 adapter path is not the verified export slot")
+    model = step_dir / "adapter_model.safetensors"
+    config = step_dir / "adapter_config.json"
+    sidecar = step_dir / "adapter_model.safetensors.sha256"
+    manifest_path = step_dir / "adapter_manifest.json"
+    stable = step_dir / "STABLE"
+    paths = {
+        "adapter_model.safetensors": model,
+        "adapter_config.json": config,
+        "adapter_model.safetensors.sha256": sidecar,
+        "adapter_manifest.json": manifest_path,
+        "STABLE": stable,
+    }
+    if {path.name for path in step_dir.iterdir()} != set(paths):
+        raise Step1DeltaError("step-1 adapter has unexpected files")
+    for name, path in paths.items():
+        _regular(path, f"step-1 {name}")
+    model_identity = _identity(model, "step-1 adapter")
+    config_identity = _identity(config, "step-1 config")
+    try:
+        sidecar_value = sidecar.read_text(encoding="ascii").strip()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise Step1DeltaError("step-1 manifest or sidecar is invalid") from error
+    if sidecar_value != model_identity["sha256"]:
+        raise Step1DeltaError("step-1 adapter sidecar differs")
+    expected_files = {
+        "adapter_config.json": {**config_identity},
+        "adapter_model.safetensors": {**model_identity},
+    }
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != 1
+        or manifest.get("kind") != "lora-adapter"
+        or manifest.get("mode") != "full"
+        or manifest.get("target_step") != STEP1
+        or manifest.get("base_step") is not None
+        or manifest.get("target_sha256") != model_identity["sha256"]
+        or manifest.get("target_size") != model_identity["size"]
+        or manifest.get("full_sha256") != model_identity["sha256"]
+        or manifest.get("full_size") != model_identity["size"]
+        or manifest.get("config_sha256") != config_identity["sha256"]
+        or manifest.get("config_size") != config_identity["size"]
+    ):
+        raise Step1DeltaError("step-1 manifest identity is invalid")
+    files = manifest.get("files")
+    records = {item.get("name"): item for item in files if isinstance(item, dict)} if isinstance(files, list) else {}
+    if set(records) != set(expected_files) or any(
+        records[name].get("sha256") != identity["sha256"] or records[name].get("size") != identity["size"]
+        for name, identity in expected_files.items()
+    ):
+        raise Step1DeltaError("step-1 manifest file identities differ")
+    return model_identity, config_identity, {
+        name: _identity(path, f"step-1 {name}")
+        for name, path in paths.items()
+    }
+
+
+def _tensor_blocks(shape: tuple[int, ...], chunk_elements: int):
+    if not shape:
+        yield ()
+        return
+
+    def recurse(axis: int, prefix: list[slice], remaining: int):
+        if axis == len(shape):
+            yield tuple(prefix)
+            return
+        tail = math.prod(shape[axis + 1:])
+        width = max(1, min(shape[axis], remaining // tail if tail else remaining))
+        for start in range(0, shape[axis], width):
+            end = min(shape[axis], start + width)
+            yield from recurse(axis + 1, prefix + [slice(start, end)], max(1, remaining // (end - start)))
+
+    yield from recurse(0, [], chunk_elements)
+
+
+def _compare_tensors(policy_path: Path, step_path: Path, chunk_elements: int) -> dict[str, Any]:
+    if np is None or safe_open is None:
+        raise Step1DeltaError("numpy and safetensors are required")
+    if type(chunk_elements) is not int or chunk_elements <= 0:
+        raise Step1DeltaError("chunk size must be a positive integer")
+    try:
+        policy_handle = safe_open(str(policy_path), framework="numpy", device="cpu")
+        step_handle = safe_open(str(step_path), framework="numpy", device="cpu")
+    except Exception as error:
+        raise Step1DeltaError("cannot open safetensors adapter") from error
+    changed_elements = 0
+    changed_tensors = 0
+    max_abs = 0.0
+    sum_squares = 0.0
+    try:
+        with policy_handle as policy, step_handle as step:
+            policy_keys = set(policy.keys())
+            step_keys = set(step.keys())
+            if policy_keys != step_keys:
+                raise Step1DeltaError("safetensors tensor key sets differ")
+            for key in sorted(policy_keys):
+                policy_slice = policy.get_slice(key)
+                step_slice = step.get_slice(key)
+                policy_shape = tuple(policy_slice.get_shape())
+                step_shape = tuple(step_slice.get_shape())
+                if policy_shape != step_shape or policy_slice.get_dtype() != step_slice.get_dtype():
+                    raise Step1DeltaError(f"safetensors tensor metadata differs: {key}")
+                tensor_changed = False
+                for indexes in _tensor_blocks(policy_shape, chunk_elements):
+                    policy_values = np.asarray(policy.get_tensor(key) if not indexes else policy_slice[indexes])
+                    step_values = np.asarray(step.get_tensor(key) if not indexes else step_slice[indexes])
+                    if not np.all(np.isfinite(policy_values)) or not np.all(np.isfinite(step_values)):
+                        raise Step1DeltaError(f"safetensors tensor {key} contains non-finite values")
+                    policy_float = policy_values.astype(np.float64, copy=False)
+                    step_float = step_values.astype(np.float64, copy=False)
+                    difference = step_float - policy_float
+                    if not np.all(np.isfinite(difference)):
+                        raise Step1DeltaError(f"safetensors tensor {key} has a non-finite delta")
+                    nonzero = np.not_equal(policy_values, step_values)
+                    count = int(np.count_nonzero(nonzero))
+                    if count:
+                        tensor_changed = True
+                        changed_elements += count
+                        max_abs = max(max_abs, float(np.max(np.abs(difference[nonzero]))))
+                    with np.errstate(over="raise", invalid="raise"):
+                        try:
+                            sum_squares += float(np.sum(difference * difference, dtype=np.float64))
+                        except FloatingPointError as error:
+                            raise Step1DeltaError("safetensors delta norm is not finite") from error
+                    if not math.isfinite(sum_squares):
+                        raise Step1DeltaError("safetensors delta norm is not finite")
+                if tensor_changed:
+                    changed_tensors += 1
+    except Step1DeltaError:
+        raise
+    except Exception as error:
+        raise Step1DeltaError("safetensors tensor read failed") from error
+    if changed_elements == 0:
+        raise Step1DeltaError("step-1 adapter has no nonzero delta")
+    return {
+        "changed_element_count": changed_elements,
+        "changed_tensor_count": changed_tensors,
+        "max_abs_delta": max_abs,
+        "l2_delta": math.sqrt(sum_squares),
+    }
+
+
+def _atomic_no_clobber(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.partial.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except FileExistsError as error:
+        raise Step1DeltaError(f"refusing to clobber existing receipt: {path}") from error
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def validate_step1_adapter_delta(
+    policy0_adapter_path: Path,
+    step1_dir: Path,
+    expected_identity: Mapping[str, Any],
+    trainer_evidence: Mapping[str, Any],
+    receipt_path: Path,
+    *,
+    chunk_elements: int = DEFAULT_CHUNK_ELEMENTS,
+    failure_receipt_path: Path | None = None,
+) -> dict[str, Any]:
+    """Validate one exported step-1 adapter without loading either file whole."""
+    failure_path = failure_receipt_path or receipt_path.with_name(receipt_path.stem + ".failure.json")
+    try:
+        expected = _validate_expected_identity(expected_identity)
+        policy_identity = _identity(Path(policy0_adapter_path), "policy-0 adapter")
+        model_identity, config_identity, artifact_identities = _validate_step1_files(Path(step1_dir))
+        before = {
+            "policy0_adapter": policy_identity,
+            "step1_adapter": model_identity,
+            "step1_config": config_identity,
+            "step1_manifest": artifact_identities["adapter_manifest.json"],
+            "step1_sidecar": artifact_identities["adapter_model.safetensors.sha256"],
+            "step1_stable": artifact_identities["STABLE"],
+            "artifacts": artifact_identities,
+        }
+        metrics = _compare_tensors(
+            Path(policy0_adapter_path),
+            Path(step1_dir) / "adapter_model.safetensors",
+            chunk_elements,
+        )
+        _, _, after_artifact_identities = _validate_step1_files(Path(step1_dir))
+        after = {
+            "policy0_adapter": _identity(Path(policy0_adapter_path), "policy-0 adapter"),
+            "step1_adapter": after_artifact_identities["adapter_model.safetensors"],
+            "step1_config": after_artifact_identities["adapter_config.json"],
+            "step1_manifest": after_artifact_identities["adapter_manifest.json"],
+            "step1_sidecar": after_artifact_identities["adapter_model.safetensors.sha256"],
+            "step1_stable": after_artifact_identities["STABLE"],
+            "artifacts": after_artifact_identities,
+        }
+        if before != after:
+            raise Step1DeltaError("adapter source changed during validation")
+        _validate_evidence(policy_identity, model_identity, expected, trainer_evidence)
+        receipt = {
+            "schema_version": 1,
+            "kind": "h200_step1_adapter_delta",
+            "run_id": expected["run_id"],
+            "policy0_adapter": policy_identity,
+            "step1_adapter": model_identity,
+            "step1_config": config_identity,
+            "step1_manifest_sha256": artifact_identities["adapter_manifest.json"]["sha256"],
+            "trainer_config": {
+                "sha256": expected["trainer_config_sha256"],
+                "size": expected["trainer_config_size"],
+            },
+            "identities_before": before,
+            "identities_after": after,
+            "expected_identity": dict(expected),
+            "trainer_evidence": dict(trainer_evidence),
+            **metrics,
+        }
+        _atomic_no_clobber(Path(receipt_path), receipt)
+        return receipt
+    except Step1DeltaError as error:
+        try:
+            _atomic_no_clobber(
+                Path(failure_path),
+                {
+                    "schema_version": 1,
+                    "kind": "h200_step1_adapter_delta_failure",
+                    "error": str(error),
+                },
+            )
+        except Step1DeltaError:
+            pass
+        raise
+    except Exception as error:
+        wrapped = Step1DeltaError(f"step-1 adapter delta validation failed: {error}")
+        try:
+            _atomic_no_clobber(
+                Path(failure_path),
+                {
+                    "schema_version": 1,
+                    "kind": "h200_step1_adapter_delta_failure",
+                    "error": str(wrapped),
+                },
+            )
+        except Step1DeltaError:
+            pass
+        raise wrapped from error
