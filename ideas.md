@@ -1155,6 +1155,16 @@ only after measured learning.
 
 ## Repeated packed 1f1b parity qualification
 
+- **Measured parser failure and retry correction.** At `2026-09-27
+  21:00:11 UTC`, TrainerConfig rejected the extra top-level input
+  `name='packed-1f1b-run'`. The run completed `0` steps and did no forward,
+  forward/backward, or PP work. Its output directory exists but is empty.
+  Remove the unsupported `name` field. Use planned qualification name
+  `packed-1f1b-run-v2`, with output directory
+  `/data/glm52-rl/qualifications/trinity-h200-synthetic-packed-1f1b-parity/packed-1f1b-run-v2`.
+  Preserve all other settings and gates. This is a parser correction;
+  it gives no numerical or timing evidence for 1f1b.
+
 - **Measured baseline.** Packed gpipe forward/backward took `103.600719s`
   (PP `71.33s`). Against H200, `32763` selected positions had absolute
   delta mean `0.06331701576755229`, p95 `0.22156524658203125`, maximum
