@@ -1,0 +1,51 @@
+# Hugging Face revision: 6412c1ad1588c664977b0f830b80a20273173318
+
+enable_lora = true
+router = "None"
+max_loras = 1
+max_cpu_loras = 2
+max_lora_rank = 32
+lora_target_modules = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "shared_expert",
+    "experts",
+]
+gpu_memory_utilization = 0.92
+enable_prefix_caching = true
+enable_expert_parallel = true
+enable_eplb = false
+enable_return_routed_experts = true
+api_server_count = 1
+
+[server]
+host = "0.0.0.0"
+port = 8000
+liveness_timeout_seconds = 120.0
+
+[log]
+level = "info"
+
+[model]
+name = "/data/trinity-thinking-fp8"
+dtype = "bfloat16"
+max_model_len = 65536
+enforce_eager = false
+reasoning_parser = "deepseek_r1"
+
+[parallel]
+tp = 8
+dp = 1
+
+[weight_broadcast]
+type = "filesystem"
+
+[env_vars]
+PRIME_LORA_CACHE_DIR = "/data/glm52-rl/lora-cache/trinity-decensor-experimental-fixed-diag-d29a5958"
+VLLM_WORKER_MULTIPROC_METHOD = "spawn"
+NCCL_SOCKET_IFNAME = "eth0"
