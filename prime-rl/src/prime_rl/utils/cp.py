@@ -4,6 +4,8 @@ from __future__ import annotations
 import prime_rl._compat  # noqa: F401
 
 from typing import Literal
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -14,6 +16,62 @@ from ring_flash_attn import update_ring_flash_attn_params
 from prime_rl.utils.sequence import get_cu_seqlens_from_seq_lens
 
 CPStyle = Literal["ring", "ulysses"]
+
+
+@dataclass(frozen=True)
+class CpAttentionState:
+    cu_seqlens: torch.Tensor
+    max_seqlen: int
+    cp_group: dist.ProcessGroup
+    cp_style: CPStyle
+
+
+# The attention implementations themselves use process-global state. Keep this
+# handle in the same scope so autograd worker threads restore the actual state.
+_cp_attention_state: CpAttentionState | None = None
+
+
+def capture_cp_attention_state() -> CpAttentionState | None:
+    return _cp_attention_state
+
+
+def _publish_cp_attention_state(state: CpAttentionState) -> None:
+    global _cp_attention_state
+    if state.cp_style == "ring":
+        update_ring_flash_attn_params(state.cu_seqlens, state.cp_group)
+    elif state.cp_style == "ulysses":
+        from prime_rl.trainer.models.layers.ulysses_attn import update_ulysses_params
+
+        update_ulysses_params(state.cu_seqlens, state.max_seqlen)
+    else:
+        raise ValueError(f"Unknown cp_style: {state.cp_style}")
+    _cp_attention_state = state
+
+
+@contextmanager
+def use_cp_attention_state(state: CpAttentionState | None):
+    """Bind one call, including a checkpoint replay, to its packed boundaries."""
+    if state is None:
+        yield
+        return
+    previous = capture_cp_attention_state()
+    if previous is None:
+        raise RuntimeError("CP attention state was not initialized")
+    _publish_cp_attention_state(state)
+    try:
+        yield
+    finally:
+        _publish_cp_attention_state(previous)
+
+
+def cp_attention_state_for_lengths(total_tokens: int, seq_lens: torch.Tensor) -> CpAttentionState:
+    previous = capture_cp_attention_state()
+    if previous is None:
+        raise RuntimeError("CP attention state was not initialized before the PP stage")
+    if not isinstance(seq_lens, torch.Tensor) or seq_lens.dtype not in (torch.int32, torch.int64):
+        raise ValueError("CP sequence lengths must be an integer tensor")
+    cu_seqlens, max_seqlen = get_cu_seqlens_from_seq_lens(seq_lens, total_tokens=total_tokens)
+    return CpAttentionState(cu_seqlens, max_seqlen, previous.cp_group, previous.cp_style)
 
 
 def _has_linear_attn_layer(model: nn.Module) -> bool:
@@ -203,13 +261,4 @@ def setup_cp_attention_params_for_length(
         total_tokens=total_tokens,
     )
 
-    if cp_style == "ring":
-        update_ring_flash_attn_params(cu_seqlens, cp_group)
-    elif cp_style == "ulysses":
-        # Delayed import: ulysses_attn lives under trainer.models, which imports
-        # back into prime_rl.utils — top-level import would deadlock at startup.
-        from prime_rl.trainer.models.layers.ulysses_attn import update_ulysses_params
-
-        update_ulysses_params(cu_seqlens, max_seqlen)
-    else:
-        raise ValueError(f"Unknown cp_style: {cp_style}")
+    _publish_cp_attention_state(CpAttentionState(cu_seqlens, max_seqlen, cp_group, cp_style))

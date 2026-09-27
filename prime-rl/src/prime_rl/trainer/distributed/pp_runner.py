@@ -522,6 +522,17 @@ class PipelineStageModule(nn.Module):
         elif not self.receive_sparse_indices:
             sparse_indices_cache = None
         side = self._next_side()
+        from prime_rl.utils.cp import cp_attention_state_for_lengths, use_cp_attention_state
+
+        cp_state = None
+        if side.get("seq_lens_are_pre_shard", False):
+            cp_state = cp_attention_state_for_lengths(
+                sum(side["sequence_lengths"]), side["seq_lens"]
+            )
+        with use_cp_attention_state(cp_state):
+            return self._forward_with_side(x, sparse_indices_cache, side)
+
+    def _forward_with_side(self, x, sparse_indices_cache, side):
         kwargs = dict(
             position_ids=side["position_ids"],
             routed_experts=side.get("routed_experts"),

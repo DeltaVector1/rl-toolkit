@@ -140,6 +140,43 @@ class PipelineBoundariesTest(unittest.TestCase):
             self.assertEqual(self.boundaries(), [0, 3, 8])
         self.assertEqual(self.boundaries(), [0, 8])
 
+    def test_exact_production_boundaries_and_no_cp(self):
+        self.cp.setup_cp_attention_params_for_length(
+            32768, None, seq_lens=torch.tensor([32768]), cp_style="ulysses"
+        )
+        lengths = torch.tensor([8187, 7006, 6543, 6436, 4596])
+        production = self.cp.cp_attention_state_for_lengths(32768, lengths)
+        with self.cp.use_cp_attention_state(production):
+            self.assertEqual(self.boundaries(), [0, 8187, 15193, 21736, 28172, 32768])
+            self.assertEqual(self.params["max_seqlen"], 8187)
+        self.assertEqual(self.boundaries(), [0, 32768])
+        self.assertEqual(self.params["max_seqlen"], 32768)
+        self.cp._cp_attention_state = None
+        with self.cp.use_cp_attention_state(None):
+            self.assertIsNone(self.cp.capture_cp_attention_state())
+
+    def test_checkpoint_without_cp_keeps_gradients(self):
+        self.cp._cp_attention_state = None
+        module = nn.Linear(2, 1, bias=False)
+        self.checkpointing.checkpoint_method(module, "forward", use_reentrant=True)
+        x = torch.ones(1, 2, requires_grad=True)
+        module(x).sum().backward()
+        self.assertTrue(torch.equal(module.weight.grad, torch.ones_like(module.weight)))
+
+    def test_ring_publisher_also_restores_its_boundaries(self):
+        calls = []
+        group = object()
+        self.cp.update_ring_flash_attn_params = lambda cu, actual_group: calls.append(
+            (cu.tolist(), actual_group)
+        )
+        self.cp.setup_cp_attention_params_for_length(
+            8, group, seq_lens=torch.tensor([8]), cp_style="ring"
+        )
+        packed = self.cp.cp_attention_state_for_lengths(8, torch.tensor([3, 5]))
+        with self.cp.use_cp_attention_state(packed):
+            self.assertEqual(calls[-1], ([0, 3, 8], group))
+        self.assertEqual(calls[-1], ([0, 8], group))
+
 
 if __name__ == "__main__":
     unittest.main()

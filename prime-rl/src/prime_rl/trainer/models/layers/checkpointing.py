@@ -66,6 +66,12 @@ def checkpoint_method(
         if not _should_checkpoint(module):
             return original(*args, **kwargs)
 
+        from prime_rl.utils.cp import capture_cp_attention_state, use_cp_attention_state
+
+        # Stage globals can change before backward. The closure owns this
+        # call's immutable boundary handle for initial execution and recompute.
+        cp_state = capture_cp_attention_state()
+
         # Reentrant checkpointing only tracks tensors passed as positional
         # checkpoint inputs. Custom GLM blocks pass the hidden state and the
         # position tensors through keyword and nested arguments, so flatten the
@@ -102,7 +108,8 @@ def checkpoint_method(
                 phase = "recompute" if torch.is_grad_enabled() else "forward"
                 token = _REENTRANT_BLOCK_PHASE.set(phase)
             try:
-                return original(*restored_args, **restored_kwargs)
+                with use_cp_attention_state(cp_state):
+                    return original(*restored_args, **restored_kwargs)
             finally:
                 if token is not None:
                     _REENTRANT_BLOCK_PHASE.reset(token)
