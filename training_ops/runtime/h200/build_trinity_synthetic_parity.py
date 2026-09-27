@@ -205,10 +205,11 @@ def _flatten_prompt_logprobs(raw: Any, input_ids: Sequence[int]) -> list[float]:
 
 def _route_raw(route: Mapping[str, Any], token_count: int | None = None) -> tuple[dict[str, Any], bytes]:
     is_reference_route = isinstance(route, Mapping) and set(route) == _REFERENCE_ROUTE_FIELDS
-    if not isinstance(route, Mapping) or not (
-        _ROUTE_FIELDS.issubset(route) or set(route) == _REFERENCE_ROUTE_FIELDS
+    if not isinstance(route, Mapping) or (
+        (is_reference_route and set(route) != _REFERENCE_ROUTE_FIELDS)
+        or (not is_reference_route and set(route) != _ROUTE_FIELDS)
     ):
-        raise SyntheticParityError("response is missing routed experts")
+        raise SyntheticParityError("routed experts have an invalid schema")
     shape = route.get("shape")
     if (
         not isinstance(shape, list)
@@ -829,8 +830,10 @@ def compare_packed_individual(
     expected_positions = [
         position for length in SEQUENCE_LENGTHS for position in range(length)
     ]
-    packed_positions = packed_ref.get("position_ids", expected_positions)
-    packed_mask = packed_ref.get("loss_mask")
+    if "position_ids" not in packed_ref or "loss_mask" not in packed_ref:
+        raise SyntheticParityError("packed reference requires position_ids and loss_mask")
+    packed_positions = packed_ref["position_ids"]
+    packed_mask = packed_ref["loss_mask"]
     expected_mask = []
     for length in SEQUENCE_LENGTHS:
         expected_mask.extend([False] + [True] * (length - 1))
@@ -884,7 +887,12 @@ def compare_packed_individual(
         )
         if sequence_length != length or microbatch.get("sequence_lengths") != [max(SEQUENCE_LENGTHS)]:
             raise SyntheticParityError("individual sequence lengths are not bound")
-        positions = microbatch.get("position_ids", list(range(max(SEQUENCE_LENGTHS))))
+        for field in ("position_ids", "microbatch_index", "microbatch_count"):
+            if field not in microbatch:
+                raise SyntheticParityError(
+                    f"individual microbatch requires {field}"
+                )
+        positions = microbatch["position_ids"]
         if positions != list(range(max(SEQUENCE_LENGTHS))):
             raise SyntheticParityError("individual positions are not bound")
         mask = microbatch.get("loss_mask")

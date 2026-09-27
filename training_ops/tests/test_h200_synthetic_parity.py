@@ -276,6 +276,49 @@ class SyntheticParityTest(unittest.TestCase):
             with self.assertRaisesRegex(synthetic.SyntheticParityError, "input IDs"):
                 synthetic.compare_packed_individual(packed, individual)
 
+            clean_individual = copy.deepcopy(artifact["individual_reference"])
+            for index, microbatch in enumerate(clean_individual["microbatches"]):
+                microbatch["microbatch_index"] = index
+                microbatch["microbatch_count"] = 5
+            for field in ("position_ids", "loss_mask"):
+                missing_packed = copy.deepcopy(packed)
+                del missing_packed[field]
+                with self.assertRaisesRegex(synthetic.SyntheticParityError, field):
+                    synthetic.compare_packed_individual(missing_packed, clean_individual)
+            for field in ("position_ids", "microbatch_index", "microbatch_count"):
+                missing_individual = copy.deepcopy(clean_individual)
+                del missing_individual["microbatches"][0][field]
+                with self.assertRaisesRegex(synthetic.SyntheticParityError, field):
+                    synthetic.compare_packed_individual(packed, missing_individual)
+
+    def test_route_schemas_reject_extra_fields(self):
+        def extra_route(_endpoint, request, _timeout):
+            response = response_for(request["token_ids"])
+            response["choices"][0]["routed_experts"]["unexpected"] = True
+            return response
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(synthetic.SyntheticParityError, "schema"):
+                synthetic.build_artifact(
+                    endpoint="http://h200/inference/v1/generate",
+                    output_dir=Path(directory),
+                    post_json=extra_route,
+                )
+
+        def post(_endpoint, request, _timeout):
+            return response_for(request["token_ids"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = synthetic.build_artifact(
+                endpoint="http://h200/inference/v1/generate",
+                output_dir=Path(directory),
+                post_json=post,
+            )
+            changed = copy.deepcopy(artifact)
+            changed["packed"]["routed_experts"]["unexpected"] = True
+            with self.assertRaisesRegex(synthetic.SyntheticParityError, "routed experts"):
+                synthetic.validate_artifact(changed)
+
     def test_endpoint_requires_exact_serialized_generate_path(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(synthetic.SyntheticParityError, "inference/v1/generate"):
