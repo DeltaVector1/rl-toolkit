@@ -384,10 +384,8 @@ def initialize_fresh_lora_policy(
     return len(fresh_b), int(nonzero_b_shards.item())
 
 
-def verify_fresh_trainer_only_lora(
-    multi_run_manager, lora_config, checkpoint_step, resume_adapter
-) -> dict | None:
-    """Verify fresh trainer-only adapters without changing their parameters."""
+def agree_fresh_trainer_only_lora(lora_config, checkpoint_step, resume_adapter) -> bool:
+    """Agree on freshness before any conditional adapter load collectives."""
     eligibility = {
         "rank": dist.get_rank(),
         "eligible": (
@@ -400,9 +398,11 @@ def verify_fresh_trainer_only_lora(
     dist.all_gather_object(ranks, eligibility)
     if len({record["eligible"] for record in ranks}) != 1:
         raise RuntimeError(f"trainer-only fresh LoRA eligibility differs across ranks: {ranks}")
-    if not eligibility["eligible"]:
-        return None
+    return eligibility["eligible"]
 
+
+def verify_fresh_trainer_only_lora(multi_run_manager, lora_config) -> dict:
+    """Verify agreed-fresh trainer-only adapters without changing parameters."""
     local = {
         "rank": dist.get_rank(),
         "b_count": 0,
@@ -440,6 +440,7 @@ def verify_fresh_trainer_only_lora(
         # Every rank must reach the evidence collective, including a rank whose
         # adapter slot or local shard cannot be inspected.
         local["error"] = f"{type(error).__name__}: {error}"
+    ranks = [None] * dist.get_world_size()
     dist.all_gather_object(ranks, local)
     failures = [record for record in ranks if record["error"]]
     if failures:
@@ -1093,6 +1094,15 @@ def train(config: TrainerConfig):
         )
         logger.info("Initialized multi-run checkpoint manager")
 
+    resume_adapter = (
+        os.environ.get("PRIME_RL_RESUME_ADAPTER") if checkpoint_step is None else None
+    )
+    fresh_trainer_only_lora = False
+    if trainer_only and config.model.lora is not None:
+        fresh_trainer_only_lora = agree_fresh_trainer_only_lora(
+            config.model.lora, checkpoint_step, resume_adapter
+        )
+
     # Initialize the model and tokenizer
     logger.info(f"Initializing model ({config.model})")
     loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
@@ -1108,9 +1118,6 @@ def train(config: TrainerConfig):
         _set_pg_timeout(group_timeout, group)
     logger.info(
         f"Set {len(process_groups)} distributed group timeouts to {config.dist_timeout_seconds} seconds"
-    )
-    resume_adapter = (
-        os.environ.get("PRIME_RL_RESUME_ADAPTER") if checkpoint_step is None else None
     )
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
@@ -1346,11 +1353,11 @@ def train(config: TrainerConfig):
         # Restore the requested resume adapter after that reset sequence.
         load_initial_lora_adapter(model, resume_adapter, adapter_idx=0)
 
-    if trainer_only and config.model.lora is not None:
+    if fresh_trainer_only_lora:
         fresh_evidence = verify_fresh_trainer_only_lora(
-            multi_run_manager, config.model.lora, checkpoint_step, resume_adapter
+            multi_run_manager, config.model.lora
         )
-        if fresh_evidence is not None and world.is_master:
+        if world.is_master:
             logger.info(
                 f"Verified fresh trainer-only LoRA on {fresh_evidence['rank_count']} ranks: "
                 f"{fresh_evidence['local_b_count']} local B matrices; "
