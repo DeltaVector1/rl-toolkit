@@ -13,6 +13,8 @@ from typing import Any, Mapping
 
 
 CANONICAL_CONFIG_DIR = "configs/trinity-h200-post-update-qualification"
+QUALIFICATION_ROOT = "/data/glm52-rl/qualifications/trinity-h200-post-update-qualification"
+RUNS_ROOT = "/data/glm52-rl/runs"
 QUALIFICATION_SLOT = "trinity-h200-post-update-qualification-slot1"
 EXPECTED_FILES = (
     "adapter_config.json",
@@ -46,6 +48,7 @@ _EVIDENCE_KEYS = frozenset(
         "trainer_config_size", "code_sha256", "code_size", "loss_identity",
     }
 )
+_IDENTITY_CHAIN_KEYS = frozenset({"policy0_adapter", "policy0_config", "step1_adapter", "step1_config", "step1_manifest", "artifacts"})
 _RESULT_KEYS = frozenset(
     {
         "schema_version", "kind", "status", "qualification_slot", "source_url",
@@ -137,12 +140,14 @@ def parse_delta_receipt(payload: bytes | str, expected_sha256: str) -> dict[str,
     manifest_sha = _digest(receipt.get("step1_manifest_sha256"), "step-1 manifest")
     before = receipt.get("identities_before")
     after = receipt.get("identities_after")
-    if not isinstance(before, Mapping) or not isinstance(after, Mapping) or before != after:
+    if not isinstance(before, Mapping) or not isinstance(after, Mapping) or set(before) != _IDENTITY_CHAIN_KEYS or set(after) != _IDENTITY_CHAIN_KEYS or before != after:
         _fail("delta receipt identity before/after values differ")
     if before.get("step1_adapter") != model or before.get("step1_config") != config:
         _fail("delta receipt step-1 identity chain is inconsistent")
     policy_model = _identity(receipt.get("policy0_adapter"), "policy-0 adapter")
     policy_config = _identity(receipt.get("policy0_config"), "policy-0 config")
+    if model == policy_model or config == policy_config:
+        _fail("step-1 identity must differ from policy-0")
     if before.get("policy0_adapter") != policy_model or before.get("policy0_config") != policy_config:
         _fail("delta receipt policy-0 identity chain is inconsistent")
     manifest = _identity(before.get("step1_manifest"), "step-1 manifest")
@@ -169,17 +174,19 @@ def parse_delta_receipt(payload: bytes | str, expected_sha256: str) -> dict[str,
     evidence = receipt.get("trainer_evidence")
     if not isinstance(evidence, Mapping) or set(evidence) != _EVIDENCE_KEYS:
         _fail("delta receipt trainer evidence schema is invalid")
-    if evidence.get("run_id") != receipt["run_id"] or evidence.get("completed_optimizer_steps") != 1 or evidence.get("learning_rate") != 8e-6 or evidence.get("export_completed") is not True:
+    if evidence.get("run_id") != receipt["run_id"] or type(evidence.get("completed_optimizer_steps")) is not int or evidence.get("completed_optimizer_steps") != 1 or type(evidence.get("learning_rate")) is not float or evidence.get("learning_rate") != 8e-6 or evidence.get("export_completed") is not True:
         _fail("delta receipt trainer evidence does not prove one update")
     if evidence.get("reference_sha256") != expected["reference_sha256"] or evidence.get("trainer_config_sha256") != expected["trainer_config_sha256"] or evidence.get("trainer_config_size") != expected["trainer_config_size"] or evidence.get("code_sha256") != expected["code_sha256"] or evidence.get("code_size") != expected["code_size"]:
         _fail("delta receipt trainer evidence identity differs")
     _finite(evidence.get("loss"), "trainer loss")
-    if _finite(evidence.get("grad_norm"), "trainer grad norm") <= 0 or _finite(evidence.get("export_seconds"), "export seconds") <= 0 or _finite(evidence.get("forward_backward_seconds"), "forward/backward seconds") > 600:
+    if _finite(evidence.get("grad_norm"), "trainer grad norm") <= 0 or _finite(evidence.get("export_seconds"), "export seconds") <= 0 or not 0 <= _finite(evidence.get("forward_backward_seconds"), "forward/backward seconds") <= 600:
         _fail("delta receipt trainer timing or gradient is invalid")
     initial = _identity({"sha256": evidence.get("initial_adapter_sha256"), "size": evidence.get("initial_adapter_size")}, "initial adapter")
     final = _identity({"sha256": evidence.get("final_adapter_sha256"), "size": evidence.get("final_adapter_size")}, "final adapter")
     if initial == final:
         _fail("initial and final adapter identities are identical")
+    if initial != policy_model or final != model:
+        _fail("trainer initial/final adapter identities are not bound to policy-0 and step-1")
     loss = evidence.get("loss_identity")
     if not isinstance(loss, Mapping) or loss != {"sha256": expected["loss_sha256"], "size": expected["loss_size"], "mode": expected["loss_mode"]}:
         _fail("delta receipt loss identity differs")
@@ -204,6 +211,11 @@ def parse_result_receipt(payload: bytes | str, expected_sha256: str) -> dict[str
     for field in ("source_url", "source_adapter_dir"):
         if not isinstance(result[field], str) or not result[field]:
             _fail(f"result {field} is invalid")
+    manifest = result["manifest_sha256"]
+    expected_url = f"http://127.0.0.1:18100/qualified-adapters/{manifest}/step_1"
+    expected_dir = f"{RUNS_ROOT}/qualified-adapters/{manifest}/step_1"
+    if result["source_url"] != expected_url or result["source_adapter_dir"] != expected_dir:
+        _fail("result source identity is not the canonical publication")
     adapter = result["adapter_identity"]
     if not isinstance(adapter, Mapping) or set(adapter) != {"source_url", "target_sha256", "target_size", "config_sha256", "config_size"} or adapter["source_url"] != result["source_url"]:
         _fail("result adapter identity is invalid")
@@ -219,15 +231,24 @@ def parse_result_receipt(payload: bytes | str, expected_sha256: str) -> dict[str
     files = published.get("files")
     if not isinstance(files, Mapping) or set(files) != set(EXPECTED_FILES):
         _fail("result publication file identity is invalid")
-    _artifacts(files)
+    published_files = _artifacts(files)
+    if published_files["adapter_model.safetensors"] != {"sha256": adapter["target_sha256"], "size": adapter["target_size"]} or published_files["adapter_config.json"] != {"sha256": adapter["config_sha256"], "size": adapter["config_size"]} or published_files["adapter_manifest.json"]["sha256"] != result["manifest_sha256"]:
+        _fail("result publication adapter identity differs")
     stage = result["stage_result"]
     if not isinstance(stage, Mapping) or stage.get("status") != "ok" or stage.get("adapter_identity") != adapter:
         _fail("result stage identity is invalid")
     loaded = result["load_result"]
     if not isinstance(loaded, list) or not loaded:
         _fail("result load receipts are invalid")
+    loaded_instances = []
+    for item in loaded:
+        if not isinstance(item, Mapping) or item.get("lora_name") != QUALIFICATION_SLOT or item.get("source_url") != result["source_url"] or item.get("target_sha256") != adapter["target_sha256"] or item.get("target_size") != adapter["target_size"] or item.get("config_sha256") != adapter["config_sha256"] or item.get("config_size") != adapter["config_size"] or not isinstance(item.get("server_instance"), str) or not item["server_instance"]:
+            _fail("result load receipt identity is invalid")
+        loaded_instances.append(item["server_instance"])
     if not isinstance(result["server_instances"], list) or not result["server_instances"] or any(not isinstance(item, str) or not item for item in result["server_instances"]):
         _fail("result receipt server identity is invalid")
+    if sorted(loaded_instances) != sorted(result["server_instances"]):
+        _fail("result server identities differ from load receipts")
     for field in ("engine_identity_before", "engine_identity_after"):
         identity = result[field]
         if not isinstance(identity, Mapping) or set(identity) != {"container_id", "container_started_at", "api_pid", "api_start_time"} or any(not identity[key] for key in identity):
@@ -265,11 +286,20 @@ def derive_plan(
         _fail("qualified adapter load requires the canonical config directory")
     root = _canonical_absolute(qualification_root, "qualification root")
     runs = _canonical_absolute(runs_root, "runs root")
+    if root != QUALIFICATION_ROOT or runs != RUNS_ROOT:
+        _fail("qualified adapter roots are not the exact configured roots")
+    expected_receipt = _digest(expected_receipt_sha256, "expected receipt")
     if trainer_head != "n82" or not isinstance(inference_host, str) or not inference_host:
         _fail("qualified adapter load host identity is invalid")
     if type(inference_port) is not int or not 1 <= inference_port <= 65535 or type(direct_route_port) is not int or direct_route_port != 18100:
         _fail("qualified adapter load route is invalid")
     manifest_sha = _digest(receipt.get("step1_manifest_sha256"), "step-1 manifest")
+    identities_after = receipt.get("identities_after")
+    if not isinstance(identities_after, Mapping):
+        _fail("step-1 artifact identity is missing")
+    artifacts = _artifacts(identities_after.get("artifacts"))
+    if artifacts["adapter_manifest.json"]["sha256"] != manifest_sha:
+        _fail("step-1 manifest identity differs")
     source_dir = f"{runs}/qualified-adapters/{manifest_sha}/step_1"
     source_url = f"http://127.0.0.1:{direct_route_port}/qualified-adapters/{manifest_sha}/step_1"
     return {
@@ -291,9 +321,26 @@ def derive_plan(
         "origin_urls": [f"http://127.0.0.1:{inference_port}/v1"],
         "engine_ports": [inference_port],
         "engine_container": "glm52-decensor-h200",
-        "receipt_sha256": expected_receipt_sha256,
-        "artifacts": dict(receipt["identities_after"]["artifacts"]),
+        "receipt_sha256": expected_receipt,
+        "artifacts": artifacts,
     }
+
+
+def _validate_plan_paths(plan: Mapping[str, Any]) -> tuple[str, str, str]:
+    root = _canonical_absolute(plan.get("qualification_root"), "qualification root")
+    runs = _canonical_absolute(plan.get("runs_root"), "runs root")
+    if root != QUALIFICATION_ROOT or runs != RUNS_ROOT:
+        _fail("qualified adapter roots are not the exact configured roots")
+    manifest = _digest(plan.get("manifest_sha256"), "step-1 manifest")
+    expected_dir = f"{runs}/qualified-adapters/{manifest}/step_1"
+    expected_url = f"http://127.0.0.1:18100/qualified-adapters/{manifest}/step_1"
+    if plan.get("source_adapter_dir") != expected_dir or plan.get("source_url") != expected_url:
+        _fail("qualified adapter publication path is not canonical")
+    if plan.get("qualification_slot") != QUALIFICATION_SLOT:
+        _fail("qualified adapter slot is not canonical")
+    if plan.get("source_step1_dir") != f"{root}/run_trainer_only/broadcasts/step_1":
+        _fail("qualified adapter source path is not canonical")
+    return root, runs, manifest
 
 
 def _q(value: object) -> str:
@@ -319,9 +366,11 @@ def _artifact_checks(variable: str, artifacts: Mapping[str, Mapping[str, Any]]) 
 
 def build_publish_script(plan: Mapping[str, Any]) -> str:
     """Build the n82-only no-clobber publication and direct-route probe."""
+    _validate_plan_paths(plan)
     artifacts = plan.get("artifacts")
     if not isinstance(artifacts, Mapping) or set(artifacts) != set(EXPECTED_FILES):
         _fail("publish plan artifact identities are incomplete")
+    artifacts = _artifacts(artifacts)
     root = _q(plan["qualification_root"])
     source = _q(plan["source_step1_dir"])
     runs = _q(plan["runs_root"])
@@ -355,35 +404,76 @@ done
 {tmp_checks.replace('$$', '$')}
 source_after=$(identity_tree "$source"); test "$source_before" = "$source_after"
 atomic_noreplace() {{ # RENAME_NOREPLACE
-python3 - "$1" "$2" <<'PY'
+python3 - "$1" "$2" "$3" <<'PY'
 import ctypes, errno, os, sys
+parent, temporary, final = sys.argv[1:]
+if "/" in temporary or "/" in final or not temporary or not final:
+    raise SystemExit(94)
+def open_directory_chain(path):
+    fd = os.open("/", os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in path.strip("/").split("/"):
+            if component:
+                next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+parent_fd = open_directory_chain(parent)
+before = os.fstat(parent_fd)
 libc = ctypes.CDLL(None, use_errno=True)
 renameat2 = getattr(libc, "renameat2", None)
 if renameat2 is None: raise SystemExit(95)
 renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
 renameat2.restype = ctypes.c_int
-if renameat2(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 1) != 0:
-    error = ctypes.get_errno()
-    raise SystemExit(17 if error == errno.EEXIST else 95)
+try:
+    try:
+        existing = os.stat(final, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        if not __import__("stat").S_ISDIR(existing.st_mode) or __import__("stat").S_ISLNK(existing.st_mode):
+            raise SystemExit(96)
+        print("EXISTING")
+    else:
+        if renameat2(parent_fd, os.fsencode(temporary), parent_fd, os.fsencode(final), 1) != 0:
+            error = ctypes.get_errno()
+            if error != errno.EEXIST:
+                raise SystemExit(95)
+            existing = os.stat(final, dir_fd=parent_fd, follow_symlinks=False)
+            if not __import__("stat").S_ISDIR(existing.st_mode) or __import__("stat").S_ISLNK(existing.st_mode):
+                raise SystemExit(96)
+            print("EXISTING")
+        else:
+            print("PUBLISHED")
+    after = os.fstat(parent_fd)
+    if (before.st_dev, before.st_ino, before.st_mode) != (after.st_dev, after.st_ino, after.st_mode):
+        raise SystemExit(97)
+finally:
+    os.close(parent_fd)
 PY
 }}
 published_new=0
-if [ -e "$final_root" ] || [ -L "$final_root" ]; then
+publish_state=$(atomic_noreplace "$parent" "${{tmp_root##*/}}" "$manifest" || true)
+case "$publish_state" in
+PUBLISHED)
+  test -d "$final_root" && test ! -L "$final_root"
+  test -d "$final" && test ! -L "$final"
+  published_new=1; status=published
+  ;;
+EXISTING)
   test -d "$final_root" && test ! -L "$final_root"
   test -d "$final" && test ! -L "$final"
   existing="$final"; {tmp_checks.replace('tmp', 'existing')}
   rm -rf -- "$tmp_root"; published_new=1
   status=existing
-else
-  if atomic_noreplace "$tmp_root" "$final_root"; then
-    published_new=1; status=published
-  elif [ -d "$final" ] && [ ! -L "$final" ]; then
-    existing="$final"; {tmp_checks.replace('tmp', 'existing')}
-    rm -rf -- "$tmp_root"; published_new=1; status=existing
-  else
-    echo 'existing destination appeared with a conflicting identity' >&2; exit 96
-  fi
-fi
+  ;;
+*)
+  echo 'existing destination appeared with a conflicting identity' >&2; exit 96
+  ;;
+esac
 owner_token=""
 if [ "$status" = published ]; then owner_token=$(stat -c '%d:%i:%s:%y:%z' -- "$final_root" | tr ' ' '_'); fi
 route_tmp=$(mktemp -d)
@@ -422,7 +512,7 @@ def parse_publish_result(value: str | Mapping[str, Any], plan: Mapping[str, Any]
         _fail("publish result manifest identity differs")
     if result.get("status") == "published" and (not isinstance(result.get("owner_token"), str) or not result["owner_token"] or any(character.isspace() for character in result["owner_token"])):
         _fail("publish result owner identity is missing")
-    if "files" in result and result["files"] != plan.get("artifacts"):
+    if result.get("files") != plan.get("artifacts"):
         _fail("publish result file identities differ")
     return result
 
@@ -436,6 +526,7 @@ def build_rollback_script(plan: Mapping[str, Any], *, remove_published: bool) ->
     """
     if remove_published:
         _fail("publication rollback requires the owner-token cleanup script")
+    _validate_plan_paths(plan)
     container = _q(plan.get("engine_container", "glm52-decensor-h200"))
     slot = _q(plan["qualification_slot"])
     port = int(plan["inference_port"])
@@ -450,6 +541,7 @@ printf 'QUALIFIED_ROLLBACK slot=%s\\n' "$slot"
 
 def build_publication_cleanup_script(plan: Mapping[str, Any], *, owner_token: str) -> str:
     """Remove only a publication created by this load session."""
+    _validate_plan_paths(plan)
     if not isinstance(owner_token, str) or not owner_token or any(character.isspace() for character in owner_token):
         _fail("publication owner token is invalid")
     artifacts = plan.get("artifacts")
@@ -473,6 +565,7 @@ printf 'QUALIFIED_PUBLICATION_ROLLBACK path=%s\\n' "$final_root"
 
 def build_result_receipt_script(plan: Mapping[str, Any], payload_b64: str) -> str:
     """Publish one immutable result receipt on the source host."""
+    _validate_plan_paths(plan)
     if not re.fullmatch(r"[A-Za-z0-9+/=_-]+", payload_b64):
         _fail("result receipt payload encoding is invalid")
     target = f'{plan["qualification_root"]}/qualified-adapter-load-receipt.json'

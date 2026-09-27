@@ -19,7 +19,7 @@ from training_ops.runtime.h200.qualified_adapter_load import (
     parse_result_receipt,
     parse_publish_result,
 )
-from training_ops import _qualified_receipt_from_output, _qualified_adapter_receipt_script
+from training_ops import _qualified_receipt_from_output, _qualified_result_receipt_from_output, _qualified_adapter_receipt_script
 
 
 def receipt():
@@ -85,7 +85,7 @@ def result_receipt():
         "adapter_identity": adapter,
         "published": {"status": "published", "source_url": source_url, "source_adapter_dir": source_dir, "manifest_sha256": "c" * 64, "owner_token": "8:99:123:456", "files": artifacts},
         "stage_result": {"status": "ok", "adapter_identity": adapter},
-        "load_result": [{"server_instance": "instance-a"}],
+        "load_result": [{"lora_name": "trinity-h200-post-update-qualification-slot1", "source_url": source_url, "target_sha256": "a" * 64, "target_size": 100, "config_sha256": "b" * 64, "config_size": 200, "server_instance": "instance-a"}],
         "server_instances": ["instance-a"],
         "engine_identity_before": {"container_id": "container-a", "container_started_at": "2026-09-27T00:00:00Z", "api_pid": 321, "api_start_time": "1001"},
         "engine_identity_after": {"container_id": "container-a", "container_started_at": "2026-09-27T00:00:00Z", "api_pid": 321, "api_start_time": "1001"},
@@ -97,7 +97,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
     def apply_plan(self):
         plan = derive_plan(
             "configs/trinity-h200-post-update-qualification", receipt(), "f" * 64,
-            qualification_root="/data/q", runs_root="/data/runs", trainer_head="n82",
+            qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", runs_root="/data/glm52-rl/runs", trainer_head="n82",
             inference_host="h200b", inference_port=8000, direct_route_port=18100,
         )
         plan.update(
@@ -153,6 +153,85 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         with self.assertRaisesRegex(QualifiedAdapterLoadError, "initial.*final"):
             parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
 
+    def test_delta_receipt_binds_initial_final_and_rejects_negative_gate(self):
+        mutated = json.loads(json.dumps(receipt()))
+        mutated["trainer_evidence"]["initial_adapter_sha256"] = "1" * 64
+        mutated["trainer_evidence"]["initial_adapter_size"] = 111
+        payload = json.dumps(mutated, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "initial"):
+            parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
+        mutated = json.loads(json.dumps(receipt()))
+        mutated["trainer_evidence"]["forward_backward_seconds"] = -0.1
+        payload = json.dumps(mutated, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "timing"):
+            parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
+
+    def test_delta_receipt_rejects_step1_equal_to_policy0(self):
+        mutated = json.loads(json.dumps(receipt()))
+        policy_model = mutated["policy0_adapter"]
+        policy_config = mutated["policy0_config"]
+        mutated["step1_adapter"] = policy_model
+        mutated["step1_config"] = policy_config
+        for identity in (mutated["identities_before"], mutated["identities_after"]):
+            identity["step1_adapter"] = policy_model
+            identity["step1_config"] = policy_config
+            identity["artifacts"]["adapter_model.safetensors"] = policy_model
+            identity["artifacts"]["adapter_config.json"] = policy_config
+        payload = json.dumps(mutated, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "policy-0"):
+            parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
+
+    def test_delta_receipt_rejects_extra_chain_fields_and_boolean_step_count(self):
+        mutated = json.loads(json.dumps(receipt()))
+        mutated["identities_before"]["extra"] = True
+        mutated["identities_after"]["extra"] = True
+        payload = json.dumps(mutated, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "identity"):
+            parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
+        mutated = json.loads(json.dumps(receipt()))
+        mutated["trainer_evidence"]["completed_optimizer_steps"] = True
+        payload = json.dumps(mutated, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "one update"):
+            parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
+
+    def test_derive_plan_rejects_broad_roots_and_untrusted_values(self):
+        cases = (
+            ("/", "/data/glm52-rl/runs"),
+            ("/data", "/data/glm52-rl/runs"),
+            ("/data/glm52-rl/qualifications/alias", "/data/glm52-rl/runs"),
+            ("/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", "/"),
+            ("/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", "/data"),
+            ("/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", "/data/glm52-rl/runs/alias"),
+        )
+        for qualification_root, runs_root in cases:
+            with self.subTest(qualification_root=qualification_root, runs_root=runs_root), self.assertRaisesRegex(QualifiedAdapterLoadError, "root"):
+                derive_plan("configs/trinity-h200-post-update-qualification", receipt(), "f" * 64, qualification_root=qualification_root, runs_root=runs_root, trainer_head="n82", inference_host="h200b", inference_port=8000, direct_route_port=18100)
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "receipt"):
+            derive_plan("configs/trinity-h200-post-update-qualification", receipt(), "$(touch /tmp/owned)", qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", runs_root="/data/glm52-rl/runs", trainer_head="n82", inference_host="h200b", inference_port=8000, direct_route_port=18100)
+
+    def test_result_receipt_rejects_forged_arbitrary_source_path(self):
+        mutated = result_receipt()
+        mutated["source_url"] = "file:///etc/passwd"
+        payload = json.dumps(mutated, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "source"):
+            parse_result_receipt(payload, hashlib.sha256(payload).hexdigest())
+
+    def test_result_receipt_must_equal_the_local_live_plan(self):
+        expected = result_receipt()
+        raw = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        expected_sha = hashlib.sha256(raw).hexdigest()
+        header = "QUALIFIED_RESULT_RECEIPT path=/data/glm52-rl/qualifications/trinity-h200-post-update-qualification/qualified-adapter-load-receipt.json sha256=" + expected_sha + " size=" + str(len(raw))
+        output = header + "\nQUALIFIED_RESULT_RECEIPT_BEGIN\n" + base64.b64encode(raw).decode() + "\nQUALIFIED_RESULT_RECEIPT_END\n"
+        self.assertEqual(_qualified_result_receipt_from_output(output, expected_sha, expected)["status"], "loaded")
+        forged = json.loads(json.dumps(expected))
+        forged["load_result"][0]["server_instance"] = "other-instance"
+        forged_raw = json.dumps(forged, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        forged_sha = hashlib.sha256(forged_raw).hexdigest()
+        forged_header = "QUALIFIED_RESULT_RECEIPT path=/data/glm52-rl/qualifications/trinity-h200-post-update-qualification/qualified-adapter-load-receipt.json sha256=" + forged_sha + " size=" + str(len(forged_raw))
+        forged_output = forged_header + "\nQUALIFIED_RESULT_RECEIPT_BEGIN\n" + base64.b64encode(forged_raw).decode() + "\nQUALIFIED_RESULT_RECEIPT_END\n"
+        with self.assertRaisesRegex(Refused, "differ"):
+            _qualified_result_receipt_from_output(forged_output, forged_sha, expected)
+
     def test_plan_binds_canonical_output_step1_route_and_fixed_slot(self):
         plan = derive_plan(
             "configs/trinity-h200-post-update-qualification",
@@ -177,8 +256,8 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
             "configs/trinity-h200-post-update-qualification",
             receipt(),
             "f" * 64,
-            qualification_root="/data/q",
-            runs_root="/data/runs",
+            qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification",
+            runs_root="/data/glm52-rl/runs",
             trainer_head="n82",
             inference_host="h200b",
             inference_port=8000,
@@ -193,11 +272,13 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         for text in ("%y", "%z", "directory entry", "route_manifest", "route_config", "target_step", "mode"):
             self.assertIn(text, script)
         self.assertIn('test ! -L "$runs"', script)
+        for text in ("O_DIRECTORY", "O_NOFOLLOW", "dir_fd", "fstat", "renameat2"):
+            self.assertIn(text, script)
 
     def test_result_receipt_is_atomic_no_clobber(self):
         plan = derive_plan(
             "configs/trinity-h200-post-update-qualification", receipt(), "f" * 64,
-            qualification_root="/data/q", runs_root="/data/runs", trainer_head="n82",
+            qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", runs_root="/data/glm52-rl/runs", trainer_head="n82",
             inference_host="h200b", inference_port=8000, direct_route_port=18100,
         )
         script = build_result_receipt_script(plan, "e30=")
@@ -239,7 +320,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
     def test_publish_result_rejects_mismatched_source_or_slot(self):
         plan = derive_plan(
             "configs/trinity-h200-post-update-qualification", receipt(), "f" * 64,
-            qualification_root="/data/q", runs_root="/data/runs", trainer_head="n82",
+            qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", runs_root="/data/glm52-rl/runs", trainer_head="n82",
             inference_host="h200b", inference_port=8000, direct_route_port=18100,
         )
         result = {"status": "published", "source_url": plan["source_url"], "source_adapter_dir": plan["source_adapter_dir"], "manifest_sha256": "c" * 64, "owner_token": "8:99:123:456", "files": receipt()["identities_after"]["artifacts"]}

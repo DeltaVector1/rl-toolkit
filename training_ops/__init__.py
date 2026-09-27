@@ -10876,10 +10876,14 @@ def _qualified_receipt_from_output(output: str, expected_sha256: str) -> dict[st
         raise Refused("remote delta receipt identity differs from the expected receipt")
     begin = "QUALIFIED_RECEIPT_BEGIN\n"
     end = "\nQUALIFIED_RECEIPT_END"
+    if output.count(begin) != 1 or output.count(end) != 1:
+        raise Refused("remote delta receipt framing is ambiguous")
     start = output.find(begin)
     finish = output.find(end, start + len(begin)) if start >= 0 else -1
     if start < 0 or finish < 0:
         raise Refused("remote delta receipt body is missing")
+    if output[finish + len(end):].strip():
+        raise Refused("remote delta receipt has trailing output")
     encoded = output[start + len(begin):finish].strip()
     try:
         raw = base64.b64decode(encoded, validate=True)
@@ -10893,19 +10897,23 @@ def _qualified_receipt_from_output(output: str, expected_sha256: str) -> dict[st
         raise Refused(f"remote delta receipt validation failed: {error}") from error
 
 
-def _qualified_result_receipt_from_output(output: str, expected_sha256: str) -> dict[str, object]:
+def _qualified_result_receipt_from_output(output: str, expected_sha256: str, expected_result: Mapping[str, object] | None = None) -> dict[str, object]:
     lines = [line for line in output.splitlines() if line.startswith("QUALIFIED_RESULT_RECEIPT ")]
     if len(lines) != 1:
         raise Refused("remote qualified load result receipt identity is missing")
     fields = dict(item.split("=", 1) for item in lines[0].split()[1:] if "=" in item)
-    if fields.get("sha256") != expected_sha256 or not fields.get("size", "").isdigit():
+    if fields.get("path") != "/data/glm52-rl/qualifications/trinity-h200-post-update-qualification/qualified-adapter-load-receipt.json" or fields.get("sha256") != expected_sha256 or not fields.get("size", "").isdigit():
         raise Refused("remote qualified load result receipt identity differs")
     begin = "QUALIFIED_RESULT_RECEIPT_BEGIN\n"
     end = "\nQUALIFIED_RESULT_RECEIPT_END"
+    if output.count(begin) != 1 or output.count(end) != 1:
+        raise Refused("remote qualified load result receipt framing is ambiguous")
     start = output.find(begin)
     finish = output.find(end, start + len(begin)) if start >= 0 else -1
     if start < 0 or finish < 0:
         raise Refused("remote qualified load result receipt body is missing")
+    if output[finish + len(end):].strip():
+        raise Refused("remote qualified load result receipt has trailing output")
     try:
         raw = base64.b64decode(output[start + len(begin):finish].strip(), validate=True)
     except (ValueError, base64.binascii.Error) as error:
@@ -10913,9 +10921,12 @@ def _qualified_result_receipt_from_output(output: str, expected_sha256: str) -> 
     if len(raw) != int(fields["size"]):
         raise Refused("remote qualified load result receipt size differs")
     try:
-        return parse_result_receipt(raw, expected_sha256)
+        result = parse_result_receipt(raw, expected_sha256)
     except QualifiedAdapterLoadError as error:
         raise Refused(f"remote qualified load result receipt validation failed: {error}") from error
+    if expected_result is not None and result != dict(expected_result):
+        raise Refused("remote qualified load result receipt differs from the local live plan")
+    return result
 
 
 def _qualified_adapter_load_plan(config_dir: str, receipt_path: str, expected_sha256: str) -> tuple[dict[str, object], dict[str, object]]:
@@ -11119,7 +11130,7 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
         code, output = _ssh(str(plan["trainer_head"]), build_result_receipt_script(plan, payload), timeout=180)
         if code:
             raise Refused(f"qualified adapter result receipt publication failed: {output.strip()}")
-        _qualified_result_receipt_from_output(output, result_sha256)
+        _qualified_result_receipt_from_output(output, result_sha256, result)
         return result
     except BaseException as error:
         rollback = _qualified_adapter_rollback(plan, published, publication_owner_token) if (published or load_attempted) else "not-owned"
