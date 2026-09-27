@@ -182,6 +182,52 @@ class FixedSequenceRescoreTest(unittest.TestCase):
         self.assertEqual(result["comparisons"]["fresh_vs_reference"]["selected"]["max_abs"], 0.0)
         self.assertEqual(result["decision"], "fresh_matches_stored_rollout_but_trainer_differs")
 
+    def test_masked_padded_fifth_sentinels_are_allowed_and_excluded(self):
+        self.assertEqual(self.lengths[-1], 5)
+        self.assertFalse(self.mask[-1])
+        self.record["reference_logprobs"][-1] = -9999.0
+        self.record["trainer_logprobs"][-1] = -9999.0
+        self.record["delta"][-1] = -9999.0
+        result, _, _ = self._run()
+        self.assertEqual(result["masked_tokens"], len(self.mask) - sum(self.mask))
+        self.assertEqual(
+            result["comparisons"]["fresh_vs_reference"]["all"]["count"],
+            len(self.ids) - 1,
+        )
+        self.assertEqual(
+            result["comparisons"]["fresh_vs_trainer"]["all"]["count"],
+            len(self.ids) - 1,
+        )
+
+    def test_masked_sentinel_delta_validation_is_skipped_only_for_masked_position(self):
+        self.record["reference_logprobs"][-1] = -9999.0
+        self.record["trainer_logprobs"][-1] = -9999.0
+        self.record["delta"][-1] = -9999.0
+        loaded = fixed.load_parity_record(self.record)
+        self.assertEqual(loaded["reference_logprobs"][-1], -9999.0)
+        self.assertEqual(loaded["trainer_logprobs"][-1], -9999.0)
+        self.assertEqual(loaded["delta"][-1], -9999.0)
+
+    def test_selected_stored_sentinel_fails_closed_for_each_field(self):
+        for field in ("reference_logprobs", "trainer_logprobs", "delta"):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(self.record)
+                changed[field][1] = -9999.0
+                with self.assertRaisesRegex(fixed.FixedSequenceRescoreError, "selected|loss_mask"):
+                    fixed.load_parity_record(changed)
+
+    def test_masked_fresh_sentinel_is_excluded_and_selected_fresh_sentinel_fails(self):
+        fresh = list(self.reference)
+        fresh[-1] = -9999.0
+        result, _, _ = self._run(response_values=fresh)
+        self.assertEqual(
+            result["comparisons"]["fresh_vs_reference"]["all"]["count"],
+            len(self.ids) - 1,
+        )
+        fresh[1] = -9999.0
+        with self.assertRaisesRegex(fixed.FixedSequenceRescoreError, "selected|loss_mask"):
+            self._run(response_values=fresh)
+
     def test_decision_classes_cover_all_three_diagnoses(self):
         fresh_reference = list(self.reference)
         fresh_trainer = list(self.trainer)
