@@ -1088,13 +1088,13 @@ esac
 echo "TRAINER_FAILED $trainer_failed"
 echo "ORCH_LAST $(sudo docker logs __ORCH__ 2>&1 | strip | grep -a 'SUCCESS Step' | tail -1)"
 echo "BATCH $(sudo docker logs --tail 40 __ORCH__ 2>&1 | grep -oE 'batch [0-9]+/[0-9]+[^;]*; [0-9]+ inflight' | tail -1)"
-pipeline_telemetry=$(sudo docker logs --tail 200 __ORCH__ 2>&1 | grep -a 'PIPELINE_TELEMETRY ' | tail -1 || true)
+pipeline_telemetry=$(sudo docker logs --tail 200 __ORCH__ 2>&1 | strip | grep -a 'PIPELINE_TELEMETRY ' | tail -1 || true)
 if [ -n "$pipeline_telemetry" ]; then
   pipeline_telemetry_value=${pipeline_telemetry##*PIPELINE_TELEMETRY }
   pipeline_telemetry_value=${pipeline_telemetry_value%%;*}
   echo "PIPELINE_TELEMETRY $pipeline_telemetry_value"
 fi
-pipeline_telemetry_ts=$(sudo docker logs -t --tail 200 __ORCH__ 2>&1 | grep -a 'PIPELINE_TELEMETRY ' | tail -1 | cut -d' ' -f1 || true)
+pipeline_telemetry_ts=$(sudo docker logs -t --tail 200 __ORCH__ 2>&1 | strip | grep -a 'PIPELINE_TELEMETRY ' | tail -1 | cut -d' ' -f1 || true)
 echo "PIPELINE_TELEMETRY_AGE $pipeline_telemetry_ts"
 recent_rollouts=$(sudo docker logs --since 5m __ORCH__ 2>&1 || true)
 echo "FAILS5M $(printf '%s\n' "$recent_rollouts" | grep -ai 'Rollout failed' | grep -avi 'rollout is unscored' | wc -l)"
