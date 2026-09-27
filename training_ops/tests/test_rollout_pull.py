@@ -146,7 +146,10 @@ class RolloutPullTest(unittest.TestCase):
             )
             for path in (tools / "flock", tools / "lslocks"):
                 path.chmod(0o755)
-            environment.update(FAKE_FLOCK_STATUS="1", FAKE_LOCK_PATH=str(lock_file))
+            environment.update(
+                FAKE_FLOCK_STATUS="75",
+                FAKE_LOCK_PATH=str(lock_file),
+            )
             old_script = training_ops.rollout_pull_script
             try:
                 training_ops.rollout_pull_script = str(puller)
@@ -160,6 +163,131 @@ class RolloutPullTest(unittest.TestCase):
                 )
                 self.assertEqual(stopped.returncode, 0, stopped.stderr)
                 self.assertTrue((run_dir / ".rollout-pull.pid").exists())
+            finally:
+                training_ops.rollout_pull_script = old_script
+
+    def test_stop_rejects_malformed_lock_owner_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            tools = Path(directory) / "tools"
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            lock_file = run_dir / ".rollout-pull.lock"
+            lock_file.touch()
+            pid_file = run_dir / ".rollout-pull.pid"
+            pid_file.write_text("other-run-owner\n")
+            (tools / "flock").write_text(
+                "#!/usr/bin/env bash\n"
+                "exit 75\n"
+            )
+            (tools / "lslocks").write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$FAKE_LOCK_RECORD\"\n"
+            )
+            for path in (tools / "flock", tools / "lslocks"):
+                path.chmod(0o755)
+            old_script = training_ops.rollout_pull_script
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                stop_command = training_ops._rollout_pull_command(str(run_dir), "stop")
+                for record in (
+                    f"unknown {lock_file}",
+                    f"? {lock_file}",
+                    str(lock_file),
+                ):
+                    environment["FAKE_LOCK_RECORD"] = record
+                    stopped = subprocess.run(
+                        ["bash", "-c", stop_command],
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertNotEqual(stopped.returncode, 0, record)
+                    self.assertTrue(pid_file.exists(), record)
+            finally:
+                training_ops.rollout_pull_script = old_script
+
+    def test_stop_accepts_dead_numeric_lock_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            tools = Path(directory) / "tools"
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            lock_file = run_dir / ".rollout-pull.lock"
+            lock_file.touch()
+            pid_file = run_dir / ".rollout-pull.pid"
+            pid_file.write_text("dead-owner\n")
+            (tools / "flock").write_text("#!/usr/bin/env bash\nexit 75\n")
+            (tools / "lslocks").write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"999999999 $FAKE_LOCK_PATH\"\n"
+            )
+            for path in (tools / "flock", tools / "lslocks"):
+                path.chmod(0o755)
+            environment["FAKE_LOCK_PATH"] = str(lock_file)
+            old_script = training_ops.rollout_pull_script
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                stopped = subprocess.run(
+                    ["bash", "-c", training_ops._rollout_pull_command(str(run_dir), "stop")],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                self.assertTrue(pid_file.exists())
+            finally:
+                training_ops.rollout_pull_script = old_script
+
+    def test_stop_holds_lock_while_removing_pid_against_new_owner_race(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            tools = Path(directory) / "tools"
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            lock_file = run_dir / ".rollout-pull.lock"
+            pid_file = run_dir / ".rollout-pull.pid"
+            pid_file.write_text("old-owner\n")
+            race_marker = Path(directory) / "race-started"
+            flock_log = Path(directory) / "flock-log"
+            (tools / "flock").write_text(
+                "#!/usr/bin/env bash\n"
+                "set -eu\n"
+                "printf '%s\\n' \"$*\" >>\"$FAKE_FLOCK_LOG\"\n"
+                "if [ \"${FAKE_RACE:-0}\" = 1 ] && [ ! -e \"$FAKE_RACE_MARKER\" ]; then\n"
+                "  : >\"$FAKE_RACE_MARKER\"\n"
+                "  ( /usr/bin/flock \"$FAKE_LOCK_PATH\" -c \"printf '%s\\\\n' raced > '$FAKE_PID_PATH'\" ) &\n"
+                "fi\n"
+                "exec /usr/bin/flock \"$@\"\n"
+            )
+            (tools / "flock").chmod(0o755)
+            environment.update(
+                FAKE_RACE="1",
+                FAKE_RACE_MARKER=str(race_marker),
+                FAKE_FLOCK_LOG=str(flock_log),
+                FAKE_LOCK_PATH=str(lock_file),
+                FAKE_PID_PATH=str(pid_file),
+            )
+            old_script = training_ops.rollout_pull_script
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                stopped = subprocess.run(
+                    ["bash", "-c", training_ops._rollout_pull_command(str(run_dir), "stop")],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                for _ in range(100):
+                    if pid_file.exists() and pid_file.read_text() == "raced\n":
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(pid_file.exists())
+                self.assertEqual(pid_file.read_text(), "raced\n")
+                self.assertEqual(len(flock_log.read_text().splitlines()), 1)
             finally:
                 training_ops.rollout_pull_script = old_script
 

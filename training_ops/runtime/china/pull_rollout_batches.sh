@@ -123,31 +123,48 @@ pid_live() {
   [ "$state" != Z ]
 }
 
-lock_safe() {
-  local flock_status listing pid path
-  [ ! -L "$lock_file" ] || return 1
-  if [ -e "$lock_file" ] && [ ! -f "$lock_file" ]; then
-    return 1
-  fi
-  if flock -n "$lock_file" -c true; then
-    return 0
-  else
-    flock_status=$?
-  fi
-  [ "$flock_status" -eq 1 ] || return 1
-
-  # A contended lock is safe only when its kernel owner is gone or cannot be
-  # resolved. A live owner may be another run and must stop the cleanup.
+lock_owner_safe() {
+  local listing line pid path
   listing=$(lslocks -n -o PID,PATH --notruncate 2>/dev/null) || return 1
-  while read -r pid path; do
-    [ "${path:-}" = "$lock_file" ] || continue
-    pid_live "${pid:-}" && return 1
+  [ -n "$listing" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || return 1
+    read -r pid path <<<"$line"
+    [ -n "${path:-}" ] || return 1
+    [ "$path" = "$lock_file" ] || continue
+    case "$pid" in
+      -) ;;
+      ''|*[!0-9]*) return 1 ;;
+      *) pid_live "$pid" && return 1 ;;
+    esac
   done <<<"$listing"
   return 0
 }
 
+cleanup_pid() {
+  local flock_status command
+  [ ! -L "$lock_file" ] || return 1
+  if [ -e "$lock_file" ] && [ ! -f "$lock_file" ]; then
+    return 1
+  fi
+  printf -v command \
+    'if [ -L %q ] || { [ -e %q ] && [ ! -f %q ]; }; then exit 74; fi; rm -f -- %q || exit 74' \
+    "$pid_file" "$pid_file" "$pid_file" "$pid_file"
+  if flock -n -E 75 "$lock_file" -c "$command"; then
+    return 0
+  else
+    flock_status=$?
+  fi
+  [ "$flock_status" -eq 75 ] || return 1
+
+  # A contended lock is safe only when its kernel owner is gone or is the
+  # explicit unresolved marker. A live owner may be another run and must stop
+  # the cleanup.
+  lock_owner_safe
+}
+
 stop() {
-  local pid any_live flock_status
+  local pid any_live
   local -a pids=()
   local_path_safe "$dest_dir" || return 1
   mapfile -t pids < <(matching_pids)
@@ -177,16 +194,7 @@ stop() {
     return 0
   fi
   [ -d "$dest_dir" ] && [ ! -L "$dest_dir" ] || return 1
-  lock_safe || return 1
-  # Keep the PID record when lock ownership is unresolved. It cannot be
-  # safely attributed to this run, but it does not block a later stop.
-  if flock -n "$lock_file" -c true; then
-    rm -f -- "$pid_file"
-  else
-    flock_status=$?
-    [ "$flock_status" -eq 1 ] || return 1
-    lock_safe || return 1
-  fi
+  cleanup_pid
 }
 
 start() {
