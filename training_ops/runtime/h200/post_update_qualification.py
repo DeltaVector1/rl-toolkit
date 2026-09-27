@@ -176,6 +176,8 @@ def _post_update_binding(
         "mask_false": POST_UPDATE_PROMPT_TOKENS,
         "mask_true": POST_UPDATE_COMPLETION_TOKENS,
         "request_mode": POST_UPDATE_REQUEST_MODE,
+        "policy": reference.get("policy"),
+        "policy_model": reference.get("model"),
         "policy_receipt": dict(receipt),
         "receipt_sha256": _json_sha256(receipt),
         "adapter_sha256": target_sha,
@@ -209,6 +211,7 @@ def build_post_update_reference(
     policy_receipt: Path | Mapping[str, Any],
     cache_salt: str,
     readiness_endpoint: str,
+    policy: str = "policy-0",
     timeout: float = 120.0,
     post_json: Any = None,
     get_json: Any = None,
@@ -216,6 +219,10 @@ def build_post_update_reference(
     failure_output_path: Path | None = None,
 ) -> dict[str, Any]:
     """Build one strict reference from one fresh serialized completion decode."""
+    if policy not in {"policy-0", "policy-1"}:
+        raise PostUpdateQualificationError(
+            "post-update reference policy must be policy-0 or policy-1"
+        )
     failure_path = Path(failure_output_path) if failure_output_path is not None else output_path
     if (
         output_path.exists()
@@ -287,7 +294,7 @@ def build_post_update_reference(
                 input_record=input_record,
                 output_path=temporary_output,
                 base_model=base_model,
-                policy="policy-0",
+                policy=policy,
                 policy_model=policy_model,
                 policy_receipt=policy_receipt,
                 expected_policy_identity=expected_policy_identity,
@@ -452,6 +459,8 @@ def validate_post_update_reference(
     *,
     expected_seq_len: int | None = None,
     expected_policy_identity: Mapping[str, Any] | None = None,
+    expected_policy: str = "policy-0",
+    expected_policy_model: str | None = None,
     expected_response: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate one non-rescore reference with real, aligned advantages."""
@@ -467,7 +476,10 @@ def validate_post_update_reference(
             "post-update reference must use completion qualification mode"
         )
     try:
-        validated = validate_policy0_reference(value)
+        validated = validate_policy0_reference(
+            value,
+            expected_policy=expected_policy,
+        )
     except QualificationError as error:
         raise PostUpdateQualificationError(str(error)) from error
 
@@ -577,6 +589,8 @@ def validate_post_update_reference(
     policy = validated.get("policy_identity")
     if not isinstance(before, Mapping) or not isinstance(after, Mapping) or before != after or policy != before:
         raise PostUpdateQualificationError("post-update policy receipt is stale or mismatched")
+    if expected_policy_model is not None and before.get("lora_name") != expected_policy_model:
+        raise PostUpdateQualificationError("post-update policy receipt is not bound to the expected loaded slot")
     if expected_policy_identity is not None and dict(before) != dict(expected_policy_identity):
         raise PostUpdateQualificationError("post-update policy receipt differs from expected receipt")
     advantages = validated.get("advantages")
@@ -602,6 +616,8 @@ def validate_post_update_references(
     *,
     expected_seq_len: int = POST_UPDATE_SEQ_LEN,
     expected_policy_identity: Mapping[str, Any] | None = None,
+    expected_policy: str = "policy-0",
+    expected_policy_model: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping) or value.get("schema_version") != 1:
         raise PostUpdateQualificationError("post-update reference collection schema is invalid")
@@ -613,6 +629,8 @@ def validate_post_update_references(
             item,
             expected_seq_len=expected_seq_len,
             expected_policy_identity=expected_policy_identity,
+            expected_policy=expected_policy,
+            expected_policy_model=expected_policy_model,
         )
         for item in microbatches
     ]

@@ -27,7 +27,8 @@ from urllib.request import Request, urlopen
 
 _RAW_ROUTE_FIELDS = {"data", "dtype", "shape", "start"}
 _MAX_ROUTE_BYTES = 512 * 1024 * 1024
-_POLICIES = {"base", "policy-0"}
+_POLICIES = {"base", "policy-0", "policy-1"}
+_LOADED_POLICIES = {"policy-0", "policy-1"}
 _PREFILL_RESCORE_REQUEST_MODE = "serialized_generate_decode256_prefill_rescore"
 _PREFILL_RESCORE_PROMPT_TOKENS = 256
 _PREFILL_RESCORE_COMPLETION_TOKENS = 256
@@ -427,7 +428,7 @@ def _endpoint_url(endpoint: str) -> str:
 
 def _readiness_url(endpoint: str | None, generate_endpoint: str) -> str:
     if not isinstance(endpoint, str) or not endpoint.strip():
-        raise ReferenceError("policy-0 requires an explicit staging readiness endpoint")
+        raise ReferenceError("loaded policy requires an explicit staging readiness endpoint")
     value = endpoint.rstrip("/")
     parsed = urlsplit(value)
     generated = urlsplit(generate_endpoint)
@@ -532,7 +533,7 @@ def _extract_policy_receipt(payload: Mapping[str, Any], policy_model: str) -> di
 def _validate_cache_salt(value: str | None, *, required: bool) -> str | None:
     if value is None:
         if required:
-            raise ReferenceError("policy-0 requires a fresh cache_salt")
+            raise ReferenceError("loaded policy requires a fresh cache_salt")
         return None
     if not isinstance(value, str) or not value.strip() or len(value) > 256:
         raise ReferenceError("cache_salt must be a non-empty string of at most 256 characters")
@@ -569,8 +570,8 @@ def build_reference(
         raise ReferenceError("prefill_rescore must be a boolean")
     if not prefill_rescore and rescore_cache_salt is not None:
         raise ReferenceError("rescore_cache_salt requires --prefill-rescore")
-    if prefill_rescore and policy != "policy-0":
-        raise ReferenceError("prefill-rescore is only supported for policy-0")
+    if prefill_rescore and policy not in _LOADED_POLICIES:
+        raise ReferenceError("prefill-rescore is only supported for a loaded policy")
     if trainer_seq_len is None:
         trainer_seq_len = (
             _PREFILL_RESCORE_SEQUENCE_TOKENS if prefill_rescore else 8192
@@ -581,7 +582,7 @@ def build_reference(
         )
     if minimum_completion_tokens is None:
         minimum_completion_tokens = completion_tokens
-    if not base_model or (policy == "policy-0" and not policy_model):
+    if not base_model or (policy in _LOADED_POLICIES and not policy_model):
         raise ReferenceError("base_model and selected policy model are required")
     if isinstance(minimum_tokens, bool) or minimum_tokens < 0:
         raise ReferenceError("minimum_tokens must be non-negative")
@@ -618,10 +619,10 @@ def build_reference(
 
     model = base_model if policy == "base" else policy_model
     assert model is not None
-    if policy == "policy-0":
+    if policy in _LOADED_POLICIES:
         if expected_policy_identity is None:
             raise ReferenceError(
-                "policy-0 requires a readiness receipt and expected policy identity"
+                f"{policy} requires a readiness receipt and expected policy identity"
             )
         generate_endpoint = _endpoint_url(endpoint)
         readiness_url = _readiness_url(readiness_endpoint, generate_endpoint)
@@ -649,8 +650,8 @@ def build_reference(
         ):
             raise ReferenceError("base policy cannot use a policy readiness receipt")
         policy_identity = None
-    cache_salt = _validate_cache_salt(cache_salt, required=policy == "policy-0")
-    if policy == "policy-0":
+    cache_salt = _validate_cache_salt(cache_salt, required=policy in _LOADED_POLICIES)
+    if policy in _LOADED_POLICIES:
         if prefill_rescore:
             if (
                 completion_tokens != _PREFILL_RESCORE_COMPLETION_TOKENS
@@ -665,11 +666,13 @@ def build_reference(
             if cache_salt == rescore_cache_salt:
                 raise ReferenceError("decode and prefill cache salts must be distinct")
         elif completion_tokens != 32 or minimum_completion_tokens != 32:
-            raise ReferenceError("policy-0 qualification requires exactly 32 generated tokens")
+            raise ReferenceError(
+                f"{policy} qualification requires exactly 32 generated tokens"
+            )
         expected_prompt_tokens = trainer_seq_len - completion_tokens
         if token_count != expected_prompt_tokens:
             raise ReferenceError(
-                f"policy-0 prompt must contain exactly {expected_prompt_tokens} tokens"
+                f"{policy} prompt must contain exactly {expected_prompt_tokens} tokens"
             )
     response_hashes: dict[str, str] = {}
     request_bodies: dict[str, dict[str, Any]] = {}
@@ -849,13 +852,13 @@ def build_reference(
             raise ReferenceError("prefill routed expert digest differs from the preserved expectation")
     else:
         sampling_params = {
-            "max_tokens": completion_tokens if policy == "policy-0" else 1,
-            "temperature": 0.0 if policy == "policy-0" else 1.0,
+            "max_tokens": completion_tokens if policy in _LOADED_POLICIES else 1,
+            "temperature": 0.0 if policy in _LOADED_POLICIES else 1.0,
             "top_p": 1.0,
         }
         if policy == "base":
             sampling_params["prompt_logprobs"] = 1
-        if policy == "policy-0":
+        if policy in _LOADED_POLICIES:
             sampling_params["logprobs"] = 1
             sampling_params["min_tokens"] = completion_tokens
         request_body: dict[str, Any] = {
@@ -866,7 +869,7 @@ def build_reference(
         if cache_salt is not None:
             request_body["cache_salt"] = cache_salt
         response = post_json(
-            generate_endpoint if policy == "policy-0" else _endpoint_url(endpoint),
+            generate_endpoint if policy in _LOADED_POLICIES else _endpoint_url(endpoint),
             request_body,
             timeout,
         )
@@ -880,11 +883,11 @@ def build_reference(
         finish_reason = choice.get("finish_reason")
         prompt_logprobs = (
             [0.0] * token_count
-            if policy == "policy-0"
+            if policy in _LOADED_POLICIES
             else _flatten_prompt_logprobs(response.get("prompt_logprobs"), input_ids)
         )
         full_logprobs = prompt_logprobs
-        if policy == "policy-0":
+        if policy in _LOADED_POLICIES:
             raw_generated_ids = choice.get("token_ids")
             if (
                 not isinstance(raw_generated_ids, list)
@@ -892,10 +895,12 @@ def build_reference(
                 or len(raw_generated_ids) > completion_tokens
                 or any(isinstance(token, bool) or not isinstance(token, int) for token in raw_generated_ids)
             ):
-                raise ReferenceError("policy-0 response has too few or invalid generated token IDs")
+                raise ReferenceError(
+                    f"{policy} response has too few or invalid generated token IDs"
+                )
             if len(input_ids) + len(raw_generated_ids) != trainer_seq_len:
                 raise ReferenceError(
-                    f"policy-0 response must contain exactly trainer seq_len={trainer_seq_len} tokens"
+                    f"{policy} response must contain exactly trainer seq_len={trainer_seq_len} tokens"
                 )
             generated_ids = list(raw_generated_ids)
             generated_logprobs = _flatten_completion_logprobs(
@@ -909,7 +914,9 @@ def build_reference(
                 for logprob, trainable in zip(full_logprobs, loss_mask)
                 if not trainable
             ):
-                raise ReferenceError("policy-0 prompt inference logprobs must be zero")
+                raise ReferenceError(
+                    f"{policy} prompt inference logprobs must be zero"
+                )
         route = choice.get("routed_experts")
         if not isinstance(route, dict):
             raise ReferenceError("serialized generate response is missing routed experts")
@@ -917,7 +924,9 @@ def build_reference(
         # the final generated token has no following-token forward position.  The
         # trainer loader applies the same zero-tail padding as production rollout
         # packing; keep the serialized qualification artifact raw.
-        route_token_count = len(full_ids) - 1 if policy == "policy-0" else len(full_ids)
+        route_token_count = (
+            len(full_ids) - 1 if policy in _LOADED_POLICIES else len(full_ids)
+        )
         route = _normalise_route(route, route_token_count)
         if expected_shape is not None and route.get("shape") != expected_shape:
             raise ReferenceError("routed expert shape differs from the preserved expectation")
@@ -935,7 +944,9 @@ def build_reference(
         "input_ids": full_ids,
         "inference_logprobs": full_logprobs,
         "sequence_lengths": (
-            [len(full_ids)] if policy == "policy-0" else list(record["sequence_lengths"])
+            [len(full_ids)]
+            if policy in _LOADED_POLICIES
+            else list(record["sequence_lengths"])
         ),
         "routed_experts": route,
         "temperature": sampling_params["temperature"],
@@ -948,7 +959,7 @@ def build_reference(
             if prefill_rescore
             else (
                 "serialized_generate_completion_logprobs"
-                if policy == "policy-0"
+                if policy in _LOADED_POLICIES
                 else "serialized_generate_prompt_logprobs"
             )
         ),
@@ -957,7 +968,7 @@ def build_reference(
             json.dumps(input_ids, separators=(",", ":")).encode()
         ).hexdigest(),
     }
-    if policy == "policy-0":
+    if policy in _LOADED_POLICIES:
         after_payload = get_json(readiness_url, timeout)
         policy_identity_after = _validate_policy_receipt(
             _extract_policy_receipt(after_payload, model),
@@ -1035,10 +1046,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-count", type=int, default=_DEFAULT_TOKEN_COUNT)
     parser.add_argument("--base-model")
     parser.add_argument("--policy", choices=sorted(_POLICIES))
-    parser.add_argument("--policy-model", help="exact loaded LoRA model name; required for policy-0")
-    parser.add_argument("--policy-receipt", type=Path, help="JSON readiness/load receipt for policy-0")
-    parser.add_argument("--expected-policy-identity", type=Path, help="JSON expected policy identity for policy-0")
-    parser.add_argument("--cache-salt", help="fresh top-level prefix-cache salt for policy-0")
+    parser.add_argument("--policy-model", help="exact loaded LoRA model name; required for a loaded policy")
+    parser.add_argument("--policy-receipt", type=Path, help="JSON readiness/load receipt for a loaded policy")
+    parser.add_argument("--expected-policy-identity", type=Path, help="JSON expected policy identity for a loaded policy")
+    parser.add_argument("--cache-salt", help="fresh top-level prefix-cache salt for a loaded policy")
     parser.add_argument(
         "--prefill-rescore",
         action="store_true",
@@ -1048,7 +1059,7 @@ def _parser() -> argparse.ArgumentParser:
         "--rescore-cache-salt",
         help="distinct fresh top-level prefix-cache salt for prefill-rescore",
     )
-    parser.add_argument("--readiness-endpoint", help="explicit active staging readiness URL for policy-0")
+    parser.add_argument("--readiness-endpoint", help="explicit active staging readiness URL for a loaded policy")
     parser.add_argument("--completion-tokens", type=int)
     parser.add_argument("--minimum-completion-tokens", type=int)
     parser.add_argument("--trainer-seq-len", type=int)

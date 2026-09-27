@@ -446,12 +446,18 @@ def validate_lora_config(
     return dict(value)
 
 
-def validate_reference(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Require one fresh, full-token, policy-0 trainer reference."""
+def validate_reference(
+    value: Mapping[str, Any],
+    *,
+    expected_policy: str = "policy-0",
+) -> dict[str, Any]:
+    """Require one fresh, full-token reference for the selected loaded policy."""
     if not isinstance(value, Mapping):
         raise QualificationError("reference must be an object")
-    if value.get("policy") != "policy-0":
-        raise QualificationError("reference is not a policy-0 reference")
+    if expected_policy not in {"policy-0", "policy-1"}:
+        raise QualificationError("expected policy is not supported")
+    if value.get("policy") != expected_policy:
+        raise QualificationError(f"reference is not a {expected_policy} reference")
     request_mode = value.get("request_mode")
     if request_mode not in {
         "serialized_generate_completion_logprobs",

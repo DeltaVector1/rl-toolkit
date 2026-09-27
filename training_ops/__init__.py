@@ -47,6 +47,7 @@ from training_ops.runtime.policy0_source import (
     parse_result as parse_policy0_source_result,
 )
 from training_ops.runtime.h200.post_update_qualification import (
+    POST_UPDATE_LOAD_SLOT,
     PostUpdateQualificationError,
     validate_post_update_references,
 )
@@ -228,6 +229,22 @@ def _config_dir(
 
 
 _POST_UPDATE_CONFIG_DIR = "configs/trinity-h200-post-update-qualification"
+_STEP1_PARITY_CONFIG_DIR = "configs/trinity-h200-step1-parity"
+_STRICT_POST_UPDATE_CONFIG_DIRS = frozenset(
+    {_POST_UPDATE_CONFIG_DIR, _STEP1_PARITY_CONFIG_DIR}
+)
+
+
+def _strict_post_update_reference_settings(
+    selected: Mapping[str, object],
+) -> tuple[str, str | None] | None:
+    """Return the strict reference policy and loaded slot for one config."""
+    trainer = selected.get("trainer")
+    if trainer == f"{_POST_UPDATE_CONFIG_DIR}/trainer.toml":
+        return "policy-0", None
+    if trainer == f"{_STEP1_PARITY_CONFIG_DIR}/trainer.toml":
+        return "policy-1", POST_UPDATE_LOAD_SLOT
+    return None
 
 
 def _guard_post_update_config_dir(config_dir: str) -> None:
@@ -237,39 +254,71 @@ def _guard_post_update_config_dir(config_dir: str) -> None:
     path = Path(config_dir)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         return
-    canonical_trainer = repo_root / _POST_UPDATE_CONFIG_DIR / "trainer.toml"
     candidate_trainer = repo_root / path / "trainer.toml"
-    if config_dir != _POST_UPDATE_CONFIG_DIR and candidate_trainer.is_file():
+    for strict_dir in _STRICT_POST_UPDATE_CONFIG_DIRS:
+        canonical_trainer = repo_root / strict_dir / "trainer.toml"
+        if config_dir != strict_dir and candidate_trainer.is_file():
+            copied_bytes = None
+            canonical_bytes = None
+            try:
+                copied_bytes = candidate_trainer.read_bytes()
+                canonical_bytes = canonical_trainer.read_bytes()
+                with candidate_trainer.open("rb") as stream:
+                    candidate_config = tomllib.load(stream)
+            except (OSError, tomllib.TOMLDecodeError):
+                candidate_config = None
+            fake = (
+                candidate_config.get("data", {}).get("fake", {})
+                if isinstance(candidate_config, dict)
+                else {}
+            )
+            model = (
+                candidate_config.get("model", {})
+                if isinstance(candidate_config, dict)
+                else {}
+            )
+            lora = model.get("lora", {}) if isinstance(model, dict) else {}
+            strict_shape = (
+                fake.get("batch_size") == 8
+                and model.get("seq_len") == 8192
+                and isinstance(lora.get("initial_adapter_path"), str)
+            )
+            if (
+                copied_bytes is not None
+                and canonical_bytes is not None
+                and copied_bytes == canonical_bytes
+            ) or (
+                strict_dir == _POST_UPDATE_CONFIG_DIR
+                and fake.get("export_final_adapter") is True
+            ) or (
+                strict_dir == _STEP1_PARITY_CONFIG_DIR
+                and strict_shape
+                and str(lora.get("initial_adapter_path", "")).endswith(
+                    "/policy-1/adapter_model.safetensors"
+                )
+            ):
+                raise Refused(
+                    "post-update qualification requires the canonical config directory"
+                )
         try:
-            copied_bytes = candidate_trainer.read_bytes()
-            canonical_bytes = canonical_trainer.read_bytes()
-            with candidate_trainer.open("rb") as stream:
-                candidate_config = tomllib.load(stream)
-        except (OSError, tomllib.TOMLDecodeError):
-            candidate_config = None
-        fake = candidate_config.get("data", {}).get("fake", {}) if isinstance(candidate_config, dict) else {}
-        if copied_bytes == canonical_bytes or fake.get("export_final_adapter") is True:
+            resolved_trainer = (repo_root / path / "trainer.toml").resolve()
+            canonical_trainer = canonical_trainer.resolve()
+        except OSError:
+            continue
+        if resolved_trainer != canonical_trainer:
+            continue
+        if config_dir != strict_dir:
             raise Refused(
                 "post-update qualification requires the canonical config directory"
             )
-    try:
-        resolved_trainer = (repo_root / path / "trainer.toml").resolve()
-        canonical_trainer = canonical_trainer.resolve()
-    except OSError:
+        current = repo_root
+        for component in Path(strict_dir).parts:
+            current /= component
+            if current.is_symlink():
+                raise Refused(
+                    "post-update qualification config path contains a symlink component"
+                )
         return
-    if resolved_trainer != canonical_trainer:
-        return
-    if config_dir != _POST_UPDATE_CONFIG_DIR:
-        raise Refused(
-            "post-update qualification requires the canonical config directory"
-        )
-    current = repo_root
-    for component in Path(_POST_UPDATE_CONFIG_DIR).parts:
-        current /= component
-        if current.is_symlink():
-            raise Refused(
-                "post-update qualification config path contains a symlink component"
-            )
 
 
 def _selected_inference_config(selected: dict) -> str:
@@ -6142,6 +6191,9 @@ def _validate_post_update_qualification_reference(
     trainer_config: dict,
     reference_path: Path,
     expected_identity: dict[str, str | int] | None = None,
+    *,
+    expected_policy: str = "policy-0",
+    expected_policy_model: str | None = None,
 ) -> dict:
     """Validate the local eight-reference post-update input before any SSH."""
     fake = trainer_config.get("data", {}).get("fake", {})
@@ -6157,6 +6209,8 @@ def _validate_post_update_qualification_reference(
         validate_post_update_references(
             reference,
             expected_seq_len=model["seq_len"],
+            expected_policy=expected_policy,
+            expected_policy_model=expected_policy_model,
         )
         digest = hashlib.sha256(reference_path.read_bytes()).hexdigest()
         if digest != expected_identity["final_reference_sha256"] or reference_path.stat().st_size != expected_identity["final_reference_size"]:
@@ -8259,6 +8313,9 @@ def _policy0_post_update_reference_copy(
     reference_path: Path,
     expected_identity: dict[str, str | int],
     source_adapter_identity: dict[str, dict[str, int | str]] | None = None,
+    *,
+    expected_policy: str = "policy-0",
+    expected_policy_model: str | None = None,
 ) -> dict[str, int | str]:
     """Validate one exact local post-update reference byte copy.
 
@@ -8282,6 +8339,8 @@ def _policy0_post_update_reference_copy(
             trainer_config,
             reference_path,
             expected,
+            expected_policy=expected_policy,
+            expected_policy_model=expected_policy_model,
         )
     except (Refused, PostUpdateQualificationError) as error:
         raise Refused(f"post-update local reference validation failed: {error}") from error
@@ -8402,6 +8461,9 @@ def _policy0_fetch_and_validate_post_update_reference(
     source_reference_path: str,
     expected_identity: dict[str, str | int],
     source_adapter_identity: dict[str, dict[str, int | str]],
+    *,
+    expected_policy: str = "policy-0",
+    expected_policy_model: str | None = None,
 ) -> tuple[Path, tempfile.TemporaryDirectory[str], dict[str, int | str]]:
     """Fetch, validate, and retain one local H200 reference copy."""
     expected = _validate_post_update_reference_identity(expected_identity)
@@ -8447,6 +8509,8 @@ def _policy0_fetch_and_validate_post_update_reference(
             local_reference,
             expected,
             source_adapter_identity,
+            expected_policy=expected_policy,
+            expected_policy_model=expected_policy_model,
         )
         source_after = _policy0_post_update_source_identity(
             source_reference_host,
@@ -8469,6 +8533,9 @@ def _validate_post_update_remote_reference(
     trainer_config: dict,
     reference_path: str,
     expected_identity: dict[str, str | int] | None = None,
+    *,
+    expected_policy: str = "policy-0",
+    expected_policy_model: str | None = None,
 ) -> dict[str, int | str]:
     """Validate the staged trainer reference through a read-only local copy."""
     if not isinstance(reference_path, str):
@@ -8528,6 +8595,8 @@ def _validate_post_update_remote_reference(
             trainer_config,
             local_reference,
             expected,
+            expected_policy=expected_policy,
+            expected_policy_model=expected_policy_model,
         )
         remote_after_validation = _policy0_remote_reference_identity(
             trainer_head,
@@ -9227,8 +9296,10 @@ def prepare_policy0_qualification(
     except (OSError, tomllib.TOMLDecodeError) as error:
         raise Refused(f"cannot read qualification config {trainer_path}: {error}") from error
     post_update_identity = None
-    if selected.get("trainer") == f"{_POST_UPDATE_CONFIG_DIR}/trainer.toml":
+    strict_reference = _strict_post_update_reference_settings(selected)
+    if strict_reference is not None:
         post_update_identity = _post_update_reference_identity()
+    expected_policy, expected_policy_model = strict_reference or ("policy-0", None)
     data = config.get("data", {}).get("fake", {})
     reference_path = data.get("reference_path")
     lora = config.get("model", {}).get("lora", {})
@@ -9394,6 +9465,8 @@ def prepare_policy0_qualification(
             source_reference_path,
             post_update_identity,
             source_manifest,
+            expected_policy=expected_policy,
+            expected_policy_model=expected_policy_model,
         )
         reference_manifest["reference.json"] = local_reference_identity
         transfer_results = _policy0_controller_transfer_reference(
@@ -10559,11 +10632,21 @@ def qualify(
         raise Refused(
             f"{relative_config} has no [data.fake]; use start() for an RL run"
         )
-    if selected.get("trainer") == "configs/trinity-h200-post-update-qualification/trainer.toml":
+    strict_reference = _strict_post_update_reference_settings(selected)
+    if strict_reference is not None:
+        expected_policy, expected_policy_model = strict_reference
         configured_reference = config["data"]["fake"].get("reference_path")
         if not isinstance(configured_reference, str):
             raise Refused("post-update qualification reference_path is missing")
-        _validate_post_update_remote_reference(config, configured_reference)
+        if expected_policy == "policy-0" and expected_policy_model is None:
+            _validate_post_update_remote_reference(config, configured_reference)
+        else:
+            _validate_post_update_remote_reference(
+                config,
+                configured_reference,
+                expected_policy=expected_policy,
+                expected_policy_model=expected_policy_model,
+            )
     if selected.get("kind") == "trinity":
         _trinity_trainer_loss_preflight(nodes)
     rc, out = _ssh(
