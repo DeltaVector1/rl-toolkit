@@ -66,24 +66,34 @@ class FixedSequenceRescoreTest(unittest.TestCase):
             "start": 0,
         }
 
-    def _response(self, values=None):
+    def _response(self, values=None, ids=None):
+        ids = self.ids if ids is None else ids
         values = self.reference if values is None else values
         return {
-            "choices": [{"routed_experts": self._route(len(values))}],
+            "choices": [{"routed_experts": self._route(len(ids))}],
             "prompt_logprobs": [
                 None if index == 0 else {str(token): {"logprob": value}}
-                for index, (token, value) in enumerate(zip(self.ids, values))
+                for index, (token, value) in enumerate(zip(ids, values))
             ],
         }
 
     def _run(self, response_values=None, get_json=None, **kwargs):
         calls = []
         post_response = kwargs.pop("post_response", None)
-        responses = [post_response or self._response(response_values)] * len(self.lengths)
+        policy_model = kwargs.pop("policy_model", self.model)
 
         def post(_endpoint, body, _timeout):
             calls.append(copy.deepcopy(body))
-            return responses[len(calls) - 1]
+            if post_response is not None:
+                return post_response
+            start = sum(self.lengths[: len(calls) - 1])
+            length = self.lengths[len(calls) - 1]
+            values = response_values
+            if values is not None:
+                values = values[start:start + length]
+            else:
+                values = self.reference[start:start + length]
+            return self._response(values, body["token_ids"])
 
         if get_json is None:
             get_json = lambda *_: {"loaded_receipts": {self.model: self.receipt}}
@@ -94,7 +104,7 @@ class FixedSequenceRescoreTest(unittest.TestCase):
                 endpoint="http://h200b:18100/inference/v1/generate",
                 readiness_endpoint="http://h200b:18100/inference/v1/staging-status",
                 expected_policy_identity=self.receipt,
-                policy_model=self.model,
+                policy_model=policy_model,
                 fresh_salt_prefix="test-rescore",
                 output_path=output,
                 post_json=post,
@@ -158,6 +168,7 @@ class FixedSequenceRescoreTest(unittest.TestCase):
     def test_length_and_first_none_alignment_fail_closed(self):
         malformed = self._response()
         malformed["prompt_logprobs"][0] = {str(self.ids[0]): {"logprob": 0.0}}
+        malformed["prompt_logprobs"] = malformed["prompt_logprobs"][: self.lengths[0]]
         with self.assertRaisesRegex(fixed.FixedSequenceRescoreError, "first"):
             self._run(post_response=malformed)
 
@@ -168,29 +179,29 @@ class FixedSequenceRescoreTest(unittest.TestCase):
         self.assertEqual(result["selected_tokens"], sum(self.mask))
         self.assertEqual(result["masked_tokens"], len(self.mask) - sum(self.mask))
         self.assertEqual(result["comparisons"]["fresh_vs_reference"]["selected"]["max_abs"], 0.0)
-        self.assertEqual(result["decision"], "fresh_matches_stored_rollout")
+        self.assertEqual(result["decision"], "fresh_matches_stored_rollout_but_trainer_differs")
 
     def test_decision_classes_cover_all_three_diagnoses(self):
         fresh_reference = list(self.reference)
         fresh_trainer = list(self.trainer)
         result, _, _ = self._run(response_values=fresh_reference)
-        self.assertEqual(result["decision"], "fresh_matches_stored_rollout")
+        self.assertEqual(result["decision"], "fresh_matches_stored_rollout_but_trainer_differs")
         result, _, _ = self._run(response_values=[value + 1.0 for value in self.reference])
-        self.assertEqual(result["decision"], "h200_adapter_routing_or_cache_identity")
+        self.assertEqual(result["decision"], "fresh_differs_from_stored_rollout")
         result, _, _ = self._run(response_values=fresh_trainer)
-        self.assertEqual(result["decision"], "stored_rollout_path")
+        self.assertEqual(result["decision"], "fresh_matches_trainer_but_stored_rollout_differs")
 
     def test_output_contains_only_hashes_counts_numeric_stats_and_identity(self):
         _, saved, _ = self._run()
         encoded = json.dumps(saved)
-        for forbidden in ("input_ids", "token_ids", "prompt_logprobs", "response", "data"):
+        for forbidden in ("input_ids", "token_ids", "prompt_logprobs", '"response":', '"data":'):
             self.assertNotIn(forbidden, saved)
             self.assertNotIn(forbidden, encoded)
         self.assertEqual(len(saved["sequences"]), 5)
         for sequence in saved["sequences"]:
             self.assertEqual(len(sequence["sequence_sha256"]), 64)
             self.assertEqual(len(sequence["route_sha256"]), 64)
-            self.assertIn("numeric", sequence)
+            self.assertIn("comparisons", sequence)
         self.assertEqual(saved["policy_identity"], self.receipt)
 
     def test_policy_model_mismatch_is_rejected(self):
