@@ -52,6 +52,16 @@ _PRE_BATCH_REJECTION_REASONS = (
 
 
 @dataclass
+class PreBatchGroupRecord:
+    """Numeric outcome for one finalized group, without retaining traces."""
+
+    clean: bool
+    rejected_rollouts: int
+    rejection_reason: str | None = None
+    policy_invalid_rollouts: int = 0
+
+
+@dataclass
 class PreBatchProgress:
     """Bounded, prompt-free collection counters for the next train batch."""
 
@@ -64,23 +74,82 @@ class PreBatchProgress:
         default_factory=lambda: {name: 0 for name in _PRE_BATCH_REJECTION_REASONS}
     )
 
+    def _add_record(self, record: PreBatchGroupRecord) -> None:
+        self.complete_groups += 1
+        self.policy_invalid_rollouts += record.policy_invalid_rollouts
+        if record.clean:
+            self.clean_groups += 1
+            return
+        self.rejected_groups += 1
+        self.rejected_rollouts += record.rejected_rollouts
+        reason = record.rejection_reason or "unknown"
+        if reason not in self.rejection_reasons:
+            # Keep the schema bounded if a future caller adds a reason.
+            reason = "unknown"
+            self.rejection_reasons.setdefault(reason, 0)
+        self.rejection_reasons[reason] += 1
+
+    def _remove_record(self, record: PreBatchGroupRecord) -> None:
+        self.complete_groups -= 1
+        self.policy_invalid_rollouts -= record.policy_invalid_rollouts
+        if record.clean:
+            self.clean_groups -= 1
+            return
+        self.rejected_groups -= 1
+        self.rejected_rollouts -= record.rejected_rollouts
+        reason = record.rejection_reason or "unknown"
+        if reason not in self.rejection_reasons:
+            reason = "unknown"
+            self.rejection_reasons.setdefault(reason, 0)
+        self.rejection_reasons[reason] = self.rejection_reasons.get(reason, 0) - 1
+
     def record_group(
         self,
         group: list[Rollout],
         *,
         rejection_reason: str | None = None,
+        policy_invalid_rollouts: int = 0,
+    ) -> PreBatchGroupRecord:
+        record = PreBatchGroupRecord(
+            clean=rejection_reason is None,
+            rejected_rollouts=0 if rejection_reason is None else len(group),
+            rejection_reason=rejection_reason,
+            policy_invalid_rollouts=policy_invalid_rollouts,
+        )
+        self._add_record(record)
+        return record
+
+    @staticmethod
+    def stale_record(rejected_rollouts: int) -> PreBatchGroupRecord:
+        return PreBatchGroupRecord(
+            clean=False,
+            rejected_rollouts=max(0, int(rejected_rollouts)),
+            rejection_reason="stale_policy",
+        )
+
+    def reclassify_group(
+        self,
+        previous: PreBatchGroupRecord,
+        replacement: PreBatchGroupRecord,
     ) -> None:
-        self.complete_groups += 1
-        if rejection_reason is None:
-            self.clean_groups += 1
-            return
-        self.rejected_groups += 1
-        self.rejected_rollouts += len(group)
-        if rejection_reason not in self.rejection_reasons:
-            # Keep the schema bounded if a future caller adds a reason.
-            rejection_reason = "unknown"
-            self.rejection_reasons.setdefault(rejection_reason, 0)
-        self.rejection_reasons[rejection_reason] += 1
+        self._remove_record(previous)
+        self._add_record(replacement)
+
+    def reset_for_batch(
+        self,
+        overflow: tuple[PreBatchGroupRecord, ...] | list[PreBatchGroupRecord] = (),
+    ) -> None:
+        """Reset counters at shipment and carry accepted overflow forward."""
+        self.complete_groups = 0
+        self.clean_groups = 0
+        self.rejected_groups = 0
+        self.rejected_rollouts = 0
+        self.policy_invalid_rollouts = 0
+        self.rejection_reasons = {
+            name: 0 for name in _PRE_BATCH_REJECTION_REASONS
+        }
+        for record in overflow:
+            self._add_record(record)
 
     def log_fields(
         self,
@@ -181,6 +250,10 @@ class TrainSink:
         self.pending_tokens: int = 0
         self.consecutive_errored_groups: int = 0
         self.pre_batch_progress = PreBatchProgress()
+        # Numeric outcomes for finalized groups still represented in the
+        # pending buffer. These records let shipment reset carry overflow
+        # without retaining prompts, responses, or rollout objects.
+        self.pending_group_progress: dict[uuid.UUID, PreBatchGroupRecord] = {}
 
         # Reset by the orchestrator after each ship via ``reset_pre_filter_stats``
         self.pre_filter_seen = 0
@@ -214,8 +287,27 @@ class TrainSink:
         stale = [r for r in self.pending_batch if r.group_id in stale_group_ids]
         self.pending_batch = [r for r in self.pending_batch if r.group_id not in stale_group_ids]
         self._mark_off_policy(stale)
+        stale_counts: dict[uuid.UUID, int] = defaultdict(int)
+        for rollout in stale:
+            stale_counts[rollout.group_id] += 1
+        telemetry_changed = False
+        for group_id, count in stale_counts.items():
+            previous = self.pending_group_progress.pop(group_id, None)
+            if previous is None:
+                continue
+            replacement = self.pre_batch_progress.stale_record(count)
+            replacement = PreBatchGroupRecord(
+                clean=replacement.clean,
+                rejected_rollouts=replacement.rejected_rollouts,
+                rejection_reason=replacement.rejection_reason,
+                policy_invalid_rollouts=previous.policy_invalid_rollouts,
+            )
+            self.pre_batch_progress.reclassify_group(previous, replacement)
+            telemetry_changed = True
         if self.token_batch_size is not None:
             self.pending_tokens = sum(payload_tokens(r) for r in self.pending_batch)
+        if telemetry_changed:
+            self._pre_batch_log()
         get_logger().warning(
             f"Dropped {len(stale)} completed rollout(s) from {len(stale_group_ids)} group(s) "
             f"past max_off_policy_steps={self.config.max_off_policy_steps}; replenishing the batch"
@@ -325,9 +417,19 @@ class TrainSink:
                     break
         return count
 
-    def _record_group(self, group: list[Rollout], rejection_reason: str | None = None) -> None:
-        self.pre_batch_progress.record_group(group, rejection_reason=rejection_reason)
-        self.pre_batch_progress.policy_invalid_rollouts += self._policy_invalid_rollouts(group)
+    def _record_group(
+        self,
+        group_id: uuid.UUID,
+        group: list[Rollout],
+        rejection_reason: str | None = None,
+    ) -> None:
+        policy_invalid_rollouts = self._policy_invalid_rollouts(group)
+        record = self.pre_batch_progress.record_group(
+            group,
+            rejection_reason=rejection_reason,
+            policy_invalid_rollouts=policy_invalid_rollouts,
+        )
+        self.pending_group_progress[group_id] = record
         self._pre_batch_log()
 
     async def add(self, episode: list[Rollout]) -> TrainBatch | None:
@@ -415,7 +517,7 @@ class TrainSink:
         task_idx = group[0].task.data.idx
         if any(self._is_stale(r) for r in group):
             self._mark_off_policy(group)
-            self._record_group(group, "stale_policy")
+            self._record_group(group_id, group, "stale_policy")
             get_logger().warning(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"dropped {len(group)} rollout(s) past max_off_policy_steps="
@@ -435,7 +537,7 @@ class TrainSink:
                 r.is_filtered = True
                 r.filter_results = {"errored_group": True}
             self.consecutive_errored_groups += 1
-            self._record_group(group, "errored_group")
+            self._record_group(group_id, group, "errored_group")
             get_logger().warning(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} (errored={num_errored}) | dropped complete group; "
@@ -473,7 +575,7 @@ class TrainSink:
                 r.samples = []
                 r.is_filtered = True
                 r.filter_results = {"trainer_seq_len_group": True}
-            self._record_group(group, "trainer_seq_len_group")
+            self._record_group(group_id, group, "trainer_seq_len_group")
             return
 
         # Untrainable traces carry no samples and must not skew the group baseline.
@@ -482,7 +584,7 @@ class TrainSink:
                 r.samples = []
                 r.is_filtered = True
                 r.filter_results = {"untrainable_group": True}
-            self._record_group(group, "untrainable_group")
+            self._record_group(group_id, group, "untrainable_group")
             get_logger().debug(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} | dropped complete group: untrainable member"
@@ -503,7 +605,7 @@ class TrainSink:
                 r.samples = []
                 r.is_filtered = True
                 r.filter_results = {"zero_advantage_group": True}
-            self._record_group(group, "zero_advantage_group")
+            self._record_group(group_id, group, "zero_advantage_group")
             get_logger().warning(
                 f"Finished group | env={env_name} task_idx={task_idx} | "
                 f"rollouts={len(group)} | dropped complete zero-advantage group"
@@ -547,7 +649,7 @@ class TrainSink:
             f"rollouts={len(group)} (errored={num_errored}, filtered={num_filtered}) | "
             f"reward={avg_reward:.4f} | filters: {filter_str}"
         )
-        self._record_group(group)
+        self._record_group(group_id, group)
 
     def process_batch(self) -> TrainBatch | None:
         """Pop a cohort off ``pending_batch`` (by rollout count when
@@ -596,7 +698,20 @@ class TrainSink:
         # finalized groups (and any overflow) into the next shipped batch's window.
         rollouts = self.pending_rollouts
         if samples:
+            overflow_group_ids = {rollout.group_id for rollout in self.pending_batch}
+            overflow_records = tuple(
+                self.pending_group_progress[group_id]
+                for group_id in overflow_group_ids
+                if group_id in self.pending_group_progress
+            )
+            self.pending_group_progress = {
+                group_id: record
+                for group_id, record in self.pending_group_progress.items()
+                if group_id in overflow_group_ids
+            }
+            self.pre_batch_progress.reset_for_batch(overflow_records)
             self.pending_rollouts = TrainRollouts()
+            self._pre_batch_log()
         return TrainBatch(rollouts=rollouts, samples=samples)
 
     def reset_pre_filter_stats(self) -> None:

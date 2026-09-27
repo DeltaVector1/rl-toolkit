@@ -931,6 +931,13 @@ def _parse_pipeline_telemetry(
         return None
     if any(parsed.get(name, 0) < 0 for name in parsed):
         return None
+    if not progress_timestamp.strip():
+        return None
+    progress_age = _age(progress_timestamp)
+    # A marker without a valid, non-future Docker timestamp is not
+    # authoritative. Do not show it as available with an invented age.
+    if progress_age is None or progress_age < 0:
+        return None
     return PreBatchProgress(
         available=True,
         complete_groups=parsed["complete_groups"],
@@ -946,7 +953,7 @@ def _parse_pipeline_telemetry(
         partial_rollouts=parsed["partial_rollouts"],
         inflight_train=parsed.get("inflight_train"),
         oldest_partial_age_seconds=partial_age,
-        progress_age_seconds=_age(progress_timestamp),
+        progress_age_seconds=progress_age,
         rejection_reasons={
             key.removeprefix("reject_"): value
             for key, value in parsed.items()
@@ -4373,6 +4380,28 @@ def _reward_note(r: RewardReport) -> str:
 # ----------------------------------------------------------- active watching
 
 
+def _watch_change_key(s: Status) -> tuple:
+    """Return bounded counters that prove collection or training changed."""
+    return (
+        s.trainer_steps,
+        s.batch,
+        s.trainer_compute_step,
+        s.trainer_compute_seconds,
+        s.trainer_compute_active,
+        s.prebatch.available,
+        s.prebatch.complete_groups,
+        s.prebatch.clean_groups,
+        s.prebatch.rejected_groups,
+        s.prebatch.rejected_rollouts,
+        s.prebatch.accepted_buffer,
+        s.prebatch.partial_groups,
+        s.prebatch.partial_rollouts,
+        s.prebatch.inflight_train,
+        s.prebatch.policy_invalid_rollouts,
+        tuple(sorted(s.prebatch.rejection_reasons.items())),
+    )
+
+
 def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
     """Print status in the foreground until the requested time ends."""
     if every > 600:
@@ -4396,20 +4425,7 @@ def watch(hours: float = 2.0, every: int = 300, run: str = "") -> list[Status]:
             continue
         history.append(s)
         print(s.report(), flush=True)
-        key = (
-            s.trainer_steps,
-            s.batch,
-            s.trainer_compute_step,
-            s.trainer_compute_seconds,
-            s.trainer_compute_active,
-            s.prebatch.complete_groups,
-            s.prebatch.clean_groups,
-            s.prebatch.rejected_groups,
-            s.prebatch.accepted_buffer,
-            s.prebatch.partial_groups,
-            s.prebatch.partial_rollouts,
-            s.prebatch.inflight_train,
-        )
+        key = _watch_change_key(s)
         if key != last_key:
             last_key, last_change = key, time.time()
         else:

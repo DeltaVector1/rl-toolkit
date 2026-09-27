@@ -15,7 +15,7 @@ def load_progress_class():
         if isinstance(node, (ast.Assign, ast.ClassDef))
         and (
             isinstance(node, ast.ClassDef)
-            and node.name == "PreBatchProgress"
+            and node.name in {"PreBatchProgress", "PreBatchGroupRecord"}
             or isinstance(node, ast.Assign)
             and any(
                 isinstance(target, ast.Name)
@@ -97,6 +97,35 @@ class PreBatchSinkTelemetryTest(unittest.TestCase):
         self.assertIn("reject_errored_group=17", fields)
         self.assertNotIn("prompt", fields.lower())
         self.assertNotIn("response", fields.lower())
+
+    def test_reset_starts_next_window_and_carries_overflow_group(self):
+        progress_class = load_progress_class()
+        progress = progress_class()
+        clean = progress.record_group([object() for _ in range(16)])
+        progress.record_group(
+            [object() for _ in range(16)], rejection_reason="errored_group"
+        )
+
+        progress.reset_for_batch([clean])
+
+        self.assertEqual(progress.complete_groups, 1)
+        self.assertEqual(progress.clean_groups, 1)
+        self.assertEqual(progress.rejected_groups, 0)
+        self.assertEqual(progress.rejection_reasons["errored_group"], 0)
+
+    def test_stale_pending_group_becomes_authoritative_rejection(self):
+        progress_class = load_progress_class()
+        progress = progress_class()
+        clean = progress.record_group([object() for _ in range(16)])
+        stale = progress.stale_record(16)
+
+        progress.reclassify_group(clean, stale)
+
+        self.assertEqual(progress.complete_groups, 1)
+        self.assertEqual(progress.clean_groups, 0)
+        self.assertEqual(progress.rejected_groups, 1)
+        self.assertEqual(progress.rejected_rollouts, 16)
+        self.assertEqual(progress.rejection_reasons["stale_policy"], 1)
 
 
 if __name__ == "__main__":

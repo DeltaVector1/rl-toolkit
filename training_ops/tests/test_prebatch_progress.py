@@ -46,6 +46,10 @@ class PreBatchProgressParserTest(unittest.TestCase):
         self.assertNotIn("response", report.lower())
 
     def test_rejects_unstructured_or_sensitive_fields(self):
+        self.assertIsNone(training_ops._parse_pipeline_telemetry(""))
+        self.assertIsNone(
+            training_ops._parse_pipeline_telemetry("current log is not structured")
+        )
         self.assertIsNone(
             training_ops._parse_pipeline_telemetry(
                 self.telemetry() + " prompt=do-not-log"
@@ -62,10 +66,40 @@ class PreBatchProgressParserTest(unittest.TestCase):
             )
         )
 
+    def test_malformed_and_future_timestamps_are_not_progress_ages(self):
+        malformed = training_ops._parse_pipeline_telemetry(
+            self.telemetry(), "not-a-docker-timestamp"
+        )
+        missing = training_ops._parse_pipeline_telemetry(self.telemetry())
+        future = training_ops._parse_pipeline_telemetry(
+            self.telemetry(), "2999-01-01T00:00:00.000000000Z"
+        )
+        old = training_ops._parse_pipeline_telemetry(
+            self.telemetry(), "2020-01-01T00:00:00.000000000Z"
+        )
+
+        self.assertIsNone(malformed)
+        self.assertIsNone(missing)
+        self.assertIsNone(future)
+        self.assertIsNotNone(old)
+        self.assertGreater(old.progress_age_seconds, 0)
+
     def test_status_without_marker_does_not_invent_progress(self):
         status = training_ops.Status()
         self.assertFalse(status.prebatch.available)
         self.assertIn("pre-batch progress: no telemetry", status.report())
+
+    def test_watch_change_key_tracks_prebatch_updates(self):
+        first = training_ops.Status()
+        second = training_ops.Status()
+        self.assertEqual(training_ops._watch_change_key(first), training_ops._watch_change_key(second))
+        second.prebatch.available = True
+        second.prebatch.accepted_buffer = 416
+        self.assertNotEqual(training_ops._watch_change_key(first), training_ops._watch_change_key(second))
+        third = training_ops.Status()
+        third.prebatch.available = True
+        third.prebatch.rejection_reasons = {"stale_policy": 1}
+        self.assertNotEqual(training_ops._watch_change_key(second), training_ops._watch_change_key(third))
 
 
 if __name__ == "__main__":
