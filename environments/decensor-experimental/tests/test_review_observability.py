@@ -354,7 +354,13 @@ def test_visible_request_errors_emit_failure_records(
     import verifiers.v1.clients.base as client_base
 
     client = _FakeClient(
-        [RuntimeError("provider token=not-a-log-value") for _ in range(3)]
+        [
+            RuntimeError(
+                "provider failed with UNIQUE_PROMPT_SECRET and "
+                "UNIQUE_OUTPUT_SECRET"
+            )
+            for _ in range(3)
+        ]
     )
     with (
         mock.patch.object(client_base, "build_async_openai", return_value=client),
@@ -369,7 +375,18 @@ def test_visible_request_errors_emit_failure_records(
     assert len(payloads) == 3
     assert all(payload["phase"] == "visible_review" for payload in payloads)
     assert all(payload["failure_status"] == "request_failed" for payload in payloads)
+    assert all(
+        payload["failure_classification"] == "provider_request_failure"
+        for payload in payloads
+    )
+    assert all(
+        payload["exception_message"] == "provider request failed"
+        for payload in payloads
+    )
     assert all(payload["raw_arguments_chars"] == 0 for payload in payloads)
+    serialized = " ".join(record.message for record in caplog.records)
+    assert "UNIQUE_PROMPT_SECRET" not in serialized
+    assert "UNIQUE_OUTPUT_SECRET" not in serialized
 
 
 def test_reasoning_request_errors_emit_failure_records(
@@ -403,7 +420,13 @@ def test_reasoning_request_errors_emit_failure_records(
     )
     client = _FakeClient(
         [_completion("submit_visible_review", visible_arguments)]
-        + [RuntimeError("provider token=not-a-log-value") for _ in range(3)]
+        + [
+            RuntimeError(
+                "provider failed with UNIQUE_PROMPT_SECRET and "
+                "UNIQUE_OUTPUT_SECRET"
+            )
+            for _ in range(3)
+        ]
     )
     with (
         mock.patch.object(client_base, "build_async_openai", return_value=client),
@@ -418,7 +441,18 @@ def test_reasoning_request_errors_emit_failure_records(
     assert len(payloads) == 3
     assert all(payload["phase"] == "reasoning_review" for payload in payloads)
     assert all(payload["failure_status"] == "request_failed" for payload in payloads)
+    assert all(
+        payload["failure_classification"] == "provider_request_failure"
+        for payload in payloads
+    )
+    assert all(
+        payload["exception_message"] == "provider request failed"
+        for payload in payloads
+    )
     assert all(payload["raw_arguments_chars"] == 0 for payload in payloads)
+    serialized = " ".join(record.message for record in caplog.records)
+    assert "UNIQUE_PROMPT_SECRET" not in serialized
+    assert "UNIQUE_OUTPUT_SECRET" not in serialized
 
 
 def test_taskset_failed_reviews_branch_logs_task_failure(

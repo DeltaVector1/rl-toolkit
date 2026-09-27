@@ -1152,7 +1152,8 @@ def log_review_failure(
     group_id: str | int | float | None = None,
     failed_reviews: list[str] | None = None,
 ) -> dict[str, Any]:
-    if raw_arguments is None:
+    request_failed = failure_status == "request_failed"
+    if request_failed or raw_arguments is None:
         argument_bytes = b""
         argument_chars = 0
     elif isinstance(raw_arguments, bytes):
@@ -1167,15 +1168,30 @@ def log_review_failure(
         "attempt": attempt if isinstance(attempt, int) and not isinstance(attempt, bool) else None,
         "exception_class": type(error).__name__ if error is not None else "ReviewFailure",
         "exception_message": (
-            _safe_error(error, redactions=_argument_redactions(argument_bytes))
-            if error is not None
-            else "review failed"
+            "provider request failed"
+            if request_failed
+            else (
+                _safe_error(error, redactions=_argument_redactions(argument_bytes))
+                if error is not None
+                else "review failed"
+            )
         ),
         "raw_arguments_chars": argument_chars,
         "raw_arguments_bytes": len(argument_bytes),
         "raw_arguments_sha256": hashlib.sha256(argument_bytes).hexdigest(),
-        "finish_reason": str(finish_reason)[:80] if finish_reason is not None else None,
-        "truncated": truncated if isinstance(truncated, bool) else None,
+        "finish_reason": (
+            None
+            if request_failed
+            else str(finish_reason)[:80] if finish_reason is not None else None
+        ),
+        "truncated": (
+            None if request_failed else truncated if isinstance(truncated, bool) else None
+        ),
+        "failure_classification": (
+            "provider_request_failure"
+            if request_failed
+            else str(failure_status)[:80]
+        ),
         "failure_status": str(failure_status)[:80],
     }
     if task_id is not None:
