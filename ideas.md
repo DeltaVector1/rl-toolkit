@@ -1197,6 +1197,52 @@ only after measured learning.
   microbatch-count effects for further tests. A pass qualifies only this
   synthetic case. It does not prove production capacity or an update.
 
+## Fresh zero-effect LoRA packed 1f1b parity
+
+- **Measured baseline (2026-09-27).** `packed-1f1b-run-v2` completed step 1.
+  Forward/backward took `94.874800s`; PP took `70.33s`. Its direct artifact
+  is `19985591` bytes, SHA-256
+  `9f9d1b6fe092f9c58c6d0ec05f60ec82b1ebd0757132a98a711d74d3aa0b25b`.
+  Its comparison artifact is `27732` bytes, SHA-256
+  `66473642ec820bd0ae1bf6fd47f2e0d05ae13a54a2080fe35aff32f4d8d6f929`.
+  Across `262104` selected positions, trainer versus H200 absolute delta
+  mean was `0.06331701576755229`, p95 `0.22156524658203125`, maximum
+  `1.8082847595214844`, and mean mismatch KL `0.006326035675103694`.
+  All trainer versus packed gpipe deltas were zero. Production guard
+  measurements remain unmasked KL `1.147836`, masked fraction `0.213119`,
+  and masked KL `2.193980`.
+- **Hypothesis and experiment.** The production LoRA-enabled trainer model
+  path can cause divergence even when policy-0 B weights are zero. Repeat
+  the passing packed batch-8 1f1b synthetic test with fresh trainer LoRA:
+  rank `32`, alpha `64` (scale `2`), dropout `0`, and the exact production
+  targets from `configs/trinity-decensor-experimental-fixed/trainer.toml`:
+  `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`,
+  `down_proj`, `shared_expert`, and `experts`. Use normal fresh zero B
+  initialization, no source adapter, no checkpoint resume, no adapter export,
+  one step, and lr `0`. This does not test adapter loading or source identity.
+- **Fixed settings and checks.** Keep the same exact H200 base reference:
+  a mathematically zero LoRA must match the base. Keep native FP8,
+  CP8/PP8/EP8, 1f1b, batch `8`, router replay, sparse-index transfer `false`,
+  file monitoring, and all packing and mask bindings. Use output directory
+  `/data/glm52-rl/qualifications/trinity-h200-synthetic-packed-1f1b-zero-lora-parity/packed-1f1b-zero-lora-run`.
+  Reuse the strict eight-microbatch comparator unchanged. Keep the
+  forward/backward limit `600s`, unmasked KL limit `0.1`, masked KL limit
+  `0.5`, and masked fraction limit `0.06`. Validate the config with the exact
+  repository TrainerConfig schema. Tests must show that only the output
+  and LoRA settings differ from v2 and that resume and export are disabled.
+- **Live-test blocker.** `create_trainer_only_run` resets LoRA, but the
+  `fresh_lora_policy` condition in `prime-rl/src/prime_rl/trainer/rl/train.py`
+  excludes trainer-only tests from the explicit distributed zero, finite,
+  and scale checks. The config alone does not prove fresh zero LoRA.
+  Do not run this live test until all-rank B-zero, finite, and scale evidence
+  is added and reviewed or otherwise measured. Trainer changes are outside
+  this config task.
+- **Decision.** A parity failure implicates the LoRA-enabled trainer path
+  for this synthetic case. A pass rules out that path only for fresh zero
+  LoRA on these tokens. It does not qualify production capacity, an update,
+  adapter loading, or policy-source identity. No live action is part of
+  this config change.
+
 ## Fresh synthetic packed sparse-MLA parity
 
 - **Measured evidence.** Production packed parity reported unmasked KL
