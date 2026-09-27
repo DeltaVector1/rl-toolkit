@@ -891,3 +891,32 @@ only after measured learning.
   source identity. Do not improvise a raw API restore.
 - The diagnostic paths contain no resume adapter, cached rollout, or stale
   rollout-batch input. This plan must be reviewed before any live execution.
+
+## Explicit fresh diagnostic start mode
+
+- **Measured restart deadlock.** The existing restart-without-resume path starts
+  the trainer and waits for a fresh broadcast before it starts the orchestrator.
+  The trainer waits for orchestrator control, while the launcher waits for the
+  broadcast that the orchestrator must produce. This can leave a new diagnostic
+  run stopped before its first batch.
+- **Design.** Add an explicit `mode="fresh"` for a disposable new run. Keep
+  `cold`, `restart`, and adapter-resume behavior unchanged. Fresh mode must
+  preflight every selected trainer, the configured orchestrator host, and the
+  H200 host before dependency deployment, global stop, or any other remote
+  mutation. The preflight must prove that the exact run parent, service,
+  trainer output, broadcast, control, rollout, and checkpoint paths are absent
+  and are not symlinks; the exact run-specific cache key derived from the
+  configured diagnostic source URL is absent on inference hosts; and no global
+  trainer, orchestrator, or adapter container is active. `n79` remains
+  excluded.
+- **Fresh order and exclusions.** After the preflight, fresh mode skips
+  `_cold_start_cleanup`, `_cold_adapter_cache_cleanup`, resume markers and
+  drains, and inference restart. It starts adapter, transport, orchestrator,
+  waits for control, then starts the trainer. Set the initial-health watchdog
+  requirement when the existing launcher interface supports it. Do not change
+  training parameters or the existing cold/restart/resume paths.
+- **Gates.** Refuse before any mutation if one exact path exists, is a symlink,
+  the source-URL-derived cache key exists, a global container is active, a
+  selected host is blocked or missing, or the dependency and run identities do
+  not match. Tests must prove fresh order and preflight-before-mutation, and
+  must prove refusal for each path, symlink, cache, and container condition.
