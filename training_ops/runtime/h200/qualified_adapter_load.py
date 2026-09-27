@@ -142,6 +142,8 @@ def parse_delta_receipt(payload: bytes | str, expected_sha256: str) -> dict[str,
     model = _identity(receipt.get("step1_adapter"), "step-1 adapter")
     config = _identity(receipt.get("step1_config"), "step-1 config")
     manifest_sha = _digest(receipt.get("step1_manifest_sha256"), "step-1 manifest")
+    policy_model = _identity(receipt.get("policy0_adapter"), "policy-0 adapter")
+    policy_config = _identity(receipt.get("policy0_config"), "policy-0 config")
     before = receipt.get("identities_before")
     after = receipt.get("identities_after")
     if not isinstance(before, Mapping) or not isinstance(after, Mapping) or set(before) != _IDENTITY_CHAIN_KEYS or set(after) != _IDENTITY_CHAIN_KEYS or before != after:
@@ -305,6 +307,8 @@ def derive_plan(
     if type(inference_port) is not int or not 1 <= inference_port <= 65535 or type(direct_route_port) is not int or direct_route_port != 18100:
         _fail("qualified adapter load route is invalid")
     manifest_sha = _digest(receipt.get("step1_manifest_sha256"), "step-1 manifest")
+    policy_model = _identity(receipt.get("policy0_adapter"), "policy-0 adapter")
+    policy_config = _identity(receipt.get("policy0_config"), "policy-0 config")
     identities_after = receipt.get("identities_after")
     if not isinstance(identities_after, Mapping):
         _fail("step-1 artifact identity is missing")
@@ -334,6 +338,12 @@ def derive_plan(
         "engine_container": "glm52-decensor-h200",
         "receipt_sha256": expected_receipt,
         "artifacts": artifacts,
+        "policy0_identity": {
+            "target_sha256": policy_model["sha256"],
+            "target_size": policy_model["size"],
+            "config_sha256": policy_config["sha256"],
+            "config_size": policy_config["size"],
+        },
     }
 
 

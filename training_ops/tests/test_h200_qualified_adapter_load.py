@@ -113,6 +113,39 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         services = {"trainers": {host: {"known": True, "active": False} for host in self.apply_plan()["trainer_hosts"]}, "orchestrator": {"known": True, "active": False}}
         return {"services": services, "engine": {"healthy": True, "container_id": "container-a", "container_started_at": "2026-09-27T00:00:00Z", "api_pid": 321, "api_start_time": "1001", "running": 0, "waiting": 0, "active_stage": False, "stage_conflict": False, "stage_status": "idle", "endpoints": ["http://127.0.0.1:8000"], "loaded_receipts": loaded}}
 
+    def policy0_receipt(self):
+        model = receipt()["policy0_adapter"]
+        config = receipt()["policy0_config"]
+        return {
+            "source_url": "http://127.0.0.1:18100/trinity-decensor-experimental-fixed/step_0",
+            "target_sha256": model["sha256"],
+            "target_size": model["size"],
+            "config_sha256": config["sha256"],
+            "config_size": config["size"],
+            "lora_name": "policy0",
+            "server_instance": "a" * 32,
+        }
+
+    def stage_record(self, plan, *, source_url, model, config):
+        return {
+            "status": "ready",
+            "source_url": source_url,
+            "path": "/data/glm52-rl/lora-cache/" + hashlib.sha256(source_url.encode()).hexdigest(),
+            "transport": "chunked-full-zstd",
+            "verified_files": {
+                "adapter_config.json": {"sha256": config["sha256"], "size": config["size"]},
+                "adapter_model.safetensors": {"sha256": model["sha256"], "size": model["size"]},
+            },
+            "target_sha256": model["sha256"],
+            "cache_hit": True,
+            "stage_id": "stage-a",
+            "pid": 456,
+            "file_stats": {
+                "adapter_config.json": {"dev": 8, "ino": 10, "size": config["size"], "mtime_ns": 100},
+                "adapter_model.safetensors": {"dev": 8, "ino": 11, "size": model["size"], "mtime_ns": 100},
+            },
+        }
+
     def test_receipt_requires_exact_hash_schema_and_identity_chain(self):
         raw = json.dumps(receipt(), sort_keys=True, separators=(",", ":")).encode() + b"\n"
         expected = hashlib.sha256(raw).hexdigest()
@@ -393,13 +426,59 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         self.assertIn("owner_token", script)
         self.assertIn("%d:%i:%s:%y:%z", script)
 
-    def test_qualified_load_rejects_failed_or_ready_engine_before_publish(self):
+    def test_qualified_load_accepts_only_exact_terminal_ready_stage(self):
         plan = self.apply_plan()
-        for stage_status in ("ready", "failed", "staging"):
-            state = self.live_state({})
+        policy = self.policy0_receipt()
+        state = self.live_state({"policy0": policy})
+        state["engine"]["stage_status"] = "ready"
+        state["engine"]["stage_record"] = self.stage_record(plan, source_url=policy["source_url"], model=receipt()["policy0_adapter"], config=receipt()["policy0_config"])
+        self.assertIs(training_ops_module._qualified_check_engine(plan, state, phase="preflight"), state["engine"])
+        for stage_status in ("failed", "staging", "unknown"):
+            state = self.live_state({"policy0": policy})
             state["engine"]["stage_status"] = stage_status
-            with self.subTest(stage_status=stage_status), self.assertRaisesRegex(Refused, "idle"):
-                training_ops_module._qualified_check_engine(plan, state)
+            with self.subTest(stage_status=stage_status), self.assertRaisesRegex(Refused, "stage"):
+                training_ops_module._qualified_check_engine(plan, state, phase="preflight")
+
+    def test_qualified_load_ready_stage_binds_step1_after_stage(self):
+        plan = self.apply_plan()
+        model = receipt()["step1_adapter"]
+        config = receipt()["step1_config"]
+        state = self.live_state({"policy0": self.policy0_receipt()})
+        state["engine"]["stage_status"] = "ready"
+        state["engine"]["stage_record"] = self.stage_record(plan, source_url=plan["source_url"], model=model, config=config)
+        self.assertIs(training_ops_module._qualified_check_engine(plan, state, phase="post-stage"), state["engine"])
+        self.assertIs(training_ops_module._qualified_check_engine(plan, state, phase="post-load"), state["engine"])
+        self.assertIs(training_ops_module._qualified_check_engine(plan, state, phase="post-load", policy0_server_instance="a" * 32), state["engine"])
+        for field, value in (("source_url", "http://127.0.0.1:18100/wrong/step_1"), ("target_sha256", "1" * 64)):
+            mutated = json.loads(json.dumps(state))
+            mutated["engine"]["stage_record"][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(Refused, "stage"):
+                training_ops_module._qualified_check_engine(plan, mutated, phase="post-stage")
+        mutated = json.loads(json.dumps(state))
+        mutated["engine"]["stage_record"]["verified_files"]["adapter_config.json"]["sha256"] = "1" * 64
+        with self.assertRaisesRegex(Refused, "stage"):
+            training_ops_module._qualified_check_engine(plan, mutated, phase="post-load")
+        mutated = json.loads(json.dumps(state))
+        mutated["engine"]["loaded_receipts"]["policy0"]["server_instance"] = "b" * 32
+        with self.assertRaisesRegex(Refused, "server"):
+            training_ops_module._qualified_check_engine(plan, mutated, phase="post-load", policy0_server_instance="a" * 32)
+
+    def test_qualified_load_ready_stage_rejects_wrong_or_incomplete_policy0_receipt(self):
+        plan = self.apply_plan()
+        policy = self.policy0_receipt()
+        state = self.live_state({"policy0": policy})
+        state["engine"]["stage_status"] = "ready"
+        state["engine"]["stage_record"] = self.stage_record(plan, source_url=policy["source_url"], model=receipt()["policy0_adapter"], config=receipt()["policy0_config"])
+        for field, value in (("source_url", "http://127.0.0.1:18100/wrong/step_0"), ("target_sha256", "1" * 64), ("server_instance", "wrong")):
+            mutated = json.loads(json.dumps(state))
+            mutated["engine"]["loaded_receipts"]["policy0"][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(Refused, "policy-0"):
+                training_ops_module._qualified_check_engine(plan, mutated, phase="preflight")
+        for field in ("verified_files", "path", "stage_id", "pid", "file_stats", "transport", "cache_hit"):
+            mutated = json.loads(json.dumps(state))
+            mutated["engine"]["stage_record"].pop(field)
+            with self.subTest(field=field), self.assertRaisesRegex(Refused, "stage"):
+                training_ops_module._qualified_check_engine(plan, mutated, phase="preflight")
 
     def test_slot_rollback_cannot_remove_publication_without_owner_proof(self):
         with self.assertRaisesRegex(QualifiedAdapterLoadError, "owner-token"):
@@ -436,7 +515,13 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         }
         old = {"source_url": "http://old/step_0", "target_sha256": "1" * 64, "target_size": 10, "config_sha256": "2" * 64, "config_size": 20, "lora_name": "policy0", "server_instance": "instance-a"}
         new = {**expected, "lora_name": plan["qualification_slot"], "server_instance": "instance-a"}
-        states = [self.live_state({"policy0": old}), self.live_state({"policy0": old}), self.live_state({"policy0": old, plan["qualification_slot"]: new})]
+        middle = self.live_state({"policy0": old})
+        middle["engine"]["stage_status"] = "ready"
+        middle["engine"]["stage_record"] = self.stage_record(plan, source_url=plan["source_url"], model=receipt()["step1_adapter"], config=receipt()["step1_config"])
+        after = self.live_state({"policy0": old, plan["qualification_slot"]: new})
+        after["engine"]["stage_status"] = "ready"
+        after["engine"]["stage_record"] = self.stage_record(plan, source_url=plan["source_url"], model=receipt()["step1_adapter"], config=receipt()["step1_config"])
+        states = [self.live_state({"policy0": old}), middle, after]
         publish = f"QUALIFIED_PUBLISH status=published source_url={plan['source_url']} source_adapter_dir={plan['source_adapter_dir']} manifest_sha256={plan['manifest_sha256']} owner_token=8:99:123:456 parent_token=1:2 final_token=3:4\n"
         calls = []
         def ssh(host, script, timeout=120):

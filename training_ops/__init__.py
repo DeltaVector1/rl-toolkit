@@ -33,6 +33,7 @@ from training_ops.runtime.h200.prepare_trinity_policy0_qualification import (
 )
 from training_ops.runtime.h200.load_policy0 import (
     EXPECTED_LORA as POLICY0_LOAD_LORA,
+    Policy0LoadError,
     _check_engine as _policy0_check_engine,
     _check_engine_identity as _policy0_check_engine_identity,
     _check_receipts as _policy0_check_receipts,
@@ -11392,14 +11393,111 @@ def _qualified_verify_publication(plan: Mapping[str, object], published: Mapping
         raise Refused(f"qualified publication {boundary} identity changed")
 
 
-def _qualified_check_engine(plan: Mapping[str, object], state: Mapping[str, object]) -> Mapping[str, object]:
-    """Require an idle engine; the neutral policy-0 guard permits ``ready``."""
+def _qualified_check_stage_file(value: object, label: str) -> dict[str, int | str]:
+    if not isinstance(value, Mapping) or set(value) != {"sha256", "size"}:
+        raise Refused(f"qualified adapter {label} identity is missing or unexpected")
+    digest = value.get("sha256")
+    size = value.get("size")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or type(size) is not int or size <= 0:
+        raise Refused(f"qualified adapter {label} identity is invalid")
+    return {"sha256": digest, "size": size}
+
+
+def _qualified_check_loaded_policy0(plan: Mapping[str, object], engine: Mapping[str, object]) -> tuple[str, str]:
+    receipts = engine.get("loaded_receipts")
+    expected = plan.get("policy0_identity")
+    if not isinstance(receipts, Mapping) or len(receipts) != 1 or not isinstance(expected, Mapping):
+        raise Refused("qualified adapter ready state has no sole pinned policy-0 receipt")
+    slot, receipt = next(iter(receipts.items()))
+    if not isinstance(slot, str) or not slot or slot == QUALIFICATION_SLOT or not isinstance(receipt, Mapping):
+        raise Refused("qualified adapter ready state has an invalid policy-0 receipt")
+    required = {"source_url", "target_sha256", "target_size", "config_sha256", "config_size", "lora_name", "server_instance"}
+    if set(receipt) != required or receipt.get("lora_name") != slot:
+        raise Refused("qualified adapter ready state policy-0 receipt schema is invalid")
+    for key in ("target_sha256", "target_size", "config_sha256", "config_size"):
+        if receipt.get(key) != expected.get(key):
+            raise Refused(f"qualified adapter ready state policy-0 receipt differs in {key}")
+    source_url = receipt.get("source_url")
+    if not isinstance(source_url, str):
+        raise Refused("qualified adapter ready state policy-0 receipt URL is invalid")
+    parsed = urlsplit(source_url)
+    if parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or parsed.port != 18100 or parsed.query or parsed.fragment or not parsed.path.endswith("/step_0"):
+        raise Refused("qualified adapter ready state policy-0 receipt URL is invalid")
+    if not isinstance(receipt.get("server_instance"), str) or not re.fullmatch(r"[0-9a-f]{32}", receipt["server_instance"]):
+        raise Refused("qualified adapter ready state policy-0 receipt server identity is invalid")
+    return source_url, receipt["server_instance"]
+
+
+def _qualified_check_ready_stage(plan: Mapping[str, object], engine: Mapping[str, object], phase: str, policy0_server_instance: str | None = None) -> None:
+    stage = engine.get("stage_record")
+    if not isinstance(stage, Mapping):
+        raise Refused("qualified adapter ready state has no exact stage receipt")
+    required = {"status", "source_url", "path", "transport", "verified_files", "target_sha256", "cache_hit", "stage_id", "pid", "file_stats"}
+    if not required.issubset(stage):
+        raise Refused("qualified adapter ready stage receipt is missing required identity fields")
+    if stage.get("status") != "ready" or not isinstance(stage.get("source_url"), str) or not isinstance(stage.get("path"), str) or not isinstance(stage.get("transport"), str) or not stage["transport"] or type(stage.get("cache_hit")) is not bool or not isinstance(stage.get("stage_id"), str) or not stage["stage_id"] or type(stage.get("pid")) is not int or stage["pid"] <= 0:
+        raise Refused("qualified adapter ready stage receipt identity is invalid")
+    if phase == "preflight":
+        expected_source, _ = _qualified_check_loaded_policy0(plan, engine)
+        expected = plan.get("policy0_identity")
+    elif phase in {"post-stage", "post-load"}:
+        expected_source = plan.get("source_url")
+        artifacts = plan.get("artifacts")
+        expected = {
+            "target_sha256": artifacts.get("adapter_model.safetensors", {}).get("sha256") if isinstance(artifacts, Mapping) else None,
+            "target_size": artifacts.get("adapter_model.safetensors", {}).get("size") if isinstance(artifacts, Mapping) else None,
+            "config_sha256": artifacts.get("adapter_config.json", {}).get("sha256") if isinstance(artifacts, Mapping) else None,
+            "config_size": artifacts.get("adapter_config.json", {}).get("size") if isinstance(artifacts, Mapping) else None,
+        }
+    else:
+        raise Refused("qualified adapter load phase is invalid")
+    if policy0_server_instance is not None:
+        receipts = engine.get("loaded_receipts")
+        if not isinstance(receipts, Mapping) or any(
+            not isinstance(value, Mapping) or value.get("server_instance") != policy0_server_instance
+            for value in receipts.values()
+        ):
+            raise Refused("qualified adapter ready state server identity differs from policy-0")
+    if not isinstance(expected_source, str) or stage.get("source_url") != expected_source:
+        raise Refused("qualified adapter ready stage source URL differs from the pinned policy-0 or step-1 identity")
+    expected_path = f"{paths['adapter_cache'].rstrip('/')}/{hashlib.sha256(expected_source.encode()).hexdigest()}"
+    if stage.get("path") != expected_path:
+        raise Refused("qualified adapter ready stage cache path differs from the pinned identity")
+    verified = stage.get("verified_files")
+    if not isinstance(verified, Mapping) or set(verified) != {"adapter_config.json", "adapter_model.safetensors"}:
+        raise Refused("qualified adapter ready stage verified files are incomplete")
+    model = _qualified_check_stage_file(verified["adapter_model.safetensors"], "model")
+    config = _qualified_check_stage_file(verified["adapter_config.json"], "config")
+    expected_model = {"sha256": expected.get("target_sha256"), "size": expected.get("target_size")} if isinstance(expected, Mapping) else {}
+    expected_config = {"sha256": expected.get("config_sha256"), "size": expected.get("config_size")} if isinstance(expected, Mapping) else {}
+    if model != expected_model or config != expected_config or stage.get("target_sha256") != model["sha256"]:
+        raise Refused("qualified adapter ready stage file identity differs from the pinned identity")
+    stats = stage.get("file_stats")
+    if not isinstance(stats, Mapping) or set(stats) != set(verified):
+        raise Refused("qualified adapter ready stage file statistics are incomplete")
+    for name, identity in (("adapter_model.safetensors", model), ("adapter_config.json", config)):
+        value = stats.get(name)
+        if not isinstance(value, Mapping) or set(value) != {"dev", "ino", "size", "mtime_ns"} or any(type(value[key]) is not int or value[key] < 0 for key in value) or value["size"] != identity["size"]:
+            raise Refused("qualified adapter ready stage file statistics are invalid")
+
+
+def _qualified_check_engine(plan: Mapping[str, object], state: Mapping[str, object], *, phase: str = "preflight", policy0_server_instance: str | None = None) -> Mapping[str, object]:
+    """Require an idle or exactly bound terminal-ready inference engine."""
     raw_engine = state.get("engine")
-    if isinstance(raw_engine, Mapping) and raw_engine.get("stage_status") != "idle":
-        raise Refused("qualified adapter load requires an idle inference engine")
-    engine = _policy0_check_engine(plan, state)
-    if engine.get("stage_status") != "idle":
-        raise Refused("qualified adapter load requires an idle inference engine")
+    if isinstance(raw_engine, Mapping) and raw_engine.get("stage_status") not in {"idle", "ready", "failed"}:
+        raise Refused("qualified adapter load requires an idle or exact terminal-ready stage")
+    try:
+        engine = _policy0_check_engine(plan, state)
+    except Policy0LoadError as error:
+        raise Refused(str(error)) from error
+    stage_status = engine.get("stage_status")
+    if stage_status == "idle":
+        if phase != "preflight":
+            raise Refused("qualified adapter load requires a ready stage after staging")
+    elif stage_status == "ready":
+        _qualified_check_ready_stage(plan, engine, phase, policy0_server_instance)
+    else:
+        raise Refused("qualified adapter load requires an idle or exact terminal-ready stage")
     if engine.get("active_stage") is True or engine.get("stage_conflict") is True:
         raise Refused("qualified adapter load requires no active adapter stage")
     return engine
@@ -11410,8 +11508,11 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
     phase: dict[str, float] = {}
     before = _policy0_load_live_state(plan)
     _policy0_check_services(plan, before)
-    before_engine = _qualified_check_engine(plan, before)
+    before_engine = _qualified_check_engine(plan, before, phase="preflight")
     _policy0_check_target_slot_free(plan, before_engine)
+    policy0_server_instance = None
+    if before_engine.get("stage_status") == "ready":
+        _, policy0_server_instance = _qualified_check_loaded_policy0(plan, before_engine)
     phase["preflight_seconds"] = time.monotonic() - phase_start
     published = False
     publication_owner_token: str | None = None
@@ -11433,7 +11534,7 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
             raise Refused("qualified adapter stage identity differs from the delta receipt")
         _qualified_verify_publication(plan, published_result, "after-stage")
         middle = _policy0_load_live_state(plan)
-        middle_engine = _qualified_check_engine(plan, middle)
+        middle_engine = _qualified_check_engine(plan, middle, phase="post-stage", policy0_server_instance=policy0_server_instance)
         _policy0_check_services(plan, middle)
         _policy0_check_engine_identity(before_engine, middle_engine)
         _policy0_check_target_slot_free(plan, middle_engine)
@@ -11447,7 +11548,7 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
             raise Refused("qualified adapter load returned no receipts")
         _qualified_verify_publication(plan, published_result, "after-load")
         after = _policy0_load_live_state(plan)
-        after_engine = _qualified_check_engine(plan, after)
+        after_engine = _qualified_check_engine(plan, after, phase="post-load", policy0_server_instance=policy0_server_instance)
         _policy0_check_services(plan, after)
         _policy0_check_engine_identity(before_engine, after_engine)
         _qualified_check_preserved_policy0(before, after)
@@ -11684,6 +11785,10 @@ if len({{record["status"].get("status") for record in records}}) != 1:
     raise SystemExit("inference endpoints have different staging states")
 if any(record["status"].get("loaded_receipts") != records[0]["status"].get("loaded_receipts") for record in records[1:]):
     raise SystemExit("inference endpoints have different loaded receipts")
+def stage_identity(status):
+    return {{key: status.get(key) for key in ("status", "source_url", "path", "transport", "verified_files", "target_sha256", "cache_hit", "stage_id", "pid", "file_stats")}}
+if any(stage_identity(record["status"]) != stage_identity(records[0]["status"]) for record in records[1:]):
+    raise SystemExit("inference endpoints have different stage identities")
 status = records[0]["status"]
 print(json.dumps({{
     "healthy": True,
@@ -11698,6 +11803,7 @@ print(json.dumps({{
     "stage_conflict": status.get("status") == "staging",
     "endpoints": [f"http://127.0.0.1:{{record['port']}}" for record in records],
     "loaded_receipts": status["loaded_receipts"],
+    "stage_record": status,
 }}))
 PY
 """
