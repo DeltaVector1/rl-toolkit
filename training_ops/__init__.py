@@ -67,6 +67,13 @@ from training_ops.runtime.h200.qualified_adapter_load import (
     parse_publish_result,
     parse_result_receipt,
 )
+from training_ops.runtime.adapter_cache_cleanup import (
+    build_script as _build_adapter_cache_cleanup_script,
+    exact_source_url as _exact_adapter_cache_source_url,
+    validate_directory as _validate_adapter_cache_directory,
+    validate_metrics as _validate_adapter_cache_metrics,
+    validate_status as _validate_adapter_cache_status,
+)
 
 repo_root = Path(__file__).resolve().parents[1]
 nodes_path = repo_root / "configs" / "nodes.toml"
@@ -10243,6 +10250,136 @@ def _cold_adapter_cache_cleanup(
         print(f"cold adapter cleanup on {host}: {output.strip()}")
 
 
+def _exact_adapter_cache_cleanup_plan(
+    run: str | None = None,
+    *,
+    config_dir: str | None = None,
+    source_url: str | None = None,
+    lora_name: str | None = None,
+) -> dict[str, object]:
+    """Resolve one exact source URL and its immutable cache key."""
+    if run is not None and not isinstance(run, str):
+        raise Refused("adapter cache run must be a string")
+    if config_dir is not None and not isinstance(config_dir, str):
+        raise Refused("adapter cache config directory must be a string")
+    if run is not None or config_dir is not None:
+        if run is None:
+            selected = _config_dir(
+                config_dir or default_config_dir,
+                require_orchestrator=True,
+                require_inference=True,
+            )
+            run = _selected_run_name(selected)
+        else:
+            selected = _config_for_run(run, config_dir=config_dir)
+        orchestrator_name = selected.get("orchestrator")
+        if not isinstance(orchestrator_name, str):
+            raise Refused("adapter cache config has no orchestrator.toml")
+        try:
+            with (repo_root / orchestrator_name).open("rb") as stream:
+                config = tomllib.load(stream)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise Refused(f"cannot read adapter cache orchestrator config: {error}") from error
+        broadcast = config.get("weight_broadcast")
+        configured_source = broadcast.get("source_url") if isinstance(broadcast, dict) else None
+        configured_lora = config.get("model", {}).get("lora", {}).get("name")
+        if source_url is not None and source_url != configured_source:
+            raise Refused("adapter cache source URL differs from the selected config")
+        if lora_name is not None and lora_name != configured_lora:
+            raise Refused("adapter cache LoRA name differs from the selected config")
+        source_url = configured_source
+        lora_name = configured_lora
+    if not isinstance(source_url, str) or not isinstance(lora_name, str) or not lora_name:
+        raise Refused("adapter cache cleanup requires an exact source URL and LoRA name")
+    try:
+        exact_source = _exact_adapter_cache_source_url(source_url)
+    except ValueError as error:
+        raise Refused(str(error)) from error
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", lora_name):
+        raise Refused("adapter cache LoRA name is invalid")
+    cache_root = paths.get("adapter_cache")
+    if (
+        not isinstance(cache_root, str)
+        or not cache_root.startswith("/")
+        or cache_root.rstrip("/") in {"", "/"}
+        or any(part in {"", ".", ".."} for part in PurePosixPath(cache_root).parts)
+    ):
+        raise Refused("configured adapter cache path is unsafe")
+    key = hashlib.sha256(exact_source.encode("utf-8")).hexdigest()
+    ports_by_host = {
+        host: list(_inference_config(host).get("ports", [])) for host in inference_hosts
+    }
+    if any(
+        not values
+        or not all(isinstance(port, int) and 1 <= port <= 65535 for port in values)
+        for values in ports_by_host.values()
+    ):
+        raise Refused("adapter cache cleanup inference ports are invalid")
+    return {
+        "run": run,
+        "source_url": exact_source,
+        "lora_name": lora_name,
+        "cache_root": cache_root.rstrip("/"),
+        "cache_key": key,
+        "cache_path": f"{cache_root.rstrip('/')}/{key}",
+        "inference_hosts": list(inference_hosts),
+        "engine_container": glm_inference_container,
+        "ports_by_host": ports_by_host,
+    }
+
+
+def remove_adapter_cache(
+    run: str | None = None,
+    config_dir: str | None = None,
+    *,
+    source_url: str | None = None,
+    lora_name: str | None = None,
+) -> dict[str, object]:
+    """Remove one exact, unloaded adapter cache entry on each inference host."""
+    plan = _exact_adapter_cache_cleanup_plan(
+        run,
+        config_dir=config_dir,
+        source_url=source_url,
+        lora_name=lora_name,
+    )
+    results = _fan(
+        list(plan["inference_hosts"]),
+        lambda host: _ssh(
+            host,
+            _build_adapter_cache_cleanup_script(
+                {
+                    **plan,
+                    "ports": plan["ports_by_host"][host],
+                }
+            ),
+            timeout=180,
+        ),
+    )
+    failures = {
+        host: output.strip() or f"exit {code}"
+        for host, (code, output) in results.items()
+        if code
+    }
+    if failures:
+        raise Refused(f"adapter cache cleanup refused: {failures}")
+    records = {}
+    for host, (_code, output) in results.items():
+        try:
+            value = json.loads(output.strip().splitlines()[-1])
+        except (IndexError, TypeError, ValueError) as error:
+            raise Refused(f"adapter cache cleanup returned invalid evidence on {host}") from error
+        if (
+            not isinstance(value, dict)
+            or value.get("status") != "removed"
+            or value.get("cache_path") != plan["cache_path"]
+            or value.get("cache_key") != plan["cache_key"]
+            or value.get("source_url") != plan["source_url"]
+        ):
+            raise Refused(f"adapter cache cleanup returned mismatched evidence on {host}")
+        records[host] = value
+    return {"status": "removed", "plan": plan, "hosts": records}
+
+
 def _check_adapter_restart(host: str, service_dir: str, step: int, role: str, adapter: str, digest: str = "") -> dict:
     source = (repo_root / "training_ops/runtime/china/resume_state.py").read_text()
     arguments = " ".join(shlex.quote(str(value)) for value in (service_dir, step, role, adapter, digest))
@@ -12374,6 +12511,49 @@ def _archive_action(arguments: list[str]):
     return archive_adapters(arguments[0], steps_to_archive or None, finished=finished)
 
 
+def _remove_adapter_cache_action(arguments: list[str]):
+    values: dict[str, str] = {}
+    positional: list[str] = []
+    options = {
+        "--run": "run",
+        "--config-dir": "config_dir",
+        "--source-url": "source_url",
+        "--lora-name": "lora_name",
+    }
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in options:
+            index += 1
+            if index >= len(arguments):
+                raise Refused(f"{argument} requires a value")
+            values[options[argument]] = arguments[index]
+        elif argument.startswith("--"):
+            raise Refused(f"unknown remove-adapter-cache option {argument}")
+        else:
+            positional.append(argument)
+        index += 1
+    if positional:
+        if len(positional) > 1:
+            raise Refused("remove-adapter-cache accepts at most one positional run name")
+        if "run" in values:
+            raise Refused("remove-adapter-cache run was provided twice")
+        values["run"] = positional[0]
+    if values.get("run") is not None or values.get("config_dir") is not None:
+        if values.get("source_url") is not None or values.get("lora_name") is not None:
+            raise Refused("remove-adapter-cache accepts either run/config or source URL/name")
+    elif (values.get("source_url") is None) != (values.get("lora_name") is None):
+        raise Refused("remove-adapter-cache requires both --source-url and --lora-name")
+    result = remove_adapter_cache(
+        values.get("run"),
+        config_dir=values.get("config_dir"),
+        source_url=values.get("source_url"),
+        lora_name=values.get("lora_name"),
+    )
+    print(json.dumps(result, indent=2))
+    return result
+
+
 def _stop_action(arguments: list[str]):
     if arguments:
         raise Refused("stop does not accept arguments")
@@ -12395,6 +12575,7 @@ actions = {
     "deploy": lambda a: deploy(*a),
     "start": _start_action,
     "archive": _archive_action,
+    "remove-adapter-cache": _remove_adapter_cache_action,
     "qualify": _qualify_action,
     "load-policy0": _load_policy0_action,
     "load-qualified-adapter": _qualified_adapter_load_action,
@@ -12430,6 +12611,10 @@ usage = f"""training-ops <action> [args]
   start <run> [cold|fresh|restart] [config-dir]  start one run config directory
   archive <run> [step ...]      upload stable old LoRA adapters
                                 add --finished after another run is active
+  remove-adapter-cache --run RUN --config-dir DIR
+                                remove one exact unloaded adapter cache entry
+  remove-adapter-cache --source-url URL --lora-name NAME
+                                remove one exact unloaded adapter cache entry
   qualify <name> [mode] [config-dir]  start a trainer-only config directory
   load-policy0 [config-dir] [plan|apply] \
     --source-run RUN --source-adapter-dir DIR --qualification-slot NAME
