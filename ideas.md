@@ -927,9 +927,13 @@ only after measured learning.
   selected host is blocked or missing, or the dependency and run identities do
   not match. Tests must prove fresh order and preflight-before-mutation, and
   must prove refusal for each path, symlink, cache, and container condition.
-- **Launcher caveat before live use.** The existing `cluster.sh` and
-  `start_orchestrator.sh` launchers still contain fixed-name `docker rm -f`
-  cleanup. The second preflight prevents replacement when the container is
-  already present, but a race after that gate can still remove a container.
-  Do not run fresh live until the launchers gain a fail-on-existing-container
-  mode or this race is separately accepted and reviewed.
+- **Fresh launcher guard.** Training-ops passes
+  `FRESH_START_NO_REPLACE=1` to every fresh trainer, adapter, and
+  orchestrator launch; the orchestrator passes it through to its relay path.
+  `cluster.sh` and `start_orchestrator.sh` validate the flag, inspect fixed
+  target names including stopped containers, refuse before mutation, skip
+  fixed-container `docker rm -f` and watchdog `pkill`, and let a create-after-
+  inspect race fail at `docker run` without removing the other container.
+  A failed fresh launch can leave its own failed container for the next
+  preflight to report; do not manually remove it as part of this mode. Fresh
+  does not invoke a trainer-side orchestrator launcher.

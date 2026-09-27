@@ -10761,6 +10761,7 @@ def start(
         f"TRAINER_CONFIG={trainer_config} PRIME_EP_PROFILE=0 PRIME_EP_AC_CACHE=0 "
         "PRIME_INT4_COMBINE_ROUNDS=8 PRIME_FP8_EXPERT_ACTIVATION_OFFLOAD=1"
     )
+    fresh_launcher_env = "FRESH_START_NO_REPLACE=1 " if mode == "fresh" else ""
     if resume_adapter is not None:
         missing = [
             host
@@ -10797,7 +10798,7 @@ def start(
             nodes,
             lambda h: _ssh(
                 h,
-                f"node_id={shlex.quote(h.removeprefix('n'))} {env} "
+                f"node_id={shlex.quote(h.removeprefix('n'))} {fresh_launcher_env}{env} "
                 f"bash {trainer_launcher} trainer",
                 300,
             ),
@@ -10817,7 +10818,7 @@ def start(
         node_id = trainer_head.removeprefix("n")
         rc, out = _ssh(
             trainer_head,
-            f"node_id={shlex.quote(node_id)} {runtime_env} RUN={shlex.quote(run)}"
+            f"node_id={shlex.quote(node_id)} {fresh_launcher_env}{runtime_env} RUN={shlex.quote(run)}"
             f"{predictive_adapter_env} "
             f"bash {trainer_launcher} adapter-http",
             300,
@@ -10830,7 +10831,7 @@ def start(
         print(f"starting edge orchestrator on {orchestrator_host}")
         rc, out = _ssh(
             orchestrator_host,
-            f"RUN={shlex.quote(run)} RUN_NAME={shlex.quote(name)} "
+            f"{fresh_launcher_env}RUN={shlex.quote(run)} RUN_NAME={shlex.quote(name)} "
             f"ORCH_CONFIG={shlex.quote(edge_config)} "
             f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
             f"TRAINER_CT={shlex.quote(trainer_container)} "

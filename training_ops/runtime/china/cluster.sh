@@ -9,6 +9,11 @@ trainer_container=${trainer_container_name:?set trainer_container_name}
 master_node=${master_node_id:?set master_node_id}
 RUN=${RUN:?set RUN}
 run_name=${RUN_NAME:-run_$RUN}
+fresh_start_no_replace=${FRESH_START_NO_REPLACE:-0}
+case "$fresh_start_no_replace" in
+  0|1) ;;
+  *) echo "FRESH_START_NO_REPLACE must be 0 or 1" >&2; exit 2 ;;
+esac
 trainer_config=${TRAINER_CONFIG:-$deployment/configs/general-agent/trainer.toml}
 run_dir=$runs/$RUN/$run_name
 node=${node_id:-$(ip -4 -o addr show vlan130 | awk '{split($4, a, /[.\/]/); print a[4]}')}
@@ -108,6 +113,11 @@ printf "%s\n" "AFMOE_BASE_OK"
 
 case ${1:-} in
   trainer)
+    if [ "$fresh_start_no_replace" = 1 ] &&
+      sudo docker inspect "$trainer_container" >/dev/null 2>&1; then
+      echo "fresh start refuses existing trainer container: $trainer_container" >&2
+      exit 2
+    fi
     # trainer_nodes lists the participating nodes in rank order; a node's rank
     # is its position in that list. Set it to drop a node from the job -- e.g.
     # with n81 down, trainer_nodes="82 76 77 78 80 83 84" gives a 7-node,
@@ -235,7 +245,9 @@ PY
     # nccl shm segments leak on every trainer crash (~33MB each, observed
     # 1500+ per node = 50GB+); the container is removed below, so purge.
     sudo rm -f /dev/shm/nccl-* 2>/dev/null || true
-    sudo docker rm -f "$trainer_container" >/dev/null 2>&1 || true
+    if [ "$fresh_start_no_replace" = 0 ]; then
+      sudo docker rm -f "$trainer_container" >/dev/null 2>&1 || true
+    fi
     # Keep the optional checkpoint cache disabled. It is not selected by the
     # current dequantized, node-local EP path, but its single slot per layer is
     # not safe for multiple 1F1B micro-batches.
@@ -335,6 +347,11 @@ PY
     adapter_node=${adapter_node_id:?set adapter_node_id}
     adapter_port=${adapter_service_port:?set adapter_service_port}
     adapter_container=${adapter_container_name:?set adapter_container_name}
+    if [ "$fresh_start_no_replace" = 1 ] &&
+      sudo docker inspect "$adapter_container" >/dev/null 2>&1; then
+      echo "fresh start refuses existing adapter container: $adapter_container" >&2
+      exit 2
+    fi
     test "$node" = "$adapter_node" || { echo "the adapter server runs on n$adapter_node" >&2; exit 1; }
     broadcast_root=${BROADCAST_ROOT:-$runs}
     test -d "$broadcast_root" || { echo "broadcast root does not exist: $broadcast_root" >&2; exit 1; }
@@ -389,7 +406,9 @@ PY
       echo "predictive adapter settings require ADAPTER_PREDICTIVE_UPGRADE=1" >&2
       exit 1
     fi
-    sudo docker rm -f "$adapter_container" >/dev/null 2>&1 || true
+    if [ "$fresh_start_no_replace" = 0 ]; then
+      sudo docker rm -f "$adapter_container" >/dev/null 2>&1 || true
+    fi
     sudo docker run -d --name "$adapter_container" --restart unless-stopped \
       --network host \
       "${adapter_mounts[@]}" \

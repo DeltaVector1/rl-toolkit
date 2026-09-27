@@ -20,6 +20,10 @@ case "${1:-}" in
     printf 'inspect %s\n' "${2:-}" >>"${CALL_LOG:?}"
     target=${2:-}
     format=${4:-}
+    if [ -z "$format" ]; then
+      [ "$target" = orchestrator ] && [ -s "${CONTAINER_STATE_FILE:?}" ] || exit 1
+      exit 0
+    fi
     case "$format" in
       "{{.Id}}")
         if [ "$target" = orchestrator ] && [ -s "${CONTAINER_STATE_FILE:?}" ]; then
@@ -149,6 +153,7 @@ source <(sed -n '/^resolve_orchestrator_image() {/,/^}$/p' "$launcher")
 source <(sed -n '/^resolve_orchestrator_image_for_launch() {/,/^}$/p' "$launcher")
 source <(sed -n '/^check_swanlab_secret() {/,/^}$/p' "$launcher")
 source <(sed -n '/^check_training_env_identity() {/,/^}$/p' "$launcher")
+source <(sed -n '/^fresh_no_replace_container() {/,/^}$/p' "$launcher")
 source <(sed -n '/^remove_failed_orchestrator() {/,/^}$/p' "$launcher")
 source <(sed -n '/^orchestrator_trinity_model_path_exists() {/,/^}$/p' "$launcher")
 source <(sed -n '/^orchestrator_model_mount_required() {/,/^}$/p' "$launcher")
@@ -174,6 +179,7 @@ orchestrator_trinity_model_path_exists() {
 }
 
 tunnels_only=0
+fresh_start_no_replace=0
 printf '%s\n' '[swanlab]' 'mode = "online"' >"$config_file"
 for contents in \
   '' \
@@ -405,6 +411,19 @@ sleep_calls=0
 start_orchestrator_container
 test "$sleep_calls" -eq 20
 ! grep -F -- '-v /data/trinity-thinking-fp8:/data/trinity-thinking-fp8:ro' "$CALL_LOG"
+
+: >"$CALL_LOG"
+printf 'container-id\n' >"$CONTAINER_STATE_FILE"
+fresh_start_no_replace=1
+set +e
+start_output=$(start_orchestrator_container 2>"$tmp/fresh-existing.err")
+fresh_existing_status=$?
+set -e
+test "$fresh_existing_status" -ne 0
+test -z "$start_output"
+grep -Fx 'fresh start refuses existing container: orchestrator' "$tmp/fresh-existing.err"
+! grep -F 'rm orchestrator' "$CALL_LOG"
+fresh_start_no_replace=0
 
 peer_enabled=1
 tunnels_only=0

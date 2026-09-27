@@ -280,6 +280,19 @@ class ResumeStartTest(unittest.TestCase):
         self.assertLess(trainer, broadcast)
         self.assertLess(broadcast, orch)
 
+    def test_cold_and_restart_do_not_pass_fresh_no_replace_flag(self):
+        for mode in ("cold", "restart"):
+            with self.subTest(mode=mode):
+                calls, error = self.run_start(
+                    mode=mode,
+                    resume=False,
+                    control_files={},
+                )
+                self.assertIsNone(error)
+                self.assertFalse(
+                    any("FRESH_START_NO_REPLACE" in command for _, command in calls)
+                )
+
     def test_unstable_origin_refuses_before_deployment_or_start(self):
         calls, error = self.run_start(state_failure="origin")
         self.assertIsInstance(error, training_ops.Refused)

@@ -320,6 +320,9 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertTrue(any(command.endswith(" trainer") for command in commands))
         self.assertTrue(any(command.endswith("/runtime/orchestrator.sh") for command in commands))
         self.assertTrue(any("trinity-decensor-experimental-fixed-diag-d29a5958" in command for command in commands))
+        for command in commands:
+            if command.endswith((" adapter-http", " trainer", "/runtime/orchestrator.sh")):
+                self.assertIn("FRESH_START_NO_REPLACE=1", command)
         adapter_index = next(i for i, event in enumerate(events) if event[0] == "adapter")
         transport_index = next(i for i, event in enumerate(events) if event[0] == "transport")
         orch_index = next(i for i, event in enumerate(events) if event[0] == "orchestrator")
@@ -410,6 +413,19 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertIn(hashlib.sha256(cache_source.encode()).hexdigest(), script)
         self.assertNotIn(hashlib.sha256(source_url.encode()).hexdigest(), script)
         self.assertNotIn(hashlib.sha256(cache_source.encode()).hexdigest(), scripts["n82"])
+
+    def test_fresh_launchers_have_fail_closed_no_replace_guards(self):
+        cluster = (root / "training_ops/runtime/china/cluster.sh").read_text()
+        orchestrator = (root / "training_ops/runtime/h200/start_orchestrator.sh").read_text()
+        self.assertIn('fresh_start_no_replace=${FRESH_START_NO_REPLACE:-0}', cluster)
+        self.assertIn('fresh_start_no_replace=${FRESH_START_NO_REPLACE:-0}', orchestrator)
+        self.assertIn('fresh start refuses existing trainer container', cluster)
+        self.assertIn('fresh start refuses existing adapter container', cluster)
+        self.assertIn('fresh_no_replace_container "$relay_container"', orchestrator)
+        self.assertIn('fresh_no_replace_container "$ORCH_CT"', orchestrator)
+        self.assertIn('if [ "$fresh_start_no_replace" = 0 ]; then', cluster)
+        self.assertIn('if [ "$fresh_start_no_replace" = 0 ]; then', orchestrator)
+        self.assertIn("pkill -f '[t]rainer_failure_watchdog.sh'", orchestrator)
 
     def test_live_cleanup_and_no_clobber_contract_is_explicit(self):
         plan = (root / "ideas.md").read_text(encoding="utf-8")

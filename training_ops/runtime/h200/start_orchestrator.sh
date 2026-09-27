@@ -19,6 +19,11 @@ config_file=${ORCH_CONFIG:-$deployment/configs/general-agent/orchestrator.toml}
 nodes_file="$deployment/configs/nodes.toml"
 training_env_file=/data/trinity/training.env
 trainer_watchdog_wait_for_initial_health=${TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH:-0}
+fresh_start_no_replace=${FRESH_START_NO_REPLACE:-0}
+case "$fresh_start_no_replace" in
+  0|1) ;;
+  *) echo "FRESH_START_NO_REPLACE must be 0 or 1" >&2; exit 2 ;;
+esac
 case "$trainer_watchdog_wait_for_initial_health" in
   0|1) ;;
   *) echo "TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH must be 0 or 1" >&2; exit 2 ;;
@@ -822,6 +827,15 @@ RUN_NAME=${RUN_NAME:?set RUN_NAME}
 TRAINER_ADDRESSES=${TRAINER_ADDRESSES:?set TRAINER_ADDRESSES}
 TRAINER_CT=${TRAINER_CT:?set TRAINER_CT}
 ORCH_CT=${ORCH_CT:?set ORCH_CT}
+
+fresh_no_replace_container() {
+  local container=$1
+  [ "$fresh_start_no_replace" = 1 ] || return 0
+  if sudo docker inspect "$container" >/dev/null 2>&1; then
+    echo "fresh start refuses existing container: $container" >&2
+    return 1
+  fi
+}
 
 resolve_inference_image() {
   local inference_container inference_id inference_name inference_running image
@@ -4071,8 +4085,11 @@ adapter_tunnel_readiness() {
 
 adapter_relay_start() {
   local running relay_ready=0 relay_probe relay_status relay_identity relay_image
+  fresh_no_replace_container "$relay_container" || return 1
   if [ "$peer_enabled" != 1 ]; then
-    [ "$tunnels_only" = 1 ] || sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+    if [ "$tunnels_only" = 0 ] && [ "$fresh_start_no_replace" = 0 ]; then
+      sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+    fi
     return 0
   fi
   sudo install -d -o 1000 -g 1000 -m 0755 "$relay_cache_dir"
@@ -4091,7 +4108,9 @@ adapter_relay_start() {
         [ "$relay_status" = 404 ] && [ "$relay_probe" = $'source URL is not configured\n' ]; then
       return 0
   fi
-  sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+  if [ "$fresh_start_no_replace" = 0 ]; then
+    sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+  fi
   sudo docker run -d --name "$relay_container" --pull=never --restart unless-stopped \
     --label "com.glm52.adapter-relay.source-url=$relay_source_url" \
     --user 0:0 \
@@ -4121,7 +4140,9 @@ adapter_relay_start() {
   done
   [ "$relay_ready" = 1 ] || {
     sudo docker logs --tail 100 "$relay_container" >&2 || true
-    sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+    if [ "$fresh_start_no_replace" = 0 ]; then
+      sudo docker rm -f "$relay_container" >/dev/null 2>&1 || true
+    fi
     return 1
   }
 }
@@ -4293,7 +4314,8 @@ remove_failed_orchestrator() {
     --format '{{index .Config.Labels "com.glm52.orchestrator.launch"}}' \
     2>/dev/null || true)
   candidate_image=$(sudo docker inspect "$candidate_id" --format '{{.Image}}' 2>/dev/null || true)
-  if [ "$candidate_name" = "/$ORCH_CT" ] && [ "$candidate_label" = "$launch_label" ] && \
+  if [ "$fresh_start_no_replace" = 0 ] && \
+     [ "$candidate_name" = "/$ORCH_CT" ] && [ "$candidate_label" = "$launch_label" ] && \
      [ "$candidate_image" = "$orchestrator_image_id" ]; then
     sudo docker rm -f "$candidate_id" >/dev/null 2>&1 || true
   fi
@@ -4339,7 +4361,10 @@ start_orchestrator_container() {
     return 1
   fi
   launch_label="$RUN/$RUN_NAME/$launch_nonce"
-  sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+  fresh_no_replace_container "$ORCH_CT" || return 1
+  if [ "$fresh_start_no_replace" = 0 ]; then
+    sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+  fi
   container_id=
   launch_output=$(sudo docker run -d --name "$ORCH_CT" --pull=never \
     --label "com.glm52.orchestrator.launch=$launch_label" \
@@ -4404,7 +4429,9 @@ start_orchestrator_container() {
     echo "orchestrator state unavailable: $ORCH_CT" >&2
   sudo docker logs --tail 100 "$container_id" >&2 || \
     echo "orchestrator logs unavailable: $ORCH_CT" >&2
-  sudo docker rm -f "$container_id" >/dev/null 2>&1 || true
+  if [ "$fresh_start_no_replace" = 0 ]; then
+    sudo docker rm -f "$container_id" >/dev/null 2>&1 || true
+  fi
   return 1
 }
 
@@ -4438,7 +4465,9 @@ echo "orchestrator started on $(hostname) with $(basename "$config_file")"
 
 if [ "$rollout_transfer_direction" = orchestrator_push ]; then
   # Stop rollout production if the remote trainer cluster fails.
-  pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
+  if [ "$fresh_start_no_replace" = 0 ]; then
+    pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
+  fi
   nohup setsid env RUN="$RUN" RUN_NAME="$RUN_NAME" \
     TRAINER_ADDRESSES="$TRAINER_ADDRESSES" \
     TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
@@ -4449,12 +4478,16 @@ if [ "$rollout_transfer_direction" = orchestrator_push ]; then
   sleep 1
   if ! kill -0 "$trainer_watchdog_pid" 2>/dev/null; then
     echo "ERROR: trainer failure watchdog exited during startup" >&2
-    sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+    if [ "$fresh_start_no_replace" = 0 ]; then
+      sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+    fi
     exit 1
   fi
   echo "trainer failure watchdog started (pid $trainer_watchdog_pid)"
 else
-  pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
+  if [ "$fresh_start_no_replace" = 0 ]; then
+    pkill -f '[t]rainer_failure_watchdog.sh' 2>/dev/null || true
+  fi
   nohup setsid env MODE=lease RUN="$RUN" RUN_NAME="$RUN_NAME" \
     LEASE_FILE="/data/glm52-rl/runs/$RUN/$RUN_NAME/.trainer-health-lease" \
     TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
@@ -4465,7 +4498,9 @@ else
   sleep 1
   if ! kill -0 "$trainer_watchdog_pid" 2>/dev/null; then
     echo "ERROR: trainer lease watchdog exited during startup" >&2
-    sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+    if [ "$fresh_start_no_replace" = 0 ]; then
+      sudo docker rm -f "$ORCH_CT" >/dev/null 2>&1 || true
+    fi
     exit 1
   fi
   echo "trainer lease watchdog started (pid $trainer_watchdog_pid)"
