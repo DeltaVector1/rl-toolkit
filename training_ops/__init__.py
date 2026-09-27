@@ -21,6 +21,7 @@ import tempfile
 import time
 import tomllib
 import uuid
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -32,6 +33,11 @@ from training_ops.runtime.h200.prepare_trinity_policy0_qualification import (
 )
 from training_ops.runtime.h200.load_policy0 import (
     EXPECTED_LORA as POLICY0_LOAD_LORA,
+    _check_engine as _policy0_check_engine,
+    _check_engine_identity as _policy0_check_engine_identity,
+    _check_receipts as _policy0_check_receipts,
+    _check_services as _policy0_check_services,
+    _check_target_slot_free as _policy0_check_target_slot_free,
     build_plan as build_policy0_load_plan,
     execute_policy0_load,
 )
@@ -43,6 +49,18 @@ from training_ops.runtime.policy0_source import (
 from training_ops.runtime.h200.post_update_qualification import (
     PostUpdateQualificationError,
     validate_post_update_references,
+)
+from training_ops.runtime.h200.qualified_adapter_load import (
+    CANONICAL_CONFIG_DIR as QUALIFIED_ADAPTER_CONFIG_DIR,
+    QUALIFICATION_SLOT,
+    QualifiedAdapterLoadError,
+    build_publish_script,
+    build_publication_cleanup_script,
+    build_result_receipt_script,
+    build_rollback_script,
+    derive_plan as derive_qualified_adapter_plan,
+    parse_delta_receipt,
+    parse_publish_result,
 )
 
 repo_root = Path(__file__).resolve().parents[1]
@@ -10829,6 +10847,271 @@ def _policy0_load_config_plan(
     return plan
 
 
+def _qualified_adapter_receipt_script(receipt_path: str) -> str:
+    """Read one immutable delta receipt from the configured H200 trainer."""
+    if not isinstance(receipt_path, str) or not receipt_path.startswith(
+        "/data/glm52-rl/qualifications/trinity-h200-post-update-qualification/"
+    ) or any(part in {"", ".", ".."} for part in PurePosixPath(receipt_path).parts):
+        raise Refused("delta receipt path is not the canonical qualification receipt")
+    path = shlex.quote(receipt_path)
+    return f'''set -euo pipefail
+receipt={path}
+test -f "$receipt" && test ! -L "$receipt"
+printf 'QUALIFIED_RECEIPT_SHA256 sha256=%s size=%s\\n' "$(sha256sum -- "$receipt" | awk '{{print $1}}')" "$(stat -c %s -- "$receipt")"
+printf '%s\\n' QUALIFIED_RECEIPT_BEGIN
+cat -- "$receipt"
+printf '%s\\n' QUALIFIED_RECEIPT_END
+'''
+
+
+def _qualified_receipt_from_output(output: str, expected_sha256: str) -> dict[str, object]:
+    lines = output.splitlines()
+    identity = [line for line in lines if line.startswith("QUALIFIED_RECEIPT_SHA256 ")]
+    if len(identity) != 1:
+        raise Refused("remote delta receipt identity is missing")
+    fields = dict(item.split("=", 1) for item in identity[0].split()[1:] if "=" in item)
+    if fields.get("sha256") != expected_sha256 or not fields.get("size", "").isdigit():
+        raise Refused("remote delta receipt identity differs from the expected receipt")
+    begin = "QUALIFIED_RECEIPT_BEGIN\n"
+    end = "\nQUALIFIED_RECEIPT_END"
+    start = output.find(begin)
+    finish = output.find(end, start + len(begin)) if start >= 0 else -1
+    if start < 0 or finish < 0:
+        raise Refused("remote delta receipt body is missing")
+    raw = output[start + len(begin):finish]
+    try:
+        return parse_delta_receipt(raw, expected_sha256)
+    except QualifiedAdapterLoadError as error:
+        raise Refused(f"remote delta receipt validation failed: {error}") from error
+
+
+def _qualified_adapter_load_plan(config_dir: str, receipt_path: str, expected_sha256: str) -> tuple[dict[str, object], dict[str, object]]:
+    _guard_post_update_config_dir(config_dir)
+    if config_dir != QUALIFIED_ADAPTER_CONFIG_DIR:
+        raise Refused("qualified adapter load requires the canonical config directory")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise Refused("expected receipt SHA256 is invalid")
+    trainer_path = repo_root / config_dir / "trainer.toml"
+    try:
+        with trainer_path.open("rb") as stream:
+            trainer_config = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Refused(f"cannot read qualified adapter config: {error}") from error
+    configured_root = trainer_config.get("output_dir")
+    if configured_root != "/data/glm52-rl/qualifications/trinity-h200-post-update-qualification":
+        raise Refused("qualified adapter output root differs")
+    fake = trainer_config.get("data", {}).get("fake", {})
+    if trainer_config.get("max_steps") != 1 or fake.get("batch_size") != 8 or fake.get("export_final_adapter") is not True:
+        raise Refused("qualified adapter config is not the one-step export config")
+    expected_receipt_path = f"{configured_root}/step1-delta-receipt.json"
+    if receipt_path != expected_receipt_path:
+        raise Refused("delta receipt path must be the configured qualification receipt")
+    code, output = _ssh(trainer_head, _qualified_adapter_receipt_script(receipt_path), timeout=180)
+    if code:
+        raise Refused(f"remote delta receipt read failed: {output.strip()}")
+    receipt = _qualified_receipt_from_output(output, expected_sha256)
+    inference_host = inference_hosts[0]
+    trinity_ports = _inference_config(inference_host, "trinity").get("ports")
+    if not isinstance(trinity_ports, list) or len(trinity_ports) != 1 or not isinstance(trinity_ports[0], int):
+        raise Refused("qualified adapter inference port is not one exact configured port")
+    try:
+        plan = derive_qualified_adapter_plan(
+            config_dir,
+            receipt,
+            expected_sha256,
+            qualification_root=configured_root,
+            runs_root=run_root,
+            trainer_head=trainer_head,
+            inference_host=inference_host,
+            inference_port=trinity_ports[0],
+            direct_route_port=ports["lora_source_first"],
+        )
+    except QualifiedAdapterLoadError as error:
+        raise Refused(str(error)) from error
+    plan.update(
+        {
+            "trainer_hosts": list(trainer_hosts),
+            "orchestrator_host": orchestrator_host,
+            "inference_hosts": [inference_host],
+            "engine_ports": {inference_host: [trinity_ports[0]]},
+            "source_config_path": f"{plan['source_adapter_dir']}/adapter_config.json",
+        }
+    )
+    return plan, receipt
+
+
+def _qualified_adapter_receipt_identity(plan: Mapping[str, object]) -> dict[str, object]:
+    artifacts = plan.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise Refused("qualified adapter artifact identity is missing")
+    model = artifacts.get("adapter_model.safetensors")
+    config = artifacts.get("adapter_config.json")
+    if not isinstance(model, Mapping) or not isinstance(config, Mapping):
+        raise Refused("qualified adapter model/config identity is missing")
+    return {
+        "source_url": plan["source_url"],
+        "target_sha256": model["sha256"],
+        "target_size": model["size"],
+        "config_sha256": config["sha256"],
+        "config_size": config["size"],
+    }
+
+
+def _qualified_check_preserved_policy0(before: Mapping[str, object], after: Mapping[str, object]) -> None:
+    before_engine = before.get("engine", {})
+    after_engine = after.get("engine", {})
+    before_receipts = before_engine.get("loaded_receipts", {}) if isinstance(before_engine, Mapping) else {}
+    after_receipts = after_engine.get("loaded_receipts", {}) if isinstance(after_engine, Mapping) else {}
+    if not isinstance(before_receipts, Mapping) or not isinstance(after_receipts, Mapping):
+        raise Refused("inference loaded receipt state is missing")
+    for slot, receipt in before_receipts.items():
+        if slot == QUALIFICATION_SLOT:
+            raise Refused("qualified adapter slot was occupied before the load")
+        if after_receipts.get(slot) != receipt:
+            raise Refused(f"existing policy receipt changed for slot {slot}")
+
+
+def _qualified_adapter_rollback(plan: Mapping[str, object], remove_published: bool) -> str:
+    errors = []
+    code, output = _ssh(
+        str(plan["inference_host"]),
+        build_rollback_script(plan, remove_published=False),
+        timeout=180,
+    )
+    if code:
+        errors.append(output.strip() or f"slot rollback exit {code}")
+    if remove_published:
+        code, output = _ssh(
+            str(plan["trainer_head"]),
+            build_publication_cleanup_script(plan),
+            timeout=180,
+        )
+        if code:
+            errors.append(output.strip() or f"publication rollback exit {code}")
+    return "; ".join(errors) or "QUALIFIED_ROLLBACK slot=removed"
+
+
+def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
+    phase_start = time.monotonic()
+    phase: dict[str, float] = {}
+    before = _policy0_load_live_state(plan)
+    _policy0_check_services(plan, before)
+    before_engine = _policy0_check_engine(plan, before)
+    _policy0_check_target_slot_free(plan, before_engine)
+    phase["preflight_seconds"] = time.monotonic() - phase_start
+    published = False
+    load_attempted = False
+    try:
+        publish_start = time.monotonic()
+        code, output = _ssh(str(plan["trainer_head"]), build_publish_script(plan), timeout=900)
+        if code:
+            raise Refused(f"qualified adapter publication failed: {output.strip()}")
+        record = None
+        for line in output.splitlines():
+            if line.startswith("QUALIFIED_PUBLISH "):
+                fields = dict(item.split("=", 1) for item in line.split()[1:] if "=" in item)
+                record = {**fields, "files": plan["artifacts"]}
+        if record is None:
+            raise Refused("qualified adapter publication receipt is missing")
+        try:
+            published_result = parse_publish_result(record, plan)
+        except QualifiedAdapterLoadError as error:
+            raise Refused(str(error)) from error
+        published = published_result.get("status") == "published"
+        phase["publish_seconds"] = time.monotonic() - publish_start
+        expected = _qualified_adapter_receipt_identity(plan)
+        stage_start = time.monotonic()
+        staged = _policy0_remote_client_op(plan, "stage")
+        if not isinstance(staged, Mapping) or staged.get("adapter_identity") != expected:
+            raise Refused("qualified adapter stage identity differs from the delta receipt")
+        middle = _policy0_load_live_state(plan)
+        middle_engine = _policy0_check_engine(plan, middle)
+        _policy0_check_services(plan, middle)
+        _policy0_check_engine_identity(before_engine, middle_engine)
+        _policy0_check_target_slot_free(plan, middle_engine)
+        _qualified_check_preserved_policy0(before, middle)
+        phase["stage_seconds"] = time.monotonic() - stage_start
+        load_start = time.monotonic()
+        load_attempted = True
+        loaded = _policy0_remote_client_op(plan, "load", expected)
+        if not isinstance(loaded, list):
+            raise Refused("qualified adapter load returned no receipts")
+        after = _policy0_load_live_state(plan)
+        after_engine = _policy0_check_engine(plan, after)
+        _policy0_check_services(plan, after)
+        _policy0_check_engine_identity(before_engine, after_engine)
+        _qualified_check_preserved_policy0(before, after)
+        loaded_status = after_engine.get("loaded_receipts", {}).get(plan["qualification_slot"])
+        _policy0_check_receipts(plan, loaded, expected, [loaded_status] if loaded_status else [])
+        phase["load_seconds"] = time.monotonic() - load_start
+        result = {
+            "schema_version": 1,
+            "kind": "h200_qualified_adapter_load",
+            "status": "loaded",
+            "qualification_slot": plan["qualification_slot"],
+            "source_url": plan["source_url"],
+            "source_adapter_dir": plan["source_adapter_dir"],
+            "manifest_sha256": plan["manifest_sha256"],
+            "receipt_sha256": plan["receipt_sha256"],
+            "adapter_identity": expected,
+            "published": published_result,
+            "stage_result": dict(staged),
+            "load_result": loaded,
+            "server_instances": [item["server_instance"] for item in loaded],
+            "engine_identity_before": {key: before_engine[key] for key in ("container_id", "container_started_at", "api_pid", "api_start_time")},
+            "engine_identity_after": {key: after_engine[key] for key in ("container_id", "container_started_at", "api_pid", "api_start_time")},
+            "phase_seconds": phase,
+        }
+        payload = base64.b64encode(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()).decode()
+        code, output = _ssh(str(plan["trainer_head"]), build_result_receipt_script(plan, payload), timeout=180)
+        if code:
+            raise Refused(f"qualified adapter result receipt publication failed: {output.strip()}")
+        return result
+    except BaseException as error:
+        rollback = _qualified_adapter_rollback(plan, published) if (published or load_attempted) else "not-owned"
+        if rollback and not rollback.startswith("QUALIFIED_ROLLBACK"):
+            raise Refused(f"qualified adapter load failed: {error}; rollback failed: {rollback}") from error
+        raise
+
+
+def _qualified_adapter_load_action(arguments: list[str]):
+    positional: list[str] = []
+    values: dict[str, str] = {}
+    options = {"--delta-receipt-path": "receipt", "--expected-receipt-sha256": "sha"}
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in options:
+            index += 1
+            if index >= len(arguments):
+                raise Refused(f"{argument} requires a value")
+            values[options[argument]] = arguments[index]
+        elif argument.startswith("--"):
+            raise Refused(f"unknown load-qualified-adapter option {argument}")
+        else:
+            positional.append(argument)
+        index += 1
+    if len(positional) != 2:
+        raise Refused("load-qualified-adapter requires the canonical config and plan|apply")
+    if positional[1] not in {"plan", "apply"}:
+        raise Refused("load-qualified-adapter mode must be plan or apply")
+    receipt_path = values.get("receipt")
+    expected_sha = values.get("sha")
+    if not isinstance(receipt_path, str) or not isinstance(expected_sha, str):
+        raise Refused("load-qualified-adapter requires --delta-receipt-path and --expected-receipt-sha256")
+    try:
+        plan, receipt = _qualified_adapter_load_plan(positional[0], receipt_path, expected_sha)
+    except QualifiedAdapterLoadError as error:
+        raise Refused(str(error)) from error
+    if positional[1] == "plan":
+        output = {**plan, "receipt": receipt}
+        print(json.dumps(output, indent=2, sort_keys=True))
+        return output
+    result = _qualified_adapter_load_apply(plan)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return result
+
+
 def _policy0_load_source_script(plan: dict[str, object]) -> str:
     script = _policy0_adapter_source_manifest_script(
         f"{str(plan['source_adapter_dir']).rstrip('/')}/adapter_model.safetensors",
@@ -11358,6 +11641,7 @@ actions = {
     "archive": _archive_action,
     "qualify": _qualify_action,
     "load-policy0": _load_policy0_action,
+    "load-qualified-adapter": _qualified_adapter_load_action,
     "prepare-policy0": _prepare_policy0_action,
     "prepare-policy0-source": _prepare_policy0_source_action,
     "stop": _stop_action,
@@ -11394,6 +11678,9 @@ usage = f"""training-ops <action> [args]
   load-policy0 [config-dir] [plan|apply] \
     --source-run RUN --source-adapter-dir DIR --qualification-slot NAME
                                   verify and load one exact step-0 adapter
+  load-qualified-adapter <canonical-config> [plan|apply] \
+    --delta-receipt-path PATH --expected-receipt-sha256 SHA256
+                                  verify and load the reviewed step-1 adapter
   prepare-policy0 [config-dir] [plan|stage] \
     --source-adapter-dir DIR --source-reference-path FILE \
     [--expected-old-reference-sha256 SHA256 --expected-old-reference-size BYTES]
