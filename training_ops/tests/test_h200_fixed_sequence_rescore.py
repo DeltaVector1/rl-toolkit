@@ -198,6 +198,14 @@ class FixedSequenceRescoreTest(unittest.TestCase):
             result["comparisons"]["fresh_vs_trainer"]["all"]["count"],
             len(self.ids) - 1,
         )
+        self.assertEqual(
+            result["comparisons"]["fresh_vs_reference"]["missing_excluded_count"],
+            1,
+        )
+        self.assertEqual(
+            result["comparisons"]["fresh_vs_trainer"]["missing_excluded_count"],
+            1,
+        )
 
     def test_masked_sentinel_delta_validation_is_skipped_only_for_masked_position(self):
         self.record["reference_logprobs"][-1] = -9999.0
@@ -223,6 +231,10 @@ class FixedSequenceRescoreTest(unittest.TestCase):
         self.assertEqual(
             result["comparisons"]["fresh_vs_reference"]["all"]["count"],
             len(self.ids) - 1,
+        )
+        self.assertEqual(
+            result["comparisons"]["fresh_vs_reference"]["missing_excluded_count"],
+            1,
         )
         fresh[1] = -9999.0
         with self.assertRaisesRegex(fixed.FixedSequenceRescoreError, "selected|loss_mask"):
