@@ -1045,3 +1045,23 @@ only after measured learning.
   safe aliases consistently without allowing the target receipt to evade
   detection. Add `transport-manifest.json` only if its schema is fully
   validated as a known legacy member; unknown members must still refuse.
+
+## Measured legacy transport manifest member
+
+- **Measured production member (2026-09-27).** The archived production cache
+  entry at key `f72c3222b63fe4faf9e482d6b36fb6887521aac5a76f96655e2b94a18a630f8a`
+  contains an object named `transport-manifest.json`, size `313546` bytes,
+  mode `0600`. Cross-checks against the other cache manifests passed. The
+  observed document has version `1`, the nested production source URL, exact
+  target and config hashes and sizes matching the main manifest, mode `full`,
+  transport `chunked-full-zstd`, and `986` chunks.
+- **Acceptance criteria before allowing the member.** Treat only the exact
+  filename `transport-manifest.json` as a known legacy member. Require a real
+  regular file with the observed mode and strict top-level key set. Validate
+  every scalar value and cross-check source URL, target/config hashes, and
+  sizes against `manifest.json` and the sidecar. Validate the chunk list as a
+  uniform list with the known key set, integer indices/offsets/sizes, and
+  lowercase 64-hex hashes; reject duplicate or non-contiguous indices,
+  overlapping or inconsistent offsets/sizes, malformed entries, extra keys,
+  symlinks, unknown files, and identity mismatches. Do not implement until
+  the exact chunk key/type schema is captured from the measured member.
