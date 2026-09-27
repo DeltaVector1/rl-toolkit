@@ -10294,6 +10294,153 @@ printf '%s\n' "$image_id"
     return image_id
 
 
+def _fresh_start_preflight_script(
+    paths_to_check: list[str],
+    cache_path: str | None,
+) -> str:
+    """Build the read-only remote gate for a new, run-specific start."""
+    quoted_paths = " ".join(shlex.quote(path) for path in paths_to_check)
+    quoted_containers = " ".join(
+        shlex.quote(container)
+        for container in (
+            trainer_container,
+            orchestrator_container,
+            adapter_container,
+            adapter_relay_container,
+        )
+    )
+    cache_check = ""
+    if cache_path is not None:
+        cache_check = f'''cache_path={shlex.quote(cache_path)}
+if [ -e "$cache_path" ] || [ -L "$cache_path" ]; then
+  if [ -L "$cache_path" ]; then
+    echo "FRESH_START_CACHE_SYMLINK path=$cache_path" >&2
+  else
+    echo "FRESH_START_CACHE_PRESENT path=$cache_path" >&2
+  fi
+  exit 43
+fi
+'''
+    return f"""set -euo pipefail
+for path in {quoted_paths}; do
+  if [ ! -e \"$path\" ] && [ ! -L \"$path\" ]; then
+    continue
+  fi
+  if [ -L \"$path\" ]; then
+    echo \"FRESH_START_PATH_SYMLINK path=$path\" >&2
+    exit 41
+  fi
+  echo \"FRESH_START_PATH_PRESENT path=$path\" >&2
+  exit 42
+done
+{cache_check}
+for container in {quoted_containers}; do
+  active=$(sudo docker ps --filter \"name=^$container$\" --format '{{{{.Names}}}}')
+  if [ -n \"$active\" ]; then
+    echo \"FRESH_START_CONTAINER_ACTIVE name=$container\" >&2
+    exit 44
+  fi
+done
+printf '%s\\n' FRESH_START_PRECHECK_OK
+"""
+
+
+def _fresh_start_preflight(
+    run: str,
+    selected: Mapping[str, str],
+    nodes: list[str],
+    service_run_dir: str,
+) -> None:
+    """Refuse a fresh run unless all selected hosts have no run state."""
+    _runs_path, run_parent, expected_service_dir = _cold_run_paths(run)
+    if service_run_dir != expected_service_dir:
+        raise Refused("fresh start service directory does not match the active run")
+    trainer_relative = selected.get("trainer")
+    orchestrator_relative = selected.get("orchestrator")
+    if not isinstance(trainer_relative, str) or not isinstance(orchestrator_relative, str):
+        raise Refused("fresh start requires trainer and orchestrator configs")
+    try:
+        with (repo_root / trainer_relative).open("rb") as stream:
+            trainer_settings = tomllib.load(stream)
+        with (repo_root / orchestrator_relative).open("rb") as stream:
+            edge_settings = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise Refused(f"cannot read fresh start config: {error}") from error
+    if trainer_settings.get("output_dir") != run_parent:
+        raise Refused("fresh start trainer output directory does not match the active run")
+    if edge_settings.get("output_dir") != service_run_dir:
+        raise Refused("fresh start orchestrator output directory does not match the active run")
+    broadcast_settings = edge_settings.get("weight_broadcast")
+    source_url = (
+        broadcast_settings.get("source_url")
+        if isinstance(broadcast_settings, dict)
+        else None
+    )
+    if not isinstance(source_url, str) or not source_url.startswith(("http://", "https://")):
+        raise Refused("fresh start config has no adapter source URL")
+    source_url = source_url.rstrip("/")
+    parsed_source_url = urlsplit(source_url)
+    if (
+        parsed_source_url.hostname not in {"127.0.0.1", "localhost"}
+        or parsed_source_url.username
+        or parsed_source_url.password
+        or parsed_source_url.query
+        or parsed_source_url.fragment
+        or parsed_source_url.path.rstrip("/") != f"/{run}"
+    ):
+        raise Refused("fresh start adapter source URL does not match the active run")
+    cache_root = paths.get("adapter_cache")
+    if (
+        not isinstance(cache_root, str)
+        or not cache_root.startswith("/")
+        or cache_root.rstrip("/") in {"", "/"}
+        or any(part in {"", ".", ".."} for part in PurePosixPath(cache_root).parts)
+    ):
+        raise Refused("configured adapter cache path is unsafe")
+    cache_path = (
+        f"{cache_root.rstrip('/')}/"
+        f"{hashlib.sha256(source_url.encode('utf-8')).hexdigest()}"
+    )
+    paths_to_check = list(
+        dict.fromkeys(
+            (
+                run_parent,
+                service_run_dir,
+                f"{run_parent}/checkpoints",
+                f"{run_parent}/rollouts",
+                f"{service_run_dir}/broadcasts",
+                f"{service_run_dir}/control",
+                f"{service_run_dir}/rollouts",
+                f"{service_run_dir}/checkpoints",
+            )
+        )
+    )
+    selected_hosts = list(dict.fromkeys([*nodes, orchestrator_host, *inference_hosts]))
+    selected_hosts = [_check_host(host) for host in selected_hosts]
+    cache_hosts = set(inference_hosts) | {orchestrator_host}
+    results = _fan(
+        selected_hosts,
+        lambda host: _ssh(
+            host,
+            _fresh_start_preflight_script(
+                paths_to_check,
+                cache_path if host in cache_hosts else None,
+            ),
+            timeout=90,
+        ),
+    )
+    failures = {}
+    missing_hosts = set(selected_hosts) - set(results)
+    if missing_hosts:
+        failures["missing_hosts"] = ", ".join(sorted(missing_hosts))
+    for host, (code, output) in results.items():
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if code or "FRESH_START_PRECHECK_OK" not in lines:
+            failures[host] = " | ".join(lines[-3:]) or f"exit {code}"
+    if failures:
+        raise Refused(f"fresh start preflight refused: {failures}")
+
+
 def _validate_trinity_afmoe_overlay() -> None:
     path = repo_root / "prime-rl/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py"
     if not path.is_file():
@@ -10486,8 +10633,8 @@ def start(
     config_dir: str = default_config_dir,
 ) -> None:
     """Start a run from one explicit run config directory."""
-    if mode not in ("cold", "restart"):
-        raise Refused('mode must be "cold" or "restart"')
+    if mode not in ("cold", "fresh", "restart"):
+        raise Refused('mode must be "cold", "fresh", or "restart"')
     _runs_path, _run_parent, service_run_dir = _cold_run_paths(run)
     if (resume_adapter is None) != (resume_step is None):
         raise Refused("resume_adapter and resume_step must be set together")
@@ -10506,6 +10653,8 @@ def start(
     nodes = [_check_host(h) for h in (nodes or trainer_hosts)]
     if trainer_head in nodes:  # rank 0 is the rendezvous master and carries the readable log
         nodes = [trainer_head] + [n for n in nodes if n != trainer_head]
+    if mode == "fresh":
+        _fresh_start_preflight(run, selected, nodes, service_run_dir)
     resume_digest = ""
     if mode == "restart" and resume_adapter is not None:
         if trainer_head not in nodes:
@@ -10685,7 +10834,7 @@ def start(
             f"TRAINER_ADDRESSES={shlex.quote(trainer_addresses)} "
             f"TRAINER_CT={shlex.quote(trainer_container)} "
             f"ORCH_CT={shlex.quote(orchestrator_container)} "
-            f"TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH={'1' if mode == 'cold' else '0'} "
+            f"TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH={'1' if mode in {'cold', 'fresh'} else '0'} "
             + (f"adapter_resume_step={resume_step} " if resume_adapter is not None else "")
             + f"bash {orchestrator_launcher}",
             300,
@@ -10801,7 +10950,7 @@ exit 1
     if mode == "cold":
         _cold_start_cleanup(run, nodes)
         _cold_adapter_cache_cleanup(initial_adapter_identity)
-    if mode == "cold":
+    if mode in ("cold", "fresh"):
         launch_adapter()
         launch_transport()
         launch_orch()
@@ -12268,7 +12417,7 @@ usage = f"""training-ops <action> [args]
   watch [hours] [seconds]       monitor in the foreground
   repair <name>                 repair an engine, adapter server, orchestrator, supervisors, or microbatch sync
   deploy <path>                 copy one repository file
-  start <run> [mode] [config-dir]  start one run config directory
+  start <run> [cold|fresh|restart] [config-dir]  start one run config directory
   archive <run> [step ...]      upload stable old LoRA adapters
                                 add --finished after another run is active
   qualify <name> [mode] [config-dir]  start a trainer-only config directory

@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import tomllib
 import unittest
 from pathlib import Path
@@ -234,15 +235,28 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
             for marker in forbidden:
                 self.assertNotIn(marker, text, path.name)
 
-    def test_restart_without_resume_is_fresh_and_skips_cold_paths(self):
+    def test_fresh_start_is_fresh_and_skips_cold_paths(self):
         calls = []
+        events = []
 
         def ssh(host, command, timeout=60):
             calls.append((host, command))
+            if "FRESH_START_PRECHECK_OK" in command:
+                events.append(("preflight", host))
+                return 0, "FRESH_START_PRECHECK_OK"
+            if command.endswith(" adapter-http"):
+                events.append(("adapter", host))
+            elif command.endswith("/runtime/orchestrator.sh"):
+                events.append(("orchestrator", host))
+            elif "orchestrator control file did not arrive" in command:
+                events.append(("control", host))
+            elif command.endswith(" trainer"):
+                events.append(("trainer", host))
             return 0, "ready"
 
         def remote_ok(host, command, _label, **kwargs):
             calls.append((host, command))
+            events.append(("remote", host, command))
             return "ready"
 
         selected = {
@@ -254,9 +268,12 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         cold_cleanup = mock.Mock()
         cache_cleanup = mock.Mock()
         transport = mock.Mock()
+        transport.side_effect = lambda run_dir, restart_route=False: events.append(
+            ("transport", run_dir, restart_route)
+        )
         with mock.patch.object(training_ops, "_config_dir", return_value=selected), \
             mock.patch.object(training_ops, "_start_dependency_inventory", return_value=[]), \
-            mock.patch.object(training_ops, "_deploy_dependencies"), \
+            mock.patch.object(training_ops, "_deploy_dependencies", side_effect=lambda _files: events.append(("deploy",))), \
             mock.patch.object(training_ops, "_orchestrator_image_preflight", return_value="sha256:" + "d" * 64), \
             mock.patch.object(training_ops, "_ssh", side_effect=ssh), \
             mock.patch.object(training_ops, "_ssh_address", return_value="127.0.0.1"), \
@@ -272,7 +289,7 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
             mock.patch("builtins.print"):
             training_ops.start(
                 "trinity-decensor-experimental-fixed-diag-d29a5958",
-                mode="restart",
+                mode="fresh",
                 nodes=["n82"],
                 supervisors=False,
                 config_dir="configs/trinity-decensor-review-diagnostic",
@@ -280,6 +297,10 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
 
         cold_cleanup.assert_not_called()
         cache_cleanup.assert_not_called()
+        self.assertLess(
+            next(index for index, event in enumerate(events) if event[0] == "preflight"),
+            next(index for index, event in enumerate(events) if event[0] == "deploy"),
+        )
         transport.assert_called_once_with(
             load_config(diagnostic, "orchestrator.toml")["output_dir"],
             restart_route=False,
@@ -290,6 +311,86 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertTrue(any(command.endswith(" trainer") for command in commands))
         self.assertTrue(any(command.endswith("/runtime/orchestrator.sh") for command in commands))
         self.assertTrue(any("trinity-decensor-experimental-fixed-diag-d29a5958" in command for command in commands))
+        adapter_index = next(i for i, event in enumerate(events) if event[0] == "adapter")
+        transport_index = next(i for i, event in enumerate(events) if event[0] == "transport")
+        orch_index = next(i for i, event in enumerate(events) if event[0] == "orchestrator")
+        control_index = next(i for i, event in enumerate(events) if event[0] == "control")
+        trainer_index = next(i for i, event in enumerate(events) if event[0] == "trainer")
+        self.assertLess(adapter_index, transport_index)
+        self.assertLess(transport_index, orch_index)
+        self.assertLess(orch_index, control_index)
+        self.assertLess(control_index, trainer_index)
+        orch_command = next(command for command in commands if command.endswith("/runtime/orchestrator.sh"))
+        self.assertIn("TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH=1", orch_command)
+
+    def test_fresh_preflight_refuses_each_remote_gate_failure(self):
+        selected = {
+            "trainer": "configs/trinity-decensor-review-diagnostic/trainer.toml",
+            "orchestrator": "configs/trinity-decensor-review-diagnostic/orchestrator.toml",
+            "inference": "configs/trinity-decensor-review-diagnostic/inference.toml",
+        }
+        failures = (
+            "FRESH_START_PATH_PRESENT path=/data/glm52-rl/runs/example",
+            "FRESH_START_PATH_SYMLINK path=/data/glm52-rl/runs/example",
+            "FRESH_START_CACHE_PRESENT path=/data/glm52-rl/lora-cache/example",
+            "FRESH_START_CACHE_SYMLINK path=/data/glm52-rl/lora-cache/example",
+            "FRESH_START_CONTAINER_ACTIVE name=glm52-decensor-trainer",
+        )
+        for failure in failures:
+            with self.subTest(failure=failure):
+                with mock.patch.object(
+                    training_ops,
+                    "_ssh",
+                    return_value=(23, failure),
+                ) as ssh:
+                    with self.assertRaises(training_ops.Refused):
+                        training_ops._fresh_start_preflight(
+                            "trinity-decensor-experimental-fixed-diag-d29a5958",
+                            selected,
+                            ["n82"],
+                            "/data/glm52-rl/runs/trinity-decensor-experimental-fixed-diag-d29a5958/run_trinity-decensor-experimental-fixed-diag-d29a5958",
+                        )
+                self.assertTrue(ssh.called)
+
+    def test_fresh_preflight_script_checks_exact_paths_cache_and_containers(self):
+        selected = {
+            "trainer": "configs/trinity-decensor-review-diagnostic/trainer.toml",
+            "orchestrator": "configs/trinity-decensor-review-diagnostic/orchestrator.toml",
+            "inference": "configs/trinity-decensor-review-diagnostic/inference.toml",
+        }
+        with mock.patch.object(
+            training_ops,
+            "_ssh",
+            return_value=(0, "FRESH_START_PRECHECK_OK"),
+        ) as ssh, mock.patch.object(
+            training_ops,
+            "_fan",
+            side_effect=lambda hosts, function: {
+                host: function(host) for host in hosts
+            },
+        ):
+            training_ops._fresh_start_preflight(
+                "trinity-decensor-experimental-fixed-diag-d29a5958",
+                selected,
+                ["n82"],
+                "/data/glm52-rl/runs/trinity-decensor-experimental-fixed-diag-d29a5958/run_trinity-decensor-experimental-fixed-diag-d29a5958",
+            )
+        scripts = {
+            call.args[0]: call.args[1]
+            for call in ssh.call_args_list
+        }
+        self.assertEqual(set(scripts), {"n82", "h200b"})
+        script = scripts["h200b"]
+        self.assertIn("[ ! -e \"$path\" ]", script)
+        self.assertIn("[ ! -L \"$path\" ]", script)
+        self.assertIn("docker ps", script)
+        self.assertIn(training_ops.trainer_container, script)
+        self.assertIn(training_ops.orchestrator_container, script)
+        self.assertIn(training_ops.adapter_container, script)
+        self.assertIn("FRESH_START_PRECHECK_OK", script)
+        source_url = "http://127.0.0.1:18100/trinity-decensor-experimental-fixed-diag-d29a5958"
+        self.assertIn(hashlib.sha256(source_url.encode()).hexdigest(), script)
+        self.assertNotIn(hashlib.sha256(source_url.encode()).hexdigest(), scripts["n82"])
 
     def test_live_cleanup_and_no_clobber_contract_is_explicit(self):
         plan = (root / "ideas.md").read_text(encoding="utf-8")
