@@ -575,6 +575,7 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
             "--output", "/tmp/post-update-reference.json",
             "--base-model", "/data/trinity-thinking-fp8",
             "--policy-model", "policy-0-slot0",
+            "--policy", "policy-0",
             "--expected-policy-identity", "/tmp/expected.json",
             "--policy-receipt", "/tmp/receipt.json",
             "--cache-salt", "fresh-post-update-decode",
@@ -584,6 +585,37 @@ class H200PostUpdateReferenceTest(unittest.TestCase):
             arguments.extend(["--input-record", f"/tmp/input-{index}.json"])
         with self.assertRaises(SystemExit):
             post_update.main(arguments)
+
+    def test_builder_cli_forwards_policy_and_rejects_ambiguous_policy(self):
+        arguments = [
+            "--endpoint", "http://h200b:18100/inference/v1/generate",
+            "--output", "/tmp/post-update-reference.json",
+            "--base-model", "/data/trinity-thinking-fp8",
+            "--policy-model", "trinity-h200-post-update-qualification-slot1",
+            "--policy", "policy-1",
+            "--expected-policy-identity", "/tmp/expected.json",
+            "--policy-receipt", "/tmp/receipt.json",
+            "--cache-salt", "fresh-post-update-decode",
+            "--readiness-endpoint", "http://h200b:18100/inference/v1/staging-status",
+        ]
+        for index in range(8):
+            arguments.extend(["--input-record", f"/tmp/input-{index}.json"])
+
+        with mock.patch.object(
+            post_update, "build_post_update_references", return_value={}
+        ) as build:
+            post_update.main(arguments)
+        self.assertEqual(build.call_args.kwargs["policy"], "policy-1")
+
+        for policy_args in ([], ["--policy", "policy-2"]):
+            invalid = [item for item in arguments if item not in {"--policy", "policy-1"}]
+            invalid.extend(policy_args)
+            with mock.patch.object(
+                post_update, "build_post_update_references", return_value={}
+            ) as build:
+                with self.assertRaises(SystemExit):
+                    post_update.main(invalid)
+                build.assert_not_called()
 
     def test_eight_microbatches_are_distinct_actual_decode_references(self):
         records = []

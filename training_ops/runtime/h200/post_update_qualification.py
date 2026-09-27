@@ -880,6 +880,12 @@ def _post_update_parser():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--policy-model", required=True)
+    parser.add_argument(
+        "--policy",
+        required=True,
+        choices=("policy-0", "policy-1"),
+        help="loaded policy identity to bind into every reference",
+    )
     parser.add_argument("--expected-policy-identity", required=True, type=Path)
     parser.add_argument("--policy-receipt", required=True, type=Path)
     parser.add_argument("--cache-salt", required=True)
@@ -900,6 +906,7 @@ def main(argv: list[str] | None = None) -> int:
             output_path=args.output,
             base_model=args.base_model,
             policy_model=args.policy_model,
+            policy=args.policy,
             expected_policy_identity=args.expected_policy_identity,
             policy_receipt=args.policy_receipt,
             cache_salt=args.cache_salt,
