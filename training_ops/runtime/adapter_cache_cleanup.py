@@ -155,7 +155,14 @@ def validate_directory(
     source_url: str,
     expected_key: str,
 ) -> tuple[int, int]:
-    """Validate path, symlink, manifest, key, and contents before deletion."""
+    """Validate path, symlink, manifest, key, and contents before deletion.
+
+    The exact source URL hash and manifest bind this directory to one cache
+    entry. The sidecar and file sizes bind the expected adapter shape. This
+    cleanup never reuses the bytes, so hashing potentially multi-gigabyte
+    adapter files would only extend the readers-lock window; any metadata
+    disagreement still refuses deletion.
+    """
     root = target.parent
     try:
         root_info = root.lstat()
@@ -233,11 +240,12 @@ import json
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
 
-cache_root, cache_path, source_url, lora_name, _container, _identity, *port_values = sys.argv[1:]
+cache_root, cache_path, source_url, lora_name, container, identity_before, *port_values = sys.argv[1:]
 ports = [int(value) for value in port_values]
 receipt_keys = {"source_url", "target_sha256", "target_size", "config_sha256", "config_size", "lora_name", "server_instance"}
 required_files = {"READY", "manifest.json", "adapter_config.json", "adapter_model.safetensors", "adapter_model.safetensors.sha256"}
@@ -348,6 +356,9 @@ def validate_cache():
     files = manifest.get("files")
     if not isinstance(files, dict) or set(files) != {"adapter_config.json", "adapter_model.safetensors"}:
         raise RuntimeError("adapter cache manifest file list is invalid")
+    # The exact source hash, manifest, sidecar, and sizes identify this cache
+    # entry. Do not hash multi-gigabyte weights while holding the readers lock:
+    # this operation never reuses the bytes, and metadata disagreement refuses.
     for name, record in files.items():
         if not isinstance(record, dict) or type(record.get("size")) is not int or record["size"] < 0 or not re.fullmatch(r"[0-9a-f]{64}", record.get("sha256", "")):
             raise RuntimeError("adapter cache manifest file identity is invalid")
@@ -365,6 +376,27 @@ def validate_cache():
                 raise RuntimeError(f"adapter cache {name} source identity differs")
     return (target_info.st_dev, target_info.st_ino)
 
+def check_identity():
+    try:
+        result = subprocess.run(
+            [
+                "sudo",
+                "docker",
+                "inspect",
+                "--format",
+                "{{.Name}}|{{.Id}}|{{.State.StartedAt}}|{{.State.Running}}|{{.State.Pid}}",
+                container,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("adapter cache cleanup server identity changed") from error
+    if result.returncode != 0 or result.stdout.strip() != identity_before:
+        raise RuntimeError("adapter cache cleanup server identity changed")
+
 observe()
 before = validate_cache()
 lock_path = Path(cache_root) / f".{expected_key}.readers.lock"
@@ -378,6 +410,7 @@ with lock_path.open("a+") as lock:
     observe()
     if validate_cache() != before:
         raise RuntimeError("adapter cache target changed during validation")
+    check_identity()
     shutil.rmtree(target)
     if target.exists() or target.is_symlink():
         raise RuntimeError("adapter cache target was not removed")

@@ -86,6 +86,27 @@ class ResumeStartTest(unittest.TestCase):
             inventory,
         )
 
+    def test_production_inventory_deploys_exact_cache_cleanup_helper(self):
+        selected = {
+            "trainer": "configs/trinity-decensor-experimental-fixed/trainer.toml",
+            "orchestrator": "configs/trinity-decensor-experimental-fixed/orchestrator.toml",
+            "inference": "configs/trinity-decensor-experimental-fixed/inference.toml",
+        }
+        with mock.patch.object(training_ops, "mounted_files", return_value=[]):
+            inventory = dict(
+                training_ops._start_dependency_inventory(
+                    selected, training_ops.trainer_hosts
+                )
+            )
+        self.assertEqual(
+            set(inventory["training_ops/runtime/adapter_cache_cleanup.py"]),
+            set(training_ops.inference_hosts),
+        )
+        self.assertEqual(
+            set(inventory["training_ops/runtime/h200/start_inference.sh"]),
+            set(training_ops.inference_hosts),
+        )
+
     def test_orchestrator_launcher_includes_experimental_pythonpath(self):
         launcher = (
             Path(__file__).resolve().parents[1]

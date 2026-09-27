@@ -7165,6 +7165,7 @@ def _start_dependency_inventory(
         "training_ops/runtime/h200",
         inference_hosts,
     )
+    add("training_ops/runtime/adapter_cache_cleanup.py", inference_hosts)
     add("training_ops/runtime/china/resume_state.py", [orchestrator_host])
     add("training_ops/runtime/h200/drain_rollout_publisher.py", [trainer_head])
     add("training_ops/runtime/china/direct_adapter_route.py", [orchestrator_host])

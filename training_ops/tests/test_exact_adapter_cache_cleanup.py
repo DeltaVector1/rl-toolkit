@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -223,6 +224,16 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
                     target, source_url=SOURCE, expected_key=KEY
                 )
 
+    def test_directory_refuses_file_size_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = write_cache(root)
+            (target / "adapter_model.safetensors").write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "file size differs"):
+                adapter_cache_cleanup.validate_directory(
+                    target, source_url=SOURCE, expected_key=KEY
+                )
+
     def test_remote_script_is_exact_and_lock_aware(self):
         plan = training_ops._exact_adapter_cache_cleanup_plan(
             config_dir="configs/trinity-decensor-experimental-fixed"
@@ -233,6 +244,7 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
         self.assertIn("/staging_status", script)
         self.assertIn("num_requests_(running|waiting)", script)
         self.assertIn("LOCK_EX | fcntl.LOCK_NB", script)
+        self.assertIn("check_identity()\n    shutil.rmtree(target)", script)
         self.assertIn("shutil.rmtree(target)", script)
         self.assertIn(KEY, script)
         self.assertNotIn("cache_root/*", script)
@@ -250,6 +262,95 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
                         fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 finally:
                     probe.close()
+
+    def test_remote_identity_change_inside_lock_preserves_target(self):
+        plan = training_ops._exact_adapter_cache_cleanup_plan(
+            config_dir="configs/trinity-decensor-experimental-fixed"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            target = write_cache(cache_root)
+            other = cache_root / ("b" * 64)
+            other.mkdir()
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "sudo").write_text(
+                '#!/bin/sh\nexec "$@"\n', encoding="utf-8"
+            )
+            (fake_bin / "ss").write_text(
+                "#!/bin/sh\nprintf 'LISTEN 0 0 127.0.0.1:8000 0.0.0.0:* users:((\\\"server\\\",pid=123,fd=1))\\n'\n",
+                encoding="utf-8",
+            )
+            (fake_bin / "docker").write_text(
+                "#!/bin/sh\n"
+                "state=${DOCKER_STATE:?}\n"
+                "count=$(cat \"$state\" 2>/dev/null || printf '0')\n"
+                "count=$((count + 1))\n"
+                "printf '%s' \"$count\" > \"$state\"\n"
+                "if [ \"$count\" -eq 1 ]; then\n"
+                "  id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+                "else\n"
+                "  id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+                "fi\n"
+                "printf '/glm52-decensor-h200|%s|2026-09-27T00:00:00Z|true|123\\n' \"$id\"\n",
+                encoding="utf-8",
+            )
+            for command in fake_bin.iterdir():
+                command.chmod(0o755)
+            (root / "sitecustomize.py").write_text(
+                "import json\n"
+                "import urllib.request\n\n"
+                "class Response:\n"
+                "    status = 200\n"
+                "    def __init__(self, body):\n"
+                "        self.body = body\n"
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *_args):\n"
+                "        return False\n"
+                "    def read(self):\n"
+                "        return self.body\n\n"
+                "def fake_urlopen(request, timeout=30):\n"
+                "    url = request.full_url if hasattr(request, 'full_url') else str(request)\n"
+                "    if url.endswith('/health'):\n"
+                "        return Response(b'ok')\n"
+                "    if url.endswith('/metrics'):\n"
+                "        return Response(b'vllm:num_requests_running 0\\nvllm:num_requests_waiting 0\\n')\n"
+                "    if url.endswith('/staging_status'):\n"
+                "        return Response(json.dumps({'status': 'idle', 'loaded_receipts': {}}).encode())\n"
+                "    raise RuntimeError(url)\n\n"
+                "urllib.request.urlopen = fake_urlopen\n",
+                encoding="utf-8",
+            )
+            script = training_ops._build_adapter_cache_cleanup_script(
+                {
+                    **plan,
+                    "cache_root": str(cache_root),
+                    "cache_path": str(target),
+                    "ports": [8000],
+                }
+            )
+            docker_state = root / "docker-count"
+            docker_state.write_text("0", encoding="ascii")
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            environment["PYTHONPATH"] = str(root)
+            environment["DOCKER_STATE"] = str(docker_state)
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("server identity changed", result.stderr)
+            self.assertTrue(target.exists())
+            self.assertTrue(other.exists())
+            self.assertEqual(docker_state.read_text(encoding="ascii"), "2")
 
     def test_api_removes_one_entry_per_configured_host_from_remote_evidence(self):
         plan = training_ops._exact_adapter_cache_cleanup_plan(
