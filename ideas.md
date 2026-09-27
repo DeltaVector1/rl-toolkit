@@ -774,3 +774,27 @@ only after measured learning.
 - 2026-09-26 policy-0 load audit: the H200 engine-state probe passed Docker Go template `\\t` text to `read`, so valid container fields were separated by literal backslash-t instead of tab characters and the probe rejected a valid engine. Replace the delimiter with a safe literal pipe, parse with `IFS='|'`, and keep exact name, container ID, StartedAt, Running, listener, metric, and receipt checks. No live action.
 - 2026-09-26 policy-0 load identity hardening: the listener must match Docker State.Pid, the exact container cgroup ID, NSpid host PID then container PID 1, and the audited `PRIME-RL::Inference` command title with `PRIME-RL::Infer` comm. Its executable must match `/usr/bin/python3.12` and the container init executable by device/inode. Parse start ticks after the final `)` and repeat Docker/listener identity checks after health, metrics, and staging reads. No live action.
 - 2026-09-26 trainer-loss watchdog audit: cold start falsely stopped at 15:47:11 before the trainer first log at 15:47:42; policy-0 became STABLE at 15:49:55, while lease writers published backward epochs. The lease watchdog needs a bounded 900-second startup phase, one fresh authenticated healthy status before arming, strict newer missing epochs, and one periodic health writer in the rollout puller. No live action.
+
+## Agentic review failure observability experiment
+
+- **Measured code gap.** A failed `turn_1_review` currently ends as a generic task-level
+  review failure. The existing judge events retain full system/user messages,
+  model output, and raw tool arguments, but they do not provide one bounded,
+  field-level failure record. This makes invalid visible or reasoning tool
+  arguments hard to diagnose and risks exposing prompt or response content in
+  logs.
+- **First experiment.** Add one structured INFO record at each visible or
+  reasoning review failure boundary. Include only the phase, attempt, exception
+  class, a sanitized and truncated exception message, raw argument character and
+  UTF-8 byte lengths, raw-argument SHA-256, finish/truncation metadata when the
+  provider returns it, and the final failure status. Include the group/task
+  identifier when the task runtime provides one. Never include raw prompts,
+  model output, or raw tool arguments. Keep reward, group, retry, and timeout
+  semantics unchanged.
+- **Follow-up measurement.** After the bounded record is verified, run a
+  controlled A/B timing and failure-rate comparison for review concurrency 2
+  versus a higher value, and judge client `pool_size=4` versus `pool_size=16`.
+  Keep batch size 1024, group size 16, context length 32768, output length
+  16384, reward settings, and timing limits fixed. Use the new phase-level
+  failure counts to separate provider argument failures from timeout or service
+  failures before changing concurrency.
