@@ -304,6 +304,9 @@ class ExactAdapterCacheCleanupTest(unittest.TestCase):
         invalid(lambda value, _path: value["chunks"][1].update({"offset": 0}))
         invalid(lambda value, _path: value["chunks"][0].update({"file": "../escape"}))
         invalid(lambda value, _path: value["chunks"][0].update({"raw_sha256": "F" * 64}))
+        invalid(lambda value, _path: value["chunks"].pop())
+        invalid(lambda value, _path: value["chunks"][-1].update({"wire_size": 1}))
+        invalid(lambda value, _path: value["chunks"][-1].update({"wire_size": 6382335838 - 985}))
         invalid(lambda value, _path: value.update({"target_size": 985}))
 
         with tempfile.TemporaryDirectory() as directory:

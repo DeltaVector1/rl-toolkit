@@ -83,7 +83,7 @@ TRANSPORT_CHUNK_KEYS = frozenset(
 )
 TRANSPORT_CHUNK_COUNT = 986
 TRANSPORT_CHUNK_PREFIX = "adapter_model.safetensors.transport-full-zstd-"
-TRANSPORT_WIRE_SIZE = 6382335838
+TRANSPORT_WIRE_SIZE = 6382288128
 
 
 def exact_source_url(source_url: str) -> str:
@@ -479,7 +479,7 @@ transport_manifest_keys = {
 transport_chunk_keys = {"codec", "data_offset", "file", "offset", "raw_sha256", "raw_size", "wire_sha256", "wire_size"}
 transport_chunk_count = 986
 transport_chunk_prefix = "adapter_model.safetensors.transport-full-zstd-"
-transport_wire_size = 6382335838
+transport_wire_size = 6382288128
 expected_key = hashlib.sha256(source_url.encode()).hexdigest()
 target = Path(cache_path)
 
