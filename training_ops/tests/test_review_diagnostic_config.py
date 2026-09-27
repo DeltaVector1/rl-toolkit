@@ -268,13 +268,19 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         cold_cleanup = mock.Mock()
         cache_cleanup = mock.Mock()
         transport = mock.Mock()
+        real_preflight = training_ops._fresh_start_preflight
         transport.side_effect = lambda run_dir, restart_route=False: events.append(
             ("transport", run_dir, restart_route)
         )
+        def fresh_preflight(*args, **kwargs):
+            events.append(("preflight_phase",))
+            return real_preflight(*args, **kwargs)
+
         with mock.patch.object(training_ops, "_config_dir", return_value=selected), \
             mock.patch.object(training_ops, "_start_dependency_inventory", return_value=[]), \
             mock.patch.object(training_ops, "_deploy_dependencies", side_effect=lambda _files: events.append(("deploy",))), \
-            mock.patch.object(training_ops, "_orchestrator_image_preflight", return_value="sha256:" + "d" * 64), \
+            mock.patch.object(training_ops, "_orchestrator_image_preflight", side_effect=lambda: events.append(("image",)) or "sha256:" + "d" * 64), \
+            mock.patch.object(training_ops, "_fresh_start_preflight", side_effect=fresh_preflight), \
             mock.patch.object(training_ops, "_ssh", side_effect=ssh), \
             mock.patch.object(training_ops, "_ssh_address", return_value="127.0.0.1"), \
             mock.patch.object(training_ops, "_fan", side_effect=lambda hosts, function: {host: function(host) for host in hosts}), \
@@ -283,7 +289,7 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
             mock.patch.object(training_ops, "_cold_adapter_cache_cleanup", cache_cleanup), \
             mock.patch.object(training_ops, "_start_trainer_pull", transport), \
             mock.patch.object(training_ops, "_repair_supervisors"), \
-            mock.patch.object(training_ops.time, "sleep"), \
+            mock.patch.object(training_ops.time, "sleep") as sleep_mock, \
             mock.patch.object(training_ops, "trainer_launcher", "/runtime/cluster.sh"), \
             mock.patch.object(training_ops, "orchestrator_launcher", "/runtime/orchestrator.sh"), \
             mock.patch("builtins.print"):
@@ -297,10 +303,13 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
 
         cold_cleanup.assert_not_called()
         cache_cleanup.assert_not_called()
-        self.assertLess(
-            next(index for index, event in enumerate(events) if event[0] == "preflight"),
-            next(index for index, event in enumerate(events) if event[0] == "deploy"),
-        )
+        preflight_phases = [index for index, event in enumerate(events) if event[0] == "preflight_phase"]
+        self.assertEqual(len(preflight_phases), 2)
+        deploy_index = next(index for index, event in enumerate(events) if event[0] == "deploy")
+        image_index = next(index for index, event in enumerate(events) if event[0] == "image")
+        self.assertLess(preflight_phases[0], deploy_index)
+        self.assertLess(deploy_index, image_index)
+        self.assertLess(image_index, preflight_phases[1])
         transport.assert_called_once_with(
             load_config(diagnostic, "orchestrator.toml")["output_dir"],
             restart_route=False,
@@ -320,8 +329,11 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertLess(transport_index, orch_index)
         self.assertLess(orch_index, control_index)
         self.assertLess(control_index, trainer_index)
+        self.assertLess(preflight_phases[1], adapter_index)
         orch_command = next(command for command in commands if command.endswith("/runtime/orchestrator.sh"))
         self.assertIn("TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH=1", orch_command)
+        self.assertFalse(any("pkill" in command or "docker rm -f" in command for command in commands))
+        sleep_mock.assert_not_called()
 
     def test_fresh_preflight_refuses_each_remote_gate_failure(self):
         selected = {
@@ -332,8 +344,8 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         failures = (
             "FRESH_START_PATH_PRESENT path=/data/glm52-rl/runs/example",
             "FRESH_START_PATH_SYMLINK path=/data/glm52-rl/runs/example",
-            "FRESH_START_CACHE_PRESENT path=/data/glm52-rl/lora-cache/example",
-            "FRESH_START_CACHE_SYMLINK path=/data/glm52-rl/lora-cache/example",
+            "FRESH_START_CACHE_PRESENT path=/data/glm52-rl/lora-cache/f81b26589e09c5c655d8778664fcc641ce8be39bb19ac7f75f2a6fa9a3f28928",
+            "FRESH_START_CACHE_SYMLINK path=/data/glm52-rl/lora-cache/f81b26589e09c5c655d8778664fcc641ce8be39bb19ac7f75f2a6fa9a3f28928",
             "FRESH_START_CONTAINER_ACTIVE name=glm52-decensor-trainer",
         )
         for failure in failures:
@@ -343,13 +355,14 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
                     "_ssh",
                     return_value=(23, failure),
                 ) as ssh:
-                    with self.assertRaises(training_ops.Refused):
+                    with self.assertRaises(training_ops.Refused) as raised:
                         training_ops._fresh_start_preflight(
                             "trinity-decensor-experimental-fixed-diag-d29a5958",
                             selected,
                             ["n82"],
                             "/data/glm52-rl/runs/trinity-decensor-experimental-fixed-diag-d29a5958/run_trinity-decensor-experimental-fixed-diag-d29a5958",
                         )
+                self.assertIn(failure, str(raised.exception))
                 self.assertTrue(ssh.called)
 
     def test_fresh_preflight_script_checks_exact_paths_cache_and_containers(self):
@@ -389,8 +402,14 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertIn(training_ops.adapter_container, script)
         self.assertIn("FRESH_START_PRECHECK_OK", script)
         source_url = "http://127.0.0.1:18100/trinity-decensor-experimental-fixed-diag-d29a5958"
-        self.assertIn(hashlib.sha256(source_url.encode()).hexdigest(), script)
-        self.assertNotIn(hashlib.sha256(source_url.encode()).hexdigest(), scripts["n82"])
+        cache_source = source_url + "/broadcasts/step_0"
+        self.assertEqual(
+            hashlib.sha256(cache_source.encode()).hexdigest(),
+            "f81b26589e09c5c655d8778664fcc641ce8be39bb19ac7f75f2a6fa9a3f28928",
+        )
+        self.assertIn(hashlib.sha256(cache_source.encode()).hexdigest(), script)
+        self.assertNotIn(hashlib.sha256(source_url.encode()).hexdigest(), script)
+        self.assertNotIn(hashlib.sha256(cache_source.encode()).hexdigest(), scripts["n82"])
 
     def test_live_cleanup_and_no_clobber_contract_is_explicit(self):
         plan = (root / "ideas.md").read_text(encoding="utf-8")

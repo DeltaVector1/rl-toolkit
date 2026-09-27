@@ -10397,9 +10397,10 @@ def _fresh_start_preflight(
         or any(part in {"", ".", ".."} for part in PurePosixPath(cache_root).parts)
     ):
         raise Refused("configured adapter cache path is unsafe")
+    cache_source_url = f"{source_url}/broadcasts/step_0"
     cache_path = (
         f"{cache_root.rstrip('/')}/"
-        f"{hashlib.sha256(source_url.encode('utf-8')).hexdigest()}"
+        f"{hashlib.sha256(cache_source_url.encode('utf-8')).hexdigest()}"
     )
     paths_to_check = list(
         dict.fromkeys(
@@ -10911,41 +10912,45 @@ exit 1
             raise RuntimeError(f"fresh adapter wait failed on {trainer_head}: {detail}")
         print(output.strip())
 
-    print(f"stopping any previous containers for {run}")
-    _remote_ok(
-        trainer_head,
-        "pkill -f 'bash .*[r]un_supervisor.sh' 2>/dev/null || true; echo done",
-        "old local supervisor stop",
-    )
-    if rollout_transfer_direction == "trainer_pull":
+    if mode != "fresh":
+        print(f"stopping any previous containers for {run}")
         _remote_ok(
             trainer_head,
-            _rollout_pull_command(service_run_dir, "stop"),
-            "old rollout puller stop",
-            timeout=60,
+            "pkill -f 'bash .*[r]un_supervisor.sh' 2>/dev/null || true; echo done",
+            "old local supervisor stop",
         )
-    _remote_ok(
-        orchestrator_host,
-        ("" if resume_adapter is not None else "pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; ")
-        + f"sudo docker rm -f {orchestrator_container} {adapter_relay_container} >/dev/null 2>&1; echo done",
-        "old orchestrator stop",
-    )
-    _remote_ok(
-        trainer_head,
-        f"sudo docker rm -f {orchestrator_container} >/dev/null 2>&1; echo done",
-        "old trainer-side orchestrator stop",
-    )
-    stop_results = _fan(
-        nodes,
-        lambda h: _ssh(
-            h,
-            f"sudo pkill -9 -f '[P]RIME-RL' 2>/dev/null; sudo docker rm -f {trainer_container} >/dev/null 2>&1; echo done",
-        ),
-    )
-    stop_failures = [host for host, (code, _output) in stop_results.items() if code]
-    if stop_failures:
-        raise RuntimeError(f"old trainer stop failed on {stop_failures}")
-    time.sleep(20)
+        if rollout_transfer_direction == "trainer_pull":
+            _remote_ok(
+                trainer_head,
+                _rollout_pull_command(service_run_dir, "stop"),
+                "old rollout puller stop",
+                timeout=60,
+            )
+        _remote_ok(
+            orchestrator_host,
+            ("" if resume_adapter is not None else "pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null; ")
+            + f"sudo docker rm -f {orchestrator_container} {adapter_relay_container} >/dev/null 2>&1; echo done",
+            "old orchestrator stop",
+        )
+        _remote_ok(
+            trainer_head,
+            f"sudo docker rm -f {orchestrator_container} >/dev/null 2>&1; echo done",
+            "old trainer-side orchestrator stop",
+        )
+        stop_results = _fan(
+            nodes,
+            lambda h: _ssh(
+                h,
+                f"sudo pkill -9 -f '[P]RIME-RL' 2>/dev/null; sudo docker rm -f {trainer_container} >/dev/null 2>&1; echo done",
+            ),
+        )
+        stop_failures = [host for host, (code, _output) in stop_results.items() if code]
+        if stop_failures:
+            raise RuntimeError(f"old trainer stop failed on {stop_failures}")
+        time.sleep(20)
+
+    if mode == "fresh":
+        _fresh_start_preflight(run, selected, nodes, service_run_dir)
 
     if mode == "cold":
         _cold_start_cleanup(run, nodes)

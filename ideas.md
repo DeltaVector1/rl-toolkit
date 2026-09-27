@@ -909,10 +909,17 @@ only after measured learning.
   configured diagnostic source URL is absent on inference hosts; and no global
   trainer, orchestrator, or adapter container is active. `n79` remains
   excluded.
-- **Fresh order and exclusions.** After the preflight, fresh mode skips
-  `_cold_start_cleanup`, `_cold_adapter_cache_cleanup`, resume markers and
-  drains, and inference restart. It starts adapter, transport, orchestrator,
-  waits for control, then starts the trainer. Set the initial-health watchdog
+- **Fresh order and exclusions.** After the first preflight, dependency
+  deployment and the static image/config checks run. A second full fresh
+  preflight then runs immediately before any launch. Both preflights derive
+  the inference cache key from the exact source URL
+  `${source_url.rstrip('/')}/broadcasts/step_0`, not only the run URL. Fresh
+  mode skips `_cold_start_cleanup`, `_cold_adapter_cache_cleanup`, resume
+  markers and drains, inference restart, and the unconditional global
+  trainer/orchestrator/adapter stop block. If the second preflight sees a new
+  path, symlink, cache entry, or fixed-name container, it refuses; it never
+  removes that container. It starts adapter, transport, orchestrator, waits
+  for control, then starts the trainer. Set the initial-health watchdog
   requirement when the existing launcher interface supports it. Do not change
   training parameters or the existing cold/restart/resume paths.
 - **Gates.** Refuse before any mutation if one exact path exists, is a symlink,
@@ -920,3 +927,9 @@ only after measured learning.
   selected host is blocked or missing, or the dependency and run identities do
   not match. Tests must prove fresh order and preflight-before-mutation, and
   must prove refusal for each path, symlink, cache, and container condition.
+- **Launcher caveat before live use.** The existing `cluster.sh` and
+  `start_orchestrator.sh` launchers still contain fixed-name `docker rm -f`
+  cleanup. The second preflight prevents replacement when the container is
+  already present, but a race after that gate can still remove a container.
+  Do not run fresh live until the launchers gain a fail-on-existing-container
+  mode or this race is separately accepted and reviewed.
