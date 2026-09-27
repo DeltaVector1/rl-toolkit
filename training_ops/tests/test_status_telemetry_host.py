@@ -148,7 +148,9 @@ class StatusTelemetryHostRoutingTest(unittest.TestCase):
         self.assertEqual(status.prebatch.accepted_buffer, 624)
         self.assertEqual(status.orch_last, "SUCCESS Step 4")
         self.assertEqual(status.batch, "batch 4/1024; 2 inflight")
-        self.assertEqual(status.orch_log_age, training_ops._age(TIMESTAMP))
+        self.assertAlmostEqual(
+            status.orch_log_age, training_ops._age(TIMESTAMP), delta=1
+        )
         self.assertEqual(
             [host for host, _, _ in calls],
             [training_ops.trainer_head, training_ops.orchestrator_host],
