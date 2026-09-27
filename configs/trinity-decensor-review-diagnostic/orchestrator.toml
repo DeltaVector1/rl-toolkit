@@ -21,7 +21,7 @@ level = "info"
 project = "trinity-runs-review-diagnostic"
 name = "orchestrator-trinity-decensor-experimental-fixed-diag-d29a5958"
 group = "trinity-decensor-experimental-fixed-diag-d29a5958"
-tags = ["trinity-thinking", "decensor", "grpo", "lora-r32", "batch32", "review-diagnostic", "run-trinity-decensor-experimental-fixed-diag-d29a5958", "refusal-primary", "parity-guard"]
+tags = ["trinity-thinking", "decensor", "grpo", "lora-r32", "batch32", "review-diagnostic", "diag-d29a5958", "refusal-primary", "parity-guard"]
 mode = "online"
 
 [file_monitor]

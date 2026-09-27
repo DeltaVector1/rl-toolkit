@@ -30,7 +30,7 @@ def without_diagnostic_identity(kind: str, config: dict) -> dict:
             "50-step",
             "batch32",
             "review-diagnostic",
-            "run-trinity-decensor-experimental-fixed-diag-d29a5958",
+            "diag-d29a5958",
         ):
             if tag in result["swanlab"]["tags"]:
                 result["swanlab"]["tags"].remove(tag)
@@ -47,7 +47,7 @@ def without_diagnostic_identity(kind: str, config: dict) -> dict:
             "50-step",
             "batch32",
             "review-diagnostic",
-            "run-trinity-decensor-experimental-fixed-diag-d29a5958",
+            "diag-d29a5958",
         ):
             if tag in result["swanlab"]["tags"]:
                 result["swanlab"]["tags"].remove(tag)
@@ -156,6 +156,13 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         )
         self.assertIn("batch32", diagnostic_orchestrator["swanlab"]["tags"])
         self.assertIn("review-diagnostic", diagnostic_orchestrator["swanlab"]["tags"])
+        for filename in ("trainer.toml", "orchestrator.toml"):
+            config = load_config(diagnostic, filename)
+            tags = config["swanlab"]["tags"]
+            for tag in tags:
+                self.assertIsInstance(tag, str)
+                self.assertTrue(tag)
+                self.assertLessEqual(len(tag), 20)
 
         for path in diagnostic.glob("*.toml"):
             self.assertNotIn("n79", path.read_text(encoding="utf-8").lower())
@@ -206,11 +213,11 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
             production_orchestrator["swanlab"]["tags"],
         )
         self.assertIn(
-            "run-trinity-decensor-experimental-fixed-diag-d29a5958",
+            "diag-d29a5958",
             diagnostic_trainer["swanlab"]["tags"],
         )
         self.assertIn(
-            "run-trinity-decensor-experimental-fixed-diag-d29a5958",
+            "diag-d29a5958",
             diagnostic_orchestrator["swanlab"]["tags"],
         )
 
