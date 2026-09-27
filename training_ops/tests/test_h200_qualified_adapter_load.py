@@ -169,6 +169,15 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         with self.assertRaisesRegex(QualifiedAdapterLoadError, "config"):
             parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
 
+        both_drift = json.loads(json.dumps(config_drift))
+        both_drift["step1_adapter"] = both_drift["policy0_adapter"]
+        for identity in (both_drift["identities_before"], both_drift["identities_after"]):
+            identity["step1_adapter"] = both_drift["policy0_adapter"]
+            identity["artifacts"]["adapter_model.safetensors"] = both_drift["policy0_adapter"]
+        payload = json.dumps(both_drift, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "policy-0"):
+            parse_delta_receipt(payload, hashlib.sha256(payload).hexdigest())
+
     def test_remote_receipt_framing_preserves_exact_terminal_newline(self):
         raw = json.dumps(receipt(), sort_keys=True, separators=(",", ":")).encode() + b"\n"
         expected = hashlib.sha256(raw).hexdigest()
