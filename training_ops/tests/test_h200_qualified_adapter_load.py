@@ -521,6 +521,24 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         with self.assertRaisesRegex(Refused, "server"):
             training_ops_module._qualified_check_engine(plan, mutated, phase="post-load", policy0_server_instance="a" * 32)
 
+    def test_qualified_load_ready_stage_accepts_missing_optional_transport(self):
+        plan = self.apply_plan()
+        model = receipt()["step1_adapter"]
+        config = receipt()["step1_config"]
+        state = self.live_state({"policy0": self.policy0_receipt()})
+        state["engine"]["stage_status"] = "ready"
+        state["engine"]["stage_record"] = self.stage_record(plan, source_url=plan["source_url"], model=model, config=config)
+        state["engine"]["stage_record"].pop("transport")
+        self.assertIs(
+            training_ops_module._qualified_check_engine(plan, state, phase="post-stage"),
+            state["engine"],
+        )
+        for value in (None, "", 7):
+            mutated = json.loads(json.dumps(state))
+            mutated["engine"]["stage_record"]["transport"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(Refused, "stage"):
+                training_ops_module._qualified_check_engine(plan, mutated, phase="post-stage")
+
     def test_qualified_load_ready_stage_rejects_wrong_or_incomplete_policy0_receipt(self):
         plan = self.apply_plan()
         policy = self.policy0_receipt()
@@ -532,11 +550,20 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
             mutated["engine"]["loaded_receipts"]["policy0"][field] = value
             with self.subTest(field=field), self.assertRaisesRegex(Refused, "policy-0"):
                 training_ops_module._qualified_check_engine(plan, mutated, phase="preflight")
-        for field in ("verified_files", "path", "stage_id", "pid", "file_stats", "transport", "cache_hit"):
+        for field in ("verified_files", "path", "stage_id", "pid", "file_stats", "cache_hit"):
             mutated = json.loads(json.dumps(state))
             mutated["engine"]["stage_record"].pop(field)
             with self.subTest(field=field), self.assertRaisesRegex(Refused, "stage"):
                 training_ops_module._qualified_check_engine(plan, mutated, phase="preflight")
+
+    def test_rollback_404_requires_postcheck_proving_slot_absent(self):
+        script = build_rollback_script(self.apply_plan(), remove_published=False)
+        self.assertIn("http_code", script)
+        self.assertIn("404", script)
+        self.assertIn("/staging_status", script)
+        self.assertIn("loaded_receipts", script)
+        self.assertIn("slot", script)
+        self.assertNotIn("curl -fsS -X POST", script)
 
     def test_slot_rollback_cannot_remove_publication_without_owner_proof(self):
         with self.assertRaisesRegex(QualifiedAdapterLoadError, "owner-token"):

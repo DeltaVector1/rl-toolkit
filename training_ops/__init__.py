@@ -11434,10 +11434,12 @@ def _qualified_check_ready_stage(plan: Mapping[str, object], engine: Mapping[str
     stage = engine.get("stage_record")
     if not isinstance(stage, Mapping):
         raise Refused("qualified adapter ready state has no exact stage receipt")
-    required = {"status", "source_url", "path", "transport", "verified_files", "target_sha256", "cache_hit", "stage_id", "pid", "file_stats"}
+    required = {"status", "source_url", "path", "verified_files", "target_sha256", "cache_hit", "stage_id", "pid", "file_stats"}
     if not required.issubset(stage):
         raise Refused("qualified adapter ready stage receipt is missing required identity fields")
-    if stage.get("status") != "ready" or not isinstance(stage.get("source_url"), str) or not isinstance(stage.get("path"), str) or not isinstance(stage.get("transport"), str) or not stage["transport"] or type(stage.get("cache_hit")) is not bool or not isinstance(stage.get("stage_id"), str) or not stage["stage_id"] or type(stage.get("pid")) is not int or stage["pid"] <= 0:
+    if "transport" in stage and (not isinstance(stage["transport"], str) or not stage["transport"]):
+        raise Refused("qualified adapter ready stage transport identity is invalid")
+    if stage.get("status") != "ready" or not isinstance(stage.get("source_url"), str) or not isinstance(stage.get("path"), str) or type(stage.get("cache_hit")) is not bool or not isinstance(stage.get("stage_id"), str) or not stage["stage_id"] or type(stage.get("pid")) is not int or stage["pid"] <= 0:
         raise Refused("qualified adapter ready stage receipt identity is invalid")
     if phase == "preflight":
         expected_source, _ = _qualified_check_loaded_policy0(plan, engine)
