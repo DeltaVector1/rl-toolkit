@@ -453,9 +453,14 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertIn('fresh_no_replace_container "$ORCH_CT"', orchestrator)
         self.assertIn('ORCH_CONTAINER_ID="$orchestrator_container_id"', orchestrator)
         self.assertIn('ORCH_LAUNCH_IDENTITY="$orchestrator_launch_identity"', orchestrator)
+        self.assertIn('PUBLISHER_SCRIPT="$deployment/training_ops/runtime/h200/sync_rollout_batches.sh"', orchestrator)
         self.assertIn('if [ "$fresh_start_no_replace" = 0 ]; then', cluster)
         self.assertIn('if [ "$fresh_start_no_replace" = 0 ]; then', orchestrator)
         self.assertIn("pkill -f '[t]rainer_failure_watchdog.sh'", orchestrator)
+        watchdog = (root / "training_ops/runtime/h200/trainer_failure_watchdog.sh").read_text()
+        self.assertNotIn("pkill -f '[s]ync_rollout_batches.sh'", watchdog)
+        self.assertIn("publisher_start_time", watchdog)
+        self.assertIn("SOURCE_RUN_DIR", watchdog)
 
     def test_live_cleanup_and_no_clobber_contract_is_explicit(self):
         plan = (root / "ideas.md").read_text(encoding="utf-8")

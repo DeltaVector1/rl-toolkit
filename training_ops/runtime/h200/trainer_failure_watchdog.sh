@@ -13,7 +13,8 @@ TRAINER_CT=${TRAINER_CT:?set TRAINER_CT}
 ORCH_CT=${ORCH_CT:?set ORCH_CT}
 ORCH_CONTAINER_ID=${ORCH_CONTAINER_ID:-}
 ORCH_LAUNCH_IDENTITY=${ORCH_LAUNCH_IDENTITY:-}
-run_dir="/data/glm52-rl/runs/$RUN/$RUN_NAME"
+run_dir=${RUN_DIR:-"/data/glm52-rl/runs/$RUN/$RUN_NAME"}
+PUBLISHER_SCRIPT=${PUBLISHER_SCRIPT:-/data/glm52-rl/deployment/training_ops/runtime/h200/sync_rollout_batches.sh}
 LEASE_FILE=${LEASE_FILE:-"$run_dir/.trainer-health-lease"}
 STATUS_FILE=${STATUS_FILE:-"$run_dir/.trainer-health-status"}
 LEASE_MAX_AGE=${LEASE_MAX_AGE:-90}
@@ -49,20 +50,44 @@ trainer_failures() {
   printf '%s\n' "$output"
 }
 
-stop_edge() {
-  local current_id current_name current_launch_identity publisher_pid=""
-  if [ -z "$ORCH_CONTAINER_ID" ] || [ -z "$ORCH_LAUNCH_IDENTITY" ]; then
-    log "refusing orchestrator stop: watchdog launch identity is unavailable"
-    return 1
-  fi
+orchestrator_owned() {
+  local current_id current_name current_launch_identity
   current_id=$(sudo docker inspect --format '{{.Id}}' "$ORCH_CT" 2>/dev/null || true)
   current_name=$(sudo docker inspect --format '{{.Name}}' "$ORCH_CT" 2>/dev/null || true)
   current_launch_identity=$(sudo docker inspect \
     --format '{{index .Config.Labels "com.glm52.orchestrator.launch"}}' \
     "$ORCH_CT" 2>/dev/null || true)
-  if [ "$current_id" != "$ORCH_CONTAINER_ID" ] || \
-     [ "$current_name" != "/$ORCH_CT" ] || \
-     [ "$current_launch_identity" != "$ORCH_LAUNCH_IDENTITY" ]; then
+  [ "$current_id" = "$ORCH_CONTAINER_ID" ] && \
+    [ "$current_name" = "/$ORCH_CT" ] && \
+    [ "$current_launch_identity" = "$ORCH_LAUNCH_IDENTITY" ]
+}
+
+publisher_process_matches() {
+  local current_start_time current_command current_run_identity current_pgid
+  [ "${publisher_identity_valid:-0}" = 1 ] || return 1
+  [ -r "/proc/$publisher_pid/stat" ] || return 1
+  [ -r "/proc/$publisher_pid/cmdline" ] || return 1
+  [ -r "/proc/$publisher_pid/environ" ] || return 1
+  current_start_time=$(awk '{print $22}' "/proc/$publisher_pid/stat" 2>/dev/null || true)
+  current_command=$(tr '\0' ' ' <"/proc/$publisher_pid/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//' || true)
+  current_run_identity=$(tr '\0' '\n' <"/proc/$publisher_pid/environ" 2>/dev/null | \
+    sed -n "s/^SOURCE_RUN_DIR=//p" | head -1)
+  current_pgid=$(awk '{print $5}' "/proc/$publisher_pid/stat" 2>/dev/null || true)
+  [ "$current_start_time" = "$publisher_start_time" ] || return 1
+  [ "$current_command" = "$publisher_command" ] || return 1
+  [ "$current_run_identity" = "$run_dir" ] || return 1
+  [ "$current_pgid" = "$publisher_pgid" ]
+}
+
+stop_edge() {
+  local publisher_pid=""
+  local publisher_start_time="" publisher_command="" publisher_run_identity="" publisher_pgid=""
+  local publisher_identity_valid=0
+  if [ -z "$ORCH_CONTAINER_ID" ] || [ -z "$ORCH_LAUNCH_IDENTITY" ]; then
+    log "refusing orchestrator stop: watchdog launch identity is unavailable"
+    return 1
+  fi
+  if ! orchestrator_owned; then
     log "refusing orchestrator stop: container ownership changed"
     return 1
   fi
@@ -71,22 +96,35 @@ stop_edge() {
   fi
   case "$publisher_pid" in
     ''|*[!0-9]*) ;;
-    *) kill -- "-$publisher_pid" 2>/dev/null || kill "$publisher_pid" 2>/dev/null || true ;;
+    *)
+      publisher_start_time=$(awk '{print $22}' "/proc/$publisher_pid/stat" 2>/dev/null || true)
+      publisher_command=$(tr '\0' ' ' <"/proc/$publisher_pid/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//' || true)
+      publisher_run_identity=$(tr '\0' '\n' <"/proc/$publisher_pid/environ" 2>/dev/null | \
+        sed -n "s/^SOURCE_RUN_DIR=//p" | head -1)
+      publisher_pgid=$(awk '{print $5}' "/proc/$publisher_pid/stat" 2>/dev/null || true)
+      case "$publisher_command" in
+        *"$PUBLISHER_SCRIPT"*)
+          [ -n "$publisher_start_time" ] && [ "$publisher_run_identity" = "$run_dir" ] && \
+            [ "$publisher_pgid" = "$publisher_pid" ] && publisher_identity_valid=1
+          ;;
+      esac
+      ;;
   esac
-  pkill -f '[s]ync_rollout_batches.sh' 2>/dev/null || true
-  current_id=$(sudo docker inspect --format '{{.Id}}' "$ORCH_CT" 2>/dev/null || true)
-  current_name=$(sudo docker inspect --format '{{.Name}}' "$ORCH_CT" 2>/dev/null || true)
-  current_launch_identity=$(sudo docker inspect \
-    --format '{{index .Config.Labels "com.glm52.orchestrator.launch"}}' \
-    "$ORCH_CT" 2>/dev/null || true)
-  if [ "$current_id" != "$ORCH_CONTAINER_ID" ] || \
-     [ "$current_name" != "/$ORCH_CT" ] || \
-     [ "$current_launch_identity" != "$ORCH_LAUNCH_IDENTITY" ]; then
+  # Recheck immediately before removal. The exact ID removal is the ownership
+  # claim; a name reuse cannot remove the replacement container.
+  if ! orchestrator_owned; then
     log "refusing orchestrator removal: container ownership changed"
     return 1
   fi
-  # Remove by the verified immutable ID, not the reusable fixed name.
-  [ -z "$current_name" ] || sudo docker rm -f "$ORCH_CONTAINER_ID" >/dev/null 2>&1 || true
+  if ! sudo docker rm -f "$ORCH_CONTAINER_ID" >/dev/null 2>&1; then
+    log "refusing publisher stop: owned orchestrator removal failed"
+    return 1
+  fi
+  if publisher_process_matches; then
+    kill -- "-$publisher_pid" 2>/dev/null || kill "$publisher_pid" 2>/dev/null || true
+  else
+    log "skipping publisher stop: process ownership changed"
+  fi
 }
 
 lease_fresh() {

@@ -4477,6 +4477,7 @@ if [ "$rollout_transfer_direction" = orchestrator_push ]; then
     TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
     ORCH_CONTAINER_ID="$orchestrator_container_id" \
     ORCH_LAUNCH_IDENTITY="$orchestrator_launch_identity" \
+    PUBLISHER_SCRIPT="$deployment/training_ops/runtime/h200/sync_rollout_batches.sh" \
     WAIT_FOR_INITIAL_HEALTH="$trainer_watchdog_wait_for_initial_health" \
     bash "$deployment/training_ops/runtime/h200/trainer_failure_watchdog.sh" \
     >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
@@ -4499,6 +4500,7 @@ else
     TRAINER_CT="$TRAINER_CT" ORCH_CT="$ORCH_CT" \
     ORCH_CONTAINER_ID="$orchestrator_container_id" \
     ORCH_LAUNCH_IDENTITY="$orchestrator_launch_identity" \
+    PUBLISHER_SCRIPT="$deployment/training_ops/runtime/h200/sync_rollout_batches.sh" \
     WAIT_FOR_INITIAL_HEALTH="$trainer_watchdog_wait_for_initial_health" \
     bash "$deployment/training_ops/runtime/h200/trainer_failure_watchdog.sh" \
     >>"/data/glm52-rl/trainer-failure-watchdog-$RUN.log" 2>&1 </dev/null &
