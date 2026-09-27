@@ -47,9 +47,11 @@ type = "filesystem"
 
 [env_vars]
 # Shared H200 cache. The adapter service keys entries by the exact diagnostic
-# source and LoRA identity; do not cold-clean this shared cache. H200 has one
-# LoRA slot: after this diagnostic, remove only its entry and verify the
-# production receipt before restoring production service.
+# source and LoRA identity; do not cold-clean or raw-delete shared files. H200
+# has one LoRA slot: use the live production snapshot, POST the exact
+# diagnostic name to root `/remove_lora_adapter`, validate status/name/ID and
+# `/staging_status`, then restore the production receipt only after full
+# identity checks.
 PRIME_LORA_CACHE_DIR = "/data/glm52-rl/lora-cache"
 VLLM_WORKER_MULTIPROC_METHOD = "spawn"
 NCCL_SOCKET_IFNAME = "eth0"

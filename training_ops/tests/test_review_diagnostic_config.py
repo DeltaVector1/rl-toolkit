@@ -226,6 +226,7 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         }
         cold_cleanup = mock.Mock()
         cache_cleanup = mock.Mock()
+        transport = mock.Mock()
         with mock.patch.object(training_ops, "_config_dir", return_value=selected), \
             mock.patch.object(training_ops, "_start_dependency_inventory", return_value=[]), \
             mock.patch.object(training_ops, "_deploy_dependencies"), \
@@ -236,7 +237,7 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
             mock.patch.object(training_ops, "_remote_ok", side_effect=remote_ok), \
             mock.patch.object(training_ops, "_cold_start_cleanup", cold_cleanup), \
             mock.patch.object(training_ops, "_cold_adapter_cache_cleanup", cache_cleanup), \
-            mock.patch.object(training_ops, "_start_trainer_pull"), \
+            mock.patch.object(training_ops, "_start_trainer_pull", transport), \
             mock.patch.object(training_ops, "_repair_supervisors"), \
             mock.patch.object(training_ops.time, "sleep"), \
             mock.patch.object(training_ops, "trainer_launcher", "/runtime/cluster.sh"), \
@@ -252,12 +253,52 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
 
         cold_cleanup.assert_not_called()
         cache_cleanup.assert_not_called()
+        transport.assert_called_once_with(
+            load_config(diagnostic, "orchestrator.toml")["output_dir"],
+            restart_route=False,
+        )
         commands = [command for _host, command in calls]
         self.assertFalse(any("start_inference.sh" in command for command in commands))
         self.assertTrue(any(command.endswith(" adapter-http") for command in commands))
         self.assertTrue(any(command.endswith(" trainer") for command in commands))
         self.assertTrue(any(command.endswith("/runtime/orchestrator.sh") for command in commands))
         self.assertTrue(any("trinity-decensor-experimental-fixed-diag-d29a5958" in command for command in commands))
+
+    def test_live_cleanup_and_no_clobber_contract_is_explicit(self):
+        plan = (root / "ideas.md").read_text(encoding="utf-8")
+        for marker in (
+            "snapshot the full production staging receipt",
+            "server identity",
+            "max_loras=1",
+            "coexistence is uncertain",
+            "fail closed",
+            "no-clobber gate",
+            "every configured\n  trainer/orchestrator/H200 host",
+            "abort if any exists",
+            "POST to the root `/remove_lora_adapter` endpoint",
+            "status, name, and ID",
+            "`/staging_status`",
+            "Never run raw `rm`",
+            "cache files remain engine-managed",
+            "server-identity equality",
+        ):
+            self.assertIn(marker, plan)
+
+        trainer = load_config(diagnostic, "trainer.toml")
+        orchestrator = load_config(diagnostic, "orchestrator.toml")
+        run_dir = Path(orchestrator["output_dir"])
+        diagnostic_paths = {
+            Path(trainer["output_dir"]),
+            run_dir,
+            run_dir / "broadcasts",
+            run_dir / "control",
+            run_dir / "rollouts",
+        }
+        self.assertEqual(len(diagnostic_paths), 5)
+        self.assertNotIn(
+            Path("/data/glm52-rl/runs/trinity-decensor-experimental-fixed"),
+            diagnostic_paths,
+        )
 
 
 if __name__ == "__main__":

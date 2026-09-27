@@ -844,9 +844,21 @@ only after measured learning.
 - Start this disposable profile with `training_ops.start(..., mode="restart")`
   and no resume adapter or resume step. This launches fresh diagnostic
   components without cold-start cleanup or the inference engine start script.
-- The H200 adapter cache is shared with production. Do not cold-clean it. The
-  diagnostic source URL and LoRA name must produce a distinct hashed cache
-  entry. After the one-step run, remove only that diagnostic entry, verify the
-  production receipt and `max_loras=1` slot, then restore production service.
+- Before any live start, snapshot the full production staging receipt and
+  server identity: exact source URL, model/config hashes and sizes, verified
+  files, LoRA name and ID, status, container, listener, and start identity.
+- H200 `max_loras=1` means coexistence is uncertain. Do not assume that a
+  production adapter can remain loaded. If the live snapshot cannot prove the
+  exact slot and receipt state, fail closed.
+- Before restart, a no-clobber gate must check every configured
+  trainer/orchestrator/H200 host. The exact diagnostic run, service, output,
+  broadcast, control, and rollout paths must be absent; abort if any exists.
+- After the diagnostic stops, POST to the root `/remove_lora_adapter` endpoint
+  with the exact diagnostic LoRA name. Validate response status, name, and ID,
+  then validate `/staging_status`. Never run raw `rm` or manually remove
+  shared-cache files; cache files remain engine-managed.
+- If the snapshotted production receipt is not active and ready, reload only
+  the snapshotted exact production name and source identity. Then verify full
+  staging-receipt and server-identity equality; fail closed on any mismatch.
 - The diagnostic paths contain no resume adapter, cached rollout, or stale
   rollout-batch input. This plan must be reviewed before any live execution.

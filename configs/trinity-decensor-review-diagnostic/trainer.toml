@@ -1,5 +1,7 @@
 # Hugging Face revision: 6412c1ad1588c664977b0f830b80a20273173318
 
+# Before restart, require the no-clobber gate: this exact run path must be
+# absent on every configured trainer, orchestrator, and H200 host.
 output_dir = "/data/glm52-rl/runs/trinity-decensor-experimental-fixed-diag-d29a5958"
 max_steps = 1
 dist_timeout_seconds = 5400
