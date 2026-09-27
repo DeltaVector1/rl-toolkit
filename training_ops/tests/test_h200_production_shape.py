@@ -19,6 +19,52 @@ from training_ops.tests.test_h200_synthetic_parity import response_for
 root = Path(__file__).resolve().parents[2]
 
 
+def trinity_response(tokens):
+    response = response_for(tokens)
+    row = bytes(6 * 4) + bytes(range(4)) * 54
+    response["choices"][0]["routed_experts"] = {
+        "data": base64.b64encode(row * len(tokens)).decode(),
+        "dtype": "uint8",
+        "shape": [len(tokens), 60, 4],
+        "start": 0,
+    }
+    return response
+
+
+class ResponseContractTest(unittest.TestCase):
+    def test_wrong_route_dimensions_rejected(self):
+        sent = [{"token_ids": [20, 21]}] * 6
+        with self.assertRaisesRegex(ValueError, "60.*4"):
+            tool.assemble(sent, [response_for([20, 21]) for _ in range(6)])
+        for index in range(6):
+            responses = [trinity_response([20, 21]) for _ in range(6)]
+            responses[index] = response_for([20, 21])
+            with self.subTest(index=index), self.assertRaisesRegex(ValueError, "60.*4"):
+                tool.assemble(sent, responses)
+
+    def test_numeric_first_score_rejected(self):
+        sent = [{"token_ids": [20, 21]}] * 6
+        for index in range(6):
+            responses = [trinity_response([20, 21]) for _ in range(6)]
+            responses[index]["prompt_logprobs"][0] = {"20": {"logprob": 0.0}}
+            with self.subTest(index=index), self.assertRaisesRegex(ValueError, "null"):
+                tool.assemble(sent, responses)
+
+    def test_remaining_scores_require_exact_numeric_token_score(self):
+        sent = [{"token_ids": [20, 21]}] * 6
+        for value in (
+            None,
+            {"22": {"logprob": -1.0}},
+            {"21": {"logprob": True}},
+            {"21": {"logprob": "-1"}},
+            {"21": {"logprob": float("nan")}},
+        ):
+            responses = [trinity_response([20, 21]) for _ in range(6)]
+            responses[0]["prompt_logprobs"][1] = value
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                tool.assemble(sent, responses)
+
+
 def source_objects(path, names, namespace):
     tree = ast.parse(path.read_text())
     nodes = [node for node in tree.body if getattr(node, "name", None) in names]
@@ -32,7 +78,7 @@ class ProductionShapeTest(unittest.TestCase):
 
         def post(endpoint, request, timeout):
             cls.requests.append(request)
-            return response_for(request["token_ids"])
+            return trinity_response(request["token_ids"])
 
         cls.reference = tool.build(
             endpoint="http://localhost/inference/v1/generate", post_json=post

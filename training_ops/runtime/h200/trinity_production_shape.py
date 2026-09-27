@@ -38,13 +38,35 @@ def requests(salt):
 def assemble(sent, responses):
     if len(sent) != 6 or len(responses) != 6:
         raise ValueError("six fresh H200 requests and responses are required")
+    for request, response in zip(sent, responses):
+        prompt_scores = (
+            response.get("prompt_logprobs") if isinstance(response, dict) else None
+        )
+        if (
+            not isinstance(prompt_scores, list)
+            or not prompt_scores
+            or prompt_scores[0] is not None
+        ):
+            raise ValueError("H200 first prompt-logprob entry must be null")
+        choices = response.get("choices")
+        route = (
+            choices[0].get("routed_experts")
+            if isinstance(choices, list)
+            and len(choices) == 1
+            and isinstance(choices[0], dict)
+            else None
+        )
+        if not isinstance(route, dict) or route.get("shape") != [
+            len(request["token_ids"]),
+            60,
+            4,
+        ]:
+            raise ValueError("H200 route shape must be exactly [tokens, 60, 4]")
     parsed = [
         synthetic._parse_response(response, request["token_ids"])
         for request, response in zip(sent, responses)
     ]
-    tail = parsed[0][1]["shape"][1:]
-    if any(route["shape"][1:] != tail for _, route, _ in parsed):
-        raise ValueError("H200 route layer/top-k shapes differ")
+    tail = [60, 4]
 
     def record(indices, segment_lengths):
         return dict(
