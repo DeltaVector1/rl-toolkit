@@ -838,3 +838,15 @@ only after measured learning.
   planned separately after this evidence identifies the failure class. Do not
   reuse its run, output, checkpoint, broadcast, cache, LoRA, or SwanLab
   identity for production.
+
+## Batch-32 diagnostic restart and cleanup plan
+
+- Start this disposable profile with `training_ops.start(..., mode="restart")`
+  and no resume adapter or resume step. This launches fresh diagnostic
+  components without cold-start cleanup or the inference engine start script.
+- The H200 adapter cache is shared with production. Do not cold-clean it. The
+  diagnostic source URL and LoRA name must produce a distinct hashed cache
+  entry. After the one-step run, remove only that diagnostic entry, verify the
+  production receipt and `max_loras=1` slot, then restore production service.
+- The diagnostic paths contain no resume adapter, cached rollout, or stale
+  rollout-batch input. This plan must be reviewed before any live execution.

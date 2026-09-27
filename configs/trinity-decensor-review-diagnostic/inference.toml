@@ -46,6 +46,10 @@ dp = 1
 type = "filesystem"
 
 [env_vars]
-PRIME_LORA_CACHE_DIR = "/data/glm52-rl/lora-cache/trinity-decensor-experimental-fixed-diag-d29a5958"
+# Shared H200 cache. The adapter service keys entries by the exact diagnostic
+# source and LoRA identity; do not cold-clean this shared cache. H200 has one
+# LoRA slot: after this diagnostic, remove only its entry and verify the
+# production receipt before restoring production service.
+PRIME_LORA_CACHE_DIR = "/data/glm52-rl/lora-cache"
 VLLM_WORKER_MULTIPROC_METHOD = "spawn"
 NCCL_SOCKET_IFNAME = "eth0"

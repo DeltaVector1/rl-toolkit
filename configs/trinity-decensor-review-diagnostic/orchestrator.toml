@@ -16,10 +16,10 @@ type = "grpo"
 level = "info"
 
 [swanlab]
-project = "trinity-runs"
+project = "trinity-runs-review-diagnostic"
 name = "orchestrator-trinity-decensor-experimental-fixed-diag-d29a5958"
 group = "trinity-decensor-experimental-fixed-diag-d29a5958"
-tags = ["trinity-thinking", "decensor", "grpo", "lora-r32", "batch32", "review-diagnostic", "refusal-primary", "parity-guard"]
+tags = ["trinity-thinking", "decensor", "grpo", "lora-r32", "batch32", "review-diagnostic", "run-trinity-decensor-experimental-fixed-diag-d29a5958", "refusal-primary", "parity-guard"]
 mode = "online"
 
 [file_monitor]
@@ -30,6 +30,7 @@ name = "/data/trinity-thinking-fp8"
 
 [model.lora]
 # H200 has one LoRA slot; restore the production receipt after this diagnostic.
+# The source URL and this name make a distinct hashed shared-cache entry.
 name = "trinity-decensor-experimental-fixed-diag-d29a5958-r32-node-local"
 rank = 32
 alpha = 64

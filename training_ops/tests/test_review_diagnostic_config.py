@@ -2,6 +2,7 @@ import copy
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import training_ops
 import training_ops.tests  # Install the local-only test guard before any test runs.
@@ -22,9 +23,15 @@ def without_diagnostic_identity(kind: str, config: dict) -> dict:
     if kind == "trainer":
         result.pop("output_dir")
         result.pop("max_steps")
+        result["swanlab"].pop("project")
         result["swanlab"].pop("name")
         result["swanlab"].pop("group")
-        for tag in ("50-step", "batch32", "review-diagnostic"):
+        for tag in (
+            "50-step",
+            "batch32",
+            "review-diagnostic",
+            "run-trinity-decensor-experimental-fixed-diag-d29a5958",
+        ):
             if tag in result["swanlab"]["tags"]:
                 result["swanlab"]["tags"].remove(tag)
         result["file_monitor"].pop("filename")
@@ -33,9 +40,15 @@ def without_diagnostic_identity(kind: str, config: dict) -> dict:
         result.pop("max_steps")
         result.pop("batch_size")
         result.pop("max_inflight_rollouts")
+        result["swanlab"].pop("project")
         result["swanlab"].pop("name")
         result["swanlab"].pop("group")
-        for tag in ("50-step", "batch32", "review-diagnostic"):
+        for tag in (
+            "50-step",
+            "batch32",
+            "review-diagnostic",
+            "run-trinity-decensor-experimental-fixed-diag-d29a5958",
+        ):
             if tag in result["swanlab"]["tags"]:
                 result["swanlab"]["tags"].remove(tag)
         result["model"]["lora"].pop("name")
@@ -120,7 +133,15 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertNotEqual(diagnostic_orchestrator["swanlab"]["group"], production_orchestrator["swanlab"]["group"])
         self.assertNotEqual(diagnostic_orchestrator["model"]["lora"]["name"], production_orchestrator["model"]["lora"]["name"])
         self.assertNotEqual(diagnostic_orchestrator["weight_broadcast"]["source_url"], production_orchestrator["weight_broadcast"]["source_url"])
-        self.assertNotEqual(diagnostic_inference["env_vars"]["PRIME_LORA_CACHE_DIR"], production_inference["env_vars"]["PRIME_LORA_CACHE_DIR"])
+        self.assertEqual(
+            diagnostic_inference["env_vars"]["PRIME_LORA_CACHE_DIR"],
+            production_inference["env_vars"]["PRIME_LORA_CACHE_DIR"],
+        )
+        self.assertEqual(diagnostic_inference["max_loras"], 1)
+        self.assertIn(
+            "production receipt",
+            (diagnostic / "inference.toml").read_text(encoding="utf-8"),
+        )
         self.assertEqual(diagnostic_orchestrator["ckpt"]["resume_step"], -1)
         self.assertTrue(diagnostic_orchestrator["ckpt"]["skip_progress"])
         self.assertTrue(diagnostic_orchestrator["output_dir"].endswith("/run_trinity-decensor-experimental-fixed-diag-d29a5958"))
@@ -137,6 +158,106 @@ class ReviewDiagnosticConfigTest(unittest.TestCase):
         self.assertEqual(production_orchestrator["batch_size"], 1024)
         self.assertEqual(production_orchestrator["max_inflight_rollouts"], 256)
         self.assertEqual(production_inference["env_vars"]["PRIME_LORA_CACHE_DIR"], "/data/glm52-rl/lora-cache")
+
+    def test_file_monitors_and_swanlab_identities_are_resolved_and_unique(self):
+        diagnostic_trainer = load_config(diagnostic, "trainer.toml")
+        diagnostic_orchestrator = load_config(diagnostic, "orchestrator.toml")
+        production_trainer = load_config(production, "trainer.toml")
+        production_orchestrator = load_config(production, "orchestrator.toml")
+
+        for diagnostic_config, production_config in (
+            (diagnostic_trainer, production_trainer),
+            (diagnostic_orchestrator, production_orchestrator),
+        ):
+            diagnostic_monitor = Path(diagnostic_config["output_dir"]) / diagnostic_config["file_monitor"]["filename"]
+            production_monitor = Path(production_config["output_dir"]) / production_config["file_monitor"]["filename"]
+            self.assertNotEqual(diagnostic_monitor, production_monitor)
+            for field in ("project", "name", "group"):
+                self.assertNotEqual(
+                    diagnostic_config["swanlab"][field],
+                    production_config["swanlab"][field],
+                )
+        self.assertNotEqual(
+            diagnostic_trainer["swanlab"]["tags"],
+            production_trainer["swanlab"]["tags"],
+        )
+        self.assertNotEqual(
+            diagnostic_orchestrator["swanlab"]["tags"],
+            production_orchestrator["swanlab"]["tags"],
+        )
+        self.assertIn(
+            "run-trinity-decensor-experimental-fixed-diag-d29a5958",
+            diagnostic_trainer["swanlab"]["tags"],
+        )
+        self.assertIn(
+            "run-trinity-decensor-experimental-fixed-diag-d29a5958",
+            diagnostic_orchestrator["swanlab"]["tags"],
+        )
+
+    def test_diagnostic_has_no_resume_or_cached_rollout_inputs(self):
+        forbidden = (
+            "initial_adapter_path",
+            "resume_adapter",
+            "cached_rollout",
+            "rollout_batch",
+            "train_rollouts.bin",
+        )
+        for path in diagnostic.glob("*.toml"):
+            text = path.read_text(encoding="utf-8")
+            for marker in forbidden:
+                self.assertNotIn(marker, text, path.name)
+
+    def test_restart_without_resume_is_fresh_and_skips_cold_paths(self):
+        calls = []
+
+        def ssh(host, command, timeout=60):
+            calls.append((host, command))
+            return 0, "ready"
+
+        def remote_ok(host, command, _label, **kwargs):
+            calls.append((host, command))
+            return "ready"
+
+        selected = {
+            "kind": "general-agent",
+            "trainer": "configs/trinity-decensor-review-diagnostic/trainer.toml",
+            "orchestrator": "configs/trinity-decensor-review-diagnostic/orchestrator.toml",
+            "inference": "configs/trinity-decensor-review-diagnostic/inference.toml",
+        }
+        cold_cleanup = mock.Mock()
+        cache_cleanup = mock.Mock()
+        with mock.patch.object(training_ops, "_config_dir", return_value=selected), \
+            mock.patch.object(training_ops, "_start_dependency_inventory", return_value=[]), \
+            mock.patch.object(training_ops, "_deploy_dependencies"), \
+            mock.patch.object(training_ops, "_orchestrator_image_preflight", return_value="sha256:" + "d" * 64), \
+            mock.patch.object(training_ops, "_ssh", side_effect=ssh), \
+            mock.patch.object(training_ops, "_ssh_address", return_value="127.0.0.1"), \
+            mock.patch.object(training_ops, "_fan", side_effect=lambda hosts, function: {host: function(host) for host in hosts}), \
+            mock.patch.object(training_ops, "_remote_ok", side_effect=remote_ok), \
+            mock.patch.object(training_ops, "_cold_start_cleanup", cold_cleanup), \
+            mock.patch.object(training_ops, "_cold_adapter_cache_cleanup", cache_cleanup), \
+            mock.patch.object(training_ops, "_start_trainer_pull"), \
+            mock.patch.object(training_ops, "_repair_supervisors"), \
+            mock.patch.object(training_ops.time, "sleep"), \
+            mock.patch.object(training_ops, "trainer_launcher", "/runtime/cluster.sh"), \
+            mock.patch.object(training_ops, "orchestrator_launcher", "/runtime/orchestrator.sh"), \
+            mock.patch("builtins.print"):
+            training_ops.start(
+                "trinity-decensor-experimental-fixed-diag-d29a5958",
+                mode="restart",
+                nodes=["n82"],
+                supervisors=False,
+                config_dir="configs/trinity-decensor-review-diagnostic",
+            )
+
+        cold_cleanup.assert_not_called()
+        cache_cleanup.assert_not_called()
+        commands = [command for _host, command in calls]
+        self.assertFalse(any("start_inference.sh" in command for command in commands))
+        self.assertTrue(any(command.endswith(" adapter-http") for command in commands))
+        self.assertTrue(any(command.endswith(" trainer") for command in commands))
+        self.assertTrue(any(command.endswith("/runtime/orchestrator.sh") for command in commands))
+        self.assertTrue(any("trinity-decensor-experimental-fixed-diag-d29a5958" in command for command in commands))
 
 
 if __name__ == "__main__":
