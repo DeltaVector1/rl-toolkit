@@ -115,8 +115,39 @@ group_live() {
   ps -eo pgid=,stat= | awk -v group="$1" '$1 == group && $2 !~ /^Z/ {found=1} END {exit !found}'
 }
 
+pid_live() {
+  local pid=$1 state
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" -gt 1 ] || return 1
+  state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) || return 1
+  [ "$state" != Z ]
+}
+
+lock_safe() {
+  local flock_status listing pid path
+  [ ! -L "$lock_file" ] || return 1
+  if [ -e "$lock_file" ] && [ ! -f "$lock_file" ]; then
+    return 1
+  fi
+  if flock -n "$lock_file" -c true; then
+    return 0
+  else
+    flock_status=$?
+  fi
+  [ "$flock_status" -eq 1 ] || return 1
+
+  # A contended lock is safe only when its kernel owner is gone or cannot be
+  # resolved. A live owner may be another run and must stop the cleanup.
+  listing=$(lslocks -n -o PID,PATH --notruncate 2>/dev/null) || return 1
+  while read -r pid path; do
+    [ "${path:-}" = "$lock_file" ] || continue
+    pid_live "${pid:-}" && return 1
+  done <<<"$listing"
+  return 0
+}
+
 stop() {
-  local pid any_live
+  local pid any_live flock_status
   local -a pids=()
   local_path_safe "$dest_dir" || return 1
   mapfile -t pids < <(matching_pids)
@@ -146,8 +177,16 @@ stop() {
     return 0
   fi
   [ -d "$dest_dir" ] && [ ! -L "$dest_dir" ] || return 1
-  flock -n "$lock_file" -c true || return 1
-  rm -f -- "$pid_file"
+  lock_safe || return 1
+  # Keep the PID record when lock ownership is unresolved. It cannot be
+  # safely attributed to this run, but it does not block a later stop.
+  if flock -n "$lock_file" -c true; then
+    rm -f -- "$pid_file"
+  else
+    flock_status=$?
+    [ "$flock_status" -eq 1 ] || return 1
+    lock_safe || return 1
+  fi
 }
 
 start() {

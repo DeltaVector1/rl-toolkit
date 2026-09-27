@@ -102,6 +102,128 @@ class RolloutPullTest(unittest.TestCase):
                     subprocess.run(["bash", "-c", commands[2]], env=environment, capture_output=True, timeout=10)
                 training_ops.rollout_pull_script = old_script
 
+    def test_stop_is_idempotent_with_stale_lock_and_pid_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            (run_dir / ".rollout-pull.lock").touch()
+            (run_dir / ".rollout-pull.pid").write_text("orphaned-owner\n")
+            old_script = training_ops.rollout_pull_script
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                stop_command = training_ops._rollout_pull_command(str(run_dir), "stop")
+                for _ in range(2):
+                    stopped = subprocess.run(
+                        ["bash", "-c", stop_command],
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                self.assertFalse((run_dir / ".rollout-pull.pid").exists())
+                self.assertTrue((run_dir / ".rollout-pull.lock").exists())
+            finally:
+                training_ops.rollout_pull_script = old_script
+
+    def test_stop_accepts_unresolvable_lock_owner_but_preserves_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            tools = Path(directory) / "tools"
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            lock_file = run_dir / ".rollout-pull.lock"
+            lock_file.touch()
+            (run_dir / ".rollout-pull.pid").write_text("unresolvable-owner\n")
+            (tools / "flock").write_text(
+                "#!/usr/bin/env bash\n"
+                "exit \"${FAKE_FLOCK_STATUS:-0}\"\n"
+            )
+            (tools / "lslocks").write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' '- '\"$FAKE_LOCK_PATH\"\n"
+            )
+            for path in (tools / "flock", tools / "lslocks"):
+                path.chmod(0o755)
+            environment.update(FAKE_FLOCK_STATUS="1", FAKE_LOCK_PATH=str(lock_file))
+            old_script = training_ops.rollout_pull_script
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                stop_command = training_ops._rollout_pull_command(str(run_dir), "stop")
+                stopped = subprocess.run(
+                    ["bash", "-c", stop_command],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                self.assertTrue((run_dir / ".rollout-pull.pid").exists())
+            finally:
+                training_ops.rollout_pull_script = old_script
+
+    def test_stop_fails_closed_for_live_lock_owner_and_probe_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            lock_file = run_dir / ".rollout-pull.lock"
+            owner = subprocess.Popen(["flock", "-n", str(lock_file), "-c", "sleep 10"])
+            try:
+                for _ in range(100):
+                    owners = subprocess.run(
+                        ["lslocks", "-n", "-o", "PID,PATH", "--notruncate"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if str(lock_file) in owners.stdout:
+                        break
+                    time.sleep(0.05)
+                self.assertIn(str(lock_file), owners.stdout)
+                (run_dir / ".rollout-pull.pid").write_text("other-run-owner\n")
+                old_script = training_ops.rollout_pull_script
+                try:
+                    training_ops.rollout_pull_script = str(puller)
+                    stop_command = training_ops._rollout_pull_command(str(run_dir), "stop")
+                    stopped = subprocess.run(
+                        ["bash", "-c", stop_command],
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    self.assertNotEqual(stopped.returncode, 0)
+                    self.assertIsNone(owner.poll())
+                    self.assertTrue((run_dir / ".rollout-pull.pid").exists())
+                finally:
+                    training_ops.rollout_pull_script = old_script
+            finally:
+                owner.terminate()
+                owner.wait(timeout=10)
+
+            tools = Path(directory) / "tools"
+            (tools / "flock").write_text(
+                "#!/usr/bin/env bash\n"
+                "exit 2\n"
+            )
+            (tools / "flock").chmod(0o755)
+            environment["FAKE_FLOCK_STATUS"] = "2"
+            old_script = training_ops.rollout_pull_script
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                stopped = subprocess.run(
+                    ["bash", "-c", training_ops._rollout_pull_command(str(run_dir), "stop")],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertNotEqual(stopped.returncode, 0)
+                self.assertTrue((run_dir / ".rollout-pull.pid").exists())
+            finally:
+                training_ops.rollout_pull_script = old_script
+
     def test_start_waits_for_delayed_readiness_and_cleans_up_failed_child(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory) / "alpha/run_alpha"
