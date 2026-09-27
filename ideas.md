@@ -1243,6 +1243,44 @@ only after measured learning.
   adapter loading, or policy-source identity. No live action is part of
   this config change.
 
+## Production-density loss-mask compaction diagnostic
+
+- **Measurements.** Fresh zero-LoRA packed batch-8 1f1b forward/backward
+  took `109.649182s`, with PP `105.50s`. The direct artifact has `19987039`
+  bytes and SHA-256
+  `87553e22d668b0e307c98bc9982d9f2a6f35941c962657dc3971a2eed0d7012d`.
+  Guard unmasked KL was `0.006344088818877935`, maximum
+  `0.007684200070798397`; strict mean KL was `0.006420181652246836`.
+  Production selected `29420/32768` positions with KL `1.147836`, first
+  lengths `[8187,7006,6543,6436,4596]`, and `66` tail padding positions.
+  The passing synthetic case selected `32763/32768` positions.
+- **Hypothesis.** FP8 LM-head label compaction and all-to-all with uneven
+  masks can cause misalignment or numerical error before loss calculation.
+  Derive a new reference from the exact existing `packed-reference.json`.
+  Keep tokens, inference scores, positions, sequence lengths, routes, and
+  source/model identity unchanged. For lengths `[4096,5632,6656,7680,8704]`,
+  mask prefixes `[410,563,666,768,870]` including sequence starts, plus the
+  last `71` positions of the last sequence. Assert no overlap, `3348` false
+  and `29420` true positions; eight copies select `235360` positions.
+  This matches production density, not the exact production mask or lengths.
+- **Method.** Record the source byte size and SHA-256 with the mask spec.
+  Generate identical derived bytes independently on each node later; make
+  no inference request, rollout, or network transfer. Use fresh zero LoRA
+  with exact production rank and targets, batch `8`, 1f1b, native FP8,
+  CP8/PP8/EP8, lr `0`, and sparse-index transfer `false`. Use the new
+  config `trinity-h200-synthetic-packed-1f1b-masked-parity` and output run
+  `packed-1f1b-masked-run`. Live use requires the merged all-rank fresh-zero
+  verifier. No live action is part of this change.
+- **Checks and limits.** Require eight ordered schema-v2 records bound to
+  the derived mask and float32 reference scores, finite per-copy,
+  per-sequence, and total metrics, and trainer logs. Optional comparison
+  with the passing zero-LoRA dense artifact uses only sparse-selected
+  positions and permits only the prescribed mask difference. Keep the
+  `600s` forward/backward limit and trainer gates `0.1` unmasked KL, `0.5`
+  masked KL, and `0.06` masked fraction. Report `qualification_pass=null`;
+  trainer guard evidence remains separate. A pass applies only to this
+  synthetic diagnostic, not production capacity or an update.
+
 ## Fresh synthetic packed sparse-MLA parity
 
 - **Measured evidence.** Production packed parity reported unmasked KL
