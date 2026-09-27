@@ -952,3 +952,19 @@ only after measured learning.
   compatible. Fresh preflight must include the configured adapter host even
   when custom trainer nodes omit `trainer_head`; a test must prove this host is
   checked before deployment or launch mutation.
+
+## Watchdog process-side-effect race
+
+- **Measured race.** The watchdog checks the orchestrator identity, then kills
+  the batch publisher and runs a broad `pkill` before it checks the container
+  again. A deterministic container identity change between those checks can
+  therefore leave the new container running but still kill publisher processes
+  from the wrong launch.
+- **Acceptance test.** A race harness must change the reported container ID or
+  launch label between the ownership checks and assert zero `docker rm`, zero
+  publisher `kill`, and zero broad `pkill`. The implementation must make
+  successful removal of the exact immutable container ID the ownership claim,
+  then touch only an exact, independently verified publisher PID with its
+  start time, command, and run identity. If exact process ownership cannot be
+  proved, it must skip that process action. The normal failure path must still
+  remove its owned container and stop its owned publisher.
