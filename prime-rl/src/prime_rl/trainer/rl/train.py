@@ -384,6 +384,78 @@ def initialize_fresh_lora_policy(
     return len(fresh_b), int(nonzero_b_shards.item())
 
 
+def verify_fresh_trainer_only_lora(
+    multi_run_manager, lora_config, checkpoint_step, resume_adapter
+) -> dict | None:
+    """Verify fresh trainer-only adapters without changing their parameters."""
+    eligibility = {
+        "rank": dist.get_rank(),
+        "eligible": (
+            checkpoint_step is None
+            and not resume_adapter
+            and lora_config.initial_adapter_path is None
+        ),
+    }
+    ranks = [None] * dist.get_world_size()
+    dist.all_gather_object(ranks, eligibility)
+    if len({record["eligible"] for record in ranks}) != 1:
+        raise RuntimeError(f"trainer-only fresh LoRA eligibility differs across ranks: {ranks}")
+    if not eligibility["eligible"]:
+        return None
+
+    local = {
+        "rank": dist.get_rank(),
+        "b_count": 0,
+        "nonzero_b_shards": 0,
+        "scale": None,
+        "error": None,
+    }
+    try:
+        parameters = list(multi_run_manager.get_named_parameters_for_run(0))
+        finite = True
+        for name, parameter in parameters:
+            shard = parameter.to_local() if hasattr(parameter, "to_local") else parameter
+            finite = bool(torch.isfinite(shard).all().item()) and finite
+            if "lora_B" in name:
+                local["b_count"] += 1
+                local["nonzero_b_shards"] += int(torch.count_nonzero(shard).item() != 0)
+        expected_scale = lora_config.alpha / lora_config.rank
+        scale = float(multi_run_manager.scaling_factors[0])
+        local["scale"] = scale
+        errors = []
+        if not local["b_count"]:
+            errors.append("no B matrices")
+        if not finite:
+            errors.append("run parameters must be finite")
+        if local["nonzero_b_shards"]:
+            errors.append("B matrices must already be zero")
+        if (
+            not math.isfinite(expected_scale)
+            or not math.isfinite(scale)
+            or scale != expected_scale
+        ):
+            errors.append("scale must be finite and match alpha/rank")
+        local["error"] = "; ".join(errors) or None
+    except Exception as error:
+        # Every rank must reach the evidence collective, including a rank whose
+        # adapter slot or local shard cannot be inspected.
+        local["error"] = f"{type(error).__name__}: {error}"
+    dist.all_gather_object(ranks, local)
+    failures = [record for record in ranks if record["error"]]
+    if failures:
+        raise RuntimeError(
+            "trainer-only fresh LoRA verification failed: "
+            + "; ".join(f"rank={record['rank']} {record['error']}" for record in failures)
+        )
+    return {
+        "rank_count": len(ranks),
+        "local_b_count": local["b_count"],
+        "global_b_count": sum(record["b_count"] for record in ranks),
+        "nonzero_b_shards": sum(record["nonzero_b_shards"] for record in ranks),
+        "scale": local["scale"],
+    }
+
+
 def parity_guard_failures(tensor_stats: dict, guard) -> list[str]:
     """Return parity violations. Missing or nonfinite evidence fails closed."""
     failures = []
@@ -1273,6 +1345,19 @@ def train(config: TrainerConfig):
         # Run creation resets adapter slots and invokes initial-adapter hooks.
         # Restore the requested resume adapter after that reset sequence.
         load_initial_lora_adapter(model, resume_adapter, adapter_idx=0)
+
+    if trainer_only and config.model.lora is not None:
+        fresh_evidence = verify_fresh_trainer_only_lora(
+            multi_run_manager, config.model.lora, checkpoint_step, resume_adapter
+        )
+        if fresh_evidence is not None and world.is_master:
+            logger.info(
+                f"Verified fresh trainer-only LoRA on {fresh_evidence['rank_count']} ranks: "
+                f"{fresh_evidence['local_b_count']} local B matrices; "
+                f"{fresh_evidence['global_b_count']} global B shards; "
+                f"pre-reset nonzero B shards={fresh_evidence['nonzero_b_shards']}; "
+                f"all run parameters finite; scale={fresh_evidence['scale']:g} matches alpha/rank"
+            )
 
     logger.info(
         f"Starting from step {progress.step} (total_tokens={progress.total_tokens}, total_samples={progress.total_samples})"

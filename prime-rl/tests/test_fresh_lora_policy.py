@@ -56,7 +56,7 @@ class FreshLoraPolicyTest(unittest.TestCase):
 
     def verify(self, dist=None, checkpoint_step=None, resume_adapter=None):
         namespace = load_helpers(dist or Dist())
-        self.assertIn("verify_fresh_trainer_only_lora", namespace)
+        self.assertIn("verify_fresh_trainer_only_lora", list(namespace))
         return namespace["verify_fresh_trainer_only_lora"](
             self.manager, self.config, checkpoint_step, resume_adapter
         )
@@ -86,7 +86,7 @@ class FreshLoraPolicyTest(unittest.TestCase):
                     parameter.copy_(original)
 
     def test_bad_or_nonfinite_scale_fails(self):
-        for scale in (1.0, float("inf"), float("nan")):
+        for scale in (1.0, 2.000001, float("inf"), float("nan")):
             with self.subTest(scale=scale):
                 self.manager.scaling_factors = [scale]
                 with self.assertRaisesRegex(RuntimeError, "scale"):
@@ -111,6 +111,12 @@ class FreshLoraPolicyTest(unittest.TestCase):
     def test_remote_inspection_failure_rejects_valid_local_policy(self):
         with self.assertRaisesRegex(RuntimeError, "rank=1.*bad shard"):
             self.verify(Dist({2: {"error": "bad shard"}}))
+
+    def test_local_shards_and_bfloat16_scale(self):
+        self.parameters = [(name, SimpleNamespace(to_local=lambda p=value: p))
+                           for name, value in self.parameters]
+        self.manager.scaling_factors = torch.tensor([2.0], dtype=torch.bfloat16)
+        self.assertEqual(self.verify()["scale"], 2.0)
 
     def test_mixed_eligibility_fails_before_inspection(self):
         self.manager.get_named_parameters_for_run = Mock(side_effect=AssertionError("must not inspect"))
@@ -163,6 +169,15 @@ class TrainerOnlyFreshPolicyTest(unittest.TestCase):
             namespace["logger"].reset_mock()
             exec(compile(ast.Module(body=[block], type_ignores=[]), str(source_path), "exec"), namespace)
             self.assertEqual(namespace["logger"].info.call_count, int(master))
+            if master:
+                message = namespace["logger"].info.call_args.args[0]
+                for evidence in ("2 ranks", "1 local B matrices", "2 global B shards",
+                                 "pre-reset nonzero B shards=0", "finite", "scale=2"):
+                    self.assertIn(evidence, message)
+        namespace["verify_fresh_trainer_only_lora"].reset_mock()
+        namespace["trainer_only"] = False
+        exec(compile(ast.Module(body=[block], type_ignores=[]), str(source_path), "exec"), namespace)
+        namespace["verify_fresh_trainer_only_lora"].assert_not_called()
         self.assertIn("if fresh_lora_policy and progress.step == 1:", source_path.read_text())
 
 
