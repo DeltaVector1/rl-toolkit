@@ -10,6 +10,11 @@ import tomllib
 
 import training_ops
 
+try:
+    from prime_rl.trainer.distributed.pp_runner import minimum_pipeline_microbatches
+except (ImportError, ModuleNotFoundError):
+    minimum_pipeline_microbatches = None
+
 
 ROOT = Path(__file__).resolve().parents[2]
 BUILDER_PATH = ROOT / "training_ops/runtime/h200/build_trinity_synthetic_parity.py"
@@ -364,6 +369,7 @@ class SyntheticParityTest(unittest.TestCase):
             self.assertEqual(config["model"]["name"], "/data/trinity-thinking-fp8")
             self.assertNotIn("lora", config["model"])
             self.assertEqual((config["model"]["cp"], config["model"]["pp"], config["model"]["ep"]), (8, 8, 8))
+            self.assertEqual(config["model"]["pp_schedule"], "gpipe")
             self.assertEqual(config["model"]["pp_transfer_sparse_indices"], False)
             self.assertEqual(config["model"]["quantization"]["type"], "fp8")
             self.assertEqual(config["optim"]["lr"], 0.0)
@@ -372,6 +378,8 @@ class SyntheticParityTest(unittest.TestCase):
                 "max_masked_mismatch_kl": 0.5,
                 "max_masked_fraction": 0.06,
             })
+        if minimum_pipeline_microbatches is not None:
+            self.assertEqual(minimum_pipeline_microbatches("gpipe", 8), 1)
         selected_packed = training_ops._config_dir(
             "configs/trinity-h200-synthetic-packed-parity",
             require_inference=True,
