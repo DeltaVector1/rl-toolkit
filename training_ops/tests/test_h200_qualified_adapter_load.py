@@ -11,6 +11,7 @@ from training_ops import Refused, _qualified_adapter_load_action, actions
 from training_ops.runtime.h200.qualified_adapter_load import (
     QualifiedAdapterLoadError,
     build_publish_script,
+    build_publication_boundary_script,
     build_publication_cleanup_script,
     build_result_receipt_script,
     build_rollback_script,
@@ -83,7 +84,7 @@ def result_receipt():
         "manifest_sha256": "c" * 64,
         "receipt_sha256": "f" * 64,
         "adapter_identity": adapter,
-        "published": {"status": "published", "source_url": source_url, "source_adapter_dir": source_dir, "manifest_sha256": "c" * 64, "owner_token": "8:99:123:456", "files": artifacts},
+        "published": {"status": "published", "source_url": source_url, "source_adapter_dir": source_dir, "manifest_sha256": "c" * 64, "owner_token": "8:99:123:456", "parent_token": "1:2", "final_token": "3:4", "files": artifacts},
         "stage_result": {"status": "ok", "adapter_identity": adapter},
         "load_result": [{"lora_name": "trinity-h200-post-update-qualification-slot1", "source_url": source_url, "target_sha256": "a" * 64, "target_size": 100, "config_sha256": "b" * 64, "config_size": 200, "server_instance": "instance-a"}],
         "server_instances": ["instance-a"],
@@ -232,6 +233,30 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         with self.assertRaisesRegex(Refused, "differ"):
             _qualified_result_receipt_from_output(forged_output, forged_sha, expected)
 
+    def test_result_nested_schemas_and_headers_are_exact(self):
+        expected = result_receipt()
+        expected["published"]["extra"] = True
+        raw = json.dumps(expected, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "publication"):
+            parse_result_receipt(raw, hashlib.sha256(raw).hexdigest())
+        for field, mutate in (("stage_result", lambda value: value.update({"extra": True})), ("load_result", lambda value: value[0].update({"extra": True}))):
+            mutated = result_receipt()
+            mutate(mutated[field])
+            nested_raw = json.dumps(mutated, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+            with self.subTest(field=field), self.assertRaisesRegex(QualifiedAdapterLoadError, "result"):
+                parse_result_receipt(nested_raw, hashlib.sha256(nested_raw).hexdigest())
+        raw = json.dumps(result_receipt(), sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        sha = hashlib.sha256(raw).hexdigest()
+        duplicate = "QUALIFIED_RESULT_RECEIPT path=/data/glm52-rl/qualifications/trinity-h200-post-update-qualification/qualified-adapter-load-receipt.json sha256=" + sha + " sha256=" + sha + " size=" + str(len(raw)) + "\nQUALIFIED_RESULT_RECEIPT_BEGIN\n" + base64.b64encode(raw).decode() + "\nQUALIFIED_RESULT_RECEIPT_END\n"
+        with self.assertRaisesRegex(Refused, "identity"):
+            _qualified_result_receipt_from_output(duplicate, sha)
+
+    def test_publication_boundary_script_reopens_all_ancestors(self):
+        plan = self.apply_plan()
+        boundary = build_publication_boundary_script(plan, parent_token="1:2", final_token="3:4")
+        for text in ("O_DIRECTORY", "O_NOFOLLOW", "dir_fd", "fstat", "parent_token", "final_token"):
+            self.assertIn(text, boundary)
+
     def test_plan_binds_canonical_output_step1_route_and_fixed_slot(self):
         plan = derive_plan(
             "configs/trinity-h200-post-update-qualification",
@@ -269,7 +294,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         self.assertNotIn("ln --", script)
         self.assertIn("test ! -L", script)
         self.assertIn("existing destination", script)
-        for text in ("%y", "%z", "directory entry", "route_manifest", "route_config", "target_step", "mode"):
+        for text in ("%y", "%z", "directory entry", "route_manifest", "route_config", "target_step", "mode", "parent_token", "final_token"):
             self.assertIn(text, script)
         self.assertIn('test ! -L "$runs"', script)
         for text in ("O_DIRECTORY", "O_NOFOLLOW", "dir_fd", "fstat", "renameat2"):
@@ -323,7 +348,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
             qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", runs_root="/data/glm52-rl/runs", trainer_head="n82",
             inference_host="h200b", inference_port=8000, direct_route_port=18100,
         )
-        result = {"status": "published", "source_url": plan["source_url"], "source_adapter_dir": plan["source_adapter_dir"], "manifest_sha256": "c" * 64, "owner_token": "8:99:123:456", "files": receipt()["identities_after"]["artifacts"]}
+        result = {"status": "published", "source_url": plan["source_url"], "source_adapter_dir": plan["source_adapter_dir"], "manifest_sha256": "c" * 64, "owner_token": "8:99:123:456", "parent_token": "1:2", "final_token": "3:4", "files": receipt()["identities_after"]["artifacts"]}
         parsed = parse_publish_result(json.dumps(result), plan)
         self.assertEqual(parsed["manifest_sha256"], "c" * 64)
         result["source_url"] += "/wrong"
@@ -349,27 +374,48 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         old = {"source_url": "http://old/step_0", "target_sha256": "1" * 64, "target_size": 10, "config_sha256": "2" * 64, "config_size": 20, "lora_name": "policy0", "server_instance": "instance-a"}
         new = {**expected, "lora_name": plan["qualification_slot"], "server_instance": "instance-a"}
         states = [self.live_state({"policy0": old}), self.live_state({"policy0": old}), self.live_state({"policy0": old, plan["qualification_slot"]: new})]
-        publish = f"QUALIFIED_PUBLISH status=published source_url={plan['source_url']} source_adapter_dir={plan['source_adapter_dir']} manifest_sha256={plan['manifest_sha256']} owner_token=8:99:123:456\n"
+        publish = f"QUALIFIED_PUBLISH status=published source_url={plan['source_url']} source_adapter_dir={plan['source_adapter_dir']} manifest_sha256={plan['manifest_sha256']} owner_token=8:99:123:456 parent_token=1:2 final_token=3:4\n"
         calls = []
         def ssh(host, script, timeout=120):
             calls.append((host, script))
             if "QUALIFIED_PUBLISH" in script:
                 return 0, publish
+            if "QUALIFIED_PUBLICATION_BOUNDARY" in script:
+                return 0, "QUALIFIED_PUBLICATION_BOUNDARY parent_token=1:2 final_token=3:4\n"
             return 0, "QUALIFIED_RESULT_RECEIPT path=/data/q/qualified-adapter-load-receipt.json sha256=" + "3" * 64 + " size=10\n"
         with patch.object(training_ops_module, "_policy0_load_live_state", side_effect=states), patch.object(training_ops_module, "_policy0_remote_client_op", side_effect=[{"status": "ok", "adapter_identity": expected}, [new]]), patch.object(training_ops_module, "_ssh", side_effect=ssh), patch.object(training_ops_module, "_qualified_result_receipt_from_output", return_value={"status": "loaded"}):
             result = training_ops_module._qualified_adapter_load_apply(plan)
         self.assertEqual(result["status"], "loaded")
         self.assertEqual(result["qualification_slot"], plan["qualification_slot"])
         self.assertIn("QUALIFIED_PUBLISH", calls[0][1])
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 7)
 
     def test_apply_rolls_back_session_owned_slot_when_stage_identity_differs(self):
         plan = self.apply_plan()
         states = [self.live_state({})]
-        publish = f"QUALIFIED_PUBLISH status=published source_url={plan['source_url']} source_adapter_dir={plan['source_adapter_dir']} manifest_sha256={plan['manifest_sha256']} owner_token=8:99:123:456\n"
-        with patch.object(training_ops_module, "_policy0_load_live_state", side_effect=states), patch.object(training_ops_module, "_policy0_remote_client_op", return_value={"status": "ok", "adapter_identity": {}}), patch.object(training_ops_module, "_ssh", return_value=(0, publish)), patch.object(training_ops_module, "_qualified_adapter_rollback", return_value="QUALIFIED_ROLLBACK slot=removed"):
+        publish = f"QUALIFIED_PUBLISH status=published source_url={plan['source_url']} source_adapter_dir={plan['source_adapter_dir']} manifest_sha256={plan['manifest_sha256']} owner_token=8:99:123:456 parent_token=1:2 final_token=3:4\n"
+        def ssh(host, script, timeout=120):
+            if "QUALIFIED_PUBLICATION_BOUNDARY" in script:
+                return 0, "QUALIFIED_PUBLICATION_BOUNDARY parent_token=1:2 final_token=3:4\n"
+            return 0, publish
+        with patch.object(training_ops_module, "_policy0_load_live_state", side_effect=states), patch.object(training_ops_module, "_policy0_remote_client_op", return_value={"status": "ok", "adapter_identity": {}}), patch.object(training_ops_module, "_ssh", side_effect=ssh), patch.object(training_ops_module, "_qualified_adapter_rollback", return_value="QUALIFIED_ROLLBACK slot=removed"):
             with self.assertRaisesRegex(Refused, "stage identity"):
                 training_ops_module._qualified_adapter_load_apply(plan)
+
+    def test_boundary_swap_fails_closed_and_rolls_back_owned_publication(self):
+        plan = self.apply_plan()
+        expected = {"source_url": plan["source_url"], "target_sha256": "a" * 64, "target_size": 100, "config_sha256": "b" * 64, "config_size": 200}
+        states = [self.live_state({})]
+        publish = f"QUALIFIED_PUBLISH status=published source_url={plan['source_url']} source_adapter_dir={plan['source_adapter_dir']} manifest_sha256={plan['manifest_sha256']} owner_token=8:99:123:456 parent_token=1:2 final_token=3:4\n"
+        boundaries = []
+        def verify(_plan, _published, boundary):
+            boundaries.append(boundary)
+            if boundary == "after-stage":
+                raise Refused("publication ancestor identity changed")
+        with patch.object(training_ops_module, "_policy0_load_live_state", side_effect=states), patch.object(training_ops_module, "_policy0_remote_client_op", return_value={"status": "ok", "adapter_identity": expected}), patch.object(training_ops_module, "_ssh", return_value=(0, publish)), patch.object(training_ops_module, "_qualified_verify_publication", side_effect=verify), patch.object(training_ops_module, "_qualified_adapter_rollback", return_value="QUALIFIED_ROLLBACK slot=removed"):
+            with self.assertRaisesRegex(Refused, "ancestor"):
+                training_ops_module._qualified_adapter_load_apply(plan)
+        self.assertEqual(boundaries, ["after-route", "after-stage"])
 
 
 if __name__ == "__main__":

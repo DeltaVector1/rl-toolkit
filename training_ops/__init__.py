@@ -55,6 +55,7 @@ from training_ops.runtime.h200.qualified_adapter_load import (
     QUALIFICATION_SLOT,
     QualifiedAdapterLoadError,
     build_publish_script,
+    build_publication_boundary_script,
     build_publication_cleanup_script,
     build_result_receipt_script,
     build_rollback_script,
@@ -10871,7 +10872,10 @@ def _qualified_receipt_from_output(output: str, expected_sha256: str) -> dict[st
     identity = [line for line in lines if line.startswith("QUALIFIED_RECEIPT_SHA256 ")]
     if len(identity) != 1:
         raise Refused("remote delta receipt identity is missing")
-    fields = dict(item.split("=", 1) for item in identity[0].split()[1:] if "=" in item)
+    raw_fields = identity[0].split()[1:]
+    if len(raw_fields) != 2 or any(item.count("=") != 1 for item in raw_fields):
+        raise Refused("remote delta receipt identity header is invalid")
+    fields = dict(item.split("=", 1) for item in raw_fields)
     if fields.get("sha256") != expected_sha256 or not fields.get("size", "").isdigit():
         raise Refused("remote delta receipt identity differs from the expected receipt")
     begin = "QUALIFIED_RECEIPT_BEGIN\n"
@@ -10901,7 +10905,10 @@ def _qualified_result_receipt_from_output(output: str, expected_sha256: str, exp
     lines = [line for line in output.splitlines() if line.startswith("QUALIFIED_RESULT_RECEIPT ")]
     if len(lines) != 1:
         raise Refused("remote qualified load result receipt identity is missing")
-    fields = dict(item.split("=", 1) for item in lines[0].split()[1:] if "=" in item)
+    raw_fields = lines[0].split()[1:]
+    if len(raw_fields) != 3 or any(item.count("=") != 1 for item in raw_fields):
+        raise Refused("remote qualified load result receipt identity header is invalid")
+    fields = dict(item.split("=", 1) for item in raw_fields)
     if fields.get("path") != "/data/glm52-rl/qualifications/trinity-h200-post-update-qualification/qualified-adapter-load-receipt.json" or fields.get("sha256") != expected_sha256 or not fields.get("size", "").isdigit():
         raise Refused("remote qualified load result receipt identity differs")
     begin = "QUALIFIED_RESULT_RECEIPT_BEGIN\n"
@@ -11038,6 +11045,29 @@ def _qualified_adapter_rollback(plan: Mapping[str, object], remove_published: bo
     return "; ".join(errors) or "QUALIFIED_ROLLBACK slot=removed"
 
 
+def _qualified_verify_publication(plan: Mapping[str, object], published: Mapping[str, object], boundary: str) -> None:
+    parent_token = published.get("parent_token")
+    final_token = published.get("final_token")
+    if not isinstance(parent_token, str) or not isinstance(final_token, str):
+        raise Refused(f"qualified publication {boundary} identity is missing")
+    code, output = _ssh(
+        str(plan["trainer_head"]),
+        build_publication_boundary_script(plan, parent_token=parent_token, final_token=final_token),
+        timeout=180,
+    )
+    if code:
+        raise Refused(f"qualified publication {boundary} verification failed: {output.strip()}")
+    lines = [line for line in output.splitlines() if line.startswith("QUALIFIED_PUBLICATION_BOUNDARY ")]
+    if len(lines) != 1:
+        raise Refused(f"qualified publication {boundary} receipt is missing")
+    fields = lines[0].split()[1:]
+    if len(fields) != 2 or any(item.count("=") != 1 for item in fields):
+        raise Refused(f"qualified publication {boundary} receipt is invalid")
+    values = dict(item.split("=", 1) for item in fields)
+    if values != {"parent_token": parent_token, "final_token": final_token}:
+        raise Refused(f"qualified publication {boundary} identity changed")
+
+
 def _qualified_check_engine(plan: Mapping[str, object], state: Mapping[str, object]) -> Mapping[str, object]:
     """Require an idle engine; the neutral policy-0 guard permits ``ready``."""
     raw_engine = state.get("engine")
@@ -11081,11 +11111,13 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
         published = published_result.get("status") == "published"
         publication_owner_token = published_result.get("owner_token") if published else None
         phase["publish_seconds"] = time.monotonic() - publish_start
+        _qualified_verify_publication(plan, published_result, "after-route")
         expected = _qualified_adapter_receipt_identity(plan)
         stage_start = time.monotonic()
         staged = _policy0_remote_client_op(plan, "stage")
         if not isinstance(staged, Mapping) or staged.get("adapter_identity") != expected:
             raise Refused("qualified adapter stage identity differs from the delta receipt")
+        _qualified_verify_publication(plan, published_result, "after-stage")
         middle = _policy0_load_live_state(plan)
         middle_engine = _qualified_check_engine(plan, middle)
         _policy0_check_services(plan, middle)
@@ -11095,9 +11127,11 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
         phase["stage_seconds"] = time.monotonic() - stage_start
         load_start = time.monotonic()
         load_attempted = True
+        _qualified_verify_publication(plan, published_result, "before-load")
         loaded = _policy0_remote_client_op(plan, "load", expected)
         if not isinstance(loaded, list):
             raise Refused("qualified adapter load returned no receipts")
+        _qualified_verify_publication(plan, published_result, "after-load")
         after = _policy0_load_live_state(plan)
         after_engine = _qualified_check_engine(plan, after)
         _policy0_check_services(plan, after)
@@ -11130,6 +11164,7 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
         code, output = _ssh(str(plan["trainer_head"]), build_result_receipt_script(plan, payload), timeout=180)
         if code:
             raise Refused(f"qualified adapter result receipt publication failed: {output.strip()}")
+        _qualified_verify_publication(plan, published_result, "before-result")
         _qualified_result_receipt_from_output(output, result_sha256, result)
         return result
     except BaseException as error:
