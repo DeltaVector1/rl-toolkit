@@ -61,6 +61,7 @@ from training_ops.runtime.h200.qualified_adapter_load import (
     derive_plan as derive_qualified_adapter_plan,
     parse_delta_receipt,
     parse_publish_result,
+    parse_result_receipt,
 )
 
 repo_root = Path(__file__).resolve().parents[1]
@@ -10859,7 +10860,8 @@ receipt={path}
 test -f "$receipt" && test ! -L "$receipt"
 printf 'QUALIFIED_RECEIPT_SHA256 sha256=%s size=%s\\n' "$(sha256sum -- "$receipt" | awk '{{print $1}}')" "$(stat -c %s -- "$receipt")"
 printf '%s\\n' QUALIFIED_RECEIPT_BEGIN
-cat -- "$receipt"
+base64 -w0 -- "$receipt"
+printf '\\n'
 printf '%s\\n' QUALIFIED_RECEIPT_END
 '''
 
@@ -10878,11 +10880,42 @@ def _qualified_receipt_from_output(output: str, expected_sha256: str) -> dict[st
     finish = output.find(end, start + len(begin)) if start >= 0 else -1
     if start < 0 or finish < 0:
         raise Refused("remote delta receipt body is missing")
-    raw = output[start + len(begin):finish]
+    encoded = output[start + len(begin):finish].strip()
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise Refused("remote delta receipt base64 framing is invalid") from error
+    if len(raw) != int(fields["size"]):
+        raise Refused("remote delta receipt byte size differs")
     try:
         return parse_delta_receipt(raw, expected_sha256)
     except QualifiedAdapterLoadError as error:
         raise Refused(f"remote delta receipt validation failed: {error}") from error
+
+
+def _qualified_result_receipt_from_output(output: str, expected_sha256: str) -> dict[str, object]:
+    lines = [line for line in output.splitlines() if line.startswith("QUALIFIED_RESULT_RECEIPT ")]
+    if len(lines) != 1:
+        raise Refused("remote qualified load result receipt identity is missing")
+    fields = dict(item.split("=", 1) for item in lines[0].split()[1:] if "=" in item)
+    if fields.get("sha256") != expected_sha256 or not fields.get("size", "").isdigit():
+        raise Refused("remote qualified load result receipt identity differs")
+    begin = "QUALIFIED_RESULT_RECEIPT_BEGIN\n"
+    end = "\nQUALIFIED_RESULT_RECEIPT_END"
+    start = output.find(begin)
+    finish = output.find(end, start + len(begin)) if start >= 0 else -1
+    if start < 0 or finish < 0:
+        raise Refused("remote qualified load result receipt body is missing")
+    try:
+        raw = base64.b64decode(output[start + len(begin):finish].strip(), validate=True)
+    except (ValueError, base64.binascii.Error) as error:
+        raise Refused("remote qualified load result receipt base64 is invalid") from error
+    if len(raw) != int(fields["size"]):
+        raise Refused("remote qualified load result receipt size differs")
+    try:
+        return parse_result_receipt(raw, expected_sha256)
+    except QualifiedAdapterLoadError as error:
+        raise Refused(f"remote qualified load result receipt validation failed: {error}") from error
 
 
 def _qualified_adapter_load_plan(config_dir: str, receipt_path: str, expected_sha256: str) -> tuple[dict[str, object], dict[str, object]]:
@@ -10971,7 +11004,7 @@ def _qualified_check_preserved_policy0(before: Mapping[str, object], after: Mapp
             raise Refused(f"existing policy receipt changed for slot {slot}")
 
 
-def _qualified_adapter_rollback(plan: Mapping[str, object], remove_published: bool) -> str:
+def _qualified_adapter_rollback(plan: Mapping[str, object], remove_published: bool, owner_token: str | None = None) -> str:
     errors = []
     code, output = _ssh(
         str(plan["inference_host"]),
@@ -10981,9 +11014,12 @@ def _qualified_adapter_rollback(plan: Mapping[str, object], remove_published: bo
     if code:
         errors.append(output.strip() or f"slot rollback exit {code}")
     if remove_published:
+        if not isinstance(owner_token, str) or not owner_token:
+            errors.append("publication owner proof is missing")
+            return "; ".join(errors)
         code, output = _ssh(
             str(plan["trainer_head"]),
-            build_publication_cleanup_script(plan),
+            build_publication_cleanup_script(plan, owner_token=owner_token),
             timeout=180,
         )
         if code:
@@ -10991,15 +11027,29 @@ def _qualified_adapter_rollback(plan: Mapping[str, object], remove_published: bo
     return "; ".join(errors) or "QUALIFIED_ROLLBACK slot=removed"
 
 
+def _qualified_check_engine(plan: Mapping[str, object], state: Mapping[str, object]) -> Mapping[str, object]:
+    """Require an idle engine; the neutral policy-0 guard permits ``ready``."""
+    raw_engine = state.get("engine")
+    if isinstance(raw_engine, Mapping) and raw_engine.get("stage_status") != "idle":
+        raise Refused("qualified adapter load requires an idle inference engine")
+    engine = _policy0_check_engine(plan, state)
+    if engine.get("stage_status") != "idle":
+        raise Refused("qualified adapter load requires an idle inference engine")
+    if engine.get("active_stage") is True or engine.get("stage_conflict") is True:
+        raise Refused("qualified adapter load requires no active adapter stage")
+    return engine
+
+
 def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
     phase_start = time.monotonic()
     phase: dict[str, float] = {}
     before = _policy0_load_live_state(plan)
     _policy0_check_services(plan, before)
-    before_engine = _policy0_check_engine(plan, before)
+    before_engine = _qualified_check_engine(plan, before)
     _policy0_check_target_slot_free(plan, before_engine)
     phase["preflight_seconds"] = time.monotonic() - phase_start
     published = False
+    publication_owner_token: str | None = None
     load_attempted = False
     try:
         publish_start = time.monotonic()
@@ -11018,6 +11068,7 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
         except QualifiedAdapterLoadError as error:
             raise Refused(str(error)) from error
         published = published_result.get("status") == "published"
+        publication_owner_token = published_result.get("owner_token") if published else None
         phase["publish_seconds"] = time.monotonic() - publish_start
         expected = _qualified_adapter_receipt_identity(plan)
         stage_start = time.monotonic()
@@ -11025,7 +11076,7 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
         if not isinstance(staged, Mapping) or staged.get("adapter_identity") != expected:
             raise Refused("qualified adapter stage identity differs from the delta receipt")
         middle = _policy0_load_live_state(plan)
-        middle_engine = _policy0_check_engine(plan, middle)
+        middle_engine = _qualified_check_engine(plan, middle)
         _policy0_check_services(plan, middle)
         _policy0_check_engine_identity(before_engine, middle_engine)
         _policy0_check_target_slot_free(plan, middle_engine)
@@ -11037,7 +11088,7 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
         if not isinstance(loaded, list):
             raise Refused("qualified adapter load returned no receipts")
         after = _policy0_load_live_state(plan)
-        after_engine = _policy0_check_engine(plan, after)
+        after_engine = _qualified_check_engine(plan, after)
         _policy0_check_services(plan, after)
         _policy0_check_engine_identity(before_engine, after_engine)
         _qualified_check_preserved_policy0(before, after)
@@ -11062,13 +11113,16 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
             "engine_identity_after": {key: after_engine[key] for key in ("container_id", "container_started_at", "api_pid", "api_start_time")},
             "phase_seconds": phase,
         }
-        payload = base64.b64encode(json.dumps(result, sort_keys=True, separators=(",", ":")).encode()).decode()
+        result_raw = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+        result_sha256 = hashlib.sha256(result_raw).hexdigest()
+        payload = base64.b64encode(result_raw).decode()
         code, output = _ssh(str(plan["trainer_head"]), build_result_receipt_script(plan, payload), timeout=180)
         if code:
             raise Refused(f"qualified adapter result receipt publication failed: {output.strip()}")
+        _qualified_result_receipt_from_output(output, result_sha256)
         return result
     except BaseException as error:
-        rollback = _qualified_adapter_rollback(plan, published) if (published or load_attempted) else "not-owned"
+        rollback = _qualified_adapter_rollback(plan, published, publication_owner_token) if (published or load_attempted) else "not-owned"
         if rollback and not rollback.startswith("QUALIFIED_ROLLBACK"):
             raise Refused(f"qualified adapter load failed: {error}; rollback failed: {rollback}") from error
         raise
