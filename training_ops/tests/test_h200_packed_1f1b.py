@@ -110,7 +110,8 @@ class Packed1f1bTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         old = tomllib.loads((root / "configs/trinity-h200-synthetic-packed-parity/trainer.toml").read_text())
         new = tomllib.loads((root / "configs/trinity-h200-synthetic-packed-1f1b-parity/trainer.toml").read_text())
-        self.assertEqual(new.pop("name"), Path(new["output_dir"]).name)
+        self.assertNotIn("name", new)
+        self.assertEqual(Path(new["output_dir"]).name, "packed-1f1b-run-v2")
         self.assertEqual(new.pop("file_monitor"), {"filename": "trainer-metrics.jsonl"})
         self.assertNotEqual(new["output_dir"], old["output_dir"])
         self.assertEqual(new["data"]["fake"]["batch_size"], 8)
@@ -119,6 +120,28 @@ class Packed1f1bTest(unittest.TestCase):
         new["data"]["fake"]["batch_size"] = 1
         new["model"]["pp_schedule"] = "gpipe"
         self.assertEqual(new, old)
+
+    def test_config_validates_with_trainer_schema_when_available(self):
+        try:
+            from prime_rl.configs.trainer import TrainerConfig
+        except ModuleNotFoundError as error:
+            if error.name not in {"prime_rl", "prime_rl.configs", "prime_rl.configs.trainer"}:
+                raise
+            self.skipTest("TrainerConfig schema is not installed in this local environment")
+        from pydantic import ValidationError
+
+        root = Path(__file__).resolve().parents[2]
+        config = tomllib.loads(
+            (root / "configs/trinity-h200-synthetic-packed-1f1b-parity/trainer.toml").read_text()
+        )
+        parsed = TrainerConfig.model_validate(config)
+        self.assertEqual(parsed.output_dir.name, "packed-1f1b-run-v2")
+        with self.assertRaises(ValidationError) as error:
+            TrainerConfig.model_validate(dict(config, name="packed-1f1b-run"))
+        self.assertTrue(any(
+            item["loc"] == ("name",) and item["type"] == "extra_forbidden"
+            for item in error.exception.errors()
+        ))
 
 
 if __name__ == "__main__":

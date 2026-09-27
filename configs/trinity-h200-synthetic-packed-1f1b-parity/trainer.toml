@@ -1,7 +1,6 @@
 # Repeat the existing packed H200 reference eight times for PP8 1f1b.
 
-name = "packed-1f1b-run"
-output_dir = "/data/glm52-rl/qualifications/trinity-h200-synthetic-packed-1f1b-parity/packed-1f1b-run"
+output_dir = "/data/glm52-rl/qualifications/trinity-h200-synthetic-packed-1f1b-parity/packed-1f1b-run-v2"
 max_steps = 1
 dist_timeout_seconds = 5400
 enable_router_replay = true
