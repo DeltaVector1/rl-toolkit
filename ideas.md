@@ -1153,6 +1153,40 @@ only after measured learning.
   different source identity. Keep existing publication and qualification
   gates unchanged.
 
+## Repeated packed 1f1b parity qualification
+
+- **Measured baseline.** Packed gpipe forward/backward took `103.600719s`
+  (PP `71.33s`). Against H200, `32763` selected positions had absolute
+  delta mean `0.06331701576755229`, p95 `0.22156524658203125`, maximum
+  `1.8082847595214844`, and mean mismatch KL `0.006326035675103694`.
+  The packed-run/direct-parity.json artifact under
+  `/data/glm52-rl/qualifications/trinity-h200-synthetic-packed-parity/`
+  is `2694767` bytes, SHA-256
+  `bcfc9d74347ef66974a16228a54400155d004ea9a18f5cc3f0703fa5fde21a09`.
+  Individual gpipe took `105.949494s`, with mean KL
+  `0.0065851526030371605`. The same directory's comparison-result.json
+  has SHA-256
+  `dd5a241d1a4309efcf18e316cb2d4f512641ac5ce2ca1dfc6b195fdde34d9abd`.
+  Production failed with unmasked KL `1.147836`, masked fraction
+  `0.213119`, and masked KL `2.193980`.
+- **Hypothesis and variables.** Packing alone did not reproduce production
+  error under gpipe. Repeat the same packed synthetic H200 reference eight
+  times with FakeDataLoader batch_size `8` and PP schedule `1f1b`. This
+  isolates the combined change in schedule and number of microbatches;
+  it does not separate those two variables. Each microbatch keeps five
+  sequences and `32768` positions. Keep native FP8, CP8/PP8/EP8, no LoRA,
+  lr `0`, router replay, and sparse-index transfer `false`. Use a new
+  trinity-h200-synthetic-packed-1f1b-parity output directory.
+- **Checks and decision.** Require schema-v2 output with exactly eight
+  ordered microbatches. Bind each record's tokens, positions, lengths,
+  masks, and reference logprobs to the same packed H200 reference. Compare
+  every record with H200 and optionally the preserved packed gpipe output;
+  do not use the five-individual-sequence comparator. Keep the forward/
+  backward limit at `600s` and parity gates at unmasked KL `0.1`, masked
+  KL `0.5`, and masked fraction `0.06`. A failure isolates schedule or
+  microbatch-count effects for further tests. A pass qualifies only this
+  synthetic case. It does not prove production capacity or an update.
+
 ## Fresh synthetic packed sparse-MLA parity
 
 - **Measured evidence.** Production packed parity reported unmasked KL
