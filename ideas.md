@@ -953,6 +953,29 @@ only after measured learning.
   when custom trainer nodes omit `trainer_head`; a test must prove this host is
   checked before deployment or launch mutation.
 
+## Rollout puller stop lock evidence
+
+- **Measured baseline.** At `404c75eab4a52623a4a973b21d89ab92f4fbb3d5`,
+  `pull_rollout_batches.sh stop` scans `/proc` for the exact source and
+  destination environment, stops only matching process groups, then runs
+  `flock -n .rollout-pull.lock -c true`. A plain stale lock file is harmless
+  and returned status 0 in a disposable run directory. If `flock` reports a
+  lock holder while no exact-run puller is discoverable, the command returns
+  status 1. This makes stop fail on stale or unresolvable lock evidence.
+- **Acceptance.** Stop is idempotent success when no exact-run puller is
+  live, including a stale `.rollout-pull.lock`, stale PID text, or an
+  unresolvable orphan lock record. A live puller for another run must not be
+  killed and its PID or lock evidence must not be removed; stop must fail
+  closed. A live exact-run puller must be stopped by its verified process
+  group, and its state must be cleaned only after the lock is safe. Path,
+  permission, process, and cleanup errors must still return failure.
+- **Test plan.** Add disposable local tests for stale lock/PID state,
+  unresolvable lock evidence, another-run lock ownership, exact-run process
+  shutdown, repeated stop, and injected cleanup errors. Run the focused
+  rollout-puller tests, the broader training-ops test set, `bash -n` on the
+  runtime script, Python compilation, and the repository diff check. No SSH,
+  deployment, or live training action is allowed for this repair.
+
 ## Watchdog process-side-effect race
 
 - **Measured race.** The watchdog checks the orchestrator identity, then kills
