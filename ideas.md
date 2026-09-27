@@ -1334,3 +1334,28 @@ only after measured learning.
   The exact production padding and route-mask contract must be supplied and
   loader support must be resolved before implementation. No trainer edits,
   config, generator, or live test were made for this blocked proposal.
+
+### Production-shape construction after loader review
+
+- **Measured code contract.** The PP trainer takes the maximum microbatch
+  length and calls `pad_micro_batch_to_length` before CP sharding. Seven
+  real `32702`-token records and one `32768`-token control therefore produce
+  exactly `66` tail padding positions on each of the seven short records.
+  The existing fake loader rejects mixed lengths before this call.
+- **Revised implementation.** Add a default-false `allow_variable_length`
+  fake-data option. Only schema-v2 references may use it. Require every
+  length to be positive and at most `seq_len`, and at least one record to
+  equal `seq_len`. Preserve the default exact-length requirement. Generate
+  five fresh production-length H200 requests and one fresh `32768`-token
+  control request with distinct cache salts. Pack the five real sequences
+  once and repeat them seven times; use the full control as record seven.
+  The trainer applies its own padding, so the reference has no zero padding
+  routes to decode. Test the actual loader and padding functions together.
+- **Checks.** Bind requests, responses, tokens, scores, and route bytes.
+  Require eight ordered direct records, exact padding token `1`, position
+  `0`, score `0`, loss mask `false`, and zero route rows on the seven short
+  records. Their final lengths become `[8187,7006,6543,6436,4596]`.
+  Each short record selects `32697` positions, for `228879` across seven;
+  the control selects `32767`. Report these groups separately. Direct dumps
+  do not expose routes; route padding is checked through loader/pad tests.
+  Keep prior gates, run name, and diagnostic-only qualification status.
