@@ -556,14 +556,53 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
             with self.subTest(field=field), self.assertRaisesRegex(Refused, "stage"):
                 training_ops_module._qualified_check_engine(plan, mutated, phase="preflight")
 
-    def test_rollback_404_requires_postcheck_proving_slot_absent(self):
+    def test_rollback_404_fails_and_uses_root_remove_endpoint(self):
         script = build_rollback_script(self.apply_plan(), remove_published=False)
-        self.assertIn("http_code", script)
-        self.assertIn("404", script)
-        self.assertIn("/staging_status", script)
-        self.assertIn("loaded_receipts", script)
-        self.assertIn("slot", script)
-        self.assertNotIn("curl -fsS -X POST", script)
+        self.assertIn("curl -fsS", script)
+        self.assertIn("/remove_lora_adapter", script)
+        self.assertNotIn("/v1/remove_lora_adapter", script)
+        self.assertNotIn("/staging_status", script)
+        self.assertNotIn("404)", script)
+
+    def test_rollback_skips_slot_removal_before_load_attempt(self):
+        plan = self.apply_plan()
+        calls = []
+
+        def ssh(host, script, timeout=120):
+            calls.append((host, script))
+            return 0, "QUALIFIED_PUBLICATION_ROLLBACK path=/data/glm52-rl/runs/qualified-adapters\n"
+
+        with patch.object(training_ops_module, "_ssh", side_effect=ssh):
+            result = training_ops_module._qualified_adapter_rollback(
+                plan,
+                remove_published=True,
+                owner_token="8:99:123:456",
+                load_attempted=False,
+            )
+        self.assertTrue(result.startswith("QUALIFIED_ROLLBACK"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], plan["trainer_head"])
+        self.assertNotIn("remove_lora_adapter", calls[0][1])
+
+    def test_rollback_removes_slot_only_after_load_attempt(self):
+        plan = self.apply_plan()
+        calls = []
+
+        def ssh(host, script, timeout=120):
+            calls.append((host, script))
+            return 0, "QUALIFIED_ROLLBACK slot=removed\n"
+
+        with patch.object(training_ops_module, "_ssh", side_effect=ssh):
+            result = training_ops_module._qualified_adapter_rollback(
+                plan,
+                remove_published=False,
+                load_attempted=True,
+            )
+        self.assertEqual(result, "QUALIFIED_ROLLBACK slot=removed")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], plan["inference_host"])
+        self.assertIn("http://127.0.0.1:8000/remove_lora_adapter", calls[0][1])
+        self.assertNotIn("/v1/remove_lora_adapter", calls[0][1])
 
     def test_slot_rollback_cannot_remove_publication_without_owner_proof(self):
         with self.assertRaisesRegex(QualifiedAdapterLoadError, "owner-token"):
@@ -632,9 +671,10 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
             if "QUALIFIED_PUBLICATION_BOUNDARY" in script:
                 return 0, "QUALIFIED_PUBLICATION_BOUNDARY parent_token=1:2 final_token=3:4\n"
             return 0, publish
-        with patch.object(training_ops_module, "_policy0_load_live_state", side_effect=states), patch.object(training_ops_module, "_policy0_remote_client_op", return_value={"status": "ok", "adapter_identity": {}}), patch.object(training_ops_module, "_ssh", side_effect=ssh), patch.object(training_ops_module, "_qualified_adapter_rollback", return_value="QUALIFIED_ROLLBACK slot=removed"):
+        with patch.object(training_ops_module, "_policy0_load_live_state", side_effect=states), patch.object(training_ops_module, "_policy0_remote_client_op", return_value={"status": "ok", "adapter_identity": {}}), patch.object(training_ops_module, "_ssh", side_effect=ssh), patch.object(training_ops_module, "_qualified_adapter_rollback", return_value="QUALIFIED_ROLLBACK slot=removed") as rollback:
             with self.assertRaisesRegex(Refused, "stage identity"):
                 training_ops_module._qualified_adapter_load_apply(plan)
+        rollback.assert_called_once_with(plan, True, "8:99:123:456", load_attempted=False)
 
     def test_boundary_swap_fails_closed_and_rolls_back_owned_publication(self):
         plan = self.apply_plan()

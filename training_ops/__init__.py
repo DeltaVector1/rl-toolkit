@@ -11349,27 +11349,41 @@ def _qualified_check_preserved_policy0(before: Mapping[str, object], after: Mapp
             raise Refused(f"existing policy receipt changed for slot {slot}")
 
 
-def _qualified_adapter_rollback(plan: Mapping[str, object], remove_published: bool, owner_token: str | None = None) -> str:
+def _qualified_adapter_rollback(
+    plan: Mapping[str, object],
+    remove_published: bool,
+    owner_token: str | None = None,
+    *,
+    load_attempted: bool,
+) -> str:
     errors = []
-    code, output = _ssh(
-        str(plan["inference_host"]),
-        build_rollback_script(plan, remove_published=False),
-        timeout=180,
-    )
-    if code:
-        errors.append(output.strip() or f"slot rollback exit {code}")
-    if remove_published:
-        if not isinstance(owner_token, str) or not owner_token:
-            errors.append("publication owner proof is missing")
-            return "; ".join(errors)
+    completed = []
+    if load_attempted:
         code, output = _ssh(
-            str(plan["trainer_head"]),
-            build_publication_cleanup_script(plan, owner_token=owner_token),
+            str(plan["inference_host"]),
+            build_rollback_script(plan, remove_published=False),
             timeout=180,
         )
         if code:
-            errors.append(output.strip() or f"publication rollback exit {code}")
-    return "; ".join(errors) or "QUALIFIED_ROLLBACK slot=removed"
+            errors.append(output.strip() or f"slot rollback exit {code}")
+        else:
+            completed.append("slot=removed")
+    else:
+        completed.append("slot=not-attempted")
+    if remove_published:
+        if not isinstance(owner_token, str) or not owner_token:
+            errors.append("publication owner proof is missing")
+        else:
+            code, output = _ssh(
+                str(plan["trainer_head"]),
+                build_publication_cleanup_script(plan, owner_token=owner_token),
+                timeout=180,
+            )
+            if code:
+                errors.append(output.strip() or f"publication rollback exit {code}")
+            else:
+                completed.append("publication=removed")
+    return "; ".join(errors) or "QUALIFIED_ROLLBACK " + " ".join(completed)
 
 
 def _qualified_verify_publication(plan: Mapping[str, object], published: Mapping[str, object], boundary: str) -> None:
@@ -11594,7 +11608,7 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
         _qualified_result_receipt_from_output(output, result_sha256, result)
         return result
     except BaseException as error:
-        rollback = _qualified_adapter_rollback(plan, published, publication_owner_token) if (published or load_attempted) else "not-owned"
+        rollback = _qualified_adapter_rollback(plan, published, publication_owner_token, load_attempted=load_attempted) if (published or load_attempted) else "not-owned"
         if rollback and not rollback.startswith("QUALIFIED_ROLLBACK"):
             raise Refused(f"qualified adapter load failed: {error}; rollback failed: {rollback}") from error
         raise

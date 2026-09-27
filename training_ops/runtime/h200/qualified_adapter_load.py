@@ -783,18 +783,12 @@ def build_rollback_script(plan: Mapping[str, Any], *, remove_published: bool) ->
 container={container}; slot={slot}
 name=$(sudo docker inspect --format '{{{{.Name}}}}' "$container" 2>/dev/null || true)
 [ "$name" = "/$container" ]
-tmp=$(mktemp -d /tmp/training-ops-qualified-rollback.XXXXXX)
-cleanup() {{ rm -rf -- "$tmp"; }}
-trap cleanup EXIT HUP INT TERM
 payload=$(printf '{{"lora_name":"%s"}}' "$slot")
-remove_response="$tmp/remove.json"
-if ! remove_code=$(curl -sS -o "$remove_response" -w '%{{http_code}}' -X POST -H 'content-type: application/json' -d "$payload" "http://127.0.0.1:{port}/v1/remove_lora_adapter"); then
-  echo 'qualified adapter rollback remove request failed' >&2
-  exit 93
-fi
-case "$remove_code" in
-200)
-  python3 - "$remove_response" "$slot" <<'PY'
+remove_response=$(mktemp /tmp/training-ops-qualified-rollback-response.XXXXXX)
+cleanup() {{ rm -f -- "$remove_response"; }}
+trap cleanup EXIT HUP INT TERM
+curl -fsS -o "$remove_response" -X POST -H 'content-type: application/json' -d "$payload" "http://127.0.0.1:{port}/remove_lora_adapter"
+python3 - "$remove_response" "$slot" <<'PY'
 import json, sys
 payload = json.load(open(sys.argv[1], encoding="utf-8"))
 slot = sys.argv[2]
@@ -803,28 +797,6 @@ if not isinstance(payload, dict) or payload.get("status") != "ok":
 if "lora_name" in payload and payload["lora_name"] != slot:
     raise SystemExit("qualified adapter rollback removed the wrong slot")
 PY
-  ;;
-404)
-  status_response="$tmp/status.json"
-  if ! status_code=$(curl -sS -o "$status_response" -w '%{{http_code}}' "http://127.0.0.1:{port}/staging_status"); then
-    echo 'qualified adapter rollback absence post-check failed' >&2
-    exit 94
-  fi
-  [ "$status_code" = 200 ] || {{ echo 'qualified adapter rollback absence post-check returned an invalid status' >&2; exit 94; }}
-  python3 - "$status_response" "$slot" <<'PY'
-import json, sys
-state = json.load(open(sys.argv[1], encoding="utf-8"))
-slot = sys.argv[2]
-receipts = state.get("loaded_receipts") if isinstance(state, dict) else None
-if not isinstance(receipts, dict) or slot in receipts:
-    raise SystemExit("qualified adapter rollback 404 was not proven absent")
-PY
-  ;;
-*)
-  echo "qualified adapter rollback remove returned HTTP $remove_code" >&2
-  exit 95
-  ;;
-esac
 printf 'QUALIFIED_ROLLBACK slot=%s\\n' "$slot"
 '''
 
