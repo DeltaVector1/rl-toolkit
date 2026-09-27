@@ -294,6 +294,7 @@ def derive_plan(
     inference_host: str,
     inference_port: int,
     direct_route_port: int,
+    publication_probe_port: int,
 ) -> dict[str, Any]:
     if config_dir != CANONICAL_CONFIG_DIR:
         _fail("qualified adapter load requires the canonical config directory")
@@ -304,7 +305,14 @@ def derive_plan(
     expected_receipt = _digest(expected_receipt_sha256, "expected receipt")
     if trainer_head != "n82" or not isinstance(inference_host, str) or not inference_host:
         _fail("qualified adapter load host identity is invalid")
-    if type(inference_port) is not int or not 1 <= inference_port <= 65535 or type(direct_route_port) is not int or direct_route_port != 18100:
+    if (
+        type(inference_port) is not int
+        or not 1 <= inference_port <= 65535
+        or type(direct_route_port) is not int
+        or direct_route_port != 18100
+        or type(publication_probe_port) is not int
+        or publication_probe_port != 8100
+    ):
         _fail("qualified adapter load route is invalid")
     manifest_sha = _digest(receipt.get("step1_manifest_sha256"), "step-1 manifest")
     policy_model = _identity(receipt.get("policy0_adapter"), "policy-0 adapter")
@@ -317,6 +325,7 @@ def derive_plan(
         _fail("step-1 manifest identity differs")
     source_dir = f"{runs}/qualified-adapters/{manifest_sha}/step_1"
     source_url = f"http://127.0.0.1:{direct_route_port}/qualified-adapters/{manifest_sha}/step_1"
+    publication_probe_url = f"http://127.0.0.1:{publication_probe_port}/qualified-adapters/{manifest_sha}/step_1"
     return {
         "config_dir": config_dir,
         "qualification_root": root,
@@ -326,6 +335,8 @@ def derive_plan(
         "runs_root": runs,
         "source_adapter_dir": source_dir,
         "source_url": source_url,
+        "publication_probe_port": publication_probe_port,
+        "publication_probe_url": publication_probe_url,
         "manifest_sha256": manifest_sha,
         "qualification_slot": QUALIFICATION_SLOT,
         "trainer_head": trainer_head,
@@ -355,7 +366,13 @@ def _validate_plan_paths(plan: Mapping[str, Any]) -> tuple[str, str, str]:
     manifest = _digest(plan.get("manifest_sha256"), "step-1 manifest")
     expected_dir = f"{runs}/qualified-adapters/{manifest}/step_1"
     expected_url = f"http://127.0.0.1:18100/qualified-adapters/{manifest}/step_1"
-    if plan.get("source_adapter_dir") != expected_dir or plan.get("source_url") != expected_url:
+    expected_probe_url = f"http://127.0.0.1:8100/qualified-adapters/{manifest}/step_1"
+    if (
+        plan.get("source_adapter_dir") != expected_dir
+        or plan.get("source_url") != expected_url
+        or plan.get("publication_probe_port") != 8100
+        or plan.get("publication_probe_url") != expected_probe_url
+    ):
         _fail("qualified adapter publication path is not canonical")
     if plan.get("qualification_slot") != QUALIFICATION_SLOT:
         _fail("qualified adapter slot is not canonical")
@@ -396,6 +413,7 @@ def build_publish_script(plan: Mapping[str, Any]) -> str:
     source = _q(plan["source_step1_dir"])
     runs = _q(plan["runs_root"])
     source_url = _q(plan["source_url"])
+    publication_probe_url = _q(plan["publication_probe_url"])
     manifest = _q(plan["manifest_sha256"])
     final_root = f'{runs}/qualified-adapters/{plan["manifest_sha256"]}'
     final = f'{final_root}/step_1'
@@ -403,7 +421,7 @@ def build_publish_script(plan: Mapping[str, Any]) -> str:
     tmp_checks = _artifact_checks("tmp", artifacts)
     expected_entries = ",\n".join(f"    ({name!r}, {artifacts[name]['sha256']!r}, {artifacts[name]['size']} )" for name in EXPECTED_FILES)
     return f'''set -euo pipefail
-root={root}; source={source}; runs={runs}; final={_q(final)}; final_root={_q(final_root)}; source_url={source_url}; manifest={manifest}
+root={root}; source={source}; runs={runs}; final={_q(final)}; final_root={_q(final_root)}; source_url={source_url}; publication_probe_url={publication_probe_url}; manifest={manifest}
 check_ancestors() {{ current=/; old_ifs="$IFS"; IFS=/; for component in ${{1#/}}; do [ -n "$component" ] || continue; current="$current$component"; test -d "$current" && test ! -L "$current"; current="$current/"; done; IFS="$old_ifs"; }}
 check_ancestors "$root"; check_ancestors "$source"; check_ancestors "$runs"
 test -d "$root" && test ! -L "$root"
@@ -557,8 +575,8 @@ owner_token=""
 if [ "$status" = published ]; then owner_token=$(stat -c '%d:%i:%s:%y:%z' -- "$final_root" | tr ' ' '_'); fi
 route_tmp=$(mktemp -d)
 route_manifest="$route_tmp/adapter_manifest.json"; route_config="$route_tmp/adapter_config.json"
-curl -fsS "$source_url/adapter_manifest.json" >"$route_manifest"
-curl -fsS "$source_url/adapter_config.json" >"$route_config"
+curl -fsS "$publication_probe_url/adapter_manifest.json" >"$route_manifest"
+curl -fsS "$publication_probe_url/adapter_config.json" >"$route_config"
 test "$(sha256sum -- "$route_manifest" | awk '{{print $1}}')" = {_q(artifacts['adapter_manifest.json']['sha256'])}
 test "$(stat -c %s -- "$route_manifest")" = {artifacts['adapter_manifest.json']['size']}
 test "$(sha256sum -- "$route_config" | awk '{{print $1}}')" = {_q(artifacts['adapter_config.json']['sha256'])}
@@ -627,6 +645,38 @@ printf 'QUALIFIED_PUBLISH status=%s source_url=%s source_adapter_dir=%s manifest
 trap - EXIT HUP INT TERM
 safe_remove_tmp 2>/dev/null || true
 rm -rf -- "$route_tmp" 2>/dev/null || true
+'''
+
+
+def build_route_probe_script(plan: Mapping[str, Any]) -> str:
+    """Build the H200-side read-only probe for the direct source route."""
+    _validate_plan_paths(plan)
+    artifacts = plan.get("artifacts")
+    if not isinstance(artifacts, Mapping) or set(artifacts) != set(EXPECTED_FILES):
+        _fail("route probe plan artifact identities are incomplete")
+    artifacts = _artifacts(artifacts)
+    source_url = _q(plan["source_url"])
+    manifest = _q(plan["manifest_sha256"])
+    return f'''set -euo pipefail
+source_url={source_url}; manifest={manifest}
+route_tmp=$(mktemp -d)
+cleanup() {{ rm -rf -- "$route_tmp"; }}
+trap cleanup EXIT HUP INT TERM
+route_manifest="$route_tmp/adapter_manifest.json"; route_config="$route_tmp/adapter_config.json"
+curl -fsS "$source_url/adapter_manifest.json" >"$route_manifest"
+curl -fsS "$source_url/adapter_config.json" >"$route_config"
+test "$(sha256sum -- "$route_manifest" | awk '{{print $1}}')" = {_q(artifacts['adapter_manifest.json']['sha256'])}
+test "$(stat -c %s -- "$route_manifest")" = {artifacts['adapter_manifest.json']['size']}
+test "$(sha256sum -- "$route_config" | awk '{{print $1}}')" = {_q(artifacts['adapter_config.json']['sha256'])}
+test "$(stat -c %s -- "$route_config")" = {artifacts['adapter_config.json']['size']}
+python3 - "$route_manifest" "$route_config" <<'PY'
+import json, sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+config = json.load(open(sys.argv[2], encoding="utf-8"))
+if manifest.get("target_step") != 1 or manifest.get("mode") != "full" or config.get("peft_type") != "LORA":
+    raise SystemExit("direct route content is not the exported step-1 adapter")
+PY
+printf 'QUALIFIED_ROUTE status=ready source_url=%s manifest_sha256=%s\\n' "$source_url" "$manifest"
 '''
 
 

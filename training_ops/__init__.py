@@ -57,6 +57,7 @@ from training_ops.runtime.h200.qualified_adapter_load import (
     QUALIFICATION_SLOT,
     QualifiedAdapterLoadError,
     build_publish_script,
+    build_route_probe_script,
     build_publication_boundary_script,
     build_publication_cleanup_script,
     build_result_receipt_script,
@@ -11301,6 +11302,7 @@ def _qualified_adapter_load_plan(config_dir: str, receipt_path: str, expected_sh
             inference_host=inference_host,
             inference_port=trinity_ports[0],
             direct_route_port=ports["lora_source_first"],
+            publication_probe_port=adapter_port,
         )
     except QualifiedAdapterLoadError as error:
         raise Refused(str(error)) from error
@@ -11527,6 +11529,13 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
         publication_owner_token = published_result.get("owner_token") if published else None
         phase["publish_seconds"] = time.monotonic() - publish_start
         _qualified_verify_publication(plan, published_result, "after-route")
+        code, output = _ssh(
+            str(plan["inference_host"]),
+            build_route_probe_script(plan),
+            timeout=180,
+        )
+        if code:
+            raise Refused(f"qualified H200 source route probe failed: {output.strip()}")
         expected = _qualified_adapter_receipt_identity(plan)
         stage_start = time.monotonic()
         staged = _policy0_remote_client_op(plan, "stage")

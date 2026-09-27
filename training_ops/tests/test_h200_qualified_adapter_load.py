@@ -11,6 +11,7 @@ from training_ops import Refused, _qualified_adapter_load_action, actions
 from training_ops.runtime.h200.qualified_adapter_load import (
     QualifiedAdapterLoadError,
     build_publish_script,
+    build_route_probe_script,
     build_publication_boundary_script,
     build_publication_cleanup_script,
     build_result_receipt_script,
@@ -99,7 +100,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         plan = derive_plan(
             "configs/trinity-h200-post-update-qualification", receipt(), "f" * 64,
             qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", runs_root="/data/glm52-rl/runs", trainer_head="n82",
-            inference_host="h200b", inference_port=8000, direct_route_port=18100,
+            inference_host="h200b", inference_port=8000, direct_route_port=18100, publication_probe_port=8100,
         )
         plan.update(
             trainer_hosts=["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"],
@@ -290,9 +291,9 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         )
         for qualification_root, runs_root in cases:
             with self.subTest(qualification_root=qualification_root, runs_root=runs_root), self.assertRaisesRegex(QualifiedAdapterLoadError, "root"):
-                derive_plan("configs/trinity-h200-post-update-qualification", receipt(), "f" * 64, qualification_root=qualification_root, runs_root=runs_root, trainer_head="n82", inference_host="h200b", inference_port=8000, direct_route_port=18100)
+                derive_plan("configs/trinity-h200-post-update-qualification", receipt(), "f" * 64, qualification_root=qualification_root, runs_root=runs_root, trainer_head="n82", inference_host="h200b", inference_port=8000, direct_route_port=18100, publication_probe_port=8100)
         with self.assertRaisesRegex(QualifiedAdapterLoadError, "receipt"):
-            derive_plan("configs/trinity-h200-post-update-qualification", receipt(), "$(touch /tmp/owned)", qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", runs_root="/data/glm52-rl/runs", trainer_head="n82", inference_host="h200b", inference_port=8000, direct_route_port=18100)
+            derive_plan("configs/trinity-h200-post-update-qualification", receipt(), "$(touch /tmp/owned)", qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", runs_root="/data/glm52-rl/runs", trainer_head="n82", inference_host="h200b", inference_port=8000, direct_route_port=18100, publication_probe_port=8100)
 
     def test_result_receipt_rejects_forged_arbitrary_source_path(self):
         mutated = result_receipt()
@@ -363,13 +364,69 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
             inference_host="h200b",
             inference_port=8000,
             direct_route_port=18100,
+            publication_probe_port=8100,
         )
         self.assertEqual(plan["qualification_slot"], "trinity-h200-post-update-qualification-slot1")
         self.assertTrue(plan["source_adapter_dir"].endswith("/step_1"))
         self.assertEqual(plan["source_url"], "http://127.0.0.1:18100/qualified-adapters/" + "c" * 64 + "/step_1")
         self.assertEqual(plan["source_adapter_dir"], "/data/glm52-rl/runs/qualified-adapters/" + "c" * 64 + "/step_1")
         with self.assertRaisesRegex(QualifiedAdapterLoadError, "canonical"):
-            derive_plan("configs/alias", receipt(), "f" * 64, qualification_root="/data/x", runs_root="/data/y", trainer_head="n82", inference_host="h200b", inference_port=8000, direct_route_port=18100)
+            derive_plan("configs/alias", receipt(), "f" * 64, qualification_root="/data/x", runs_root="/data/y", trainer_head="n82", inference_host="h200b", inference_port=8000, direct_route_port=18100, publication_probe_port=8100)
+
+    def test_plan_pins_local_publication_probe_and_rejects_invalid_route(self):
+        plan = derive_plan(
+            "configs/trinity-h200-post-update-qualification",
+            receipt(),
+            "f" * 64,
+            qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification",
+            runs_root="/data/glm52-rl/runs",
+            trainer_head="n82",
+            inference_host="h200b",
+            inference_port=8000,
+            direct_route_port=18100,
+            publication_probe_port=8100,
+        )
+        expected_path = "/qualified-adapters/" + "c" * 64 + "/step_1"
+        self.assertEqual(plan["publication_probe_port"], 8100)
+        self.assertEqual(plan["publication_probe_url"], "http://127.0.0.1:8100" + expected_path)
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "route"):
+            derive_plan(
+                "configs/trinity-h200-post-update-qualification",
+                receipt(),
+                "f" * 64,
+                qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification",
+                runs_root="/data/glm52-rl/runs",
+                trainer_head="n82",
+                inference_host="h200b",
+                inference_port=8000,
+                direct_route_port=18100,
+                publication_probe_port=8101,
+            )
+        invalid = dict(plan, publication_probe_url="http://127.0.0.1:18100" + expected_path)
+        with self.assertRaisesRegex(QualifiedAdapterLoadError, "publication"):
+            build_publish_script(invalid)
+
+    def test_publish_script_probes_n82_adapter_service_but_keeps_h200_load_route(self):
+        plan = self.apply_plan()
+        script = build_publish_script(plan)
+        self.assertIn("publication_probe_url=http://127.0.0.1:8100/qualified-adapters/" + "c" * 64 + "/step_1", script)
+        self.assertIn('curl -fsS "$publication_probe_url/adapter_manifest.json"', script)
+        self.assertIn('curl -fsS "$publication_probe_url/adapter_config.json"', script)
+        self.assertNotIn('curl -fsS "$source_url/adapter_manifest.json"', script)
+        self.assertNotIn('curl -fsS "$source_url/adapter_config.json"', script)
+        self.assertIn("source_url=http://127.0.0.1:18100/qualified-adapters/" + "c" * 64 + "/step_1", script)
+
+    def test_h200_route_probe_uses_load_route_and_exact_manifest_config_identity(self):
+        plan = self.apply_plan()
+        script = build_route_probe_script(plan)
+        self.assertIn("source_url=http://127.0.0.1:18100/qualified-adapters/" + "c" * 64 + "/step_1", script)
+        self.assertIn('curl -fsS "$source_url/adapter_manifest.json"', script)
+        self.assertIn('curl -fsS "$source_url/adapter_config.json"', script)
+        self.assertIn("adapter_manifest.json", script)
+        self.assertIn("adapter_config.json", script)
+        self.assertIn("QUALIFIED_ROUTE status=ready", script)
+        self.assertNotIn("publication_probe_url", script)
+        self.assertNotIn(":8100/", script)
 
     def test_publish_script_is_independent_atomic_and_fail_closed(self):
         plan = derive_plan(
@@ -382,6 +439,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
             inference_host="h200b",
             inference_port=8000,
             direct_route_port=18100,
+            publication_probe_port=8100,
         )
         script = build_publish_script(plan)
         for text in ("cp --reflink=auto", "renameat2", "RENAME_NOREPLACE", "source_before", "source_after", "adapter_model.safetensors", "adapter_config.json", "STABLE", "18100"):
@@ -400,7 +458,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         plan = derive_plan(
             "configs/trinity-h200-post-update-qualification", receipt(), "f" * 64,
             qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", runs_root="/data/glm52-rl/runs", trainer_head="n82",
-            inference_host="h200b", inference_port=8000, direct_route_port=18100,
+            inference_host="h200b", inference_port=8000, direct_route_port=18100, publication_probe_port=8100,
         )
         script = build_result_receipt_script(plan, "e30=")
         self.assertIn("renameat2", script)
@@ -488,7 +546,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         plan = derive_plan(
             "configs/trinity-h200-post-update-qualification", receipt(), "f" * 64,
             qualification_root="/data/glm52-rl/qualifications/trinity-h200-post-update-qualification", runs_root="/data/glm52-rl/runs", trainer_head="n82",
-            inference_host="h200b", inference_port=8000, direct_route_port=18100,
+            inference_host="h200b", inference_port=8000, direct_route_port=18100, publication_probe_port=8100,
         )
         result = {"status": "published", "source_url": plan["source_url"], "source_adapter_dir": plan["source_adapter_dir"], "manifest_sha256": "c" * 64, "owner_token": "8:99:123:456", "parent_token": "1:2", "final_token": "3:4", "files": receipt()["identities_after"]["artifacts"]}
         parsed = parse_publish_result(json.dumps(result), plan)
@@ -536,7 +594,8 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         self.assertEqual(result["status"], "loaded")
         self.assertEqual(result["qualification_slot"], plan["qualification_slot"])
         self.assertIn("QUALIFIED_PUBLISH", calls[0][1])
-        self.assertEqual(len(calls), 7)
+        self.assertIn("QUALIFIED_ROUTE", calls[2][1])
+        self.assertEqual(len(calls), 8)
 
     def test_apply_rolls_back_session_owned_slot_when_stage_identity_differs(self):
         plan = self.apply_plan()
