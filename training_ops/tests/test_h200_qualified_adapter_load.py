@@ -20,7 +20,7 @@ from training_ops.runtime.h200.qualified_adapter_load import (
     parse_result_receipt,
     parse_publish_result,
 )
-from training_ops import _qualified_receipt_from_output, _qualified_result_receipt_from_output, _qualified_adapter_receipt_script
+from training_ops import _qualified_receipt_from_output, _qualified_result_receipt_from_output, _qualified_publish_from_output, _qualified_adapter_receipt_script
 
 
 def receipt():
@@ -257,6 +257,17 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         for text in ("O_DIRECTORY", "O_NOFOLLOW", "dir_fd", "fstat", "parent_token", "final_token"):
             self.assertIn(text, boundary)
 
+    def test_publish_header_is_exact_and_rejects_duplicate_status(self):
+        plan = self.apply_plan()
+        valid = f"QUALIFIED_PUBLISH status=published source_url={plan['source_url']} source_adapter_dir={plan['source_adapter_dir']} manifest_sha256={plan['manifest_sha256']} owner_token=8:99:123:456 parent_token=1:2 final_token=3:4\n"
+        self.assertEqual(_qualified_publish_from_output(valid, plan)["status"], "published")
+        duplicate = valid.replace("status=published", "status=published status=published")
+        with self.assertRaisesRegex(Refused, "header"):
+            _qualified_publish_from_output(duplicate, plan)
+        missing = valid.replace(" parent_token=1:2", "")
+        with self.assertRaisesRegex(Refused, "header"):
+            _qualified_publish_from_output(missing, plan)
+
     def test_plan_binds_canonical_output_step1_route_and_fixed_slot(self):
         plan = derive_plan(
             "configs/trinity-h200-post-update-qualification",
@@ -297,6 +308,7 @@ class QualifiedAdapterLoadTest(unittest.TestCase):
         for text in ("%y", "%z", "directory entry", "route_manifest", "route_config", "target_step", "mode", "parent_token", "final_token"):
             self.assertIn(text, script)
         self.assertIn('test ! -L "$runs"', script)
+        self.assertIn("fresh_parent_identity", script)
         for text in ("O_DIRECTORY", "O_NOFOLLOW", "dir_fd", "fstat", "renameat2"):
             self.assertIn(text, script)
 

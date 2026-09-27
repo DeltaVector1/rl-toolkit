@@ -505,9 +505,12 @@ try:
             final_stat = os.stat(final, dir_fd=parent_fd, follow_symlinks=False)
             final_token = f"{{final_stat.st_dev}}:{{final_stat.st_ino}}"
             print(f"PUBLISHED parent_token={{parent_token}} final_token={{final_token}}")
-    after = os.fstat(parent_fd)
-    if (before.st_dev, before.st_ino, before.st_mode) != (after.st_dev, after.st_ino, after.st_mode):
-        raise SystemExit(97)
+    fresh_parent_fd, fresh_parent_identity = open_directory_chain(parent)
+    try:
+        if fresh_parent_identity != parent_token:
+            raise SystemExit(97)
+    finally:
+        os.close(fresh_parent_fd)
 finally:
     os.close(parent_fd)
 PY
@@ -592,9 +595,15 @@ for name, digest, size in expected:
         if hasher.hexdigest() != digest: raise SystemExit("publication artifact digest changed")
     finally:
         os.close(fd)
-after_parent = os.fstat(parent_fd)
-after_final = os.fstat(final_fd)
-if f"{{after_parent.st_dev}}:{{after_parent.st_ino}}" != parent_identity or f"{{after_final.st_dev}}:{{after_final.st_ino}}" != expected_final: raise SystemExit("publication identity changed")
+fresh_parent_fd, fresh_parent_identity = open_chain(os.path.join(runs, "qualified-adapters"))
+try:
+    if fresh_parent_identity != parent_identity: raise SystemExit("publication ancestor identity changed")
+    fresh_final_fd = os.open(manifest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fresh_parent_fd)
+    fresh_final = os.fstat(fresh_final_fd)
+    if f"{{fresh_final.st_dev}}:{{fresh_final.st_ino}}" != expected_final: raise SystemExit("publication final identity changed")
+    os.close(fresh_final_fd)
+finally:
+    os.close(fresh_parent_fd)
 os.close(step_fd); os.close(final_fd); os.close(parent_fd)
 PY
 }}
@@ -680,7 +689,15 @@ for name, digest, size in [
         if hasher.hexdigest() != digest: raise SystemExit("publication artifact digest changed")
     finally:
         os.close(fd)
-if f"{{os.fstat(parent_fd).st_dev}}:{{os.fstat(parent_fd).st_ino}}" != parent_identity or f"{{os.fstat(final_fd).st_dev}}:{{os.fstat(final_fd).st_ino}}" != expected_final: raise SystemExit("publication identity changed")
+fresh_parent_fd, fresh_parent_identity = open_chain(os.path.join(runs, "qualified-adapters"))
+try:
+    if fresh_parent_identity != parent_identity: raise SystemExit("publication ancestor identity changed")
+    fresh_final_fd = os.open(manifest, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fresh_parent_fd)
+    fresh_final = os.fstat(fresh_final_fd)
+    if f"{{fresh_final.st_dev}}:{{fresh_final.st_ino}}" != expected_final: raise SystemExit("publication final identity changed")
+    os.close(fresh_final_fd)
+finally:
+    os.close(fresh_parent_fd)
 os.close(step_fd); os.close(final_fd); os.close(parent_fd)
 PY
 printf 'QUALIFIED_PUBLICATION_BOUNDARY parent_token=%s final_token=%s\\n' {_q(parent_token)} {_q(final_token)}

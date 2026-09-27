@@ -10936,6 +10936,23 @@ def _qualified_result_receipt_from_output(output: str, expected_sha256: str, exp
     return result
 
 
+def _qualified_publish_from_output(output: str, plan: Mapping[str, object]) -> dict[str, object]:
+    lines = [line for line in output.splitlines() if line.startswith("QUALIFIED_PUBLISH ")]
+    if len(lines) != 1:
+        raise Refused("qualified publication header is missing or duplicated")
+    fields = lines[0].split()[1:]
+    expected = {"status", "source_url", "source_adapter_dir", "manifest_sha256", "owner_token", "parent_token", "final_token"}
+    if len(fields) != len(expected) or any(item.count("=") != 1 for item in fields):
+        raise Refused("qualified publication header is invalid")
+    values = dict(item.split("=", 1) for item in fields)
+    if set(values) != expected:
+        raise Refused("qualified publication header is invalid")
+    try:
+        return parse_publish_result({**values, "files": plan.get("artifacts")}, plan)
+    except QualifiedAdapterLoadError as error:
+        raise Refused(f"qualified publication header is invalid: {error}") from error
+
+
 def _qualified_adapter_load_plan(config_dir: str, receipt_path: str, expected_sha256: str) -> tuple[dict[str, object], dict[str, object]]:
     _guard_post_update_config_dir(config_dir)
     if config_dir != QUALIFIED_ADAPTER_CONFIG_DIR:
@@ -11097,17 +11114,7 @@ def _qualified_adapter_load_apply(plan: dict[str, object]) -> dict[str, object]:
         code, output = _ssh(str(plan["trainer_head"]), build_publish_script(plan), timeout=900)
         if code:
             raise Refused(f"qualified adapter publication failed: {output.strip()}")
-        record = None
-        for line in output.splitlines():
-            if line.startswith("QUALIFIED_PUBLISH "):
-                fields = dict(item.split("=", 1) for item in line.split()[1:] if "=" in item)
-                record = {**fields, "files": plan["artifacts"]}
-        if record is None:
-            raise Refused("qualified adapter publication receipt is missing")
-        try:
-            published_result = parse_publish_result(record, plan)
-        except QualifiedAdapterLoadError as error:
-            raise Refused(str(error)) from error
+        published_result = _qualified_publish_from_output(output, plan)
         published = published_result.get("status") == "published"
         publication_owner_token = published_result.get("owner_token") if published else None
         phase["publish_seconds"] = time.monotonic() - publish_start
