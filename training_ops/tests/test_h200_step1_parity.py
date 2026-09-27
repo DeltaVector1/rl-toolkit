@@ -249,6 +249,7 @@ class H200Step1ParityTest(unittest.TestCase):
             "adapter_size": 456,
             "config_sha256": "c" * 64,
             "config_size": 789,
+            "source_url": "http://h200b:18100/qualified-adapters/step1",
         }
         with mock.patch.dict(
             os.environ,
@@ -269,6 +270,36 @@ class H200Step1ParityTest(unittest.TestCase):
         self.assertEqual(plan["post_update_reference_identity"], identity)
         self.assertIn("QUAL_FILE reference.json", plan["source_reference_script"])
         self.assertNotIn("reference is not a policy-0 reference", plan["source_reference_script"])
+
+    def test_step1_staging_rejects_identity_without_pinned_source_url(self):
+        identity = {
+            "final_reference_sha256": "a" * 64,
+            "final_reference_size": 123,
+            "server_instance": "h200-step1",
+            "adapter_sha256": "b" * 64,
+            "adapter_size": 456,
+            "config_sha256": "c" * 64,
+            "config_size": 789,
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"PRIME_RL_POST_UPDATE_REFERENCE_IDENTITY": json.dumps(identity)},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                training_ops.Refused, "must pin source_url"
+            ):
+                training_ops.prepare_policy0_qualification(
+                    CONFIG_NAME,
+                    source_adapter_dir=(
+                        "/data/glm52-rl/qualifications/"
+                        "trinity-h200-post-update-qualification/"
+                        "run_trainer_only/broadcasts/step_1"
+                    ),
+                    source_reference_path="/data/glm52-rl/h200-step1/reference.json",
+                    expected_old_reference_sha256="d" * 64,
+                    expected_old_reference_size=321,
+                )
 
 
 if __name__ == "__main__":

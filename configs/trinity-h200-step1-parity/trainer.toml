@@ -16,6 +16,9 @@ max_unmasked_mismatch_kl = 0.1
 max_masked_mismatch_kl = 0.5
 max_masked_fraction = 0.06
 
+[file_monitor]
+filename = "trainer-metrics.jsonl"
+
 [log]
 level = "info"
 ranks_filter = [0]

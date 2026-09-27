@@ -2544,6 +2544,109 @@ PY
 """
 
 
+def _parity_aggregate_guard_reader_script(
+    path: str,
+    *,
+    batch_size: int,
+    max_unmasked_mismatch_kl: float,
+    max_masked_mismatch_kl: float,
+    max_masked_fraction: float,
+) -> str:
+    """Read full-step parity guard metrics separately from direct parity data."""
+    script = "python3 - " + shlex.quote(path) + """ <<'PY'
+import json,math,sys
+
+path=sys.argv[1]
+try:
+    stream=open(path,encoding='utf-8')
+except OSError as error:
+    print(json.dumps({'available':False,'reason':f'cannot read metrics: {error}'}))
+    raise SystemExit(0)
+
+rows=[]
+invalid=0
+with stream:
+    for line in stream:
+        try:
+            row=json.loads(line)
+        except (TypeError,ValueError):
+            invalid+=1
+            continue
+        if not isinstance(row,dict):
+            invalid+=1
+            continue
+        step=row.get('step')
+        if isinstance(step,bool) or not isinstance(step,(int,float)):
+            continue
+        required=(
+            'unmasked_mismatch_kl/mean',
+            'is_masked/mean',
+        )
+        if not all(key in row for key in required):
+            continue
+        values=[row[key] for key in required]
+        if any(
+            isinstance(value,bool) or not isinstance(value,(int,float)) or
+            not math.isfinite(float(value)) for value in values
+        ):
+            continue
+        masked=row.get('masked_mismatch_kl/mean')
+        masked_fraction=float(row['is_masked/mean'])
+        if masked_fraction > 0 and (
+            isinstance(masked,bool) or not isinstance(masked,(int,float)) or
+            not math.isfinite(float(masked))
+        ):
+            continue
+        rows.append(row)
+
+if not rows:
+    print(json.dumps({
+        'available':False,
+        'reason':'no complete full-step parity guard metrics found',
+        'invalid_lines':invalid,
+    }))
+    raise SystemExit(0)
+
+row=max(rows,key=lambda item:float(item['step']))
+unmasked=float(row['unmasked_mismatch_kl/mean'])
+masked=row.get('masked_mismatch_kl/mean')
+masked=(float(masked) if isinstance(masked,(int,float)) and math.isfinite(float(masked)) else None)
+masked_fraction=float(row['is_masked/mean'])
+violations=[]
+if unmasked > __MAX_UNMASKED__:
+    violations.append('unmasked mismatch KL exceeds configured limit')
+if masked_fraction > __MAX_MASKED_FRACTION__:
+    violations.append('masked token fraction exceeds configured limit')
+if masked_fraction > 0:
+    if masked is None:
+        violations.append('masked mismatch KL is missing or nonfinite')
+    elif masked > __MAX_MASKED__:
+        violations.append('masked mismatch KL exceeds configured limit')
+if row.get('diagnostic/parity_guard_rejected'):
+    violations.append('trainer recorded parity guard rejection')
+print(json.dumps({
+    'available':True,
+    'scope':'full_training_step',
+    'batch_size':__BATCH_SIZE__,
+    'step':int(row['step']),
+    'status':'rejected' if violations else 'passed',
+    'guard_rejected':bool(violations),
+    'unmasked_mismatch_kl':unmasked,
+    'masked_mismatch_kl':masked,
+    'masked_fraction':masked_fraction,
+    'violations':violations,
+    'invalid_lines':invalid,
+}))
+PY
+"""
+    return (
+        script.replace("__MAX_UNMASKED__", repr(float(max_unmasked_mismatch_kl)))
+        .replace("__MAX_MASKED__", repr(float(max_masked_mismatch_kl)))
+        .replace("__MAX_MASKED_FRACTION__", repr(float(max_masked_fraction)))
+        .replace("__BATCH_SIZE__", str(int(batch_size)))
+    )
+
+
 def parity(run: str = "") -> dict:
     """Summarize the newest token parity record on configured trainer hosts."""
     explicit_run = bool(run)
@@ -2551,6 +2654,8 @@ def parity(run: str = "") -> dict:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", run):
         raise Refused("run name contains invalid characters")
     profile = _config_for_run(run, required=not explicit_run)
+    trainer_only = False
+    aggregate_guard_config = None
     if profile is None:
         source = "archive"
         find_path = f"{run_root}/{run}"
@@ -2573,6 +2678,43 @@ def parity(run: str = "") -> dict:
             and isinstance(fake_config, dict)
             and isinstance(fake_config.get("reference_path"), str)
         )
+        guard_config = trainer_config.get("parity_guard")
+        file_monitor = trainer_config.get("file_monitor")
+        filename = (
+            file_monitor.get("filename")
+            if isinstance(file_monitor, dict)
+            else None
+        )
+        limits = (
+            guard_config.get("max_unmasked_mismatch_kl")
+            if isinstance(guard_config, dict)
+            else None,
+            guard_config.get("max_masked_mismatch_kl")
+            if isinstance(guard_config, dict)
+            else None,
+            guard_config.get("max_masked_fraction")
+            if isinstance(guard_config, dict)
+            else None,
+        )
+        batch_size = fake_config.get("batch_size") if isinstance(fake_config, dict) else None
+        if (
+            trainer_only
+            and isinstance(filename, str)
+            and filename
+            and type(batch_size) is int
+            and batch_size > 0
+            and all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in limits
+            )
+        ):
+            aggregate_guard_config = {
+                "path": str(Path(output_dir) / filename),
+                "batch_size": batch_size,
+                "max_unmasked_mismatch_kl": float(limits[0]),
+                "max_masked_mismatch_kl": float(limits[1]),
+                "max_masked_fraction": float(limits[2]),
+            }
         if trainer_only:
             find_path = output_dir.rstrip("/") + "/direct-parity.json"
             find_options = "-maxdepth 0 -type f"
@@ -2623,6 +2765,64 @@ fi
     summary["path"] = path
     summary["host"] = parity_host
     summary["unavailable_hosts"] = unavailable
+    if trainer_only:
+        direct_scope = "first_microbatch_only"
+        summary["direct_scope"] = direct_scope
+        aggregate_guard = {
+            "available": False,
+            "scope": "full_training_step",
+            "batch_size": None,
+        }
+        if aggregate_guard_config is not None:
+            aggregate_guard["batch_size"] = aggregate_guard_config["batch_size"]
+            aggregate_script = _parity_aggregate_guard_reader_script(
+                aggregate_guard_config["path"],
+                batch_size=aggregate_guard_config["batch_size"],
+                max_unmasked_mismatch_kl=aggregate_guard_config[
+                    "max_unmasked_mismatch_kl"
+                ],
+                max_masked_mismatch_kl=aggregate_guard_config[
+                    "max_masked_mismatch_kl"
+                ],
+                max_masked_fraction=aggregate_guard_config["max_masked_fraction"],
+            )
+            aggregate_code, aggregate_output = _ssh(
+                parity_host, aggregate_script, timeout=180
+            )
+            if aggregate_code:
+                aggregate_guard["reason"] = "full-step metrics reader failed"
+            else:
+                try:
+                    aggregate_result = json.loads(
+                        aggregate_output.strip().splitlines()[-1]
+                    )
+                except (ValueError, IndexError):
+                    aggregate_result = {
+                        "available": False,
+                        "reason": "full-step metrics output is invalid",
+                    }
+                if isinstance(aggregate_result, dict):
+                    aggregate_guard.update(aggregate_result)
+                    aggregate_guard["scope"] = "full_training_step"
+                    aggregate_guard["batch_size"] = aggregate_guard_config["batch_size"]
+                    if aggregate_guard.get("available") is True:
+                        aggregate_guard.pop("reason", None)
+                else:
+                    aggregate_guard["reason"] = (
+                        "full-step metrics output is not an object"
+                    )
+        else:
+            aggregate_guard["reason"] = "full-step metrics are not configured"
+        summary["aggregate_guard"] = aggregate_guard
+        summary["aggregate_vs_direct"] = {
+            "direct": {
+                "scope": direct_scope,
+                "record_tokens": summary.get("record_tokens"),
+                "selected_tokens": summary.get("selected_tokens"),
+                "mean_abs_delta": summary.get("mean_abs_delta"),
+            },
+            "aggregate": aggregate_guard,
+        }
     print(json.dumps(summary, indent=2, sort_keys=True))
     return summary
 
@@ -6161,7 +6361,8 @@ def _validate_post_update_reference_identity(value: object) -> dict[str, str | i
         "config_sha256",
         "config_size",
     )
-    if set(value) != set(fields):
+    allowed = set(fields) | {"source_url"}
+    if not set(value).issubset(allowed) or not set(fields).issubset(value):
         raise Refused("post-update reference identity fields are incomplete")
     for field in ("final_reference_sha256", "adapter_sha256", "config_sha256"):
         if not isinstance(value[field], str) or re.fullmatch(r"[0-9a-f]{64}", value[field]) is None:
@@ -6171,6 +6372,17 @@ def _validate_post_update_reference_identity(value: object) -> dict[str, str | i
             raise Refused(f"post-update reference identity {field} is invalid")
     if not isinstance(value["server_instance"], str) or not value["server_instance"]:
         raise Refused("post-update reference identity server_instance is invalid")
+    if "source_url" in value:
+        source_url = value["source_url"]
+        parsed = urlsplit(source_url.rstrip("/")) if isinstance(source_url, str) else None
+        if (
+            parsed is None
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise Refused("post-update reference identity source_url is invalid")
     return value
 
 
@@ -6223,6 +6435,14 @@ def _validate_post_update_qualification_reference(
                 or binding.get("adapter_size") != expected_identity["adapter_size"]
                 or binding.get("config_sha256") != expected_identity["config_sha256"]
                 or binding.get("config_size") != expected_identity["config_size"]
+                or (
+                    "source_url" in expected_identity
+                    and (
+                        not isinstance(binding.get("policy_receipt"), dict)
+                        or binding["policy_receipt"].get("source_url")
+                        != expected_identity["source_url"]
+                    )
+                )
             ):
                 raise PostUpdateQualificationError("post-update reference receipt identity differs")
     except (
@@ -9300,6 +9520,10 @@ def prepare_policy0_qualification(
     if strict_reference is not None:
         post_update_identity = _post_update_reference_identity()
     expected_policy, expected_policy_model = strict_reference or ("policy-0", None)
+    if expected_policy == "policy-1" and "source_url" not in post_update_identity:
+        raise Refused(
+            "policy-1 post-update reference identity must pin source_url"
+        )
     data = config.get("data", {}).get("fake", {})
     reference_path = data.get("reference_path")
     lora = config.get("model", {}).get("lora", {})

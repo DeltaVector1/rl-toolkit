@@ -599,6 +599,133 @@ class ParityReaderTest(unittest.TestCase):
         self.assertIn("/data/glm52-rl/runs/glm-perf-1/direct-parity.json", calls[0])
         self.assertNotIn("parity-step", calls[0])
 
+    def test_parity_reports_direct_scope_and_full_step_guard_separately(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            trainer_path = Path(directory) / "trainer.toml"
+            trainer_path.write_text(
+                'output_dir = "/data/glm52-rl/qualifications/trinity-h200-step1-parity"\n'
+                '[data.fake]\n'
+                'batch_size = 8\n'
+                'reference_path = "/tmp/reference"\n'
+                '[parity_guard]\n'
+                'max_unmasked_mismatch_kl = 0.1\n'
+                'max_masked_mismatch_kl = 0.5\n'
+                'max_masked_fraction = 0.06\n'
+                '[file_monitor]\n'
+                'filename = "trainer-metrics.jsonl"\n',
+                encoding="utf-8",
+            )
+
+            def fake_ssh(host, script, timeout=180):
+                calls.append(script)
+                if "trainer-metrics.jsonl" in script and script.startswith("python3 - "):
+                    return 0, json.dumps(
+                        {
+                            "step": 1,
+                            "status": "passed",
+                            "unmasked_mismatch_kl": 0.02,
+                            "masked_mismatch_kl": 0.03,
+                            "masked_fraction": 0.01,
+                        }
+                    )
+                if script.startswith("python3 - "):
+                    return 0, json.dumps(
+                        {
+                            "record_tokens": 3,
+                            "selected_tokens": 2,
+                            "mean_abs_delta": 0.4,
+                        }
+                    )
+                if "direct-parity.json" in script:
+                    return 0, (
+                        "PARITY 100.0 "
+                        "/data/glm52-rl/qualifications/trinity-h200-step1-parity/"
+                        "direct-parity.json\n"
+                    )
+                raise AssertionError("unexpected parity probe")
+
+            def fake_fan(hosts, function, workers=None):
+                host = hosts[0]
+                return {host: function(host)}
+
+            with (
+                mock.patch.object(
+                    training_ops,
+                    "_config_for_run",
+                    return_value={"trainer": str(trainer_path)},
+                ),
+                mock.patch.object(training_ops, "_fan", side_effect=fake_fan),
+                mock.patch.object(training_ops, "_ssh", side_effect=fake_ssh),
+                redirect_stdout(StringIO()),
+            ):
+                report = training_ops.parity("trinity-h200-step1-parity")
+
+        self.assertEqual(report["direct_scope"], "first_microbatch_only")
+        self.assertEqual(report["aggregate_guard"]["scope"], "full_training_step")
+        self.assertEqual(report["aggregate_guard"]["batch_size"], 8)
+        self.assertEqual(report["aggregate_guard"]["status"], "passed")
+        self.assertEqual(
+            report["aggregate_vs_direct"]["direct"]["scope"],
+            "first_microbatch_only",
+        )
+        self.assertEqual(
+            report["aggregate_vs_direct"]["aggregate"]["scope"],
+            "full_training_step",
+        )
+        self.assertIn("trainer-metrics.jsonl", "\n".join(calls))
+
+    def test_aggregate_guard_reader_uses_latest_full_step_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / "trainer-metrics.jsonl"
+            metrics_path.write_text(
+                "not json\n"
+                + json.dumps(
+                    {
+                        "step": 1,
+                        "unmasked_mismatch_kl/mean": 0.02,
+                        "masked_mismatch_kl/mean": 0.03,
+                        "is_masked/mean": 0.01,
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "step": 2,
+                        "unmasked_mismatch_kl/mean": 0.2,
+                        "masked_mismatch_kl/mean": 0.03,
+                        "is_masked/mean": 0.01,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    training_ops._parity_aggregate_guard_reader_script(
+                        str(metrics_path),
+                        batch_size=8,
+                        max_unmasked_mismatch_kl=0.1,
+                        max_masked_mismatch_kl=0.5,
+                        max_masked_fraction=0.06,
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertTrue(report["available"])
+        self.assertEqual(report["scope"], "full_training_step")
+        self.assertEqual(report["batch_size"], 8)
+        self.assertEqual(report["step"], 2)
+        self.assertEqual(report["status"], "rejected")
+        self.assertEqual(report["invalid_lines"], 1)
+
     def test_parity_uses_configured_full_run_records(self):
         calls = []
         profile = training_ops._config_dir("configs/general-agent")
