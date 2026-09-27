@@ -557,7 +557,8 @@ def _capture_direct_parity_record(
             f"duplicate direct parity microbatch index {microbatch_index}"
         )
     if records and any(
-        record.get("microbatch_count") != microbatch_count
+        not isinstance(record, dict)
+        or record.get("microbatch_count") != microbatch_count
         for record in records.values()
     ):
         raise RuntimeError("direct parity microbatch count changed during collection")
@@ -576,6 +577,8 @@ def _write_direct_parity_artifact(
     """Write a complete, ordered direct-parity artifact exactly once."""
     if type(microbatch_count) is not int or microbatch_count < 1:
         raise RuntimeError("direct parity microbatch count is invalid")
+    if any(type(index) is not int for index in records):
+        raise RuntimeError("direct parity microbatch indices are invalid")
     expected_indices = set(range(microbatch_count))
     if set(records) != expected_indices:
         missing = sorted(expected_indices - set(records))
@@ -1927,7 +1930,8 @@ def train(config: TrainerConfig):
                                 payload["valid_mean_abs_delta"],
                                 payload["valid_max_abs_delta"],
                             )
-                            direct_parity_dumped = True
+                    if not multi_direct_parity_dump:
+                        direct_parity_dumped = True
                 sl = side["sequence_lengths"]
                 loss, loss_tensors = compute_loss(
                     trainer_logprobs=o["logprobs"].squeeze().split(sl),

@@ -122,6 +122,22 @@ class DirectParityDumpTest(unittest.TestCase):
         expression = source[start : source.index("if (", start)]
         self.assertIn("config.parity_guard is not None", expression)
 
+    def test_legacy_dump_latch_is_set_for_all_ranks(self):
+        lines = TRAIN_PATH.read_text(encoding="utf-8").splitlines()
+        rank_block = next(
+            index
+            for index, line in enumerate(lines)
+            if line.strip() == "if dp_rank == 0 and cp_rank == 0:"
+        )
+        latch = next(
+            index
+            for index, line in enumerate(lines[rank_block:], rank_block)
+            if line.strip() == "if not multi_direct_parity_dump:"
+        )
+        self.assertLess(rank_block, latch)
+        self.assertEqual(len(lines[rank_block]) - len(lines[rank_block].lstrip()), 20)
+        self.assertEqual(len(lines[latch]) - len(lines[latch].lstrip()), 20)
+
 
 if __name__ == "__main__":
     unittest.main()
