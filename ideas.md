@@ -808,3 +808,33 @@ only after measured learning.
   timing limits fixed. Use the new phase-level failure counts to separate
   provider argument failures from timeout or service failures before changing
   concurrency.
+
+## Batch-32 review failure diagnostic
+
+- **Measured production evidence.** One production-shaped attempt ran for 826
+  seconds, accepted 0 rollouts, dropped 2, and recorded 3 `turn_1_review`
+  failures. The evidence does not yet include rollout IDs, the exact review
+  exception or HTTP status, the drop reasons, per-phase timings, provider
+  finish/truncation fields, or model/server/cache identities. This is not
+  enough to identify whether the failures were provider, judge, validation,
+  transport, or timeout failures.
+- **Diagnostic rationale.** Use one disposable batch-32 diagnostic to capture
+  those fields with a small blast radius. Keep the model, native FP8 path,
+  context, output limit, reward, sampling, judge/user limits, worker count,
+  pool size, and learning rate unchanged. Require every review failure to
+  produce a bounded sanitized record with phase, attempt, exception class,
+  truncated message, argument lengths, argument hash, provider finish and
+  truncation metadata when available, and final status. Never log prompts,
+  model output, or raw tool arguments.
+- **Diagnostic gates.** The run is valid only if the config parses, all paths
+  and SwanLab identifiers are unique, no cached rollout is used, every dropped
+  group has a reason, every `turn_1_review` failure has a phase record, and
+  the trainer reports the final bounded outcome. Preserve the original
+  failure counts and separate provider, judge, validation, transport, and
+  timeout categories. Stop after the one-step diagnostic; do not infer a
+  reward result from it.
+- **Scope boundary.** This batch-32 run is a failure-capture diagnostic, not
+  the later production-sized A/B experiment. A production-sized A/B must be
+  planned separately after this evidence identifies the failure class. Do not
+  reuse its run, output, checkpoint, broadcast, cache, LoRA, or SwanLab
+  identity for production.
