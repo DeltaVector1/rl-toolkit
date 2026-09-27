@@ -1374,3 +1374,28 @@ only after measured learning.
   for `[tokens,8,2]` routes and numeric position-zero entries. Keep all token
   lengths, padding, masks, settings, and parity gates unchanged. No live
   action is part of this correction.
+
+## Bind pipeline packed boundaries through checkpoint recompute
+
+- **Measurements.** The production-shape diagnostic took `131.18s`
+  forward/backward and `108.34s` PP. Control KL was `0.008315`; packed
+  sequence KL was `[0.005716,0.278246,0.754759,0.493240,1.090153]`.
+- **Code evidence.** Training prepares all microbatches before the PP
+  schedule. The final control leaves Ulysses boundaries `[0,32768]` in
+  process-global state, while each production record needs
+  `[0,8187,15193,21736,28172,32768]`. The image-provided
+  `ulysses_attn.py` reads that state at each attention invocation. Identical
+  microbatch layouts hid this difference. A stage-forward refresh alone is
+  insufficient: mounted `checkpointing.py` later calls the captured attention
+  method during backward after another microbatch has changed the state.
+- **Fix and experiment.** Bind packed CP state to each consumed PP side-input
+  record. Publish it within that stage call and restore the prior state on
+  exit. Capture that same state when each checkpoint is created and publish
+  it again inside every checkpoint invocation, including delayed recompute.
+  Keep the state and context helpers in mounted `cp.py`; use the existing
+  mounted `pp_runner.py` and `checkpointing.py`. Do not change attention
+  kernels, packing, routes, gates, or model settings. Test alternating packed
+  and control layouts, delayed reentrant and non-reentrant recompute, nested
+  contexts, restoration on errors, and missing or invalid boundaries. A
+  later authorized operator can repeat the same production-shape diagnostic;
+  this code task includes no live action.
