@@ -42,6 +42,24 @@ _EXPECTED_IDENTITY_FIELDS = {
     "loss_size",
     "loss_mode",
 }
+_EXPECTED_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "shared_expert",
+    "experts",
+)
+_BASE_CONFIG_FIELDS = (
+    "peft_type",
+    "task_type",
+    "base_model_name_or_path",
+    "bias",
+    "modules_to_save",
+)
 
 
 class Step1DeltaError(ValueError):
@@ -91,6 +109,89 @@ def _identity(path: Path, label: str) -> dict[str, int | str]:
         raise Step1DeltaError(f"{label} cannot be hashed: {path}") from error
     finally:
         os.close(fd)
+
+
+def _regular_directory(path: Path, label: str) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise Step1DeltaError(f"{label} is missing or not a regular directory: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise Step1DeltaError(f"{label} cannot be opened: {path}") from error
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise Step1DeltaError(f"{label} is not a regular directory: {path}")
+    finally:
+        os.close(fd)
+
+
+def _validate_qualification_layout(policy_path: Path, step_dir: Path) -> Path:
+    if (
+        step_dir.name != "step_1"
+        or step_dir.parent.name != "broadcasts"
+        or step_dir.parent.parent.name != "run_trainer_only"
+    ):
+        raise Step1DeltaError("step-1 adapter path is not the verified export slot")
+    output_root = step_dir.parent.parent.parent
+    expected_dirs = (
+        (output_root, "qualification output root"),
+        (output_root / "run_trainer_only", "run_trainer_only directory"),
+        (output_root / "run_trainer_only" / "broadcasts", "broadcasts directory"),
+        (output_root / "run_trainer_only" / "broadcasts" / "step_1", "step-1 directory"),
+    )
+    for path, label in expected_dirs:
+        _regular_directory(path, label)
+    try:
+        relative_policy = policy_path.relative_to(output_root)
+    except ValueError as error:
+        raise Step1DeltaError("policy-0 adapter is outside the qualification output root") from error
+    if not relative_policy.parts or any(part in {".", ".."} for part in relative_policy.parts):
+        raise Step1DeltaError("policy-0 adapter path is not canonical")
+    parent = output_root
+    for part in relative_policy.parts[:-1]:
+        parent = parent / part
+        _regular_directory(parent, "policy-0 adapter parent")
+    _regular(policy_path, "policy-0 adapter")
+    policy_config = policy_path.parent / "adapter_config.json"
+    _regular(policy_config, "policy-0 adapter config")
+    return policy_config
+
+
+def _read_json_object(path: Path, label: str) -> dict[str, Any]:
+    _regular(path, label)
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise Step1DeltaError(f"{label} is invalid") from error
+    if not isinstance(value, dict):
+        raise Step1DeltaError(f"{label} is not an object")
+    return value
+
+
+def _validate_adapter_config(step_config_path: Path, policy_config_path: Path) -> None:
+    step_config = _read_json_object(step_config_path, "step-1 adapter config")
+    policy_config = _read_json_object(policy_config_path, "policy-0 adapter config")
+    for label, config in (("policy-0", policy_config), ("step-1", step_config)):
+        if type(config.get("r")) is not int or config["r"] != 32:
+            raise Step1DeltaError(f"{label} adapter config rank is not 32")
+        alpha = config.get("lora_alpha")
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not math.isfinite(float(alpha)) or float(alpha) != 64:
+            raise Step1DeltaError(f"{label} adapter config alpha is not 64")
+        dropout = config.get("lora_dropout")
+        if isinstance(dropout, bool) or not isinstance(dropout, (int, float)) or not math.isfinite(float(dropout)) or float(dropout) != 0.0:
+            raise Step1DeltaError(f"{label} adapter config dropout is not zero")
+        targets = config.get("target_modules")
+        if not isinstance(targets, list) or tuple(targets) != _EXPECTED_TARGET_MODULES:
+            raise Step1DeltaError(f"{label} adapter config target_modules differ")
+    for field in _BASE_CONFIG_FIELDS:
+        if field not in policy_config or field not in step_config:
+            raise Step1DeltaError(f"adapter config is missing base identity field: {field}")
+        if policy_config[field] != step_config[field]:
+            raise Step1DeltaError(f"adapter config base identity differs: {field}")
+    for field in ("peft_type", "task_type", "base_model_name_or_path", "bias"):
+        if not isinstance(policy_config[field], str) or not policy_config[field]:
+            raise Step1DeltaError(f"adapter config base identity is invalid: {field}")
 
 
 def _validate_expected_identity(expected: Mapping[str, Any]) -> dict[str, Any]:
@@ -220,7 +321,15 @@ def _validate_step1_files(step_dir: Path) -> tuple[dict[str, Any], dict[str, Any
     ):
         raise Step1DeltaError("step-1 manifest identity is invalid")
     files = manifest.get("files")
-    records = {item.get("name"): item for item in files if isinstance(item, dict)} if isinstance(files, list) else {}
+    if not isinstance(files, list):
+        raise Step1DeltaError("step-1 manifest file list is invalid")
+    records: dict[str, Mapping[str, Any]] = {}
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise Step1DeltaError("step-1 manifest file record is invalid")
+        if item["name"] in records:
+            raise Step1DeltaError("step-1 manifest has duplicate file records")
+        records[item["name"]] = item
     if set(records) != set(expected_files) or any(
         records[name].get("sha256") != identity["sha256"] or records[name].get("size") != identity["size"]
         for name, identity in expected_files.items()
@@ -355,10 +464,16 @@ def validate_step1_adapter_delta(
     failure_path = failure_receipt_path or receipt_path.with_name(receipt_path.stem + ".failure.json")
     try:
         expected = _validate_expected_identity(expected_identity)
-        policy_identity = _identity(Path(policy0_adapter_path), "policy-0 adapter")
-        model_identity, config_identity, artifact_identities = _validate_step1_files(Path(step1_dir))
+        policy_path = Path(policy0_adapter_path)
+        step_path = Path(step1_dir)
+        policy_config_path = _validate_qualification_layout(policy_path, step_path)
+        policy_identity = _identity(policy_path, "policy-0 adapter")
+        policy_config_identity = _identity(policy_config_path, "policy-0 adapter config")
+        model_identity, config_identity, artifact_identities = _validate_step1_files(step_path)
+        _validate_adapter_config(step_path / "adapter_config.json", policy_config_path)
         before = {
             "policy0_adapter": policy_identity,
+            "policy0_config": policy_config_identity,
             "step1_adapter": model_identity,
             "step1_config": config_identity,
             "step1_manifest": artifact_identities["adapter_manifest.json"],
@@ -367,13 +482,14 @@ def validate_step1_adapter_delta(
             "artifacts": artifact_identities,
         }
         metrics = _compare_tensors(
-            Path(policy0_adapter_path),
-            Path(step1_dir) / "adapter_model.safetensors",
+            policy_path,
+            step_path / "adapter_model.safetensors",
             chunk_elements,
         )
-        _, _, after_artifact_identities = _validate_step1_files(Path(step1_dir))
+        _, _, after_artifact_identities = _validate_step1_files(step_path)
         after = {
-            "policy0_adapter": _identity(Path(policy0_adapter_path), "policy-0 adapter"),
+            "policy0_adapter": _identity(policy_path, "policy-0 adapter"),
+            "policy0_config": _identity(policy_config_path, "policy-0 adapter config"),
             "step1_adapter": after_artifact_identities["adapter_model.safetensors"],
             "step1_config": after_artifact_identities["adapter_config.json"],
             "step1_manifest": after_artifact_identities["adapter_manifest.json"],
@@ -389,6 +505,7 @@ def validate_step1_adapter_delta(
             "kind": "h200_step1_adapter_delta",
             "run_id": expected["run_id"],
             "policy0_adapter": policy_identity,
+            "policy0_config": policy_config_identity,
             "step1_adapter": model_identity,
             "step1_config": config_identity,
             "step1_manifest_sha256": artifact_identities["adapter_manifest.json"]["sha256"],

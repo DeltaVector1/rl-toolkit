@@ -38,12 +38,27 @@ class H200PostUpdateDeltaTest(unittest.TestCase):
     def _write_adapter(self, root, policy_arrays, step_arrays):
         policy = root / "policy0.safetensors"
         save_file(policy_arrays, str(policy))
+        policy_config = {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "/data/trinity-thinking-fp8",
+            "r": 32,
+            "lora_alpha": 64,
+            "lora_dropout": 0.0,
+            "bias": "none",
+            "target_modules": [
+                "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj",
+                "up_proj", "down_proj", "shared_expert", "experts",
+            ],
+            "modules_to_save": None,
+        }
+        (root / "adapter_config.json").write_text(json.dumps(policy_config, sort_keys=True))
         step = root / "run_trainer_only" / "broadcasts" / "step_1"
         step.mkdir(parents=True)
         model = step / "adapter_model.safetensors"
         save_file(step_arrays, str(model))
         config = step / "adapter_config.json"
-        config_bytes = b'{"r":32,"lora_alpha":64}\n'
+        config_bytes = json.dumps(policy_config, sort_keys=True).encode()
         config.write_bytes(config_bytes)
         target_sha = hashlib.sha256(model.read_bytes()).hexdigest()
         config_sha = hashlib.sha256(config_bytes).hexdigest()
@@ -129,6 +144,10 @@ class H200PostUpdateDeltaTest(unittest.TestCase):
             self.assertEqual(
                 receipt["identities_before"]["policy0_adapter"],
                 receipt["identities_after"]["policy0_adapter"],
+            )
+            self.assertEqual(
+                receipt["identities_before"]["policy0_config"],
+                receipt["identities_after"]["policy0_config"],
             )
 
     def test_metadata_only_rewrite_is_rejected(self):
@@ -241,6 +260,140 @@ class H200PostUpdateDeltaTest(unittest.TestCase):
                 validate_step1_adapter_delta(
                     policy, step, self.expected, wrong, root / "wrong.json"
                 )
+
+    def test_duplicate_manifest_records_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy, step, target_sha, target_size = self._write_adapter(
+                root,
+                {"a": np.array([1.0, 2.0], dtype=np.float32)},
+                {"a": np.array([1.0, 2.5], dtype=np.float32)},
+            )
+            manifest_path = step / "adapter_manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["files"].append(dict(manifest["files"][0]))
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+            with self.assertRaisesRegex(Step1DeltaError, "duplicate"):
+                validate_step1_adapter_delta(
+                    policy,
+                    step,
+                    self.expected,
+                    self._evidence(policy, step, target_sha, target_size),
+                    root / "receipt.json",
+                )
+
+    def test_adapter_config_semantics_and_policy0_base_identity_are_verified(self):
+        mutations = {
+            "r": 16,
+            "lora_alpha": 32,
+            "lora_dropout": 0.1,
+            "target_modules": ["q_proj"],
+            "base_model_name_or_path": "/data/other-model",
+            "bias": "lora_only",
+        }
+        for field, value in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                policy, step, target_sha, target_size = self._write_adapter(
+                    root,
+                    {"a": np.array([1.0, 2.0], dtype=np.float32)},
+                    {"a": np.array([1.0, 2.5], dtype=np.float32)},
+                )
+                config_path = step / "adapter_config.json"
+                config = json.loads(config_path.read_text())
+                config[field] = value
+                config_path.write_text(json.dumps(config, sort_keys=True))
+                manifest_path = step / "adapter_manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
+                manifest["config_sha256"] = config_sha
+                manifest["config_size"] = config_path.stat().st_size
+                for record in manifest["files"]:
+                    if record["name"] == "adapter_config.json":
+                        record.update(sha256=config_sha, size=config_path.stat().st_size)
+                manifest_path.write_text(json.dumps(manifest, sort_keys=True))
+                with self.assertRaisesRegex(Step1DeltaError, "adapter config"):
+                    validate_step1_adapter_delta(
+                        policy,
+                        step,
+                        self.expected,
+                        self._evidence(policy, step, target_sha, target_size),
+                        root / "receipt.json",
+                    )
+
+    def test_step1_and_qualification_ancestors_reject_symlinks(self):
+        for component in ("step1", "broadcasts", "run_trainer_only", "output"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "qualification"
+                root.mkdir()
+                policy, step, target_sha, target_size = self._write_adapter(
+                    root,
+                    {"a": np.array([1.0, 2.0], dtype=np.float32)},
+                    {"a": np.array([1.0, 2.5], dtype=np.float32)},
+                )
+                if component == "step1":
+                    moved = root / "step_1-real"
+                    step.rename(moved)
+                    step.symlink_to(moved, target_is_directory=True)
+                elif component == "broadcasts":
+                    actual = root / "run_trainer_only" / "broadcasts"
+                    moved = root / "broadcasts-real"
+                    actual.rename(moved)
+                    actual.symlink_to(moved, target_is_directory=True)
+                elif component == "run_trainer_only":
+                    actual = root / "run_trainer_only"
+                    moved = root / "run_trainer_only-real"
+                    actual.rename(moved)
+                    actual.symlink_to(moved, target_is_directory=True)
+                else:
+                    moved = root.parent / "qualification-real"
+                    root.rename(moved)
+                    root.symlink_to(moved, target_is_directory=True)
+                    policy = root / "policy0.safetensors"
+                    step = root / "run_trainer_only" / "broadcasts" / "step_1"
+                with self.assertRaisesRegex(Step1DeltaError, "directory|path"):
+                    validate_step1_adapter_delta(
+                        policy,
+                        step,
+                        self.expected,
+                        self._evidence(policy, step, target_sha, target_size),
+                        root / "receipt.json",
+                    )
+
+    def test_policy0_parent_must_be_regular_and_inside_qualification_root(self):
+        for mode in ("symlink", "outside"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory)
+                root = parent / "qualification"
+                root.mkdir()
+                policy, step, target_sha, target_size = self._write_adapter(
+                    root,
+                    {"a": np.array([1.0, 2.0], dtype=np.float32)},
+                    {"a": np.array([1.0, 2.5], dtype=np.float32)},
+                )
+                old_config = root / "adapter_config.json"
+                policy_dir = root / "policy-real"
+                policy_dir.mkdir()
+                policy.rename(policy_dir / "adapter_model.safetensors")
+                old_config.rename(policy_dir / "adapter_config.json")
+                if mode == "symlink":
+                    link = root / "policy-link"
+                    link.symlink_to(policy_dir, target_is_directory=True)
+                    policy = link / "adapter_model.safetensors"
+                else:
+                    outside = parent / "outside-policy"
+                    outside.mkdir()
+                    policy = policy_dir / "adapter_model.safetensors"
+                    policy_dir.rename(outside)
+                    policy = outside / "adapter_model.safetensors"
+                with self.assertRaisesRegex(Step1DeltaError, "policy-0 adapter"):
+                    validate_step1_adapter_delta(
+                        policy,
+                        step,
+                        self.expected,
+                        self._evidence(policy, step, target_sha, target_size),
+                        root / "receipt.json",
+                    )
 
     def test_export_and_gradient_signals_must_be_positive(self):
         with tempfile.TemporaryDirectory() as directory:
