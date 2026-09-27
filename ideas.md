@@ -1087,3 +1087,40 @@ only after measured learning.
   overlapping or inconsistent offsets/sizes, malformed entries, extra keys,
   symlinks, unknown files, and identity mismatches. Do not implement until
   the exact chunk key/type schema is captured from the measured member.
+
+## Exact fixed-token production-step1 policy-v0 re-score
+
+- **Measured evidence.** The preserved production step-1 artifact is
+  `/data/glm52-rl/runs/trinity-decensor-experimental-fixed/run_trinity-decensor-experimental-fixed/rollouts/step_1/train_rollouts.bin`,
+  size `326027085` bytes, SHA-256
+  `29a55a5e1efd674fb8ce7237a83105efd2624340829721f7624fc1763f68c86c`.
+  It contains `1068` samples and `1203614` tokens. The first packed
+  microbatch has sequence lengths `[8187, 7006, 6543, 6436, 4596]`; the
+  first four are complete, and the fifth is `4530` source tokens plus `66`
+  masked right-padding tokens. This is the required packing and alignment
+  contract.
+- **Measured parity failure.** The parity-step-1 artifact SHA-256 is
+  `284761f2e5c0f37b6ac45d701e7266aa63f12b779b26c5d2c3c81e3c9f5ad678`.
+  It contains `32768` packed positions and `29420` valid positions. Valid
+  logprob delta mean is `-1.011637` and absolute mean is `1.156809`.
+  Mismatch KL is mean `0.979907`, p95 `4.254092`, and maximum `2595.608`;
+  per-sequence means are `1.2541`, `0.9708`, `1.0013`, `0.6167`, and
+  `0.9832`. The full guard aggregation was unmasked KL `1.147836`, masked
+  fraction `0.213119`, and masked KL `2.193980`. The prior diagnostic had
+  KL mean `0.694752` and absolute delta mean `0.953952`; the passing 8192
+  qualification exercised only `32` active tokens.
+- **Experiment.** Re-score exactly five fixed-token sequences from this
+  artifact on a fresh H200 policy-v0 request. Identify each sequence by a
+  SHA-256 hash, and record only hashes and numeric metadata, never raw
+  prompts or responses. Compare fresh policy-v0 per-token logprobs against
+  the stored rollout logprobs and trainer per-token logprobs. Record exact
+  model, adapter, server-instance, request/cache-salt, route, and reference
+  identities for every comparison. Keep the native FP8 model, packing,
+  padding, masks, and existing parity gates unchanged.
+- **Decision.** If fresh policy-v0 matches stored rollout but both differ
+  from trainer, investigate trainer ingestion or logprob alignment. If fresh
+  policy-v0 differs from stored rollout, investigate H200 routing, adapter,
+  or cache identity. If fresh policy-v0 and trainer agree while stored data
+  differs, quarantine the stored rollout path. Run the router replay with
+  router replay off and on only if the first comparison cannot distinguish
+  these cases; do not change production settings before the result.
