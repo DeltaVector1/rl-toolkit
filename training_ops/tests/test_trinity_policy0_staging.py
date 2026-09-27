@@ -14,6 +14,7 @@ import training_ops
 from training_ops import (
     Refused,
     _policy0_controller_transfer_reference,
+    _policy0_post_update_reference_copy,
     _policy0_reference_lan_fanout_script,
     _policy0_reference_seed_prepare_script,
     _policy0_qualification_verify_script,
@@ -178,8 +179,9 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 "configs/trinity-h200-post-update-qualification", **kwargs
             )
         self.assertEqual(plan["post_update_reference_identity"], POST_UPDATE_IDENTITY)
-        self.assertIn("exactly eight microbatches", plan["source_reference_script"])
-        self.assertIn("request_without_id", plan["source_reference_script"])
+        self.assertIn("QUAL_FILE reference.json", plan["source_reference_script"])
+        self.assertNotIn("exactly eight microbatches", plan["source_reference_script"])
+        self.assertNotIn("request_without_id", plan["source_reference_script"])
         self.assertNotIn("reference is not a policy-0 reference", plan["source_reference_script"])
 
     def test_old_parity_plan_does_not_require_post_update_identity(self):
@@ -212,7 +214,7 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 with self.assertRaisesRegex(Refused, "canonical config directory"):
                     _guard_post_update_config_dir("configs/post-update-alias")
 
-    def test_remote_collection_validator_rejects_recalculated_mutations(self):
+    def test_post_update_mutations_fail_local_before_trainer_ssh(self):
         case = H200PostUpdateReferenceTest()
         receipt = case.receipt()
         records = []
@@ -246,31 +248,150 @@ class TrinityPolicy0StagingTest(unittest.TestCase):
                 get_json=lambda *_: receipt,
             )
             original = json.loads(output.read_text(encoding="utf-8"))
-            for label, mutate in (
-                ("receipt", lambda item: item["policy_identity"]["server_instance"] == "stale"),
-                ("binding", lambda item: item["qualification_binding"].__setitem__("receipt_sha256", "0" * 64)),
-                ("advantage", lambda item: item["advantages"].__setitem__(0, False)),
-                ("prompt_logprob", lambda item: item["inference_logprobs"].__setitem__(0, 0.5)),
-            ):
+            expected = dict(POST_UPDATE_IDENTITY)
+            expected["final_reference_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
+            expected["final_reference_size"] = output.stat().st_size
+            config = {"data": {"fake": {"batch_size": 8}}, "model": {"seq_len": 8192}}
+
+            def refresh_hashes(item):
+                request = item["request_bodies"]["decode"]
+                response = item["responses"]["decode"]
+                request_hash = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                response_hash = hashlib.sha256(json.dumps(response, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                item["request_sha256"]["decode"] = request_hash
+                item["response_sha256"]["decode"] = response_hash
+                item["qualification_binding"]["request_sha256"] = request_hash
+                item["qualification_binding"]["response_sha256"] = response_hash
+
+            mutations = {
+                "minus-9999": lambda item: item["responses"]["decode"]["choices"][0]["logprobs"]["content"][0].__setitem__("logprob", -9999.0),
+                "non-int-token": lambda item: item["responses"]["decode"]["choices"][0]["token_ids"].__setitem__(0, "not-an-int"),
+                "count31": lambda item: item["responses"]["decode"]["choices"][0]["token_ids"].pop(),
+                "extra-binding": lambda item: item["qualification_binding"].__setitem__("unexpected", "mutation"),
+                "stale-receipt": lambda item: item["policy_identity_before"].__setitem__("server_instance", "stale"),
+                "binding-receipt": lambda item: item["qualification_binding"].__setitem__("receipt_sha256", "0" * 64),
+                "bool-advantage": lambda item: item["advantages"].__setitem__(0, False),
+                "prompt-logprob": lambda item: item["inference_logprobs"].__setitem__(0, 0.5),
+            }
+            for label, mutate in mutations.items():
                 changed = copy.deepcopy(original)
-                if label == "receipt":
-                    changed["microbatches"][0]["policy_identity"]["server_instance"] = "stale"
-                    changed["microbatches"][0]["policy_identity_before"]["server_instance"] = "stale"
-                    changed["microbatches"][0]["policy_identity_after"]["server_instance"] = "stale"
-                else:
-                    mutate(changed["microbatches"][0])
-                output.write_text(json.dumps(changed, separators=(",", ":")) + "\n")
-                expected = dict(POST_UPDATE_IDENTITY)
+                item = changed["microbatches"][0]
+                mutate(item)
+                if label == "non-int-token":
+                    item["generated_token_ids"][0] = "not-an-int"
+                if label == "count31":
+                    item["generated_token_ids"].pop()
+                if label == "stale-receipt":
+                    item["policy_identity"] = copy.deepcopy(item["policy_identity_before"])
+                    item["policy_identity_after"] = copy.deepcopy(item["policy_identity_before"])
+                refresh_hashes(item)
+                output.write_text(json.dumps(changed, separators=(",", ":")) + "\n", encoding="utf-8")
                 expected["final_reference_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
                 expected["final_reference_size"] = output.stat().st_size
-                script = training_ops._post_update_reference_source_verify_script(
-                    str(output),
-                    {"sha256": receipt["target_sha256"], "size": receipt["target_size"]},
-                    {"sha256": receipt["config_sha256"], "size": receipt["config_size"]},
-                    expected,
-                )
-                result = subprocess.run(["bash", "-c", script], text=True, capture_output=True)
-                self.assertNotEqual(result.returncode, 0, label)
+                with self.subTest(label=label), patch("training_ops._ssh") as ssh:
+                    with self.assertRaises(Refused):
+                        _policy0_post_update_reference_copy(config, output, expected)
+                    ssh.assert_not_called()
+
+    def test_post_update_local_copy_rejects_byte_change_after_validation(self):
+        case = H200PostUpdateReferenceTest()
+        receipt = case.receipt()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "reference.json"
+            responses = []
+            for index in range(8):
+                response = case.response()
+                response["request_id"] = f"server-response-{index}"
+                response["choices"][0]["token_ids"] = [10000 + index * 100 + token for token in range(32)]
+                response["choices"][0]["logprobs"]["content"] = [
+                    {"token": f"token_id:{token}", "logprob": -0.25}
+                    for token in response["choices"][0]["token_ids"]
+                ]
+                responses.append(response)
+            build_post_update_references(
+                endpoint="http://h200b:18100/inference/v1/generate",
+                input_records=[case.input_record() | {"input_ids": [token + index * 10000 for token in case.input_record()["input_ids"]]} for index in range(8)],
+                output_path=output,
+                base_model="/data/trinity-thinking-fp8",
+                policy_model="policy-0-slot0",
+                expected_policy_identity=receipt,
+                policy_receipt=receipt,
+                cache_salt="fresh-post-update-decode",
+                readiness_endpoint="http://h200b:18100/inference/v1/staging-status",
+                post_json=lambda *_: responses.pop(0),
+                get_json=lambda *_: receipt,
+            )
+            expected = dict(POST_UPDATE_IDENTITY)
+            expected["final_reference_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
+            expected["final_reference_size"] = output.stat().st_size
+            original_validate = training_ops._validate_post_update_qualification_reference
+
+            def validate_then_mutate(*args, **kwargs):
+                value = original_validate(*args, **kwargs)
+                output.write_bytes(output.read_bytes() + b"mutation")
+                return value
+
+            with patch.object(training_ops, "_validate_post_update_qualification_reference", side_effect=validate_then_mutate):
+                with self.assertRaisesRegex(Refused, "changed during validation"):
+                    _policy0_post_update_reference_copy(
+                        {"data": {"fake": {"batch_size": 8}}, "model": {"seq_len": 8192}},
+                        output,
+                        expected,
+                    )
+
+    def test_post_update_apply_validates_local_copy_before_trainer_ssh(self):
+        kwargs = {
+            "source_adapter_dir": "/data/glm52-rl/preserved-step0",
+            "source_reference_path": "/data/glm52-rl/fresh-h200/reference.json",
+            "expected_old_reference_sha256": OLD_SHA256,
+            "expected_old_reference_size": OLD_SIZE,
+        }
+        nodes = ["n76", "n77", "n78", "n80", "n82", "n83", "n84", "n85"]
+        source_manifest = "\n".join([
+            "QUAL_FILE adapter_model.safetensors " + "a" * 64 + " 10",
+            "QUAL_FILE adapter_config.json " + "b" * 64 + " 20",
+        ])
+        transfer_result = {host: {"ok": True, "message": "installed"} for host in nodes}
+        events = []
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {"PRIME_RL_POST_UPDATE_REFERENCE_IDENTITY": json.dumps(POST_UPDATE_IDENTITY)},
+            clear=True,
+        ):
+            local_reference = Path(directory) / "reference.json"
+            local_reference.write_text("local", encoding="utf-8")
+            retained_directory = tempfile.TemporaryDirectory()
+            try:
+                def fetch(*args, **kwargs):
+                    events.append("fetch")
+                    return local_reference, retained_directory, {"sha256": "c" * 64, "size": 30}
+
+                def transfer(*args, **kwargs):
+                    events.append("transfer")
+                    self.assertEqual(kwargs["local_reference_path"], local_reference)
+                    return transfer_result
+
+                def ssh(*args, **kwargs):
+                    events.append("ssh")
+                    return (0, source_manifest if len([item for item in events if item == "ssh"]) == 1 else "staged")
+
+                with patch("training_ops._policy0_fetch_and_validate_post_update_reference", side_effect=fetch) as fetch_mock, patch(
+                    "training_ops._policy0_controller_transfer_reference", side_effect=transfer
+                ) as transfer_mock, patch("training_ops._ssh", side_effect=ssh), patch(
+                    "training_ops._copy_resume_adapter"
+                ), patch("training_ops._fan", return_value={host: (0, "verified") for host in nodes}):
+                    result = prepare_policy0_qualification(
+                        "configs/trinity-h200-post-update-qualification",
+                        apply=True,
+                        **kwargs,
+                    )
+                self.assertTrue(result["staged"])
+                fetch_mock.assert_called_once()
+                transfer_mock.assert_called_once()
+                self.assertEqual(events[:3], ["fetch", "transfer", "ssh"])
+                self.assertNotIn("exactly eight microbatches", result["source_reference_script"])
+            finally:
+                retained_directory.cleanup()
 
     def test_api_requires_expected_old_pair(self):
         kwargs = {

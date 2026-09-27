@@ -7327,6 +7327,63 @@ done
 """
 
 
+def _policy0_qualification_identity_verify_script(
+    adapter_path: str,
+    config_path: str,
+    reference_path: str,
+    expected_files: dict[str, dict[str, int | str]],
+) -> str:
+    """Verify only regular-file identities after strict local validation."""
+    paths = {
+        "adapter_model.safetensors": adapter_path,
+        "adapter_config.json": config_path,
+        "reference.json": reference_path,
+    }
+    identity_json = json.dumps(
+        {
+            name: {
+                "path": paths[name],
+                "sha256": record["sha256"],
+                "size": record["size"],
+            }
+            for name, record in expected_files.items()
+            if name in paths
+        },
+        separators=(",", ":"),
+    )
+    if set(expected_files) != set(paths):
+        raise Refused("post-update remote artifact identity is incomplete")
+    return f"""set -euo pipefail
+python3 - {shlex.quote(identity_json)} <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+files = json.loads(sys.argv[1])
+for name, record in files.items():
+    path = record["path"]
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SystemExit(name + " is not a regular file")
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    finally:
+        os.close(fd)
+    if digest.hexdigest() != record["sha256"] or info.st_size != record["size"]:
+        raise SystemExit(name + " identity differs")
+    print("QUAL_FILE", name, digest.hexdigest(), info.st_size)
+PY
+"""
+
+
 def _policy0_adapter_source_manifest_script(
     adapter_path: str,
     config_path: str,
@@ -7679,166 +7736,36 @@ printf 'QUAL_FILE reference.json %s %s\\n' \\
 """
 
 
-def _post_update_reference_source_verify_script(
-    reference_path: str,
-    adapter_identity: dict[str, int | str],
-    config_identity: dict[str, int | str],
-    expected_identity: dict[str, str | int],
-) -> str:
-    """Verify the strict eight-reference post-update collection on H200."""
-    identity_json = shlex.quote(
-        json.dumps(
-            {
-                "adapter": adapter_identity,
-                "config": config_identity,
-                "expected": expected_identity,
-            },
-            separators=(",", ":"),
-        )
-    )
-    return (
-        "set -euo pipefail\n"
-        f"reference={shlex.quote(reference_path)}\n"
-        "test -f \"$reference\" && test ! -L \"$reference\"\n"
-        "python3 - \"$reference\" " + identity_json + " <<'PY'\n"
-        "import base64\n"
-        "import hashlib\n"
-        "import json\n"
-        "import math\n"
-        "import sys\n"
-        "\n"
-        "reference_path, identity_path = sys.argv[1:]\n"
-        "identity = json.loads(identity_path)\n"
-        "expected = identity['expected']\n"
-        "adapter = identity['adapter']\n"
-        "config = identity['config']\n"
-        "\n"
-        "def fail(message):\n"
-        "    raise SystemExit(message)\n"
-        "\n"
-        "def digest(value):\n"
-        "    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
-        "\n"
-        "def valid_sha(value):\n"
-        "    return isinstance(value, str) and len(value) == 64 and all(item in '0123456789abcdef' for item in value)\n"
-        "\n"
-        "def check_route(canonical, raw, label):\n"
-        "    if not isinstance(canonical, dict) or set(canonical) != {'schema_version', 'encoding', 'dtype', 'shape', 'dense_layers', 'experts', 'sha256', 'data'}:\n"
-        "        fail(label + ' route schema is invalid')\n"
-        "    if canonical.get('schema_version') != 1 or canonical.get('encoding') != 'base64' or canonical.get('dtype') != 'uint8' or canonical.get('shape') != [8191, 60, 4] or canonical.get('dense_layers') != 6 or canonical.get('experts') != 256 or not valid_sha(canonical.get('sha256')):\n"
-        "        fail(label + ' route metadata is invalid')\n"
-        "    try:\n"
-        "        canonical_bytes = base64.b64decode(canonical['data'], validate=True)\n"
-        "    except Exception:\n"
-        "        fail(label + ' route data is invalid')\n"
-        "    if len(canonical_bytes) != 8191 * 60 * 4 or hashlib.sha256(canonical_bytes).hexdigest() != canonical['sha256']:\n"
-        "        fail(label + ' route checksum is invalid')\n"
-        "    row_width = 60 * 4\n"
-        "    for offset in range(0, len(canonical_bytes), row_width):\n"
-        "        row = canonical_bytes[offset:offset + row_width]\n"
-        "        if any(row[:6 * 4]):\n"
-        "            fail(label + ' dense route IDs are invalid')\n"
-        "        for layer in range(6, 60):\n"
-        "            selected = row[layer * 4:(layer + 1) * 4]\n"
-        "            if len(set(selected)) != len(selected) or any(value >= 256 for value in selected):\n"
-        "                fail(label + ' sparse route IDs are invalid')\n"
-        "    if not isinstance(raw, dict) or set(raw) != {'data', 'dtype', 'shape', 'start'} or raw.get('dtype') != 'uint8' or raw.get('shape') != [8191, 60, 4] or raw.get('start') != 0:\n"
-        "        fail(label + ' response route is invalid')\n"
-        "    try:\n"
-        "        raw_bytes = base64.b64decode(raw['data'], validate=True)\n"
-        "    except Exception:\n"
-        "        fail(label + ' response route data is invalid')\n"
-        "    if len(raw_bytes) != 8191 * 60 * 4 or raw_bytes != canonical_bytes:\n"
-        "        fail(label + ' response route differs')\n"
-        "\n"
-        "try:\n"
-        "    raw_bytes = open(reference_path, 'rb').read()\n"
-        "    reference = json.loads(raw_bytes)\n"
-        "except Exception as error:\n"
-        "    fail('post-update reference is unreadable: ' + str(error))\n"
-        "if hashlib.sha256(raw_bytes).hexdigest() != expected['final_reference_sha256'] or len(raw_bytes) != expected['final_reference_size']:\n"
-        "    fail('post-update final reference identity differs from caller contract')\n"
-        "if not isinstance(reference, dict) or reference.get('schema_version') != 1 or not isinstance(reference.get('microbatches'), list) or len(reference['microbatches']) != 8:\n"
-        "    fail('post-update reference must contain exactly eight microbatches')\n"
-        "if expected.get('server_instance') == '' or expected.get('adapter_sha256') != adapter.get('sha256') or expected.get('adapter_size') != adapter.get('size') or expected.get('config_sha256') != config.get('sha256') or expected.get('config_size') != config.get('size'):\n"
-        "    fail('caller reference identity does not match staged adapter/config')\n"
-        "\n"
-        "input_ids = []\n"
-        "response_hashes = []\n"
-        "client_ids = []\n"
-        "server_ids = []\n"
-        "salts = []\n"
-        "for index, item in enumerate(reference['microbatches']):\n"
-        "    label = 'microbatch ' + str(index)\n"
-        "    if not isinstance(item, dict) or item.get('policy') != 'policy-0' or item.get('request_mode') != 'serialized_generate_completion_logprobs' or item.get('source_kind') in {'rollout_batch', 'cached_rollout_batch'}:\n"
-        "        fail(label + ' is not a strict completion reference')\n"
-        "    ids = item.get('input_ids')\n"
-        "    mask = item.get('loss_mask')\n"
-        "    advantages = item.get('advantages')\n"
-        "    logs = item.get('inference_logprobs')\n"
-        "    if not isinstance(ids, list) or len(ids) != 8192 or any(type(token) is not int for token in ids) or item.get('sequence_lengths') != [8192] or mask != [False] * 8160 + [True] * 32 or not isinstance(advantages, list) or len(advantages) != 8192 or not isinstance(logs, list) or len(logs) != 8192:\n"
-        "        fail(label + ' token alignment is invalid')\n"
-        "    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in advantages):\n"
-        "        fail(label + ' advantages are not finite numeric values')\n"
-        "    if any(value != 0.0 for value in advantages[:8160]) or any(value != 1.0 for value in advantages[8160:]):\n"
-        "        fail(label + ' advantages are not strict prompt-zero completion-one values')\n"
-        "    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in logs):\n"
-        "        fail(label + ' inference logprobs are invalid')\n"
-        "    if any(value != 0.0 for value in logs[:8160]):\n"
-        "        fail(label + ' prompt inference logprobs are not zero')\n"
-        "    source_hash = hashlib.sha256(json.dumps(ids[:8160], separators=(',', ':')).encode()).hexdigest()\n"
-        "    if item.get('source_input_sha256') != source_hash:\n"
-        "        fail(label + ' source input hash differs')\n"
-        "    before = item.get('policy_identity_before')\n"
-        "    after = item.get('policy_identity_after')\n"
-        "    if not isinstance(before, dict) or before != after or item.get('policy_identity') != before or before.get('server_instance') != expected['server_instance'] or before.get('target_sha256') != expected['adapter_sha256'] or before.get('target_size') != expected['adapter_size'] or before.get('config_sha256') != expected['config_sha256'] or before.get('config_size') != expected['config_size']:\n"
-        "        fail(label + ' policy receipt is stale or differs from caller contract')\n"
-        "    if not isinstance(item.get('cache_salt'), str) or not item['cache_salt']:\n"
-        "        fail(label + ' cache salt is missing')\n"
-        "    requests = item.get('request_bodies')\n"
-        "    responses = item.get('responses')\n"
-        "    request = requests.get('decode') if isinstance(requests, dict) else None\n"
-        "    response = responses.get('decode') if isinstance(responses, dict) else None\n"
-        "    if not isinstance(request, dict) or not isinstance(response, dict):\n"
-        "        fail(label + ' raw request or response is missing')\n"
-        "    client_id = request.get('request_id')\n"
-        "    server_id = response.get('request_id')\n"
-        "    request_without_id = dict(request)\n"
-        "    request_without_id.pop('request_id', None)\n"
-        "    if not isinstance(client_id, str) or not client_id or client_id != digest(request_without_id) or not isinstance(server_id, str) or not server_id:\n"
-        "        fail(label + ' request or response ID is invalid')\n"
-        "    if item.get('request_sha256', {}).get('decode') != digest(request) or item.get('response_sha256', {}).get('decode') != digest(response):\n"
-        "        fail(label + ' stored request or response hash differs')\n"
-        "    sampling = {'max_tokens': 32, 'temperature': 0.0, 'top_p': 1.0, 'logprobs': 1, 'min_tokens': 32}\n"
-        "    if request.get('sampling_params') != sampling or request.get('token_ids') != ids[:8160] or request.get('cache_salt') != item.get('cache_salt'):\n"
-        "        fail(label + ' request parameters are not deterministic')\n"
-        "    choices = response.get('choices')\n"
-        "    generated = item.get('generated_token_ids')\n"
-        "    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict) or choices[0].get('token_ids') != generated or not isinstance(generated, list) or len(generated) != 32:\n"
-        "        fail(label + ' generated response tokens differ')\n"
-        "    content = choices[0].get('logprobs', {}).get('content') if isinstance(choices[0].get('logprobs'), dict) else None\n"
-        "    if not isinstance(content, list) or len(content) != 32 or any(entry.get('token') != 'token_id:' + str(token) or not isinstance(entry.get('logprob'), (int, float)) or not math.isfinite(float(entry.get('logprob'))) for entry, token in zip(content, generated)):\n"
-        "        fail(label + ' generated response logprobs differ')\n"
-        "    if [float(entry['logprob']) for entry in content] != [float(value) for value in logs[8160:]]:\n"
-        "        fail(label + ' generated response logprobs are not bound')\n"
-        "    check_route(item.get('routed_experts'), choices[0].get('routed_experts'), label)\n"
-        "    binding = item.get('qualification_binding')\n"
-        "    if (not isinstance(binding, dict) or binding.get('seq_len') != 8192 or binding.get('prompt_tokens') != 8160 or binding.get('completion_tokens') != 32 or binding.get('mask_false') != 8160 or binding.get('mask_true') != 32 or binding.get('request_mode') != 'serialized_generate_completion_logprobs' or binding.get('client_request_id') != client_id or binding.get('server_response_id') != server_id or binding.get('request_sha256') != item['request_sha256']['decode'] or binding.get('response_sha256') != item['response_sha256']['decode'] or binding.get('input_sha256') != hashlib.sha256(json.dumps(ids[:8160], separators=(',', ':')).encode()).hexdigest() or binding.get('full_input_sha256') != digest(ids) or binding.get('policy_receipt') != before or binding.get('receipt_sha256') != digest(before) or binding.get('server_instance') != expected['server_instance'] or binding.get('server_instance_sha256') != hashlib.sha256(expected['server_instance'].encode()).hexdigest() or binding.get('adapter_sha256') != expected['adapter_sha256'] or binding.get('adapter_size') != expected['adapter_size'] or binding.get('config_sha256') != expected['config_sha256'] or binding.get('config_size') != expected['config_size'] or binding.get('route_shape') != [8191, 60, 4] or binding.get('route_sha256') != item.get('routed_experts', {}).get('sha256') or binding.get('advantage_value') != 1.0):\n"
-        "        fail(label + ' qualification binding differs')\n"
-        "    if item.get('client_request_id') != client_id or item.get('server_response_id') != server_id:\n"
-        "        fail(label + ' top-level request or response ID differs')\n"
-        "    input_ids.append(binding['input_sha256'])\n"
-        "    response_hashes.append(binding['response_sha256'])\n"
-        "    client_ids.append(client_id)\n"
-        "    server_ids.append(server_id)\n"
-        "    salts.append(item['cache_salt'])\n"
-        "if any(len(set(values)) != 8 for values in (input_ids, response_hashes, client_ids, server_ids, salts)):\n"
-        "    fail('post-update collection reuses input, response, ID, or cache-salt evidence')\n"
-        "print('QUAL_FILE reference.json %s %s' % (hashlib.sha256(raw_bytes).hexdigest(), len(raw_bytes)))\n"
-        "PY\n"
-        "sha256sum -- \"$reference\"\n"
-        "stat -c '%s' -- \"$reference\"\n"
-    )
+def _policy0_reference_source_identity_script(reference_path: str) -> str:
+    """Return only the H200 source file identity; semantic checks stay local."""
+    reference = shlex.quote(reference_path)
+    return f"""set -euo pipefail
+reference={reference}
+test -f \"$reference\" && test ! -L \"$reference\"
+python3 - \"$reference\" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise SystemExit("reference is not a regular file")
+    digest = hashlib.sha256()
+    while True:
+        block = os.read(fd, 1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    print(f"QUAL_FILE reference.json {{digest.hexdigest()}} {{info.st_size}}")
+finally:
+    os.close(fd)
+PY
+"""
 
 
 def _policy0_stage_head_file_script(source_path: str, target_path: str) -> str:
@@ -8294,6 +8221,142 @@ def _policy0_local_file_identity(path: Path) -> dict[str, int | str]:
     return {"sha256": digest.hexdigest(), "size": path.stat().st_size}
 
 
+def _policy0_post_update_reference_copy(
+    trainer_config: dict,
+    reference_path: Path,
+    expected_identity: dict[str, str | int],
+) -> dict[str, int | str]:
+    """Validate one exact local post-update reference byte copy.
+
+    This is the only semantic validation entry point for the post-update
+    collection.  The file identity is checked before and after validation so
+    a concurrent local mutation cannot pass on a stale parse.
+    """
+    expected = _validate_post_update_reference_identity(expected_identity)
+    before = _policy0_local_file_identity(reference_path)
+    expected_file = {
+        "sha256": expected["final_reference_sha256"],
+        "size": expected["final_reference_size"],
+    }
+    if before != expected_file:
+        raise Refused(
+            "post-update local reference identity differs before validation: "
+            f"expected {expected_file}, got {before}"
+        )
+    try:
+        _validate_post_update_qualification_reference(
+            trainer_config,
+            reference_path,
+            expected,
+        )
+    except (Refused, PostUpdateQualificationError) as error:
+        raise Refused(f"post-update local reference validation failed: {error}") from error
+    after = _policy0_local_file_identity(reference_path)
+    if after != before:
+        raise Refused(
+            "post-update local reference changed during validation: "
+            f"before {before}, after {after}"
+        )
+    return after
+
+
+def _policy0_parse_reference_identity(output: str) -> dict[str, int | str]:
+    """Parse one identity-only H200 source response."""
+    records = []
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) == 4 and parts[0] == "QUAL_FILE" and parts[1] == "reference.json":
+            digest, size_text = parts[2:]
+            if re.fullmatch(r"[0-9a-f]{64}", digest) and size_text.isdigit():
+                records.append({"sha256": digest, "size": int(size_text)})
+    if len(records) != 1:
+        raise Refused("H200 source reference identity output is incomplete")
+    return records[0]
+
+
+def _policy0_post_update_source_identity(
+    source_reference_host: str,
+    source_reference_path: str,
+) -> dict[str, int | str]:
+    """Read only the H200 source identity, without semantic remote checks."""
+    code, output = _ssh(
+        source_reference_host,
+        _policy0_reference_source_identity_script(source_reference_path),
+        timeout=180,
+    )
+    if code:
+        detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
+        raise Refused(f"H200 source reference identity failed: {detail}")
+    return _policy0_parse_reference_identity(output)
+
+
+def _policy0_fetch_and_validate_post_update_reference(
+    trainer_config: dict,
+    source_reference_host: str,
+    source_reference_path: str,
+    expected_identity: dict[str, str | int],
+) -> tuple[Path, tempfile.TemporaryDirectory[str], dict[str, int | str]]:
+    """Fetch, validate, and retain one local H200 reference copy."""
+    expected = _validate_post_update_reference_identity(expected_identity)
+    source_before = _policy0_post_update_source_identity(
+        source_reference_host,
+        source_reference_path,
+    )
+    expected_file = {
+        "sha256": expected["final_reference_sha256"],
+        "size": expected["final_reference_size"],
+    }
+    if source_before != expected_file:
+        raise Refused(
+            "H200 source reference identity differs before fetch: "
+            f"expected {expected_file}, got {source_before}"
+        )
+    directory = tempfile.TemporaryDirectory(prefix="training-ops-post-update-reference-")
+    local_reference = Path(directory.name) / "reference.json"
+    try:
+        _, source_scp_options, source_destination = _ssh_destination(source_reference_host)
+        source_url = f"{source_destination}:{source_reference_path}"
+        try:
+            fetched = _run_process(
+                scp_command + source_scp_options + [source_url, str(local_reference)],
+                stdin=subprocess.DEVNULL,
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise Refused("reference fetch from H200 timed out") from error
+        except OSError as error:
+            raise Refused(f"reference fetch from H200 failed: {error}") from error
+        if fetched.returncode:
+            detail = ((fetched.stdout or "") + (fetched.stderr or "")).strip()
+            raise Refused(f"reference fetch from H200 failed: {detail[:200]}")
+        fetched_identity = _policy0_local_file_identity(local_reference)
+        if fetched_identity != source_before:
+            raise Refused(
+                "H200 source reference changed during fetch: "
+                f"expected {source_before}, got {fetched_identity}"
+            )
+        validated_identity = _policy0_post_update_reference_copy(
+            trainer_config,
+            local_reference,
+            expected,
+        )
+        source_after = _policy0_post_update_source_identity(
+            source_reference_host,
+            source_reference_path,
+        )
+        if source_after != source_before:
+            raise Refused(
+                "H200 source reference changed during validation: "
+                f"before {source_before}, after {source_after}"
+            )
+        if _policy0_local_file_identity(local_reference) != validated_identity:
+            raise Refused("post-update local reference changed before transfer")
+        return local_reference, directory, validated_identity
+    except BaseException:
+        directory.cleanup()
+        raise
+
+
 class _Policy0ReferenceTransferError(RuntimeError):
     """Carry every per-host result when one reference install fails."""
 
@@ -8591,25 +8654,33 @@ def _policy0_controller_transfer_reference(
     expected_manifest: dict[str, int | str],
     expected_old_sha256: str | None,
     expected_old_size: int | None,
+    local_reference_path: Path | None = None,
 ) -> dict[str, dict[str, object]]:
-    """Fetch one verified reference locally, then install it on each trainer."""
+    """Install one verified local reference on each trainer.
+
+    The optional local path is used by the strict post-update route.  The
+    older parity route keeps its existing H200 fetch behavior.
+    """
     with tempfile.TemporaryDirectory(prefix="training-ops-policy0-reference-") as directory:
-        local_reference = Path(directory) / "reference.json"
-        _, source_scp_options, source_destination = _ssh_destination(source_reference_host)
-        source_url = f"{source_destination}:{source_reference_path}"
-        try:
-            fetched = _run_process(
-                scp_command + source_scp_options + [source_url, str(local_reference)],
-                stdin=subprocess.DEVNULL,
-                timeout=600,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise Refused("reference fetch from H200 timed out") from error
-        except OSError as error:
-            raise Refused(f"reference fetch from H200 failed: {error}") from error
-        if fetched.returncode:
-            detail = ((fetched.stdout or "") + (fetched.stderr or "")).strip()
-            raise Refused(f"reference fetch from H200 failed: {detail[:200]}")
+        if local_reference_path is None:
+            local_reference = Path(directory) / "reference.json"
+            _, source_scp_options, source_destination = _ssh_destination(source_reference_host)
+            source_url = f"{source_destination}:{source_reference_path}"
+            try:
+                fetched = _run_process(
+                    scp_command + source_scp_options + [source_url, str(local_reference)],
+                    stdin=subprocess.DEVNULL,
+                    timeout=600,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise Refused("reference fetch from H200 timed out") from error
+            except OSError as error:
+                raise Refused(f"reference fetch from H200 failed: {error}") from error
+            if fetched.returncode:
+                detail = ((fetched.stdout or "") + (fetched.stderr or "")).strip()
+                raise Refused(f"reference fetch from H200 failed: {detail[:200]}")
+        else:
+            local_reference = Path(local_reference_path)
         identity = _policy0_local_file_identity(local_reference)
         if identity != expected_manifest:
             raise Refused(
@@ -9047,8 +9118,21 @@ def prepare_policy0_qualification(
         raise Refused("source adapter directory must be distinct from qualification destination")
     selected_nodes = [_check_host(host) for host in (nodes or trainer_hosts)]
     selected_nodes = list(dict.fromkeys(selected_nodes))
-    verify_script = _policy0_qualification_verify_script(
-        adapter_path, config_path, reference_path, expected_lora
+    verify_script = (
+        _policy0_qualification_identity_verify_script(
+            adapter_path,
+            config_path,
+            reference_path,
+            {
+                "adapter_model.safetensors": {"sha256": "0" * 64, "size": 0},
+                "adapter_config.json": {"sha256": "0" * 64, "size": 0},
+                "reference.json": {"sha256": "0" * 64, "size": 0},
+            },
+        )
+        if post_update_identity is not None
+        else _policy0_qualification_verify_script(
+            adapter_path, config_path, reference_path, expected_lora
+        )
     )
     manifest_script = _policy0_qualification_manifest_script(
         adapter_path, config_path, reference_path
@@ -9057,12 +9141,7 @@ def prepare_policy0_qualification(
         source_adapter_path, source_config_path, expected_lora
     )
     source_reference_script = (
-        _post_update_reference_source_verify_script(
-            source_reference_path,
-            {"sha256": "expected-after-source-check", "size": 0},
-            {"sha256": "expected-after-source-check", "size": 0},
-            post_update_identity,
-        )
+        _policy0_reference_source_identity_script(source_reference_path)
         if post_update_identity is not None
         else _policy0_reference_source_verify_script(
             source_reference_path,
@@ -9107,6 +9186,34 @@ def prepare_policy0_qualification(
         plan["post_update_reference_identity"] = post_update_identity
     if not apply:
         return plan
+    post_update_local_reference: Path | None = None
+    post_update_reference_directory: tempfile.TemporaryDirectory[str] | None = None
+    reference_manifest: dict[str, dict[str, int | str]] = {}
+    transfer_results: dict[str, dict[str, object]]
+    if post_update_identity is not None:
+        (
+            post_update_local_reference,
+            post_update_reference_directory,
+            local_reference_identity,
+        ) = _policy0_fetch_and_validate_post_update_reference(
+            config,
+            source_reference_host,
+            source_reference_path,
+            post_update_identity,
+        )
+        reference_manifest["reference.json"] = local_reference_identity
+        transfer_results = _policy0_controller_transfer_reference(
+            source_reference_host,
+            source_reference_path,
+            reference_path,
+            selected_nodes,
+            local_reference_identity,
+            expected_old_reference_sha256,
+            expected_old_reference_size,
+            local_reference_path=post_update_local_reference,
+        )
+        post_update_reference_directory.cleanup()
+        post_update_reference_directory = None
     code, output = _ssh(source_adapter_host, source_adapter_script, timeout=180)
     if code:
         detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
@@ -9120,43 +9227,34 @@ def prepare_policy0_qualification(
                 source_manifest[name] = {"sha256": digest, "size": int(size_text)}
     if set(source_manifest) != {"adapter_model.safetensors", "adapter_config.json"}:
         raise Refused("source step-0 adapter identity output is incomplete")
-    reference_verify = (
-        _post_update_reference_source_verify_script(
-            source_reference_path,
-            source_manifest["adapter_model.safetensors"],
-            source_manifest["adapter_config.json"],
-            post_update_identity,
-        )
-        if post_update_identity is not None
-        else _policy0_reference_source_verify_script(
+    if post_update_identity is None:
+        reference_verify = _policy0_reference_source_verify_script(
             source_reference_path,
             source_manifest["adapter_model.safetensors"],
             source_manifest["adapter_config.json"],
         )
-    )
-    plan["source_reference_script"] = reference_verify
-    code, output = _ssh(source_reference_host, reference_verify, timeout=180)
-    if code:
-        detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
-        raise Refused(f"fresh H200 reference failed validation: {detail}")
-    reference_manifest: dict[str, dict[str, int | str]] = {}
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) == 4 and parts[0] == "QUAL_FILE":
-            name, digest, size_text = parts[1:]
-            if re.fullmatch(r"[0-9a-f]{64}", digest) and size_text.isdigit():
-                reference_manifest[name] = {"sha256": digest, "size": int(size_text)}
-    if set(reference_manifest) != {"reference.json"}:
-        raise Refused("fresh H200 reference identity output is incomplete")
-    transfer_results = _policy0_controller_transfer_reference(
-        source_reference_host,
-        source_reference_path,
-        reference_path,
-        selected_nodes,
-        reference_manifest["reference.json"],
-        expected_old_reference_sha256,
-        expected_old_reference_size,
-    )
+        plan["source_reference_script"] = reference_verify
+        code, output = _ssh(source_reference_host, reference_verify, timeout=180)
+        if code:
+            detail = " | ".join(output.strip().splitlines()[-5:]) if output.strip() else "no output"
+            raise Refused(f"fresh H200 reference failed validation: {detail}")
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) == 4 and parts[0] == "QUAL_FILE":
+                name, digest, size_text = parts[1:]
+                if re.fullmatch(r"[0-9a-f]{64}", digest) and size_text.isdigit():
+                    reference_manifest[name] = {"sha256": digest, "size": int(size_text)}
+        if set(reference_manifest) != {"reference.json"}:
+            raise Refused("fresh H200 reference identity output is incomplete")
+        transfer_results = _policy0_controller_transfer_reference(
+            source_reference_host,
+            source_reference_path,
+            reference_path,
+            selected_nodes,
+            reference_manifest["reference.json"],
+            expected_old_reference_sha256,
+            expected_old_reference_size,
+        )
     plan["transfer_results"] = transfer_results
     for source, target in (
         (source_adapter_path, adapter_path),
@@ -9180,8 +9278,17 @@ def prepare_policy0_qualification(
         "adapter_config.json": source_manifest["adapter_config.json"],
         "reference.json": reference_manifest["reference.json"],
     }
-    verify_script = _policy0_qualification_verify_script(
-        adapter_path, config_path, reference_path, expected_lora, manifest
+    verify_script = (
+        _policy0_qualification_identity_verify_script(
+            adapter_path,
+            config_path,
+            reference_path,
+            manifest,
+        )
+        if post_update_identity is not None
+        else _policy0_qualification_verify_script(
+            adapter_path, config_path, reference_path, expected_lora, manifest
+        )
     )
     plan["verify_script"] = verify_script
     plan["manifest"] = manifest
