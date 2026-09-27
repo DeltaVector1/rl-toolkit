@@ -38,6 +38,7 @@ SEQUENCE_COUNT = 5
 DEFAULT_BASE_MODEL = "/data/trinity-thinking-fp8"
 MATCH_ABS_TOLERANCE = 1e-4
 MATCH_REL_TOLERANCE = 1e-4
+MISSING_LOGPROB = -9999.0
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _RECEIPT_FIELDS = (
     "source_url",
@@ -78,11 +79,15 @@ def _sha256_file(path: Path) -> tuple[str, int]:
         raise FixedSequenceRescoreError(f"cannot hash parity record {path}") from error
 
 
-def _finite(value: Any, label: str) -> float:
+def _number(value: Any, label: str, *, allow_missing: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise FixedSequenceRescoreError(f"{label} is not numeric")
     value = float(value)
-    if not math.isfinite(value) or value == -9999.0:
+    if value == MISSING_LOGPROB:
+        if allow_missing:
+            return value
+        raise FixedSequenceRescoreError(f"{label} is a missing logprob")
+    if not math.isfinite(value):
         raise FixedSequenceRescoreError(f"{label} is not finite evidence")
     return value
 
@@ -125,14 +130,38 @@ def load_parity_record(
     mask = _array(value, "loss_mask", count)
     if any(type(flag) is not bool for flag in mask) or not any(mask):
         raise FixedSequenceRescoreError("loss_mask must contain booleans and select tokens")
-    trainer = [_finite(item, "trainer_logprobs") for item in _array(value, "trainer_logprobs", count)]
-    reference = [_finite(item, "reference_logprobs") for item in _array(value, "reference_logprobs", count)]
-    delta = [_finite(item, "delta") for item in _array(value, "delta", count)]
-    if any(
-        not math.isclose(actual, predicted - baseline, rel_tol=1e-6, abs_tol=1e-6)
-        for actual, predicted, baseline in zip(delta, trainer, reference)
-    ):
-        raise FixedSequenceRescoreError("delta does not equal trainer_logprobs - reference_logprobs")
+    trainer = [
+        _number(item, "trainer_logprobs", allow_missing=True)
+        for item in _array(value, "trainer_logprobs", count)
+    ]
+    reference = [
+        _number(item, "reference_logprobs", allow_missing=True)
+        for item in _array(value, "reference_logprobs", count)
+    ]
+    delta = [
+        _number(item, "delta", allow_missing=True)
+        for item in _array(value, "delta", count)
+    ]
+    for index, (actual, predicted, baseline) in enumerate(zip(delta, trainer, reference)):
+        if mask[index] and (
+            actual == MISSING_LOGPROB
+            or predicted == MISSING_LOGPROB
+            or baseline == MISSING_LOGPROB
+        ):
+            raise FixedSequenceRescoreError(
+                f"selected loss_mask token {index} contains a missing logprob"
+            )
+        if (
+            actual != MISSING_LOGPROB
+            and predicted != MISSING_LOGPROB
+            and baseline != MISSING_LOGPROB
+            and not math.isclose(
+                actual, predicted - baseline, rel_tol=1e-6, abs_tol=1e-6
+            )
+        ):
+            raise FixedSequenceRescoreError(
+                f"delta does not equal trainer_logprobs - reference_logprobs at {index}"
+            )
     expected_positions: list[int] = []
     for length in lengths:
         expected_positions.extend(range(length))
@@ -255,9 +284,15 @@ def _receipt_event(
     }
 
 
-def _prompt_scores(response: Mapping[str, Any], token_ids: list[int]) -> list[float]:
+def _prompt_scores(
+    response: Mapping[str, Any], token_ids: list[int], loss_mask: list[bool]
+) -> list[float]:
     raw = response.get("prompt_logprobs")
-    if not isinstance(raw, list) or len(raw) != len(token_ids):
+    if (
+        not isinstance(raw, list)
+        or len(raw) != len(token_ids)
+        or len(loss_mask) != len(token_ids)
+    ):
         raise FixedSequenceRescoreError("prompt logprob count is not aligned")
     if raw[0] is not None:
         raise FixedSequenceRescoreError("first prompt logprob must be null")
@@ -269,7 +304,16 @@ def _prompt_scores(response: Mapping[str, Any], token_ids: list[int]) -> list[fl
         matches = [value for key, value in entry.items() if key == token_id or str(key) == str(token_id)]
         if len(matches) != 1 or not isinstance(matches[0], Mapping):
             raise FixedSequenceRescoreError(f"prompt logprob {index} token key is misaligned")
-        scores.append(_finite(matches[0].get("logprob"), f"prompt logprob {index}"))
+        score = _number(
+            matches[0].get("logprob"),
+            f"prompt logprob {index}",
+            allow_missing=True,
+        )
+        if score == MISSING_LOGPROB and loss_mask[index]:
+            raise FixedSequenceRescoreError(
+                f"selected loss_mask token {index} contains a missing prompt logprob"
+            )
+        scores.append(score)
     return scores
 
 
@@ -300,7 +344,11 @@ def _comparison(
     mask: list[bool],
 ) -> tuple[dict[str, Any], bool]:
     selected_deltas = [actual - expected for actual, expected, keep in zip(fresh, other, mask) if keep]
-    all_deltas = [actual - expected for actual, expected in zip(fresh, other)]
+    all_deltas = [
+        actual - expected
+        for actual, expected in zip(fresh, other)
+        if actual != MISSING_LOGPROB and expected != MISSING_LOGPROB
+    ]
     mismatches = sum(
         not math.isclose(actual, expected, rel_tol=MATCH_REL_TOLERANCE, abs_tol=MATCH_ABS_TOLERANCE)
         for actual, expected, keep in zip(fresh, other, mask)
@@ -311,6 +359,7 @@ def _comparison(
         "all": _stats(all_deltas),
         "selected_mismatch_count": mismatches,
         "selected_match": mismatches == 0,
+        "missing_excluded_count": len(fresh) - len(all_deltas),
         "abs_tolerance": MATCH_ABS_TOLERANCE,
         "rel_tolerance": MATCH_REL_TOLERANCE,
     }, mismatches == 0
@@ -418,7 +467,7 @@ def build_rescore(
             raise FixedSequenceRescoreError(f"sequence {index} request failed: {error}") from error
         if not isinstance(response, Mapping):
             raise FixedSequenceRescoreError(f"sequence {index} response is not an object")
-        scores = _prompt_scores(response, token_ids)
+        scores = _prompt_scores(response, token_ids, mask)
         choice = _choice(response)
         raw_route = choice.get("routed_experts")
         if not isinstance(raw_route, Mapping):
