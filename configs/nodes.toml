@@ -66,6 +66,8 @@ trinity = "/data/trinity-thinking-fp8"
 [rollout_transfer]
 direction = "trainer_pull"
 backend = "b2_s3"
+download_workers = 8
+download_threshold_bytes = 67108864
 # Provision this H200 host venv explicitly from b2-rollout-requirements.txt.
 # It is never installed automatically or mounted in a model container.
 b2_python = "/data/trinity/b2-transport-venv/bin/python"
