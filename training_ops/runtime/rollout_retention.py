@@ -517,6 +517,13 @@ def _final_quarantine_check(
         batch_fd, batch_info = _open_file_at(directory_fd, "train_rollouts.bin", "quarantined rollout batch")
         marker_fd, marker_info = _open_file_at(directory_fd, "train_rollouts.bin.delivered", "quarantined delivery marker")
         opened.extend((batch_fd, marker_fd))
+        for descriptor in (batch_fd, marker_fd):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                _fail("quarantined rollout file lock is open")
+            except OSError as error:
+                _fail(f"quarantined rollout file lock cannot be checked: {error}")
         if any(info.st_uid != owner_uid or info.st_gid != owner_gid for info in (batch_info, marker_info)):
             _fail("quarantined rollout ownership changed")
         payload = _read_fd(batch_fd)

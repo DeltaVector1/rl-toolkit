@@ -12976,6 +12976,8 @@ def _rollout_retention_action(arguments: list[str]):
             bytes_used = record.get("selected_bytes")
             all_steps = record.get("all_steps")
             active_step = record.get("active_step")
+            if record.get("run_name") != run or record.get("run_dir") != run_dir:
+                raise Refused(f"rollout-retention {phase} result path or run identity differs on {host}")
             selected_identity = candidate_identity(record.get("selected"), "selected")
             if (
                 not isinstance(steps, list)

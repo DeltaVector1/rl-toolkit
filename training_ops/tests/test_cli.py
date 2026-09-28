@@ -26,6 +26,8 @@ class CliTest(unittest.TestCase):
         }
         result = {
             "node": host,
+            "run_name": "demo",
+            "run_dir": "/tmp/run_demo",
             "active_step": 4,
             "all_steps": all_steps or [0, 1, 2, 3, 4],
             "selected_steps": [step],
@@ -245,7 +247,7 @@ class CliTest(unittest.TestCase):
             "required_steps": [3, 4], "nodes": {host: {"run_dir": "/tmp/run_demo"} for host in nodes},
         }
         def fake_fan(hosts, callback):
-            result = {"node": hosts[0], "active_step": 4, "all_steps": [3, 4], "selected_steps": [], "selected_bytes": 0, "selected": []}
+            result = {"node": hosts[0], "run_name": "demo", "run_dir": "/tmp/run_demo", "active_step": 4, "all_steps": [3, 4], "selected_steps": [], "selected_bytes": 0, "selected": []}
             return {host: (0, json.dumps(dict(result, node=host))) for host in hosts}
         with mock.patch.object(training_ops, "_cold_run_paths", return_value=("/tmp", "/tmp/demo", "/tmp/run_demo")), \
             mock.patch.object(training_ops._rollout_retention, "validate_evidence", return_value=evidence), \
