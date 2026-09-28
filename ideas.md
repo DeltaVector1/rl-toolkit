@@ -1399,3 +1399,23 @@ only after measured learning.
   contexts, restoration on errors, and missing or invalid boundaries. A
   later authorized operator can repeat the same production-shape diagnostic;
   this code task includes no live action.
+
+## Bounded rollout transport connection test
+
+- **Measurements.** A `350074342`-byte rollout used `16` rsync-over-SSH
+  streams. Connections reset or closed; the transfer reached the `60s`
+  timeout with `44302336` bytes preserved. The adapter route already holds
+  `64` separate WAN SSH owners.
+- **Experiment.** Create one fresh disposable incompressible file of exactly
+  `350074342` bytes. Transfer it from the H200 source to `n82` only, using
+  the current endpoint and host-key security. Keep chunk boundaries fixed.
+  Run one trial each with `1`, then `2`, then `4` workers. For each trial,
+  record exact source and destination bytes and SHA-256, elapsed time,
+  goodput, errors, and bytes transferred again. Stop escalation on the first
+  timeout, connection reset, or hash fault. Keep the `60s` timeout and all
+  other measurement limits unchanged.
+- **Scope and decision.** Use no trainer, model, or rollout data. Preserve
+  evidence, then remove only the disposable test artifacts. Select the
+  lowest reliable connection count for rollout transport from these bounded
+  trials. Adapter transport design remains a separate task. This record
+  precedes live testing; this documentation change performs no live action.
