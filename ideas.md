@@ -1460,3 +1460,34 @@ only after measured learning.
   objects and local test files. Verify that those objects and files are
   absent. This entry precedes live action; this documentation task performs
   no network or live calls.
+
+## B2 backend for trainer rollout binaries
+
+- **Scope.** Add an explicit `b2_s3` rollout backend for H200-to-`n82`
+  `train_rollouts.bin` only. Keep SSH as the default. Keep adapter transport,
+  small control files, and trainer LAN fanout unchanged. This implementation
+  task performs no live or network action.
+- **Publisher.** Use a separately provisioned H200 host interpreter with
+  boto3 and explicit B2 fields from `/data/trinity/training.env`; fail
+  preflight if either is absent. Never use ambient AWS credentials or mount
+  credentials in model containers. Validate a regular non-symlink source
+  under the configured run root, stable source identity, size, and SHA-256.
+  Use private objects under an allowlisted prefix with run, generation,
+  step, and content identity. Permit reuse only for matching metadata.
+  Disable SDK retries, bound multipart concurrency and total time, and issue
+  an expiring presigned HTTPS GET for the exact object.
+- **Receiver and acknowledgement.** The trainer head receives no permanent
+  B2 credentials. Parse publisher JSON without shell evaluation or signed-URL
+  logging. Download once to the private partial file with a `300s` absolute
+  limit and `60s` no-progress limit, with no redirects or retries. Verify
+  exact size and SHA before existing no-replace publication and `.delivered`
+  acknowledgement. Delete only the exact returned object after verified
+  delivery. Preserve pending deletion metadata without a signed URL if
+  acknowledgement cleanup needs a later attempt. Treat authentication,
+  timeout, source mutation, size, and hash faults as terminal for B2 transfer.
+- **Checks.** Use fake S3 clients, disposable local fixtures, and the network
+  guard to test default SSH behavior, path/key/JSON validation, stable source
+  checks, deadlines, no retries, publication and exact deletion order, control
+  files, dependency deployment, and absent-credential preflight. Enable a
+  production selection only after these checks pass; local checks do not
+  qualify the live data path.
