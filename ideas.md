@@ -232,6 +232,14 @@ no fixed prefill, TailRL, staged ratios, group filters, or held-out split wiring
   filesystem, or lease break fails closed and preserves the quarantine. Test
   this with a bounded competing subprocess and an unsupported-lease fixture;
   do not accept advisory flock as the race boundary.
+- **Rejected exact-inode removal experiment.** `renameat2(RENAME_EXCHANGE)` can
+  move a checked entry to a private sentinel atomically, but Linux has no
+  compare-and-unlink or unlink-by-file-descriptor operation. After the
+  displaced inode is removed, deleting the sentinel still names a mutable
+  directory entry; a same-UID `rename` can replace it between verification and
+  `unlinkat`. Write leases protect inode contents, not directory names. Keep
+  the action fail-closed until writer quiescence or a kernel primitive that
+  binds removal to the held inode is available.
 
 ## Measured long-haul evidence
 
