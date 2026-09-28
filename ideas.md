@@ -1,5 +1,24 @@
 # Difficulty ideas
 
+## One bounded B2 API retry with exact receipt identity
+
+- **Measured failure.** A transient B2/S3 `ClientError` during the step 7
+  publish phase can fail an otherwise valid rollout while the SDK is set to
+  one total attempt. Retrying every exception would risk duplicate object
+  versions, hide permission faults, and leak provider details.
+- **Plan.** Add one operation-deadline-bounded retry only for explicit
+  transient status codes or error codes. Revalidate the source and the
+  deterministic object metadata after every publish attempt; if a transient
+  response may have committed, accept only the exact existing object and
+  version, and clean up failed multipart state. Retry acknowledgement and
+  exact-version deletion once, accepting a second delete only when the
+  documented idempotent post-delete absence check proves the requested
+  version is gone. Emit only operation and sanitized error-code telemetry.
+- **Gates.** Deterministic tests must cover transient publish, acknowledge,
+  and delete recovery; permanent errors; exact version and object identity;
+  multipart cleanup; no duplicate accepted artifact; no URL, key, bucket, or
+  credential leakage; and the unchanged shared deadline.
+
 ## Pre-batch group progress telemetry
 
 - **Measured production baseline.** The `h200b` snapshot contained 849 trace
