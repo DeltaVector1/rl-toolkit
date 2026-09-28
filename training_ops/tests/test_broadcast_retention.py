@@ -1,6 +1,9 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
+import shutil
 import tempfile
 import time
 import unittest
@@ -22,31 +25,57 @@ class BroadcastRetentionTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def _step(self, step, *, ack=True, model=None, writer=False):
+    def _step(self, step, *, ack=True, model=None, writer=False, transport=False):
         path = self.broadcasts / f"step_{step}"
         path.mkdir()
         if model is None:
-            model = f"model-{step}".encode()
+            model = (bytes(range(256)) * 4)[:986] if transport else f"model-{step}".encode()
         config = b'{"r":32}\n'
         model_sha = hashlib.sha256(model).hexdigest()
         config_sha = hashlib.sha256(config).hexdigest()
         (path / "adapter_model.safetensors").write_bytes(model)
         (path / "adapter_config.json").write_bytes(config)
         (path / "adapter_model.safetensors.sha256").write_text(model_sha + "\n")
-        (path / "adapter_manifest.json").write_text(json.dumps({
+        manifest = {
             "version": 1,
             "kind": "lora-adapter",
             "mode": "full",
             "target_step": step,
+            "full_sha256": model_sha,
+            "full_size": len(model),
             "target_sha256": model_sha,
             "target_size": len(model),
             "config_sha256": config_sha,
             "config_size": len(config),
+            "encoded_size": len(model),
+            "chunk_size": 1,
+            "chunk_count": 0,
             "files": [
                 {"name": "adapter_config.json", "sha256": config_sha, "size": len(config)},
                 {"name": "adapter_model.safetensors", "sha256": model_sha, "size": len(model)},
             ],
-        }))
+        }
+        if transport:
+            chunks = []
+            for index, value in enumerate(model):
+                name = f"adapter_model.safetensors.transport-full-zstd-{index:06d}"
+                payload = bytes([value])
+                (path / name).write_bytes(payload)
+                chunks.append({
+                    "file": name,
+                    "offset": index,
+                    "raw_size": 1,
+                    "wire_size": 1,
+                    "wire_sha256": hashlib.sha256(payload).hexdigest(),
+                    "raw_sha256": hashlib.sha256(payload).hexdigest(),
+                    "codec": "zstd",
+                })
+            manifest.update({
+                "transport": "chunked-full-zstd",
+                "chunk_count": len(chunks),
+                "chunks": chunks,
+            })
+        (path / "adapter_manifest.json").write_text(json.dumps(manifest))
         if writer:
             (path / "WRITING").write_text("1")
         else:
@@ -72,7 +101,15 @@ class BroadcastRetentionTest(unittest.TestCase):
                 )},
                 "receivers": [{
                     "endpoint": "http://h200",
-                    "receipt": identity,
+                    "receipt": {
+                        "source_url": identity["source_url"],
+                        "target_sha256": identity["target_sha256"],
+                        "target_size": identity["target_size"],
+                        "config_sha256": identity["config_sha256"],
+                        "config_size": identity["config_size"],
+                        "lora_name": identity["slot"],
+                        "server_instance": identity["server_instance"],
+                    },
                 }],
             }))
         return identity
@@ -91,8 +128,9 @@ class BroadcastRetentionTest(unittest.TestCase):
             os.utime(item, (old, old), follow_symlinks=False)
 
     def test_inventory_selects_only_acknowledged_old_stable_and_old_partial(self):
-        old = self._step(0)
-        active = self._step(2)
+        old = self._step(0, transport=True)
+        active = self._step(2, transport=True)
+        self.assertEqual(len(list((self.broadcasts / "step_0").iterdir())), 992)
         partial = self.broadcasts / "step_1"
         partial.mkdir()
         (partial / "partial.bin").write_bytes(b"partial")
@@ -103,7 +141,7 @@ class BroadcastRetentionTest(unittest.TestCase):
             keep_latest=1,
             partial_age_seconds=60,
             max_entries=8,
-            max_bytes=100000,
+            max_bytes=1000000,
             now=time.time(),
         )
         selected = {item["path"] for item in report["selected"]}
@@ -112,8 +150,23 @@ class BroadcastRetentionTest(unittest.TestCase):
         self.assertNotIn(str(self.broadcasts / "step_2"), selected)
         self.assertEqual(report["loaded"]["step"], 2)
 
+    def test_mutated_chunk_and_special_file_are_not_eligible(self):
+        old = self._step(0, transport=True)
+        active = self._step(2)
+        chunk = self.broadcasts / "step_0" / "adapter_model.safetensors.transport-full-zstd-000000"
+        chunk.write_bytes(b"changed")
+        report = retention.inventory(self.root, self._evidence(active, old, active), max_bytes=1000000)
+        self.assertNotIn(str(self.broadcasts / "step_0"), {item["path"] for item in report["selected"]})
+        self.assertTrue(any("transport chunk identity differs" in item["reason"] for item in report["invalid"]))
+
+        shutil.rmtree(self.broadcasts / "step_0")
+        old = self._step(0, transport=True)
+        os.mkfifo(self.broadcasts / "step_0" / "special")
+        report = retention.inventory(self.root, self._evidence(active, old, active), max_bytes=1000000)
+        self.assertTrue(any("unknown or missing files" in item["reason"] for item in report["invalid"]))
+
     def test_dry_run_preserves_everything_and_keeps_unacknowledged_stable(self):
-        old = self._step(0, ack=False)
+        self._step(0, ack=False)
         active = self._step(2)
         result = retention.cleanup(
             self.root,
@@ -126,7 +179,7 @@ class BroadcastRetentionTest(unittest.TestCase):
         )
         self.assertTrue(result["dry_run"])
         self.assertEqual(result["removed"], [])
-        self.assertTrue((old and self.broadcasts / "step_0").exists())
+        self.assertTrue((self.broadcasts / "step_0").exists())
         self.assertTrue((self.broadcasts / "step_2").exists())
 
     def test_apply_removes_selected_atomically_and_preserves_active(self):
@@ -167,6 +220,45 @@ class BroadcastRetentionTest(unittest.TestCase):
         self.assertEqual(report["selected"], [])
         with self.assertRaisesRegex(retention.RetentionError, "n79"):
             retention.inventory("/data/n79/run_trinity", self._evidence(active, active))
+
+    def test_protected_transfer_partial_is_not_selected(self):
+        active = self._step(2)
+        partial = self.broadcasts / "step_1"
+        partial.mkdir()
+        (partial / "train_rollouts.bin.b2-ack.json").write_text("pending")
+        self._age(partial)
+        report = retention.inventory(self.root, self._evidence(active, active), partial_age_seconds=0)
+        self.assertEqual(report["selected"], [])
+        self.assertEqual(report["partials"][0]["reason"], "protected-checkpoint-or-transfer")
+
+    def test_lock_race_and_crash_quarantine_recovery_free_space(self):
+        active = self._step(2)
+        old = self._step(0)
+        quarantine = self.broadcasts / ".retention-quarantine-crashed"
+        quarantine.mkdir()
+        (quarantine / "stale").write_bytes(b"stale")
+        self._age(quarantine)
+        script = (
+            "from training_ops.runtime.broadcast_retention import producer_lock; "
+            f"lock=producer_lock({str(self.root)!r}); lock.__enter__(); import time; time.sleep(2)"
+        )
+        with retention.producer_lock(self.root):
+            process = subprocess.Popen([sys.executable, "-c", script])
+            time.sleep(0.2)
+            self.assertIsNone(process.poll())
+            process.terminate()
+            process.wait(timeout=2)
+        result = retention.cleanup(
+            self.root,
+            self._evidence(active, old, active),
+            keep_latest=1,
+            max_entries=8,
+            max_bytes=100000,
+            dry_run=False,
+        )
+        self.assertTrue(result["freed_bytes"] >= len(b"stale"))
+        self.assertEqual(len(result["recovered_quarantine"]), 1)
+        self.assertFalse(quarantine.exists())
 
 
 if __name__ == "__main__":

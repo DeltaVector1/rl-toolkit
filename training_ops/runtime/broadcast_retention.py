@@ -8,6 +8,7 @@ removes entries after validating the local publication again under a lock.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -54,6 +55,17 @@ _ACK_KEYS = frozenset(
         "receivers",
     }
 )
+_RECEIPT_KEYS = frozenset(
+    {
+        "source_url",
+        "target_sha256",
+        "target_size",
+        "config_sha256",
+        "config_size",
+        "lora_name",
+        "server_instance",
+    }
+)
 _REQUIRED_FILES = frozenset(
     {
         "STABLE",
@@ -77,6 +89,16 @@ _PROTECTED_NAMES = frozenset(
         "nv-community_GLM-5.2-NVFP4",
     }
 )
+_PROTECTED_FILE_NAMES = frozenset(
+    {
+        ".b2-ack.json",
+        ".delivered",
+        "train_rollouts.bin",
+        "train_rollouts.bin.delivered",
+        "optimizer.pt",
+        "optimizer.bin",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -97,6 +119,7 @@ class _Partial:
     newest_mtime_ns: int
     reason: str
     stat_key: tuple[int, int, int]
+    protected: bool
 
 
 def _fail(message: str) -> None:
@@ -242,7 +265,12 @@ def _manifest_identity(path: Path, step: int) -> tuple[dict[str, Any], set[str]]
     config_size = _regular(config, "adapter config").st_size
     model_sha = _sha256(model, "adapter model")
     config_sha = _sha256(config, "adapter config")
-    if manifest.get("target_size") != model_size or manifest.get("target_sha256") != model_sha:
+    if (
+        manifest.get("full_size") != model_size
+        or manifest.get("full_sha256") != model_sha
+        or manifest.get("target_size") != model_size
+        or manifest.get("target_sha256") != model_sha
+    ):
         _fail(f"adapter manifest model identity differs: {path}")
     if manifest.get("config_size") != config_size or manifest.get("config_sha256") != config_sha:
         _fail(f"adapter manifest config identity differs: {path}")
@@ -270,15 +298,84 @@ def _manifest_identity(path: Path, step: int) -> tuple[dict[str, Any], set[str]]
         _fail(f"adapter checksum sidecar is invalid: {error}")
     if sidecar_value != model_sha:
         _fail(f"adapter checksum sidecar differs: {path}")
+    chunk_count = manifest.get("chunk_count")
+    if type(chunk_count) is not int or not 0 <= chunk_count <= 10000:
+        _fail(f"adapter manifest chunk count is invalid: {path}")
+    encoded_size = manifest.get("encoded_size")
+    if type(encoded_size) is not int or encoded_size <= 0:
+        _fail(f"adapter manifest encoded size is invalid: {path}")
+    chunk_size = manifest.get("chunk_size")
+    if type(chunk_size) is not int or chunk_size <= 0:
+        _fail(f"adapter manifest chunk size is invalid: {path}")
+    mode = manifest.get("mode")
+    if mode not in {"full", "delta", "predictive"}:
+        _fail(f"adapter manifest mode is invalid: {path}")
     extras = set()
     chunks = manifest.get("chunks", [])
-    if chunks is not None:
-        if not isinstance(chunks, list):
-            _fail(f"adapter manifest chunks are invalid: {path}")
-        for item in chunks:
-            if not isinstance(item, Mapping) or not isinstance(item.get("file"), str) or not item["file"] or "/" in item["file"] or "\\" in item["file"]:
-                _fail(f"adapter manifest chunk name is invalid: {path}")
-            extras.add(item["file"])
+    if chunks is None:
+        chunks = []
+    if not isinstance(chunks, list) or len(chunks) != chunk_count:
+        _fail(f"adapter manifest chunks do not match chunk_count: {path}")
+    if chunk_count == 0:
+        if manifest.get("transport") not in (None, "identity"):
+            _fail(f"adapter manifest has transport without chunks: {path}")
+        if encoded_size != model_size:
+            _fail(f"adapter manifest encoded size differs for an unchunked adapter: {path}")
+    else:
+        transport = manifest.get("transport")
+        if not isinstance(transport, str) or "zstd" not in transport:
+            _fail(f"adapter manifest chunk transport is invalid: {path}")
+    expected_offset = 0
+    wire_total = 0
+    expected_chunk_keys = {
+        "file", "offset", "raw_size", "wire_size", "wire_sha256", "raw_sha256", "codec"
+    }
+    if mode == "predictive":
+        expected_chunk_keys.add("data_offset")
+    for index, item in enumerate(chunks):
+        if not isinstance(item, Mapping) or set(item) != expected_chunk_keys:
+            _fail(f"adapter manifest chunk record is invalid: {path}")
+        name = item.get("file")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in extras
+            or "/" in name
+            or "\\" in name
+            or name in _REQUIRED_FILES
+        ):
+            _fail(f"adapter manifest chunk name is invalid: {path}")
+        if (
+            type(item.get("offset")) is not int
+            or item["offset"] != expected_offset
+            or type(item.get("raw_size")) is not int
+            or item["raw_size"] <= 0
+            or type(item.get("wire_size")) is not int
+            or item["wire_size"] <= 0
+            or not isinstance(item.get("wire_sha256"), str)
+            or _DIGEST.fullmatch(item["wire_sha256"]) is None
+            or not isinstance(item.get("raw_sha256"), str)
+            or _DIGEST.fullmatch(item["raw_sha256"]) is None
+            or item.get("codec") != "zstd"
+        ):
+            _fail(f"adapter manifest chunk identity is invalid: {path}")
+        if mode == "predictive" and (
+            type(item.get("data_offset")) is not int
+            or item["data_offset"] < 0
+            or item["data_offset"] > model_size
+        ):
+            _fail(f"adapter manifest predictive chunk offset is invalid: {path}")
+        chunk_path = path / name
+        chunk_info = _regular(chunk_path, "adapter transport chunk")
+        if chunk_info.st_size != item["wire_size"] or _sha256(chunk_path, "adapter transport chunk") != item["wire_sha256"]:
+            _fail(f"adapter transport chunk identity differs: {path}")
+        extras.add(name)
+        expected_offset += item["raw_size"]
+        wire_total += item["wire_size"]
+    if chunk_count and (expected_offset != model_size or wire_total != encoded_size):
+        _fail(f"adapter manifest chunk coverage differs: {path}")
+    if not chunk_count and manifest.get("chunks") not in (None, []):
+        _fail(f"adapter manifest has unexpected chunks: {path}")
     return {
         "step": step,
         "source_url": "",
@@ -303,10 +400,6 @@ def _ack(path: Path, *, step: int, run_name: str, identity: Mapping[str, Any]) -
         _fail(f"receiver acknowledgement records are invalid: {path}")
     records = []
     endpoints = set()
-    core = {
-        name: identity[name]
-        for name in ("step", "target_sha256", "target_size", "config_sha256", "config_size")
-    }
     for item in receivers:
         if not isinstance(item, Mapping) or set(item) != {"endpoint", "receipt"}:
             _fail(f"receiver acknowledgement records are invalid: {path}")
@@ -314,17 +407,21 @@ def _ack(path: Path, *, step: int, run_name: str, identity: Mapping[str, Any]) -
         if not isinstance(endpoint, str) or not endpoint or endpoint in endpoints:
             _fail(f"receiver acknowledgement endpoints are invalid: {path}")
         receipt = item["receipt"]
-        if not isinstance(receipt, Mapping) or set(receipt) != _IDENTITY_KEYS:
+        if not isinstance(receipt, Mapping) or set(receipt) != _RECEIPT_KEYS:
             _fail(f"receiver acknowledgement receipt is invalid: {path}")
-        checked = _identity(receipt, f"receiver acknowledgement at {path}", step=step)
-        checked_core = {
-            name: checked[name]
-            for name in ("step", "target_sha256", "target_size", "config_sha256", "config_size")
-        }
-        if checked_core != core or checked["source_url"] != value["source_url"] or checked["slot"] != value["slot"]:
+        if (
+            receipt.get("source_url") != value["source_url"]
+            or receipt.get("target_sha256") != value["target_sha256"]
+            or receipt.get("target_size") != value["target_size"]
+            or receipt.get("config_sha256") != value["config_sha256"]
+            or receipt.get("config_size") != value["config_size"]
+            or receipt.get("lora_name") != value["slot"]
+            or not isinstance(receipt.get("server_instance"), str)
+            or re.fullmatch(r"[0-9a-f]{32}", receipt["server_instance"]) is None
+        ):
             _fail(f"receiver acknowledgement identity differs: {path}")
         endpoints.add(endpoint)
-        records.append(checked)
+        records.append({"server_instance": receipt["server_instance"]})
     return value, records
 
 
@@ -383,11 +480,82 @@ def _stable(path: Path, *, step: int, run_name: str) -> _Stable:
 def _partial(path: Path, step: int | None, reason: str) -> _Partial:
     info = _directory(path, "partial adapter directory")
     bytes_used, newest = _tree_size_and_mtime(path)
-    return _Partial(path, step, bytes_used, newest, reason, (info.st_dev, info.st_ino, info.st_mtime_ns))
+    protected = False
+    for entry in (path, *path.rglob("*")):
+        if entry.name in _PROTECTED_NAMES or entry.name in _PROTECTED_FILE_NAMES or entry.name.endswith(".b2-ack.json"):
+            protected = True
+            break
+    if protected:
+        reason = "protected-checkpoint-or-transfer"
+    return _Partial(path, step, bytes_used, newest, reason, (info.st_dev, info.st_ino, info.st_mtime_ns), protected)
 
 
 def _ack_match(candidate: _Stable, records: list[dict[str, Any]]) -> bool:
     return any(_core(candidate.identity) == _core(record) and record["server_instance"] in candidate.server_instances for record in records)
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        _fail(f"retention directory cannot be opened for fsync: {error}")
+    try:
+        os.fsync(fd)
+    except OSError as error:
+        _fail(f"retention directory cannot be fsynced: {error}")
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def producer_lock(run_dir: str | Path):
+    """Hold the publication lock that producers must share with cleanup."""
+    path = _safe_run_dir(run_dir)
+    broadcasts = path / "broadcasts"
+    _directory(broadcasts, "broadcast directory")
+    lock_path = broadcasts / ".retention.lock"
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as error:
+        _fail(f"retention producer lock cannot be opened: {error}")
+    try:
+        lock = os.fdopen(fd, "a+")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield lock_path
+        finally:
+            lock.close()
+    except OSError as error:
+        _fail(f"retention producer lock failed: {error}")
+
+
+def _quarantine_inventory(broadcasts: Path) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    found: list[dict[str, Any]] = []
+    invalid: list[dict[str, str]] = []
+    for path in sorted(broadcasts.glob(".retention-quarantine-*"), key=lambda item: item.name):
+        if path.is_symlink():
+            invalid.append({"path": str(path), "reason": "quarantine-is-symlink"})
+            continue
+        try:
+            info = path.lstat()
+        except OSError as error:
+            invalid.append({"path": str(path), "reason": f"quarantine-cannot-be-inspected: {error}"})
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            invalid.append({"path": str(path), "reason": "quarantine-is-not-directory"})
+            continue
+        try:
+            bytes_used, newest = _tree_size_and_mtime(path)
+        except RetentionError as error:
+            invalid.append({"path": str(path), "reason": str(error)})
+            continue
+        found.append({
+            "path": str(path),
+            "bytes": bytes_used,
+            "newest_mtime_ns": newest,
+            "stat_key": (info.st_dev, info.st_ino, info.st_mtime_ns),
+        })
+    return found, invalid
 
 
 def _snapshot(run_dir: Path, evidence: dict[str, Any], keep_latest: int, partial_age_seconds: float, max_entries: int, max_bytes: int, now: float) -> dict[str, Any]:
@@ -399,6 +567,8 @@ def _snapshot(run_dir: Path, evidence: dict[str, Any], keep_latest: int, partial
     candidates: list[_Stable] = []
     partials: list[_Partial] = []
     invalid: list[dict[str, str]] = []
+    quarantines, quarantine_invalid = _quarantine_inventory(broadcasts)
+    invalid.extend(quarantine_invalid)
     for entry in sorted(broadcasts.iterdir(), key=lambda item: item.name):
         if entry.is_symlink():
             invalid.append({"path": str(entry), "reason": "symlink"})
@@ -452,7 +622,7 @@ def _snapshot(run_dir: Path, evidence: dict[str, Any], keep_latest: int, partial
     for partial in partials:
         age = max(0.0, now - partial.newest_mtime_ns / 1_000_000_000)
         names = {item.name for item in partial.path.iterdir()}
-        protected = bool(names & _WRITER_MARKERS or "receivers-ready.json" in names or age < partial_age_seconds)
+        protected = bool(partial.protected or names & _WRITER_MARKERS or "receivers-ready.json" in names or age < partial_age_seconds)
         if not protected:
             partial_eligible.append({"path": str(partial.path), "step": partial.step, "bytes": partial.bytes, "age_seconds": age, "newest_mtime_ns": partial.newest_mtime_ns, "reason": partial.reason, "stat_key": partial.stat_key})
     selected: list[dict[str, Any]] = []
@@ -468,6 +638,8 @@ def _snapshot(run_dir: Path, evidence: dict[str, Any], keep_latest: int, partial
         "stable": [{"path": str(item.path), "step": item.step, "bytes": item.bytes, "identity": item.identity, "kept": item.step in keep_steps, "acknowledged": item.step in acked and _ack_match(item, [acked[item.step]])} for item in candidates],
         "partials": [{"path": str(item.path), "step": item.step, "bytes": item.bytes, "age_seconds": max(0.0, now - item.newest_mtime_ns / 1_000_000_000), "reason": item.reason, "eligible": any(value["path"] == str(item.path) for value in partial_eligible)} for item in partials],
         "invalid": invalid,
+        "quarantine": quarantines,
+        "quarantine_invalid": quarantine_invalid,
         "selected": selected,
         "selected_bytes": used_bytes,
     }
@@ -491,23 +663,38 @@ def inventory(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, 
 def cleanup(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, keep_latest: int = 2, partial_age_seconds: float = 1800.0, max_entries: int = 8, max_bytes: int = 50 * 1024**3, dry_run: bool = True, now: float | None = None) -> dict[str, Any]:
     """Inventory or remove bounded, identity-checked retention candidates."""
     report = inventory(run_dir, evidence, keep_latest=keep_latest, partial_age_seconds=partial_age_seconds, max_entries=max_entries, max_bytes=max_bytes, now=now)
-    if dry_run or not report["selected"]:
+    if dry_run or (not report["selected"] and not report["quarantine"]):
         report["dry_run"] = True
         report["removed"] = []
+        report["recovered_quarantine"] = []
+        report["freed_bytes"] = 0
         return report
     path = _safe_run_dir(run_dir)
     evidence_value = _load_evidence(evidence)
     broadcasts = path / "broadcasts"
-    lock_path = broadcasts / ".retention.lock"
-    _regular(lock_path, "retention lock") if lock_path.exists() else None
-    try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    except OSError as error:
-        _fail(f"retention lock cannot be opened: {error}")
     removed = []
-    with os.fdopen(fd, "a+") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    recovered = []
+    freed_bytes = 0
+    with producer_lock(path):
         fresh = inventory(path, evidence_value, keep_latest=keep_latest, partial_age_seconds=partial_age_seconds, max_entries=max_entries, max_bytes=max_bytes, now=now)
+        if fresh["quarantine_invalid"]:
+            _fail("retention quarantine recovery is invalid")
+        for item in fresh["quarantine"]:
+            quarantine = Path(item["path"])
+            info = quarantine.lstat()
+            expected = tuple(item["stat_key"])
+            if (info.st_dev, info.st_ino, info.st_mtime_ns) != expected:
+                _fail("retention quarantine identity changed before recovery")
+            current_bytes, current_newest = _tree_size_and_mtime(quarantine)
+            if current_bytes != item["bytes"] or current_newest != item["newest_mtime_ns"]:
+                _fail("retention quarantine contents changed before recovery")
+            try:
+                shutil.rmtree(quarantine)
+            except OSError as error:
+                _fail(f"retention quarantine recovery failed: {error}")
+            _fsync_directory(broadcasts)
+            recovered.append(item)
+            freed_bytes += item["bytes"]
         for item in fresh["selected"]:
             source = Path(item["path"])
             if source.parent != broadcasts or not source.name.startswith("step_"):
@@ -516,7 +703,10 @@ def cleanup(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, ke
             if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
                 _fail("retention candidate changed before removal")
             expected_stat = tuple(item.get("stat_key", ()))
-            observed_stat = (before.st_dev, before.st_ino, before.st_mtime_ns) + ((before.st_ctime_ns,) if len(expected_stat) == 4 else ())
+            stable_info = None
+            if len(expected_stat) == 4:
+                stable_info = _regular(source / "STABLE", "STABLE marker")
+            observed_stat = (before.st_dev, before.st_ino, before.st_mtime_ns) + ((stable_info.st_mtime_ns,) if stable_info is not None else ())
             if observed_stat[: len(expected_stat)] != expected_stat:
                 _fail("retention candidate identity changed before removal")
             quarantine = broadcasts / f".retention-quarantine-{uuid.uuid4().hex}"
@@ -524,6 +714,7 @@ def cleanup(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, ke
                 os.rename(source, quarantine)
             except OSError as error:
                 _fail(f"retention candidate changed before atomic quarantine: {error}")
+            _fsync_directory(broadcasts)
             try:
                 if "identity" in item:
                     checked = _stable(
@@ -547,9 +738,13 @@ def cleanup(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, ke
                 shutil.rmtree(quarantine)
             except OSError as error:
                 _fail(f"retention quarantine removal failed: {error}")
+            _fsync_directory(broadcasts)
             removed.append(item)
+            freed_bytes += item["bytes"]
     report["dry_run"] = False
     report["removed"] = removed
+    report["recovered_quarantine"] = recovered
+    report["freed_bytes"] = freed_bytes
     return report
 
 
