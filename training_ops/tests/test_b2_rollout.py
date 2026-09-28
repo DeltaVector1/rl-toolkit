@@ -99,6 +99,7 @@ class MultipartS3(FakeS3):
         self.create_error = create_error
         self.abort_failures = abort_failures
         self.retain_on_complete_error = retain_on_complete_error
+        self.list_response = None
 
     def create_multipart_upload(self, **kwargs):
         self.multipart_creates += 1
@@ -138,7 +139,12 @@ class MultipartS3(FakeS3):
         self.uploads_by_id.pop(kwargs["UploadId"], None)
 
     def list_multipart_uploads(self, **kwargs):
+        if self.list_response is not None:
+            return self.list_response
         return {
+            "Bucket": kwargs["Bucket"],
+            "Prefix": kwargs["Prefix"],
+            "IsTruncated": False,
             "Uploads": [
                 {"Key": item["kwargs"]["Key"], "UploadId": upload_id}
                 for upload_id, item in self.uploads_by_id.items()
@@ -325,6 +331,72 @@ class B2RolloutTest(unittest.TestCase):
         self.assertEqual(records[-1]["operation"], "publish.multipart.create")
         self.assertFalse(records[-1]["retry"])
         self.assertNotIn("https://secret.invalid", output.getvalue())
+
+    def test_multipart_malformed_empty_upload_entry_fails_closed(self):
+        client = MultipartS3(complete_error=True)
+        key = tool.source_info(self.source, self.runs)[0]["key"]
+        client.list_response = {
+            "Bucket": "fixture",
+            "Prefix": key,
+            "IsTruncated": False,
+            "Uploads": [{}],
+        }
+        config = SimpleNamespace(multipart_threshold=1024, multipart_chunksize=1024)
+        with self.assertRaises(tool._MultipartCleanupFailed):
+            tool.publish(
+                client, "fixture", self.source, self.runs, transfer_config=config
+            )
+        self.assertEqual(client.multipart_creates, 1)
+        self.assertEqual(len(client.aborts), 1)
+
+    def test_multipart_listing_malformed_types_duplicates_and_pagination_fail(self):
+        key = tool.source_info(self.source, self.runs)[0]["key"]
+        upload = {"Key": key, "UploadId": "upload-1"}
+
+        def page(**changes):
+            value = {
+                "Bucket": "fixture",
+                "Prefix": key,
+                "IsTruncated": False,
+                "Uploads": [],
+            }
+            value.update(changes)
+            return value
+
+        cases = [
+            page(Uploads=[None]),
+            page(Uploads=[{"Key": key}]),
+            page(Uploads=[{"Key": key, "UploadId": 1}]),
+            page(Uploads=[upload, {"Key": key, "UploadId": "upload-2"}]),
+            page(Uploads=[upload, dict(upload)]),
+            page(Uploads=None),
+            page(IsTruncated="false"),
+            page(IsTruncated=True, NextKeyMarker="next-key"),
+            page(NextKeyMarker=1, NextUploadIdMarker="next-upload"),
+            page(NextKeyMarker="next-key", NextUploadIdMarker=""),
+            page(NextKeyMarker="next-key", NextUploadIdMarker="next-upload"),
+            page(KeyMarker="unexpected"),
+            page(CommonPrefixes=[{"Prefix": "other"}]),
+            page(Delimiter="/"),
+            page(Bucket="other"),
+            page(Prefix="other"),
+        ]
+        missing_uploads = page()
+        del missing_uploads["Uploads"]
+        cases.append(missing_uploads)
+
+        class ListingClient:
+            def __init__(self, value):
+                self.value = value
+
+            def list_multipart_uploads(self, **kwargs):
+                return self.value
+
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                tool._verify_multipart_absent(
+                    ListingClient(value), "fixture", key, "upload-1"
+                )
 
     def test_multipart_abort_retries_and_verifies_exact_absence(self):
         client = MultipartS3(complete_error=True, abort_failures=1)

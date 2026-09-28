@@ -7,6 +7,7 @@ Only publisher commands read /data/trinity/training.env. Never log publish JSON.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from contextlib import contextmanager
 import hashlib
 import ipaddress
@@ -169,7 +170,7 @@ def _client_error_details(error):
     if not is_client_error:
         return None
     response = getattr(error, "response", {})
-    if not isinstance(response, dict):
+    if not isinstance(response, Mapping):
         response = {}
     metadata = response.get("ResponseMetadata", {})
     if not isinstance(metadata, dict):
@@ -414,21 +415,69 @@ def _open_source(source):
 
 
 def _verify_multipart_absent(client, bucket, key, upload_id):
+    if any(
+        type(value) is not str or not value
+        for value in (bucket, key, upload_id)
+    ):
+        raise ValueError("multipart identity is invalid")
     response = _api_call(
         "publish.multipart.list",
         lambda: client.list_multipart_uploads(Bucket=bucket, Prefix=key),
     )
-    if not isinstance(response, dict) or response.get("IsTruncated", False):
+    if not isinstance(response, dict):
         raise ValueError("multipart absence is not proven")
-    uploads = response.get("Uploads", [])
-    if uploads is None:
-        uploads = []
-    if not isinstance(uploads, list):
+    if response.get("Bucket") != bucket or response.get("Prefix") != key:
+        raise ValueError("multipart listing identity differs")
+    if type(response.get("IsTruncated")) is not bool:
+        raise ValueError("multipart pagination flag is invalid")
+    uploads = response.get("Uploads")
+    if type(uploads) is not list:
         raise ValueError("multipart listing is invalid")
+    for marker in ("KeyMarker", "UploadIdMarker"):
+        value = response.get(marker, "")
+        if type(value) is not str or value:
+            raise ValueError("multipart pagination marker is invalid")
+    if "Delimiter" in response and (
+        type(response["Delimiter"]) is not str or response["Delimiter"]
+    ):
+        raise ValueError("multipart delimiter is invalid")
+    if "CommonPrefixes" in response:
+        common = response["CommonPrefixes"]
+        if type(common) is not list or common:
+            raise ValueError("multipart common prefixes are invalid")
+    next_key = response.get("NextKeyMarker", "")
+    next_upload = response.get("NextUploadIdMarker", "")
+    if type(next_key) is not str or type(next_upload) is not str:
+        raise ValueError("multipart next marker is invalid")
+    if response["IsTruncated"]:
+        if not next_key or not next_upload:
+            raise ValueError("multipart pagination is incomplete")
+        raise ValueError("multipart listing is truncated")
+    if bool(next_key) != bool(next_upload):
+        raise ValueError("multipart next markers are inconsistent")
+    if next_key or next_upload:
+        raise ValueError("multipart next markers are unexpected")
+    if "MaxUploads" in response and (
+        type(response["MaxUploads"]) is not int or response["MaxUploads"] <= 0
+    ):
+        raise ValueError("multipart page size is invalid")
+    seen_keys, seen_ids = set(), set()
     for upload in uploads:
-        if not isinstance(upload, dict):
+        if not isinstance(upload, Mapping):
             raise ValueError("multipart listing is invalid")
-        if upload.get("Key") == key and upload.get("UploadId") == upload_id:
+        item_key, item_id = upload.get("Key"), upload.get("UploadId")
+        if (
+            type(item_key) is not str
+            or not item_key
+            or type(item_id) is not str
+            or not item_id
+        ):
+            raise ValueError("multipart upload identity is invalid")
+        if item_key != key or item_key in seen_keys or item_id in seen_ids:
+            raise ValueError("multipart listing is ambiguous")
+        seen_keys.add(item_key)
+        seen_ids.add(item_id)
+        if item_key == key and item_id == upload_id:
             raise ValueError("multipart upload was not aborted")
 
 
