@@ -1530,3 +1530,27 @@ only after measured learning.
   deletion, and exact-path cleanup and absence checks from the first plan.
   A pass qualifies the first production run, not `50` steps. This record
   precedes a second experiment; this task performs no live or network action.
+
+## Third and final production-size B2 qualification: reviewed Python harness
+
+- **Second-attempt measurements.** Publish transferred `350074342` bytes
+  in `26.275s`; receive transferred `350074342` bytes in `31.228s`. SHA-256
+  values matched, with no transfer errors. The harness then failed on unset
+  `python_h` before acknowledgement. The operator reports that later exact
+  cleanup acknowledgement succeeded, the version check returned `404`, and
+  test fixtures and processes were removed. The full lifecycle did not pass.
+- **Required harness.** Permit one third and final qualification only with
+  the independently reviewed Python-managed harness
+  `/tmp/b2-qualification-review.vBy14X/managed_qualification.py`. Its three
+  fake, no-network lifecycle tests, Ruff, and compile checks passed. Keep
+  the remote `300s` hard and `60s` download low-speed limits unchanged.
+- **Experiment and gates.** Use a fresh incompressible `350074342`-byte
+  synthetic file and fresh object key, one attempt per leg, and no retry.
+  Use no production or cached rollout data. Require the complete sequence:
+  publish, guarded `n82` receive, exact size and SHA-256 checks, a delivery
+  marker bound to the verified content, acknowledgement for the exact
+  object version, independent absence verification, and exact-path cleanup.
+  Record each phase's timing, transfer goodput, and errors, including
+  acknowledgement, absence checks, and cleanup. Stop on any fault. A pass
+  qualifies the first production run only, not `50`-step acceptance. This
+  entry precedes live work; this task performs no live or network action.
