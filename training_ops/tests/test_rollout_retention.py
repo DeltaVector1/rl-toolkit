@@ -167,6 +167,24 @@ class RolloutRetentionTest(unittest.TestCase):
                 retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
         self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
 
+    def test_apply_race_after_per_entry_stat_before_unlink_fails(self):
+        original_stat = retention.os.stat
+        calls = {"batch": 0}
+
+        def race(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if kwargs.get("dir_fd") is not None and path == "train_rollouts.bin":
+                calls["batch"] += 1
+                if calls["batch"] == 2:
+                    directory = Path(os.readlink(f"/proc/self/fd/{kwargs['dir_fd']}"))
+                    (directory / "train_rollouts.bin").write_bytes(b"after-stat")
+            return result
+
+        with mock.patch.object(retention.os, "stat", side_effect=race):
+            with self.assertRaisesRegex(retention.RetentionError, "changed"):
+                retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
+        self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
+
     def test_cross_node_disagreement_and_evidence_coverage_fail(self):
         other = json.loads(json.dumps(self.evidence))
         other["batches"][0]["sha256"] = "0" * 64

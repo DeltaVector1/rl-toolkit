@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -624,10 +625,30 @@ def _remove_tree_at(directory_fd: int, opened_files: list[int], expected: Mappin
             info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
         ):
             _fail(f"quarantined entry contents changed at deletion: {name}")
+        current_fd, current_info = _open_file_at(directory_fd, name, f"quarantined entry {name}")
         try:
-            os.unlink(name, dir_fd=directory_fd)
-        except OSError as error:
-            _fail(f"quarantined entry cannot be removed: {error}")
+            if (current_info.st_dev, current_info.st_ino, current_info.st_size, current_info.st_mtime_ns) != (
+                held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns
+            ):
+                _fail(f"quarantined entry changed before unlink: {name}")
+            payload = _read_fd(current_fd)
+            if name == "train_rollouts.bin":
+                if hashlib.sha256(payload).hexdigest() != expected["sha256"] or len(payload) != expected["size"]:
+                    _fail(f"quarantined batch content changed before unlink: {name}")
+            elif payload.decode("ascii") != expected["sha256"] + "\n":
+                _fail(f"quarantined delivery marker changed before unlink: {name}")
+            try:
+                library = ctypes.CDLL(None, use_errno=True)
+                unlinkat = library.unlinkat
+                unlinkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+                unlinkat.restype = ctypes.c_int
+                if unlinkat(directory_fd, os.fsencode(name), 0) != 0:
+                    error_number = ctypes.get_errno()
+                    raise OSError(error_number, os.strerror(error_number), name)
+            except OSError as error:
+                _fail(f"quarantined entry cannot be removed: {error}")
+        finally:
+            os.close(current_fd)
     try:
         if os.listdir(directory_fd):
             _fail("quarantined rollout gained a file at deletion")
