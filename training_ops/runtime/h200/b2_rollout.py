@@ -702,12 +702,9 @@ def _parts_lock(parts):
     locked = False
     try:
         os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         locked = True
         _sync_directory(parts)
-    except BlockingIOError:
-        os.close(fd)
-        raise ValueError("range receive already active")
     except BaseException:
         if locked:
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -951,6 +948,7 @@ def receive_ranges(
     workers,
     *,
     receipt=None,
+    hold_lock=False,
     clock=time.monotonic,
 ):
     until = clock() + 300
@@ -961,6 +959,7 @@ def receive_ranges(
     children, records = [], [None] * len(ranges)
     attempts = [0] * len(ranges)
     max_attempts = 2
+    handed_off = False
 
     def interrupted(*_):
         raise InterruptedError("range download interrupted")
@@ -971,6 +970,12 @@ def receive_ranges(
     }
 
     try:
+        if final.exists():
+            checked_published(final, receipt)
+            if hold_lock:
+                handed_off = True
+                return lock_fd, True
+            return None
         completed_records = {}
         for spec in expected["ranges"]:
             value = _valid_range_record(parts, spec)
@@ -1177,6 +1182,9 @@ def receive_ranges(
             for fd in part_fds:
                 os.close(fd)
         _sync_directory(partial.parent)
+        if hold_lock:
+            handed_off = True
+            return lock_fd, False
     finally:
         try:
             with defer_download_signals():
@@ -1194,7 +1202,8 @@ def receive_ranges(
         finally:
             for number, handler in previous.items():
                 signal.signal(number, handler)
-            _release_parts_lock(lock_fd)
+            if not handed_off:
+                _release_parts_lock(lock_fd)
 
 
 def cleanup_parts(final, receipt):
@@ -1300,90 +1309,105 @@ def receive(
     # Create public traversal first: partial parents may share the run root.
     publication_directory(final.parent)
     partial.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if not final.exists():
-        parallel = download_workers > 1 and receipt["size"] >= download_threshold_bytes
-        if parallel:
-            receive_ranges(
-                url,
-                receipt["size"],
-                partial,
-                final,
-                download_workers,
-                receipt=receipt,
-            )
-        fd = os.open(
-            partial,
-            os.O_WRONLY | os.O_NOFOLLOW | (0 if parallel else os.O_CREAT | os.O_TRUNC),
-            0o600,
-        )
-        try:
-            os.fchmod(fd, 0o600)
-            result = (
-                None
-                if parallel
-                else run_curl(
-                    [
-                        "curl",
-                        "--disable",
-                        "--config",
-                        "-",
-                        "--proto",
-                        "=https",
-                        "--retry",
-                        "0",
-                        "--max-redirs",
-                        "0",
-                        "--max-time",
-                        "300",
-                        "--speed-limit",
-                        "1",
-                        "--speed-time",
-                        "60",
-                        "--fail",
-                        "--silent",
-                        "--show-error",
-                        "--output",
-                        f"/proc/self/fd/{fd}",
-                        "--write-out",
-                        "%{http_code}",
-                    ],
-                    input="url = " + json.dumps(url) + "\n",
-                    text=True,
-                    capture_output=True,
-                    timeout=300,
-                    pass_fds=(fd,),
-                )
-            )
-        finally:
-            os.close(fd)
-        if result is not None and (result.returncode != 0 or result.stdout != "200"):
-            raise ValueError("HTTPS download failed")
-        _publish_partial(partial, final, receipt)
-    checked_published(final, receipt)
-    pending = safe_path(str(final) + ".b2-ack.json")
-    payload = json.dumps(receipt, sort_keys=True) + "\n"
-    temporary = None
+    publication_lock = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", dir=final.parent, prefix=".b2-ack-", delete=False
-        ) as stream:
-            temporary = Path(stream.name)
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
+        final_ready = final.exists()
+        if not final_ready:
+            parallel = (
+                download_workers > 1
+                and receipt["size"] >= download_threshold_bytes
+            )
+            if parallel:
+                publication_lock, final_ready = receive_ranges(
+                    url,
+                    receipt["size"],
+                    partial,
+                    final,
+                    download_workers,
+                    receipt=receipt,
+                    hold_lock=True,
+                )
+            if not final_ready:
+                fd = os.open(
+                    partial,
+                    os.O_WRONLY
+                    | os.O_NOFOLLOW
+                    | (0 if parallel else os.O_CREAT | os.O_TRUNC),
+                    0o600,
+                )
+                try:
+                    os.fchmod(fd, 0o600)
+                    result = (
+                        None
+                        if parallel
+                        else run_curl(
+                            [
+                                "curl",
+                                "--disable",
+                                "--config",
+                                "-",
+                                "--proto",
+                                "=https",
+                                "--retry",
+                                "0",
+                                "--max-redirs",
+                                "0",
+                                "--max-time",
+                                "300",
+                                "--speed-limit",
+                                "1",
+                                "--speed-time",
+                                "60",
+                                "--fail",
+                                "--silent",
+                                "--show-error",
+                                "--output",
+                                f"/proc/self/fd/{fd}",
+                                "--write-out",
+                                "%{http_code}",
+                            ],
+                            input="url = " + json.dumps(url) + "\n",
+                            text=True,
+                            capture_output=True,
+                            timeout=300,
+                            pass_fds=(fd,),
+                        )
+                    )
+                finally:
+                    os.close(fd)
+                if result is not None and (
+                    result.returncode != 0 or result.stdout != "200"
+                ):
+                    raise ValueError("HTTPS download failed")
+                _publish_partial(partial, final, receipt)
+        checked_published(final, receipt)
+        pending = safe_path(str(final) + ".b2-ack.json")
+        payload = json.dumps(receipt, sort_keys=True) + "\n"
+        temporary = None
         try:
-            os.link(temporary, pending, follow_symlinks=False)
-        except FileExistsError:
-            if pending.read_text() != payload:
-                raise ValueError("pending acknowledgement differs")
-        directory_fd = os.open(final.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=final.parent, prefix=".b2-ack-", delete=False
+            ) as stream:
+                temporary = Path(stream.name)
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, pending, follow_symlinks=False)
+            except FileExistsError:
+                if pending.read_text() != payload:
+                    raise ValueError("pending acknowledgement differs")
+            directory_fd = os.open(final.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
-            os.close(directory_fd)
+            if temporary is not None:
+                temporary.unlink()
     finally:
-        if temporary is not None:
-            temporary.unlink()
+        if publication_lock is not None:
+            _release_parts_lock(publication_lock)
 
 
 def credentials(path=Path("/data/trinity/training.env")):

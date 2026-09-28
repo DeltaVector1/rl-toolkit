@@ -331,18 +331,85 @@ class RangeReceiveTest(unittest.TestCase):
         tool.cleanup_parts(fixture.final, receipt)
         self.assertFalse(Path(str(fixture.final) + ".b2-parts").exists())
 
-    def test_concurrent_receiver_is_refused(self):
-        self.receive()
+    def test_concurrent_receiver_waits_for_publication(self):
         fixture = self.fixture
-        fixture.final.unlink()
-        fixture.partial.unlink(missing_ok=True)
-        parts = Path(str(fixture.final) + ".b2-parts")
-        lock_fd = tool._parts_lock(parts)
-        self.addCleanup(lambda: tool._release_parts_lock(lock_fd))
-        self.commands.clear()
-        with self.assertRaisesRegex(ValueError, "already active"):
-            self.receive()
-        self.assertEqual(self.commands, [])
+        pause = fixture.root / "publish-paused"
+        release = fixture.root / "publish-release"
+        original_publish = tool._publish_partial
+
+        first = os.fork()
+        if first == 0:
+            def pause_before_publish(partial, final, receipt):
+                pause.write_text("ready")
+                until = time.monotonic() + 5
+                while not release.exists() and time.monotonic() < until:
+                    time.sleep(0.01)
+                if not release.exists():
+                    raise TimeoutError("publication race test was not released")
+                original_publish(partial, final, receipt)
+
+            try:
+                with patch.object(tool, "_publish_partial", pause_before_publish):
+                    with patch.object(tool.subprocess, "Popen", self.spawn):
+                        self.receive()
+            except BaseException:
+                os._exit(20)
+            os._exit(0)
+
+        second = None
+        try:
+            until = time.monotonic() + 5
+            while not pause.exists() and time.monotonic() < until:
+                if os.waitpid(first, os.WNOHANG) != (0, 0):
+                    break
+                time.sleep(0.01)
+            self.assertTrue(pause.exists())
+
+            second = os.fork()
+            if second == 0:
+                try:
+                    with patch.object(tool.subprocess, "Popen", self.spawn):
+                        self.receive()
+                except BaseException:
+                    os._exit(21)
+                os._exit(0)
+
+            time.sleep(0.1)
+            self.assertEqual(os.waitpid(second, os.WNOHANG), (0, 0))
+            release.write_text("go")
+
+            until = time.monotonic() + 5
+            first_status = second_status = None
+            while time.monotonic() < until and (
+                first_status is None or second_status is None
+            ):
+                if first_status is None:
+                    waited, status = os.waitpid(first, os.WNOHANG)
+                    if waited:
+                        first_status = status
+                if second_status is None:
+                    waited, status = os.waitpid(second, os.WNOHANG)
+                    if waited:
+                        second_status = status
+                time.sleep(0.01)
+            self.assertIsNotNone(first_status)
+            self.assertIsNotNone(second_status)
+            self.assertEqual(os.waitstatus_to_exitcode(first_status), 0)
+            self.assertEqual(os.waitstatus_to_exitcode(second_status), 0)
+            self.assertEqual(fixture.final.read_bytes(), fixture.body)
+        finally:
+            release.touch()
+            for pid in [first, second]:
+                if pid is None:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
 
     def test_existing_final_wrong_mode_is_refused(self):
         fixture = self.fixture
