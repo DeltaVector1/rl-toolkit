@@ -194,6 +194,32 @@ no fixed prefill, TailRL, staged ratios, group filters, or held-out split wiring
   deferral only when liveness or a rising token counter proves the engine is
   alive.
 
+## Fail-closed consumed rollout retention
+
+- **Measured production risk (2026-09-28).** All eight configured trainer
+  nodes retain consumed rollout step directories. The measured total is
+  8,344,539,136 bytes at trainer step 14 on a 22,840,700,928-byte free-space
+  budget on n76. Each later step adds about 0.4-0.8 GB, so a 50-step run can
+  exhaust n76 before completion. The configured trainer set is n76, n77, n78,
+  n80, n82, n83, n84, and n85; n79 is blocked.
+- **Bounded experiment.** Add an explicit `training-ops rollout-retention`
+  action that accepts one exact active run and authoritative per-node
+  evidence. Dry-run is the default. It selects only old, consumed
+  `rollouts/step_N` directories with an exact delivered batch identity, keeps
+  the current and latest two steps plus every batch required by resume state,
+  and applies only when every configured trainer node agrees. Apply quarantines
+  each candidate with an atomic rename, fsyncs the parent where possible, then
+  deletes only the quarantined tree. Report exact bytes and step numbers.
+- **Fail-closed gates.** Refuse canonical-path or ownership changes, symlinks,
+  open descriptors, locks, writer or partial markers, unknown files, changed
+  identities, missing or partial delivery evidence, and cross-node
+  disagreement. Recheck every identity immediately before quarantine and
+  delete. Use existing training-ops host APIs for the configured trainers
+  only; never include n79. No live deletion is part of this experiment.
+- **Tests.** Disposable fixtures must cover dry-run and apply, races and
+  changed identity, symlinks, open files, unknown files, latest protection,
+  partial or delivered evidence, cross-node failure, and exact byte totals.
+
 ## Measured long-haul evidence
 
 Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
