@@ -1,4 +1,5 @@
 import hashlib
+import fcntl
 import json
 import os
 import subprocess
@@ -17,6 +18,7 @@ class RolloutRetentionTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.run_dir = Path(self.temp.name) / "run_demo"
         (self.run_dir / "rollouts").mkdir(parents=True)
+        (self.run_dir / ".microbatch-sync.lock").touch()
         for step in range(5):
             directory = self.run_dir / "rollouts" / f"step_{step}"
             directory.mkdir()
@@ -127,6 +129,136 @@ class RolloutRetentionTest(unittest.TestCase):
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             with self.assertRaisesRegex(retention.RetentionError, "writer or consumer lock"):
                 retention.inventory(self.run_dir, self._evidence(), node="n76")
+
+    def test_namespace_lock_is_acquired_and_released(self):
+        lock = self.run_dir / ".microbatch-sync.lock"
+        with retention._microbatch_namespace_lock(self.run_dir) as held:
+            self.assertEqual(held, lock)
+            descriptor = os.open(lock, os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
+        descriptor = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+    def test_writer_alive_refuses_before_inventory(self):
+        script = (
+            "import fcntl, os, pathlib, time; "
+            f"p=pathlib.Path({str(self.run_dir / '.microbatch-sync.lock')!r}); "
+            "fd=os.open(p, os.O_RDWR); fcntl.flock(fd, fcntl.LOCK_EX); "
+            f"pathlib.Path({str(self.run_dir / '.microbatch-sync.pid')!r}).write_text(str(os.getpid())+'\\n'); "
+            "time.sleep(5)"
+        )
+        process = subprocess.Popen([sys.executable, "-c", script])
+        try:
+            time.sleep(0.15)
+            with self.assertRaisesRegex(retention.RetentionError, "writer is alive|lock is busy"):
+                retention.cleanup(self.run_dir, self._evidence(), node="n76")
+        finally:
+            process.terminate()
+            process.wait(timeout=3)
+
+    def test_process_identity_refuses_unrelated_pid(self):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+        try:
+            (self.run_dir / ".microbatch-sync.pid").write_text(f"{process.pid}\n")
+            with self.assertRaisesRegex(retention.RetentionError, "does not identify the exact run"):
+                retention.cleanup(self.run_dir, self._evidence(), node="n76")
+        finally:
+            process.terminate()
+            process.wait(timeout=3)
+
+    def test_stale_process_identity_refuses_restart_ambiguity(self):
+        (self.run_dir / ".microbatch-sync.pid").write_text("99999999\n")
+        with self.assertRaisesRegex(retention.RetentionError, "stale.*restart responsibility"):
+            retention.cleanup(self.run_dir, self._evidence(), node="n76")
+
+    def test_nonregular_rollout_file_refuses(self):
+        path = self.run_dir / "rollouts" / "step_0" / "train_rollouts.bin"
+        path.unlink()
+        os.mkfifo(path)
+        with self.assertRaisesRegex(retention.RetentionError, "regular file"):
+            retention.cleanup(self.run_dir, self._evidence(), node="n76")
+
+    def test_candidate_path_confinement_refuses_forged_path(self):
+        preview = retention.inventory(self.run_dir, self._evidence(), node="n76")
+        preview["selected"][0]["path"] = str(self.run_dir / "outside" / "step_0")
+        with mock.patch.object(retention, "inventory", return_value=preview):
+            with self.assertRaisesRegex(retention.RetentionError, "escaped the rollout directory"):
+                retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
+
+    def test_directory_mtime_recheck_refuses_change_before_quarantine(self):
+        original_rename = retention.os.rename
+        changed = {"done": False}
+
+        def race(source, destination):
+            if not changed["done"]:
+                changed["done"] = True
+                info = source.stat()
+                os.utime(source, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+            return original_rename(source, destination)
+
+        with mock.patch.object(retention.os, "rename", side_effect=race):
+            with self.assertRaisesRegex(retention.RetentionError, "identity changed"):
+                retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
+        self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
+
+    def test_concurrent_rename_cannot_acquire_namespace_lock(self):
+        result_path = self.run_dir / "rename-result"
+        source = self.run_dir / "rollouts" / "step_0"
+        replacement = self.run_dir / "rollouts" / "step_0-renamed"
+        original_inventory = retention.inventory
+        child = {}
+
+        def start_child(*args, **kwargs):
+            result = original_inventory(*args, **kwargs)
+            if "process" not in child:
+                script = (
+                    "import fcntl, os, pathlib\n"
+                    f"lock=os.open({str(self.run_dir / '.microbatch-sync.lock')!r}, os.O_RDWR)\n"
+                    "result='blocked'\n"
+                    "try:\n"
+                    "    fcntl.flock(lock, fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+                    "except BlockingIOError:\n"
+                    "    pass\n"
+                    "else:\n"
+                    f"    os.rename({str(source)!r}, {str(replacement)!r})\n"
+                    "    result='renamed'\n"
+                    f"pathlib.Path({str(result_path)!r}).write_text(result)\n"
+                )
+                child["process"] = subprocess.Popen([sys.executable, "-c", script])
+                child["process"].wait(timeout=3)
+            return result
+
+        try:
+            with mock.patch.object(retention, "inventory", side_effect=start_child):
+                result = retention.cleanup(self.run_dir, self._evidence(), node="n76")
+            self.assertTrue(result["dry_run"])
+            self.assertEqual(result_path.read_text(), "blocked")
+            self.assertTrue(source.exists())
+            self.assertFalse(replacement.exists())
+        finally:
+            process = child.get("process")
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
+
+    def test_cleanup_failure_keeps_quarantine_for_recovery(self):
+        with mock.patch.object(retention, "_delete_quarantine", side_effect=retention.RetentionError("cleanup failure")):
+            with self.assertRaisesRegex(retention.RetentionError, "cleanup failure"):
+                retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
+        self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
+
+    def test_apply_reports_restart_responsibility(self):
+        result = retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
+        self.assertTrue(result["restart_required"])
+        self.assertIn("operator must restart", result["restart_responsibility"])
 
     def test_apply_race_after_stat_keeps_uncertain_quarantine(self):
         original_rename = retention.os.rename

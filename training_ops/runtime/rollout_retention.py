@@ -292,7 +292,8 @@ def _lock_is_busy(path: Path) -> bool:
     return False
 
 
-def _check_locks(run_dir: Path) -> None:
+def _check_locks(run_dir: Path, *, skip_paths: set[Path] | None = None) -> None:
+    skip_paths = skip_paths or set()
     candidates: set[Path] = set()
     for root in (run_dir, run_dir / "rollouts"):
         try:
@@ -305,6 +306,8 @@ def _check_locks(run_dir: Path) -> None:
     for name in _LOCK_NAMES:
         candidates.add(run_dir / name)
     for path in sorted(candidates):
+        if path in skip_paths:
+            continue
         if path == run_dir / ".rollout-retention.lock":
             continue
         if _lock_is_busy(path):
@@ -368,7 +371,13 @@ def _batch_record(path: Path, item: Mapping[str, Any], owner_uid: int, owner_gid
     }
 
 
-def inventory(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, node: str | None = None) -> dict[str, Any]:
+def inventory(
+    run_dir: str | Path,
+    evidence: Mapping[str, Any] | str | Path,
+    *,
+    node: str | None = None,
+    held_namespace_lock: Path | None = None,
+) -> dict[str, Any]:
     """Return a strict, dry-run inventory for one trainer node."""
     loaded = _load_evidence(evidence)
     nodes = loaded["nodes"]
@@ -387,7 +396,7 @@ def inventory(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, 
         _fail(f"run directory ownership differs on {node}")
     rollouts = path / "rollouts"
     _directory(rollouts, "rollout directory")
-    _check_locks(path)
+    _check_locks(path, skip_paths={held_namespace_lock} if held_namespace_lock is not None else None)
     if _open_fd_targets(rollouts):
         _fail("rollout tree has an open writer or consumer file descriptor")
     expected = {int(item["step"]): item for item in record["batches"]}
@@ -473,6 +482,117 @@ def _retention_lock(run_dir: Path):
                     lock_path.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _process_has_inode(process: Path, identity: tuple[int, int]) -> bool:
+    try:
+        descriptors = list((process / "fd").iterdir())
+    except (FileNotFoundError, PermissionError):
+        return False
+    except OSError as error:
+        _fail(f"microbatch writer process cannot be inspected: {error}")
+    for descriptor in descriptors:
+        try:
+            info = descriptor.stat()
+        except OSError:
+            continue
+        if (info.st_dev, info.st_ino) == identity:
+            return True
+    return False
+
+
+def _verify_writer_quiescence(run_dir: Path, lock_info: os.stat_result) -> None:
+    pid_path = run_dir / ".microbatch-sync.pid"
+    try:
+        pid_info = pid_path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        _fail(f"microbatch writer identity cannot be inspected: {error}")
+    if stat.S_ISLNK(pid_info.st_mode) or not stat.S_ISREG(pid_info.st_mode):
+        _fail("microbatch writer identity is not a regular file")
+    try:
+        raw_pid = pid_path.read_text(encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        _fail(f"microbatch writer identity cannot be read: {error}")
+    try:
+        current_pid_info = pid_path.lstat()
+    except OSError as error:
+        _fail(f"microbatch writer identity changed: {error}")
+    if (current_pid_info.st_dev, current_pid_info.st_ino, current_pid_info.st_mtime_ns) != (
+        pid_info.st_dev, pid_info.st_ino, pid_info.st_mtime_ns
+    ):
+        _fail("microbatch writer identity changed during validation")
+    if re.fullmatch(r"[0-9]+\n", raw_pid) is None or int(raw_pid) <= 1:
+        _fail("microbatch writer identity is invalid")
+    pid = int(raw_pid)
+    process = Path("/proc") / str(pid)
+    try:
+        process_stat = (process / "stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        _fail("microbatch writer pid is stale; restart responsibility is unresolved")
+    except (OSError, UnicodeError) as error:
+        _fail(f"microbatch writer process identity cannot be read: {error}")
+    try:
+        state = process_stat.rsplit(") ", 1)[1].split()[0]
+    except IndexError as error:
+        _fail("microbatch writer process identity is invalid")
+        raise AssertionError from error
+    if state in {"Z", "X", "x"}:
+        _fail("microbatch writer process identity is stale; restart responsibility is unresolved")
+    try:
+        command = (process / "cmdline").read_bytes()
+        environment = (process / "environ").read_bytes()
+    except (OSError, UnicodeError) as error:
+        _fail(f"microbatch writer process identity cannot be read: {error}")
+    lock_identity = (lock_info.st_dev, lock_info.st_ino)
+    exact_run = f"run_dir={run_dir}".encode()
+    if exact_run not in environment or b"sync_microbatches.sh" not in command:
+        if not _process_has_inode(process, lock_identity):
+            _fail("microbatch writer pid does not identify the exact run")
+    _fail(f"microbatch writer is alive: pid {pid}")
+
+
+@contextlib.contextmanager
+def _microbatch_namespace_lock(run_dir: Path):
+    """Hold the publisher namespace lock through all retention mutations."""
+    run_info = _directory(run_dir, "run directory")
+    lock_path = run_dir / ".microbatch-sync.lock"
+    try:
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError as error:
+        _fail(f"microbatch namespace lock is missing: {error}")
+    except OSError as error:
+        _fail(f"microbatch namespace lock cannot be opened: {error}")
+    lock_info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(lock_info.st_mode)
+        or lock_info.st_uid != run_info.st_uid
+        or lock_info.st_gid != run_info.st_gid
+        or not lock_info.st_mode & stat.S_IWUSR
+    ):
+        os.close(descriptor)
+        _fail("microbatch namespace lock ownership or type is unsafe")
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            _fail(f"microbatch writer is alive or namespace lock is busy: {error}")
+        current = lock_path.lstat()
+        if (current.st_dev, current.st_ino, current.st_uid, current.st_gid) != (
+            lock_info.st_dev, lock_info.st_ino, lock_info.st_uid, lock_info.st_gid
+        ):
+            _fail("microbatch namespace lock changed during acquisition")
+        _verify_writer_quiescence(run_dir, lock_info)
+        external = _open_fd_targets(run_dir, ignore_pid=os.getpid())
+        if external:
+            _fail(f"microbatch writer or consumer remains alive: {external}")
+        yield lock_path
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _read_fd(fd: int) -> bytes:
@@ -747,48 +867,57 @@ def _delete_quarantine(
 
 def cleanup(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, node: str | None = None, dry_run: bool = True) -> dict[str, Any]:
     """Inventory or atomically quarantine and remove old consumed batches."""
-    initial = inventory(run_dir, evidence, node=node)
-    if dry_run or not initial["selected"]:
-        return {**initial, "dry_run": True, "removed": [], "freed_bytes": 0}
     loaded = _load_evidence(evidence)
     path = _canonical_run(run_dir, loaded["run_name"])
     removed: list[dict[str, Any]] = []
     freed = 0
     with _retention_lock(path):
-        fresh = inventory(path, loaded, node=node)
-        for item in fresh["selected"]:
-            source = Path(item["path"])
-            if source.parent != path / "rollouts" or not _STEP.fullmatch(source.name):
-                _fail("retention candidate escaped the rollout directory")
-            before = source.lstat()
-            expected_item = next(value for value in loaded["nodes"][fresh["node"]]["batches"] if value["step"] == item["step"])
-            if (before.st_dev, before.st_ino, before.st_mtime_ns) != (expected_item["dir_device"], expected_item["dir_inode"], expected_item["dir_mtime_ns"]):
-                _fail(f"rollout step {item['step']} changed before quarantine")
-            quarantine = source.parent / f".retention-quarantine-{uuid.uuid4().hex}"
-            try:
-                os.rename(source, quarantine)
-            except OSError as error:
-                _fail(f"rollout step {item['step']} changed before atomic quarantine: {error}")
-            _fsync(source.parent)
-            try:
-                _check_locks(path)
-                removed_bytes = _delete_quarantine(
-                    quarantine,
-                    expected_item,
-                    loaded["nodes"][fresh["node"]]["owner_uid"],
-                    loaded["nodes"][fresh["node"]]["owner_gid"],
-                )
-                if removed_bytes != item["bytes"]:
-                    _fail(f"rollout step {item['step']} actual bytes differ from preview")
-            except Exception:
-                # Keep the quarantined tree for manual recovery when any
-                # identity check fails. Never restore or delete uncertain data.
-                raise
-            _fsync(source.parent)
-            removed.append(item)
-            freed += removed_bytes
-    return {**initial, "dry_run": False, "removed": removed, "freed_bytes": freed,
-            "exact_bytes": freed, "selected_steps": [item["step"] for item in removed]}
+        with _microbatch_namespace_lock(path) as namespace_lock:
+            initial = inventory(path, loaded, node=node, held_namespace_lock=namespace_lock)
+            if dry_run or not initial["selected"]:
+                return {**initial, "dry_run": True, "removed": [], "freed_bytes": 0}
+            fresh = inventory(path, loaded, node=node, held_namespace_lock=namespace_lock)
+            for item in fresh["selected"]:
+                source = Path(item["path"])
+                if source.parent != path / "rollouts" or not _STEP.fullmatch(source.name):
+                    _fail("retention candidate escaped the rollout directory")
+                before = source.lstat()
+                expected_item = next(value for value in loaded["nodes"][fresh["node"]]["batches"] if value["step"] == item["step"])
+                if (before.st_dev, before.st_ino, before.st_mtime_ns) != (expected_item["dir_device"], expected_item["dir_inode"], expected_item["dir_mtime_ns"]):
+                    _fail(f"rollout step {item['step']} changed before quarantine")
+                quarantine = source.parent / f".retention-quarantine-{uuid.uuid4().hex}"
+                try:
+                    os.rename(source, quarantine)
+                except OSError as error:
+                    _fail(f"rollout step {item['step']} changed before atomic quarantine: {error}")
+                _fsync(source.parent)
+                try:
+                    _check_locks(path, skip_paths={namespace_lock})
+                    removed_bytes = _delete_quarantine(
+                        quarantine,
+                        expected_item,
+                        loaded["nodes"][fresh["node"]]["owner_uid"],
+                        loaded["nodes"][fresh["node"]]["owner_gid"],
+                    )
+                    if removed_bytes != item["bytes"]:
+                        _fail(f"rollout step {item['step']} actual bytes differ from preview")
+                except Exception:
+                    # Keep the quarantined tree for manual recovery when any
+                    # identity check fails. Never restore or delete uncertain data.
+                    raise
+                _fsync(source.parent)
+                removed.append(item)
+                freed += removed_bytes
+            return {
+                **initial,
+                "dry_run": False,
+                "removed": removed,
+                "freed_bytes": freed,
+                "exact_bytes": freed,
+                "selected_steps": [item["step"] for item in removed],
+                "restart_required": bool(removed),
+                "restart_responsibility": "operator must restart the exact microbatch publisher after retention",
+            }
 
 
 def build_node_evidence(run_dir: str | Path, *, node: str, run_name: str, active_step: int, required_steps: list[int]) -> dict[str, Any]:
