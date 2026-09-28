@@ -16,7 +16,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import uuid
 from pathlib import Path
@@ -32,7 +31,11 @@ _STEP = re.compile(r"step_([0-9]+)\Z")
 _RUN = re.compile(r"[A-Za-z0-9_-]+\Z")
 _NODE = re.compile(r"n[0-9]+\Z")
 _BATCH_NAMES = frozenset({"train_rollouts.bin", "train_rollouts.bin.delivered"})
-_LOCK_NAMES = frozenset({".batch-sync.lock", ".rollout-pull.lock"})
+_LOCK_NAMES = frozenset({
+    ".batch-sync.lock",
+    ".rollout-pull.lock",
+    ".microbatch-sync.lock",
+})
 
 
 def _fail(message: str) -> None:
@@ -130,6 +133,7 @@ def _load_evidence(value: Mapping[str, Any] | str | Path) -> dict[str, Any]:
         _fail("retention node evidence is empty")
     result_nodes: dict[str, dict[str, Any]] = {}
     content_identity: dict[int, tuple[int, str, str]] = {}
+    node_step_sets: dict[str, set[int]] = {}
     for node, raw in nodes.items():
         if not isinstance(node, str) or _NODE.fullmatch(node) is None or node == "n79":
             _fail("retention node identity is invalid")
@@ -185,8 +189,11 @@ def _load_evidence(value: Mapping[str, Any] | str | Path) -> dict[str, Any]:
         normalized.sort(key=lambda item: item["step"])
         if not set(required_steps) <= seen:
             _fail(f"retention resume-required batch is missing on {node}")
+        node_step_sets[node] = seen
         result_nodes[node] = {"run_dir": node_run_dir, "owner_uid": owner_uid, "owner_gid": owner_gid,
                               "active_step": active_step, "required_steps": required_steps, "batches": normalized}
+    if len({tuple(sorted(steps)) for steps in node_step_sets.values()}) != 1:
+        _fail("retention nodes disagree on the complete step inventory")
     return {"version": 1, "run_name": run_name, "active_step": active_step,
             "required_steps": required_steps, "nodes": result_nodes}
 
@@ -217,7 +224,7 @@ def _tree_bytes(path: Path) -> int:
     return total
 
 
-def _open_fd_targets(root: Path) -> list[str]:
+def _open_fd_targets(root: Path, *, ignore_pid: int | None = None) -> list[str]:
     targets: list[str] = []
     proc = Path("/proc")
     try:
@@ -226,6 +233,8 @@ def _open_fd_targets(root: Path) -> list[str]:
         _fail(f"open-file evidence cannot be inspected: {error}")
     root_text = str(root) + os.sep
     for process in processes:
+        if ignore_pid is not None and process.name == str(ignore_pid):
+            continue
         fd_dir = process / "fd"
         try:
             fds = list(fd_dir.iterdir())
@@ -275,10 +284,22 @@ def _lock_is_busy(path: Path) -> bool:
 
 
 def _check_locks(run_dir: Path) -> None:
+    candidates: set[Path] = set()
+    for root in (run_dir, run_dir / "rollouts"):
+        try:
+            candidates.update(
+                path for path in root.rglob("*")
+                if path.name in _LOCK_NAMES or path.name == ".lock" or path.name.endswith(".lock")
+            )
+        except OSError as error:
+            _fail(f"lock inventory cannot be inspected: {error}")
     for name in _LOCK_NAMES:
-        path = run_dir / name
+        candidates.add(run_dir / name)
+    for path in sorted(candidates):
+        if path == run_dir / ".rollout-retention.lock":
+            continue
         if _lock_is_busy(path):
-            _fail(f"rollout publisher lock is open: {path}")
+            _fail(f"rollout writer or consumer lock is open: {path}")
 
 
 def _batch_record(path: Path, item: Mapping[str, Any], owner_uid: int, owner_gid: int) -> dict[str, Any]:
@@ -312,8 +333,19 @@ def _batch_record(path: Path, item: Mapping[str, Any], owner_uid: int, owner_gid
         _fail(f"rollout step {step} batch identity changed")
     if _open_fd_targets(path):
         _fail(f"rollout step {step} has an open file descriptor")
-    return {"step": step, "bytes": _tree_bytes(path), "sha256": digest,
-            "path": str(path), "size": batch_info.st_size}
+    return {
+        "step": step,
+        "bytes": _tree_bytes(path),
+        "sha256": digest,
+        "path": str(path),
+        "size": batch_info.st_size,
+        "device": batch_info.st_dev,
+        "inode": batch_info.st_ino,
+        "mtime_ns": batch_info.st_mtime_ns,
+        "dir_device": info.st_dev,
+        "dir_inode": info.st_ino,
+        "dir_mtime_ns": info.st_mtime_ns,
+    }
 
 
 def inventory(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, node: str | None = None) -> dict[str, Any]:
@@ -336,6 +368,8 @@ def inventory(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, 
     rollouts = path / "rollouts"
     _directory(rollouts, "rollout directory")
     _check_locks(path)
+    if _open_fd_targets(rollouts):
+        _fail("rollout tree has an open writer or consumer file descriptor")
     expected = {int(item["step"]): item for item in record["batches"]}
     observed_steps: list[int] = []
     try:
@@ -421,6 +455,185 @@ def _retention_lock(run_dir: Path):
                 pass
 
 
+def _read_fd(fd: int) -> bytes:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks = []
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                return b"".join(chunks)
+            chunks.append(block)
+    except OSError as error:
+        _fail(f"quarantined file cannot be read: {error}")
+
+
+def _open_file_at(directory_fd: int, name: str, label: str) -> tuple[int, os.stat_result]:
+    try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        _fail(f"{label} cannot be inspected: {error}")
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        _fail(f"{label} is not a regular file")
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        _fail(f"{label} cannot be opened: {error}")
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+    ):
+        os.close(descriptor)
+        _fail(f"{label} identity changed while opening")
+    return descriptor, after
+
+
+def _final_quarantine_check(
+    quarantine: Path,
+    expected: Mapping[str, Any],
+    owner_uid: int,
+    owner_gid: int,
+) -> tuple[int, int, int, list[int]]:
+    """Hold directory and file descriptors through final removal."""
+    if _open_fd_targets(quarantine, ignore_pid=os.getpid()):
+        _fail("quarantined rollout has an open writer or consumer descriptor")
+    try:
+        directory_fd = os.open(quarantine, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        _fail(f"quarantine cannot be opened: {error}")
+    opened: list[int] = [directory_fd]
+    try:
+        directory_info = os.fstat(directory_fd)
+        if (directory_info.st_dev, directory_info.st_ino, directory_info.st_mtime_ns) != (
+            expected["dir_device"], expected["dir_inode"], expected["dir_mtime_ns"]
+        ):
+            _fail("quarantined rollout directory identity changed")
+        try:
+            names = set(os.listdir(directory_fd))
+        except OSError as error:
+            _fail(f"quarantined rollout cannot be listed: {error}")
+        if names != _BATCH_NAMES:
+            _fail(f"quarantined rollout has partial or unknown files: {sorted(names - _BATCH_NAMES)}")
+        batch_fd, batch_info = _open_file_at(directory_fd, "train_rollouts.bin", "quarantined rollout batch")
+        marker_fd, marker_info = _open_file_at(directory_fd, "train_rollouts.bin.delivered", "quarantined delivery marker")
+        opened.extend((batch_fd, marker_fd))
+        if any(info.st_uid != owner_uid or info.st_gid != owner_gid for info in (batch_info, marker_info)):
+            _fail("quarantined rollout ownership changed")
+        payload = _read_fd(batch_fd)
+        digest = hashlib.sha256(payload).hexdigest()
+        marker = _read_fd(marker_fd).decode("ascii")
+        if marker != digest + "\n" or digest != expected["sha256"] or len(payload) != expected["size"]:
+            _fail("quarantined rollout content or delivery identity changed")
+        if (batch_info.st_dev, batch_info.st_ino, batch_info.st_mtime_ns) != (
+            expected["device"], expected["inode"], expected["mtime_ns"]
+        ):
+            _fail("quarantined rollout batch identity changed")
+        return directory_fd, batch_info.st_size + marker_info.st_size, batch_info.st_size, opened
+    except UnicodeError as error:
+        _fail(f"quarantined delivery marker is invalid: {error}")
+    except Exception:
+        for descriptor in reversed(opened):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _validate_held_contents(opened: list[int], expected: Mapping[str, Any]) -> None:
+    batch_fd, marker_fd = opened[1:]
+    batch_info = os.fstat(batch_fd)
+    marker_info = os.fstat(marker_fd)
+    payload = _read_fd(batch_fd)
+    digest = hashlib.sha256(payload).hexdigest()
+    try:
+        marker = _read_fd(marker_fd).decode("ascii")
+    except UnicodeError as error:
+        _fail(f"quarantined delivery marker is invalid: {error}")
+    if marker != digest + "\n" or digest != expected["sha256"] or len(payload) != expected["size"]:
+        _fail("quarantined rollout content or delivery identity changed at deletion")
+    if (batch_info.st_dev, batch_info.st_ino, batch_info.st_size, batch_info.st_mtime_ns) != (
+        expected["device"], expected["inode"], expected["size"], expected["mtime_ns"]
+    ) or marker_info.st_size != len(marker.encode("ascii")):
+        _fail("quarantined rollout identity changed at deletion")
+
+
+def _remove_tree_at(directory_fd: int, opened_files: list[int], expected: Mapping[str, Any]) -> int:
+    """Remove one already validated tree using its held directory descriptor."""
+    directory_info = os.fstat(directory_fd)
+    if (directory_info.st_dev, directory_info.st_ino) != (expected["dir_device"], expected["dir_inode"]):
+        _fail("quarantined rollout directory identity changed at deletion")
+    _validate_held_contents([directory_fd, *opened_files], expected)
+    expected_fds = {fd: os.fstat(fd) for fd in opened_files}
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError as error:
+        _fail(f"quarantined rollout cannot be listed at deletion: {error}")
+    for name in names:
+        try:
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            _fail(f"quarantined entry cannot be inspected at deletion: {error}")
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            _fail(f"quarantined entry changed at deletion: {name}")
+        matching = [fd for fd, held in expected_fds.items() if (held.st_dev, held.st_ino) == (info.st_dev, info.st_ino)]
+        if not matching:
+            _fail(f"quarantined entry identity changed at deletion: {name}")
+        held = os.fstat(matching[0])
+        if (held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns) != (
+            info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+        ):
+            _fail(f"quarantined entry contents changed at deletion: {name}")
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except OSError as error:
+            _fail(f"quarantined entry cannot be removed: {error}")
+    try:
+        if os.listdir(directory_fd):
+            _fail("quarantined rollout gained a file at deletion")
+    except OSError as error:
+        _fail(f"quarantined rollout cannot be checked after deletion: {error}")
+    return sum(info.st_size for info in expected_fds.values())
+
+
+def _delete_quarantine(
+    quarantine: Path,
+    expected: Mapping[str, Any],
+    owner_uid: int,
+    owner_gid: int,
+) -> int:
+    directory_fd, bytes_used, _batch_bytes, opened = _final_quarantine_check(
+        quarantine, expected, owner_uid, owner_gid
+    )
+    try:
+        parent_fd = os.open(quarantine.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+        _fail(f"quarantine parent cannot be opened: {error}")
+    try:
+        # Repeat the immutable check immediately before unlinking. The held
+        # descriptors make the final identity and content checks independent
+        # of pathname replacement.
+        if _open_fd_targets(quarantine, ignore_pid=os.getpid()):
+            _fail("quarantined rollout has an open writer or consumer descriptor")
+        actual = _remove_tree_at(directory_fd, opened[1:], expected)
+        if actual != bytes_used:
+            _fail("actual freed bytes differ from the validated quarantine")
+        try:
+            os.rmdir(quarantine.name, dir_fd=parent_fd)
+        except OSError as error:
+            _fail(f"quarantined rollout directory cannot be removed: {error}")
+        return actual
+    finally:
+        os.close(parent_fd)
+        for descriptor in reversed(opened):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 def cleanup(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, node: str | None = None, dry_run: bool = True) -> dict[str, Any]:
     """Inventory or atomically quarantine and remove old consumed batches."""
     initial = inventory(run_dir, evidence, node=node)
@@ -447,17 +660,22 @@ def cleanup(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, no
                 _fail(f"rollout step {item['step']} changed before atomic quarantine: {error}")
             _fsync(source.parent)
             try:
-                checked = _batch_record(quarantine, expected_item, loaded["nodes"][fresh["node"]]["owner_uid"], loaded["nodes"][fresh["node"]]["owner_gid"])
-                if checked["bytes"] != item["bytes"]:
-                    _fail(f"rollout step {item['step']} changed during quarantine")
-                shutil.rmtree(quarantine)
+                _check_locks(path)
+                removed_bytes = _delete_quarantine(
+                    quarantine,
+                    expected_item,
+                    loaded["nodes"][fresh["node"]]["owner_uid"],
+                    loaded["nodes"][fresh["node"]]["owner_gid"],
+                )
+                if removed_bytes != item["bytes"]:
+                    _fail(f"rollout step {item['step']} actual bytes differ from preview")
             except Exception:
                 # Keep the quarantined tree for manual recovery when any
                 # identity check fails. Never restore or delete uncertain data.
                 raise
             _fsync(source.parent)
             removed.append(item)
-            freed += item["bytes"]
+            freed += removed_bytes
     return {**initial, "dry_run": False, "removed": removed, "freed_bytes": freed,
             "exact_bytes": freed, "selected_steps": [item["step"] for item in removed]}
 

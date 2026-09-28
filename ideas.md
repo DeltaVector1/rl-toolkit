@@ -219,6 +219,13 @@ no fixed prefill, TailRL, staged ratios, group filters, or held-out split wiring
 - **Tests.** Disposable fixtures must cover dry-run and apply, races and
   changed identity, symlinks, open files, unknown files, latest protection,
   partial or delivered evidence, cross-node failure, and exact byte totals.
+- **Review hardening.** The apply phase must compare the exact dry-run
+  candidate records, complete step inventory, current step, paths, identities,
+  and byte totals on every trainer. After atomic quarantine, hold directory and
+  file descriptors through a final content, lock, and open-descriptor check;
+  remove entries by descriptor-relative operations and verify actual freed
+  bytes. Reusing unchanged evidence after removal fails before mutation;
+  refreshed evidence with no candidates is a verified no-op.
 
 ## Measured long-haul evidence
 

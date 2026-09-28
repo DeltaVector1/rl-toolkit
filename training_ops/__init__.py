@@ -12917,7 +12917,11 @@ def _rollout_retention_action(arguments: list[str]):
             lambda host: _ssh(host, command(host, apply), timeout=900),
         )
 
-    def parse_phase(results: dict[str, tuple[int, str]], phase: str) -> dict[str, dict[str, object]]:
+    def parse_phase(
+        results: dict[str, tuple[int, str]],
+        phase: str,
+        expected_preview: dict[str, dict[str, object]] | None = None,
+    ) -> dict[str, dict[str, object]]:
         parsed: dict[str, dict[str, object]] = {}
         failures: dict[str, str] = {}
         for host, (code, output) in results.items():
@@ -12946,15 +12950,67 @@ def _rollout_retention_action(arguments: list[str]):
             raise Refused(f"rollout-retention {phase} failed: {failures}")
         expected_steps = None
         expected_bytes = None
+        expected_all_steps = None
+        expected_active_step = None
+
+        def candidate_identity(value: object, label: str) -> tuple:
+            if not isinstance(value, list):
+                raise Refused(f"rollout-retention {phase} {label} candidates are invalid")
+            fields = (
+                "step", "bytes", "sha256", "path", "size", "device", "inode",
+                "mtime_ns", "dir_device", "dir_inode", "dir_mtime_ns",
+            )
+            result = []
+            for item in value:
+                if not isinstance(item, dict) or any(name not in item for name in fields):
+                    raise Refused(f"rollout-retention {phase} {label} candidate identity is incomplete")
+                if not all(type(item[name]) is int for name in fields if name != "sha256" and name != "path"):
+                    raise Refused(f"rollout-retention {phase} {label} candidate identity is invalid")
+                if not isinstance(item["path"], str) or not isinstance(item["sha256"], str):
+                    raise Refused(f"rollout-retention {phase} {label} candidate identity is invalid")
+                result.append(tuple(item[name] for name in fields))
+            return tuple(result)
+
         for host, record in parsed.items():
             steps = record.get("selected_steps")
             bytes_used = record.get("selected_bytes")
-            if not isinstance(steps, list) or not all(type(item) is int for item in steps) or type(bytes_used) is not int or bytes_used < 0:
+            all_steps = record.get("all_steps")
+            active_step = record.get("active_step")
+            selected_identity = candidate_identity(record.get("selected"), "selected")
+            if (
+                not isinstance(steps, list)
+                or not all(type(item) is int for item in steps)
+                or type(bytes_used) is not int
+                or bytes_used < 0
+                or not isinstance(all_steps, list)
+                or not all(type(item) is int for item in all_steps)
+                or all_steps != sorted(set(all_steps))
+                or type(active_step) is not int
+            ):
                 raise Refused(f"rollout-retention {phase} result is invalid on {host}")
+            if [item[0] for item in selected_identity] != steps or sum(item[1] for item in selected_identity) != bytes_used:
+                raise Refused(f"rollout-retention {phase} result bytes or steps are forged on {host}")
             if expected_steps is None:
                 expected_steps, expected_bytes = steps, bytes_used
-            elif steps != expected_steps or bytes_used != expected_bytes:
-                raise Refused(f"rollout-retention {phase} nodes disagree on steps or bytes")
+                expected_all_steps, expected_active_step = all_steps, active_step
+            elif (
+                steps != expected_steps
+                or bytes_used != expected_bytes
+                or all_steps != expected_all_steps
+                or active_step != expected_active_step
+            ):
+                raise Refused(f"rollout-retention {phase} nodes disagree on current, complete, or selected steps")
+            if expected_preview is not None:
+                preview_identity = candidate_identity(expected_preview[host].get("selected"), "preview")
+                if selected_identity != preview_identity or all_steps != expected_preview[host].get("all_steps") or active_step != expected_preview[host].get("active_step"):
+                    raise Refused(f"rollout-retention apply differs from dry-run preview on {host}")
+            if phase == "apply":
+                removed_identity = candidate_identity(record.get("removed"), "removed")
+                if removed_identity != selected_identity:
+                    raise Refused(f"rollout-retention apply removed candidates differ on {host}")
+                freed = record.get("freed_bytes")
+                if type(freed) is not int or freed != sum(item[1] for item in removed_identity):
+                    raise Refused(f"rollout-retention apply freed bytes are forged on {host}")
         return parsed
 
     preview = parse_phase(run_phase(False), "dry-run")
@@ -12972,7 +13028,16 @@ def _rollout_retention_action(arguments: list[str]):
         ),
     }
     if values["apply"]:
-        applied = parse_phase(run_phase(True), "apply")
+        if not preview or not next(iter(preview.values())).get("selected_steps"):
+            result["dry_run"] = False
+            result["no_op"] = True
+            result["freed_bytes"] = 0
+            result["freed_bytes_total"] = 0
+            result["exact_bytes_total"] = 0
+            result["removed_steps"] = []
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return result
+        applied = parse_phase(run_phase(True), "apply", preview)
         result["dry_run"] = False
         result["nodes"] = applied
         result["removed_steps"] = next(iter(applied.values()))["selected_steps"] if applied else []
