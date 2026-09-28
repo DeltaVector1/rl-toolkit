@@ -22,6 +22,11 @@ pull_part_timeout=${PULL_PART_TIMEOUT:-300}
 case "$pull_part_timeout" in ''|*[!0-9]*|0) echo "PULL_PART_TIMEOUT must be a positive integer" >&2; exit 2 ;; esac
 [ "$pull_part_timeout" -le 3600 ] || { echo "PULL_PART_TIMEOUT must not exceed 3600 seconds" >&2; exit 2; }
 script=$(readlink -f "$0")
+rollout_backend=${ROLLOUT_TRANSFER_BACKEND:-ssh}
+case "$rollout_backend" in ssh|b2_s3) ;; *) echo "invalid rollout backend" >&2; exit 2 ;; esac
+b2_python=${B2_ROLLOUT_PYTHON:-/data/trinity/b2-transport-venv/bin/python}
+b2_helper=${B2_ROLLOUT_HELPER:-${script%/china/*}/h200/b2_rollout.py}
+b2_local_helper=${script%/china/*}/h200/b2_rollout.py
 pid_file="$dest_dir/.rollout-pull.pid"
 lock_file="$dest_dir/.rollout-pull.lock"
 log_file=${LOG_FILE:-"${dest_dir%/*}/rollout-pull.log"}
@@ -90,6 +95,11 @@ process_matches() {
     "SOURCE_KNOWN_HOSTS_FILE=$source_known_hosts"; do
     grep -Fxq "$expected" <<<"$environment" || return 1
   done
+  if grep -q '^ROLLOUT_TRANSFER_BACKEND=' <<<"$environment"; then
+    grep -Fxq "ROLLOUT_TRANSFER_BACKEND=$rollout_backend" <<<"$environment" || return 1
+  else
+    [ "$rollout_backend" = ssh ] || return 1
+  fi
 }
 
 status() {
@@ -207,6 +217,8 @@ start() {
   stop
   nohup setsid env \
     ROLLOUT_TRANSFER_DIRECTION=trainer_pull \
+    ROLLOUT_TRANSFER_BACKEND="$rollout_backend" \
+    B2_ROLLOUT_PYTHON="$b2_python" B2_ROLLOUT_HELPER="$b2_helper" \
     SOURCE_RUN_DIR="$source_dir" DEST_RUN_DIR="$dest_dir" \
     SOURCE_HOST="$source_host" SOURCE_PORT="$source_port" SOURCE_USER="$source_user" \
     SOURCE_IDENTITY_FILE="$source_identity" SOURCE_KNOWN_HOSTS_FILE="$source_known_hosts" \
@@ -288,6 +300,41 @@ write_receipt() {
   remote "marker='$source.delivered'; [ ! -L \"\$marker\" ] || exit 1; if [ -e \"\$marker\" ]; then [ -f \"\$marker\" ] && [ \"\$(cat \"\$marker\")\" = '$digest' ]; else partial=\$(mktemp -- \"\${marker}.tmp.XXXXXX\") || exit 1; if ! printf '%s\\n' '$digest' >\"\$partial\"; then rm -f -- \"\$partial\"; exit 1; fi; if ! ln \"\$partial\" \"\$marker\" 2>/dev/null; then equal=0; [ ! -L \"\$marker\" ] && [ -f \"\$marker\" ] && [ \"\$(cat \"\$marker\")\" = '$digest' ] && equal=1; rm -f -- \"\$partial\"; [ \"\$equal\" = 1 ]; else rm -f -- \"\$partial\"; fi; fi"
 }
 
+b2_remote() {
+  local command
+  printf -v command '%q ' timeout --signal=TERM --kill-after=5s 300s "$b2_python" "$b2_helper" "$@"
+  timeout --signal=TERM --kill-after=5s 310s ssh -n "${ssh_opts[@]}" "$source_target" "$command"
+}
+
+b2_finish() {
+  local pending=$1 final=${1%.b2-ack.json} receipt digest relative source
+  local_path_safe "$pending" || return 76
+  receipt=$(python3 "$b2_local_helper" ack-json --receipt "$pending" --final "$final") || return 76
+  relative=${final#"$dest_dir"/}
+  [[ "$relative" =~ ^rollouts/step_[0-9]+/train_rollouts\.bin$ ]] || return 76
+  source="$source_dir/$relative"
+  digest=$(sha256sum -- "$final" | awk '{print $1}') || return 76
+  write_receipt "$source" "$digest" || return 76
+  b2_remote ack --receipt "$receipt" || return 76
+  rm -- "$pending"
+}
+
+pull_b2() {
+  # Presigned URLs must not enter shell tracing, command arguments, or logs.
+  set +x
+  local source=$1 relative=${1#"$source_dir"/} final partial metadata
+  final="$dest_dir/$relative"
+  partial="$dest_dir/.incoming/$relative"
+  local_path_safe "$final" || return 76
+  local_path_safe "$partial" || return 76
+  metadata=$(b2_remote publish --source "$source") || return 76
+  printf '%s' "$metadata" | python3 "$b2_local_helper" receive \
+    --source "$source" --partial "$partial" --final "$final" || return 76
+  unset metadata
+  b2_finish "$final.b2-ack.json" || return 76
+  echo "pulled $relative via b2_s3"
+}
+
 pull_bytes() {
   local source=$1 partial=$2 digest=$3 size chunk remote_parts local_parts listing
   local part name expected status=0
@@ -335,6 +382,10 @@ pull_bytes() {
 pull_one() {
   local source=$1 relative=${1#"$source_dir"/} final partial first_digest local_digest last_digest
   valid_pull_path "$relative" || { echo "refusing unexpected rollout path: $relative" >&2; return 1; }
+  if [ "$rollout_backend" = b2_s3 ] && [[ "$relative" =~ ^rollouts/step_[0-9]+/train_rollouts\.bin$ ]]; then
+    pull_b2 "$source"
+    return
+  fi
   remote_path_safe "$source" || return 1
   final="$dest_dir/$relative"
   partial="$dest_dir/.incoming/$relative"
@@ -396,6 +447,11 @@ push_stable() {
 scan() {
   local listing remote_file local_file step status=0 attempt pushed
   local -a rollout_files=()
+  if [ "$rollout_backend" = b2_s3 ] && [ -d "$dest_dir/rollouts" ]; then
+    while IFS= read -r -d '' local_file; do
+      b2_finish "$local_file" || return 76
+    done < <(find "$dest_dir/rollouts" -type f -name 'train_rollouts.bin.b2-ack.json' -print0)
+  fi
   while IFS= read -r -d '' local_file; do
     pushed=0
     for attempt in 1 2 3; do
@@ -422,7 +478,7 @@ scan() {
   [ "$status" = 0 ] || return "$status"
   while IFS=$'\t' read -r step remote_file; do
     [ -n "$remote_file" ] || continue
-    pull_one "$remote_file" || return 1
+    pull_one "$remote_file" || return $?
   done < <(
     for remote_file in "${rollout_files[@]}"; do
       step=${remote_file##*/step_}
@@ -514,10 +570,20 @@ health_remote() {
     -i "$source_identity" -p "$source_port" "$source_user@$source_host" "$1"
 }
 
+if [ "$rollout_backend" = b2_s3 ]; then
+  [ -f "$b2_local_helper" ] || { echo "B2 receiver helper is missing" >&2; exit 76; }
+  command -v curl >/dev/null || { echo "curl is missing" >&2; exit 76; }
+  b2_remote preflight >/dev/null || exit 76
+fi
 start_health_lease
 while true; do
   status=0
   scan || {
+    failure=$?
+    if [ "$failure" = 76 ]; then
+      echo "B2 rollout transfer failed; stopped without retry" >&2
+      exit 76
+    fi
     echo "$(date -u +%FT%TZ) rollout pull failed; retrying" >&2
     status=1
   }

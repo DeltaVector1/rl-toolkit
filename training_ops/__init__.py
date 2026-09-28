@@ -102,6 +102,16 @@ rollout_transfer_direction = nodes.get("rollout_transfer", {}).get(
 )
 if rollout_transfer_direction not in {"orchestrator_push", "trainer_pull"}:
     raise RuntimeError("rollout transfer direction is invalid")
+rollout_transfer_backend = nodes.get("rollout_transfer", {}).get("backend", "ssh")
+if rollout_transfer_backend not in {"ssh", "b2_s3"}:
+    raise RuntimeError("rollout transfer backend is invalid")
+if rollout_transfer_backend == "b2_s3" and rollout_transfer_direction != "trainer_pull":
+    raise RuntimeError("B2 rollout backend requires trainer_pull")
+rollout_b2_python = nodes.get("rollout_transfer", {}).get(
+    "b2_python", "/data/trinity/b2-transport-venv/bin/python"
+)
+if not isinstance(rollout_b2_python, str) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", rollout_b2_python) or ".." in PurePosixPath(rollout_b2_python).parts:
+    raise RuntimeError("B2 host interpreter must be an absolute safe path")
 
 trainer_head = hosts["trainer_head"]
 trainer_hosts = list(hosts["trainers"])
@@ -656,6 +666,9 @@ def _rollout_pull_environment(run_dir: str) -> dict[str, str]:
         raise Refused("trainer LAN addresses are incomplete")
     values = {
         "ROLLOUT_TRANSFER_DIRECTION": "trainer_pull",
+        "ROLLOUT_TRANSFER_BACKEND": rollout_transfer_backend,
+        "B2_ROLLOUT_PYTHON": rollout_b2_python,
+        "B2_ROLLOUT_HELPER": f"{runtime_root}/h200/b2_rollout.py",
         "RUN": PurePosixPath(run_dir).parent.name,
         "TRAINER_ADDRESSES": " ".join(trainer_lan[host] for host in active_trainers),
         "TRAINER_CT": trainer_container,
@@ -722,6 +735,24 @@ def _start_trainer_pull(run_dir: str, *, restart_route: bool = False) -> None:
         trainer_head,
         _rollout_pull_command(run_dir, "start"),
         "rollout puller start",
+        timeout=60,
+    )
+
+
+def _b2_rollout_preflight() -> None:
+    if rollout_transfer_backend != "b2_s3":
+        return
+    helper = f"{runtime_root}/h200/b2_rollout.py"
+    _remote_ok(
+        orchestrator_host,
+        f"timeout --signal=TERM --kill-after=5s 50s {shlex.quote(rollout_b2_python)} {shlex.quote(helper)} preflight",
+        "B2 rollout host interpreter and credential preflight",
+        timeout=60,
+    )
+    _remote_ok(
+        trainer_head,
+        f"test -f {shlex.quote(helper)} && command -v python3 >/dev/null && command -v curl >/dev/null",
+        "B2 rollout receiver dependency preflight",
         timeout=60,
     )
 
@@ -7357,6 +7388,8 @@ def _start_dependency_inventory(
     add("training_ops/runtime/adapter_cache_cleanup.py", inference_hosts)
     add("training_ops/runtime/china/resume_state.py", [orchestrator_host])
     add("training_ops/runtime/h200/drain_rollout_publisher.py", [trainer_head])
+    add("training_ops/runtime/h200/b2_rollout.py", [orchestrator_host, trainer_head])
+    add("training_ops/runtime/h200/b2-rollout-requirements.txt", [orchestrator_host])
     add("training_ops/runtime/china/direct_adapter_route.py", [orchestrator_host])
 
     configured_hosts = list(dict.fromkeys([*trainer_hosts, *inference_hosts]))
@@ -11017,6 +11050,7 @@ def start(
         _trinity_trainer_loss_preflight(nodes)
     required_files = _start_dependency_inventory(selected, nodes)
     _deploy_dependencies(required_files)
+    _b2_rollout_preflight()
     if selected.get("kind") == "trinity":
         _trinity_trainer_preflight(nodes)
     _orchestrator_image_preflight()

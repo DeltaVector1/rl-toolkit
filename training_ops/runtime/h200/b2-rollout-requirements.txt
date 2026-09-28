@@ -1,0 +1,2 @@
+# Provision the configured H200 host venv explicitly; never install at run start.
+boto3>=1.34,<2
