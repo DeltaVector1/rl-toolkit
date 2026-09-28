@@ -1554,3 +1554,24 @@ only after measured learning.
   acknowledgement, absence checks, and cleanup. Stop on any fault. A pass
   qualifies the first production run only, not `50`-step acceptance. This
   entry precedes live work; this task performs no live or network action.
+
+## Bounded parallel B2 rollout receive
+
+- **Measurements.** The production source was `395429868` bytes. A single
+  receive reached `41472000` bytes in `300s` (`0.138 MB/s`), compared with
+  qualification's `350074342` bytes in `59.972s` (`5.84 MB/s`). Proxy use was
+  ruled out. The production receive failed its existing time limit.
+- **Experiment.** Add an explicit bounded download worker setting, default
+  `1`, and qualify `8` deterministic contiguous HTTP ranges with a fresh
+  incompressible `395429868`-byte synthetic source and exact object version.
+  Keep one shared `300s` deadline, `60s` low-speed limit, one attempt per
+  range, and no retries. Stop and reap all owned workers on any fault.
+  Require HTTP `206`, exact content ranges and part sizes, complete ordered
+  assembly, final size/SHA-256, bound delivery acknowledgement, exact-version
+  deletion, and cleanup. Record only safe per-range connection/timing/byte
+  measurements; never log signed URLs or credentials.
+- **Scope and gate.** Keep RL settings, adapter SSH transport, control files,
+  and the default single-worker receive unchanged. Activate `8` rollout
+  workers only after local tests pass; local checks do not qualify the live
+  path. This record precedes implementation and any new live qualification.
+  This writer task performs no live or network action.
