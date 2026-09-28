@@ -193,6 +193,21 @@ no fixed prefill, TailRL, staged ratios, group filters, or held-out split wiring
   responsible supervisor or launch path instead. Keep active-generation
   deferral only when liveness or a rising token counter proves the engine is
   alive.
+- **Follow-up evidence (2026-09-28).** The reported `watchdog=no` sample at
+  `14:20:07Z` cannot be an engine-watchdog shell exit: the prior process wrote
+  `engine liveness passed` at `14:20:45Z`, and the next watchdog start was not
+  written until `14:21:29Z`. The engine container ID and start time stayed
+  unchanged. The live replacement had `PPID=1`, its own process group and
+  session, stdin `/dev/null`, and stdout/stderr both bound to
+  `/root/engine_watchdog.log`. A 20-sample exact command-and-environment scan
+  returned `20` matches and `0` misses. Kernel, Docker, journal, and audit
+  queries for `14:15` to `14:22` had no process-kill or engine-restart event.
+  The engine logs show policy14 drain at `14:19:59Z` and 128 running requests
+  at about `2,775 tok/s` from `14:20:09Z`. The measured sequence is therefore
+  a transient status false negative or status timeout followed by a delayed
+  supervisor repair, which intentionally replaced the old watchdog; it is not
+  a proven saturation exit. Preserve the existing watchdog and status
+  semantics until a concurrent PID/identity trace captures a real mismatch.
 
 ## Measured long-haul evidence
 
