@@ -42,7 +42,8 @@ Path(args[args.index('--output')+1]).write_bytes(body)
 status='200' if case=='status' else '206'
 value=f'bytes {start}-{end}/{Path(source).stat().st_size}'
 if case=='header': value='bytes 0-0/1'
-header=f'HTTP/1.1 {status} OK\r\nContent-Range: {value}\r\n\r\n'
+header=(f'HTTP/1.1 {status} OK\r\nContent-Range: {value}\r\n'
+        f'Content-Length: {len(body)}\r\n\r\n')
 Path(args[args.index('--dump-header')+1]).write_bytes(header.encode())
 print(f'{status}\t192.0.2.1\t1.1\t0.01\t0.02\t0.03\t{len(body)}',end='')
 """
@@ -238,6 +239,28 @@ class RangeReceiveTest(unittest.TestCase):
             ["0-511"],
         )
 
+    def test_restart_revalidates_saved_headers_and_metrics(self):
+        self.receive()
+        fixture = self.fixture
+        fixture.final.unlink()
+        fixture.partial.unlink(missing_ok=True)
+        parts = Path(str(fixture.final) + ".b2-parts")
+        (parts / "0.headers").write_text(
+            "HTTP/1.1 206 OK\n"
+            "Content-Range: bytes 0-511/4096\n"
+            "Content-Length: 511\n\n"
+        )
+        (parts / "0.metrics").write_text(
+            "206\t192.0.2.99\t1.1\t0.01\t0.02\t0.03\t512"
+        )
+        self.commands.clear()
+        self.receive()
+        self.assertEqual(fixture.final.read_bytes(), fixture.body)
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual(
+            self.commands[0][self.commands[0].index("--range") + 1], "0-511"
+        )
+
     def test_restart_discards_special_file_evidence(self):
         self.receive()
         fixture = self.fixture
@@ -251,6 +274,24 @@ class RangeReceiveTest(unittest.TestCase):
         self.receive()
         self.assertEqual(fixture.final.read_bytes(), fixture.body)
         self.assertEqual(len(self.commands), 1)
+
+    def test_quarantine_is_bounded_and_purges_oldest_entries(self):
+        fixture = self.fixture
+        parts = Path(str(fixture.final) + ".b2-parts")
+        parts.mkdir(mode=0o700, parents=True)
+        for index in range(tool._MAX_QUARANTINE_FILES + 16):
+            path = parts / f"foreign-{index:03d}"
+            path.write_bytes(b"x" * 1024)
+            path.chmod(0o600)
+        self.receive()
+        quarantine = parts / "quarantine"
+        entries = list(quarantine.iterdir())
+        self.assertLessEqual(len(entries), tool._MAX_QUARANTINE_FILES)
+        self.assertLessEqual(
+            sum(path.stat().st_size for path in entries),
+            tool._MAX_QUARANTINE_BYTES,
+        )
+        self.assertFalse(any(path.name.endswith("foreign-000") for path in entries))
 
     def test_restart_refuses_changed_object_identity(self):
         self.receive()
@@ -302,6 +343,40 @@ class RangeReceiveTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already active"):
             self.receive()
         self.assertEqual(self.commands, [])
+
+    def test_existing_final_wrong_mode_is_refused(self):
+        fixture = self.fixture
+        fixture.final.parent.mkdir(parents=True)
+        fixture.final.write_bytes(fixture.body)
+        fixture.final.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "published file identity differs"):
+            self.receive()
+
+    def test_part_replacement_between_validation_and_assembly_is_refused(self):
+        self.receive()
+        fixture = self.fixture
+        fixture.final.unlink()
+        fixture.partial.unlink(missing_ok=True)
+        original_digest = tool._digest_fd
+        replaced = False
+
+        def race(fd):
+            nonlocal replaced
+            result = original_digest(fd)
+            target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            if not replaced and target.name == "0.part":
+                replacement = target.with_name(".race-replacement")
+                replacement.write_bytes(b"x" * 512)
+                replacement.chmod(0o600)
+                os.replace(replacement, target)
+                replaced = True
+            return result
+
+        with patch.object(tool, "_digest_fd", race), self.assertRaisesRegex(
+            ValueError, "range part changed during assembly"
+        ):
+            self.receive()
+        self.assertFalse(fixture.final.exists())
 
     def test_faults_preserve_evidence_without_publication(self):
         for case in ["status", "header", "short", "hash"]:
