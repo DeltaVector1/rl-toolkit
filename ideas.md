@@ -1440,3 +1440,23 @@ only after measured learning.
   certificates and private keys, source file, and destination file. Verify
   that no test process or listener remains. This entry precedes live action;
   this documentation task performs no live or network action.
+
+## Backblaze B2 S3 transport experiment
+
+- **Test limits.** Use fresh disposable incompressible `16777216`-byte
+  objects and unique random object names under a test prefix. Allow one
+  attempt per transfer leg, with a `300s` limit and no hidden retries. Use
+  no production data and do not access `n79`.
+- **User-approved experiment.** Use the configured S3-compatible endpoint
+  and bucket through `/data/trinity/training.env`. Keep credentials, bucket
+  names, key IDs, and secrets out of records. Measure upload from H200 to B2,
+  then download from B2 to guarded `n82`. Separately measure upload from
+  guarded `n82` to B2, then download from B2 to H200.
+- **Measurements and stop rules.** Verify exact byte count and SHA-256 for
+  each leg. Record elapsed time, goodput, and errors. Stop on authentication,
+  TLS, timeout, hash, or size faults. One pass qualifies only a larger test;
+  it does not qualify production transport.
+- **Cleanup.** Preserve evidence, then remove only the exact remote test
+  objects and local test files. Verify that those objects and files are
+  absent. This entry precedes live action; this documentation task performs
+  no network or live calls.
