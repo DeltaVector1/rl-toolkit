@@ -54,19 +54,68 @@ def parse_json(raw):
     return json.loads(raw, object_pairs_hook=unique)
 
 
+def _open_regular_fd(path, mode=None):
+    path = safe_path(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        status = os.fstat(fd)
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError("regular file required")
+        if mode is not None and (
+            status.st_uid != os.geteuid() or stat.S_IMODE(status.st_mode) != mode
+        ):
+            raise ValueError("regular file identity differs")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_fd(fd, maximum):
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
+        raise ValueError("file size or type differs")
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    total = 0
+    while True:
+        chunk = os.read(fd, min(1024 * 1024, maximum - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > maximum:
+            raise ValueError("file size exceeds bound")
+        chunks.append(chunk)
+    after = os.fstat(fd)
+    if identity(before) != identity(after) or total != before.st_size:
+        raise ValueError("file changed during read")
+    return b"".join(chunks)
+
+
+def _digest_fd(fd):
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("regular file required")
+    os.lseek(fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
+    after = os.fstat(fd)
+    if identity(before) != identity(after):
+        raise ValueError("file changed during hashing")
+    return before.st_size, digest.hexdigest(), identity(before)
+
+
 def digest_file(path):
     path = safe_path(path)
-    with os.fdopen(
-        os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb"
-    ) as stream:
-        before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError("regular file required")
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        after = os.fstat(stream.fileno())
-    if identity(before) != identity(after) or identity(after) != identity(path.stat()):
+    fd = _open_regular_fd(path)
+    try:
+        size, digest, stamp = _digest_fd(fd)
+    finally:
+        os.close(fd)
+    if identity(path.stat()) != stamp:
         raise ValueError("source changed during hashing")
-    return before.st_size, digest, identity(before)
+    return size, digest, stamp
 
 
 def identity(value):
@@ -248,6 +297,53 @@ def checked_final(final, receipt):
         raise ValueError("delivered file size or hash differs")
 
 
+def checked_published(final, receipt):
+    final = safe_path(final)
+    fd = _open_regular_fd(final)
+    try:
+        size, digest, stamp = _digest_fd(fd)
+        status = os.fstat(fd)
+        if (
+            (size, digest) != (receipt["size"], receipt["sha256"])
+            or status.st_uid != receipt["uid"]
+            or status.st_gid != receipt["gid"]
+            or stat.S_IMODE(status.st_mode) != receipt["mode"]
+            or identity(status) != stamp
+            or identity(final.stat()) != stamp
+        ):
+            raise ValueError("published file identity differs")
+    finally:
+        os.close(fd)
+
+
+def _publish_partial(partial, final, receipt):
+    fd = _open_regular_fd(partial, 0o600)
+    try:
+        size, digest, _ = _digest_fd(fd)
+        if (size, digest) != (receipt["size"], receipt["sha256"]):
+            raise ValueError("delivered file size or hash differs")
+        status = os.fstat(fd)
+        if identity(partial.stat()) != identity(status):
+            raise ValueError("partial file changed before publication")
+        os.fchown(fd, receipt["uid"], receipt["gid"])
+        os.fchmod(fd, receipt["mode"])
+        os.fsync(fd)
+        status = os.fstat(fd)
+        if identity(partial.stat()) != identity(status):
+            raise ValueError("partial file changed during publication")
+        try:
+            os.link(partial, final, follow_symlinks=False)
+        except FileExistsError:
+            checked_published(final, receipt)
+        checked_published(final, receipt)
+        if identity(partial.stat()) != identity(os.fstat(fd)):
+            raise ValueError("partial file changed after publication")
+        partial.unlink()
+        _sync_directory(final.parent)
+    finally:
+        os.close(fd)
+
+
 def publication_directory(directory):
     """Match SSH's readable publication tree, even with a private host umask."""
     directory = safe_path(directory)
@@ -306,11 +402,13 @@ def download_ranges(size, workers):
     return ranges
 
 
-def range_result(headers, metrics, start, end, size):
+def _range_result_bytes(headers_raw, metrics_raw, start, end, size):
     # No server strings are included in logs. Accept only the final HTTP block.
-    if headers.stat().st_size > 128 * 1024 or metrics.stat().st_size > 4096:
+    if len(headers_raw) > 128 * 1024 or len(metrics_raw) > 4096:
         raise ValueError("range response metadata too large")
-    blocks = headers.read_text(encoding="iso-8859-1").strip().split("\n\n")
+    headers = headers_raw.decode("iso-8859-1")
+    metrics = metrics_raw.decode("ascii")
+    blocks = headers.strip().split("\n\n")
     lines = blocks[-1].splitlines()
     if not lines or not re.fullmatch(r"HTTP/(?:1\.[01]|2|3) 206(?: .*)?", lines[0]):
         raise ValueError("range HTTP status differs")
@@ -321,7 +419,14 @@ def range_result(headers, metrics, start, end, size):
     ]
     if values != [f"bytes {start}-{end}/{size}"]:
         raise ValueError("Content-Range differs")
-    fields = metrics.read_text().split("\t")
+    lengths = [
+        line.split(":", 1)[1].strip()
+        for line in lines[1:]
+        if line.lower().startswith("content-length:")
+    ]
+    if lengths != [str(end - start + 1)]:
+        raise ValueError("Content-Length differs")
+    fields = metrics.split("\t")
     if (
         len(fields) != 7
         or fields[0] != "206"
@@ -342,6 +447,18 @@ def range_result(headers, metrics, start, end, size):
         total_s=times[2],
         bytes=int(fields[6]),
     )
+
+
+def range_result(headers, metrics, start, end, size):
+    header_fd = _open_regular_fd(headers, 0o600)
+    metrics_fd = _open_regular_fd(metrics, 0o600)
+    try:
+        headers_raw = _read_fd(header_fd, 128 * 1024)
+        metrics_raw = _read_fd(metrics_fd, 4096)
+    finally:
+        os.close(header_fd)
+        os.close(metrics_fd)
+    return _range_result_bytes(headers_raw, metrics_raw, start, end, size)
 
 
 def stop_downloads(children):
@@ -401,6 +518,8 @@ _REPORT_KEYS = {
     "total_s",
     "bytes",
 }
+_MAX_QUARANTINE_FILES = 64
+_MAX_QUARANTINE_BYTES = 64 * 1024 * 1024
 
 
 def _sync_directory(directory):
@@ -436,9 +555,9 @@ def _range_paths(parts, index):
 
 
 def _quarantine_entry(parts, path):
-    """Move one untrusted entry below the locked private quarantine."""
+    """Move bounded regular evidence or discard it under the receiver lock."""
     try:
-        path.lstat()
+        source_status = path.lstat()
     except FileNotFoundError:
         return
     quarantine = parts / "quarantine"
@@ -454,9 +573,55 @@ def _quarantine_entry(parts, path):
         or stat.S_IMODE(status.st_mode) != 0o700
     ):
         raise ValueError("range quarantine identity differs")
-    destination = quarantine / f"{time.time_ns()}-{os.getpid()}-{path.name}"
-    os.rename(path, destination)
-    _sync_directory(quarantine)
+    if not stat.S_ISREG(source_status.st_mode):
+        if stat.S_ISDIR(source_status.st_mode):
+            raise ValueError("range quarantine directory refused")
+        path.unlink()
+        _sync_directory(parts)
+        return
+    if source_status.st_uid != os.geteuid() or stat.S_IMODE(
+        source_status.st_mode
+    ) != 0o600:
+        raise ValueError("range quarantine file identity differs")
+    try:
+        existing = sorted(quarantine.iterdir(), key=lambda item: item.name)
+        usage = []
+        for item in existing:
+            status = item.lstat()
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_uid != os.geteuid()
+                or stat.S_IMODE(status.st_mode) != 0o600
+            ):
+                raise ValueError("range quarantine entry identity differs")
+            usage.append((item, status.st_size))
+        total = sum(size for _, size in usage)
+        while usage and (
+            len(usage) >= _MAX_QUARANTINE_FILES
+            or total + source_status.st_size > _MAX_QUARANTINE_BYTES
+        ):
+            old, old_size = usage.pop(0)
+            old.unlink()
+            total -= old_size
+        if (
+            source_status.st_size > _MAX_QUARANTINE_BYTES
+            or len(usage) >= _MAX_QUARANTINE_FILES
+            or total + source_status.st_size > _MAX_QUARANTINE_BYTES
+        ):
+            path.unlink()
+            _sync_directory(parts)
+            return
+        for sequence in range(_MAX_QUARANTINE_FILES):
+            destination = quarantine / f"q-{sequence:08d}-{path.name}"
+            if not destination.exists() and not destination.is_symlink():
+                break
+        else:
+            path.unlink()
+            _sync_directory(parts)
+            return
+        os.rename(path, destination)
+    finally:
+        _sync_directory(quarantine)
     _sync_directory(parts)
 
 
@@ -468,6 +633,31 @@ def _quarantine_range(parts, index):
 def _quarantine_all_ranges(parts, count):
     for index in range(count):
         _quarantine_range(parts, index)
+
+
+def _purge_quarantine(quarantine):
+    try:
+        entries = sorted(quarantine.iterdir(), key=lambda item: item.name)
+    except FileNotFoundError:
+        return
+    usage = []
+    for path in entries:
+        status = path.lstat()
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_uid != os.geteuid()
+            or stat.S_IMODE(status.st_mode) != 0o600
+        ):
+            raise ValueError("range quarantine entry identity differs")
+        usage.append((path, status.st_size))
+    total = sum(size for _, size in usage)
+    while usage and (
+        len(usage) > _MAX_QUARANTINE_FILES or total > _MAX_QUARANTINE_BYTES
+    ):
+        path, size = usage.pop(0)
+        path.unlink()
+        total -= size
+    _sync_directory(quarantine)
 
 
 def _atomic_json(path, value):
@@ -563,8 +753,11 @@ def _range_manifest(receipt, size, workers, ranges):
 
 
 def _read_json(path):
-    _owned_regular(path)
-    return parse_json(path.read_text())
+    fd = _open_regular_fd(path, 0o600)
+    try:
+        return parse_json(_read_fd(fd, 16384).decode("utf-8"))
+    finally:
+        os.close(fd)
 
 
 def _prepare_parts(parts, expected):
@@ -592,6 +785,19 @@ def _prepare_parts(parts, expected):
         for path in list(parts.iterdir()):
             if path.name not in known:
                 _quarantine_entry(parts, path)
+        quarantine = parts / "quarantine"
+        try:
+            quarantine_status = quarantine.lstat()
+        except FileNotFoundError:
+            quarantine_status = None
+        if quarantine_status is not None:
+            if (
+                not stat.S_ISDIR(quarantine_status.st_mode)
+                or quarantine_status.st_uid != os.geteuid()
+                or stat.S_IMODE(quarantine_status.st_mode) != 0o700
+            ):
+                raise ValueError("range quarantine identity differs")
+            _purge_quarantine(quarantine)
         manifest_path = parts / "manifest.json"
         try:
             manifest_path.lstat()
@@ -609,7 +815,12 @@ def _prepare_parts(parts, expected):
 
 
 def _record_report(report, expected_size):
-    if set(report) != _REPORT_KEYS or report["bytes"] != expected_size:
+    if (
+        not isinstance(report, dict)
+        or set(report) != _REPORT_KEYS
+        or type(report["bytes"]) is not int
+        or report["bytes"] != expected_size
+    ):
         raise ValueError("range report differs")
     if not isinstance(report["remote_ip"], str):
         raise ValueError("range report differs")
@@ -643,10 +854,12 @@ def _valid_range_record(parts, spec):
         present.append(path)
     if not present:
         return False
+    fds = []
     try:
         for path in (part, headers, metrics, record):
-            _owned_regular(path)
-        value = _read_json(record)
+            fds.append(_open_regular_fd(path, 0o600))
+        part_fd, headers_fd, metrics_fd, record_fd = fds
+        value = parse_json(_read_fd(record_fd, 16384).decode("utf-8"))
         if set(value) != _RANGE_RECORD_KEYS:
             raise ValueError("range record schema differs")
         if value["schema"] != _PARTS_SCHEMA or value["index"] != index:
@@ -663,13 +876,25 @@ def _valid_range_record(parts, spec):
         ):
             raise ValueError("range record hash differs")
         _record_report(value["report"], expected_size)
-        actual_size, actual_digest, _ = digest_file(part)
+        report = _range_result_bytes(
+            _read_fd(headers_fd, 128 * 1024),
+            _read_fd(metrics_fd, 4096),
+            start,
+            end,
+            total_size,
+        )
+        if report != value["report"]:
+            raise ValueError("saved range response differs")
+        actual_size, actual_digest, _ = _digest_fd(part_fd)
         if (actual_size, actual_digest) != (expected_size, value["sha256"]):
             raise ValueError("range part hash differs")
     except (OSError, ValueError, TypeError, KeyError):
         _quarantine_range(parts, index)
         return False
-    return True
+    finally:
+        for fd in fds:
+            os.close(fd)
+    return value
 
 
 def _publish_range_record(parts, spec, report):
@@ -682,11 +907,25 @@ def _publish_range_record(parts, spec, report):
     )
     _record_report(report, expected_size)
     part, headers, metrics, record = _range_paths(parts, index)
-    for path in (part, headers, metrics):
-        _owned_regular(path)
-        with path.open("rb") as stream:
-            os.fsync(stream.fileno())
-    actual_size, actual_digest, _ = digest_file(part)
+    fds = []
+    try:
+        for path in (part, headers, metrics):
+            fds.append(_open_regular_fd(path, 0o600))
+        for fd in fds:
+            os.fsync(fd)
+        current_report = _range_result_bytes(
+            _read_fd(fds[1], 128 * 1024),
+            _read_fd(fds[2], 4096),
+            start,
+            end,
+            total_size,
+        )
+        if current_report != report:
+            raise ValueError("range response changed before record")
+        actual_size, actual_digest, _ = _digest_fd(fds[0])
+    finally:
+        for fd in fds:
+            os.close(fd)
     if actual_size != expected_size:
         raise ValueError("range file size differs")
     value = {
@@ -701,6 +940,7 @@ def _publish_range_record(parts, spec, report):
         "report": report,
     }
     _atomic_json(record, value)
+    return value
 
 
 def receive_ranges(
@@ -731,11 +971,11 @@ def receive_ranges(
     }
 
     try:
-        completed = {
-            spec["index"]
-            for spec in expected["ranges"]
-            if _valid_range_record(parts, spec)
-        }
+        completed_records = {}
+        for spec in expected["ranges"]:
+            value = _valid_range_record(parts, spec)
+            if value is not False:
+                completed_records[spec["index"]] = value
 
         def start_range(index, start, end):
             """Start one range with a fresh connection and clean evidence files."""
@@ -808,9 +1048,9 @@ def receive_ranges(
                     if not stream.closed:
                         stream.close()
 
-        pending = set(range(len(ranges))) - completed
+        pending = set(range(len(ranges))) - set(completed_records)
         for index, (start, end) in enumerate(ranges):
-            if index not in completed:
+            if index not in completed_records:
                 start_range(index, start, end)
         while pending:
             if clock() >= until:
@@ -874,7 +1114,7 @@ def receive_ranges(
                     )
                     start_range(index, start, end)
                     continue
-                _publish_range_record(
+                completed_records[index] = _publish_range_record(
                     parts,
                     expected["ranges"][index],
                     report,
@@ -883,30 +1123,60 @@ def receive_ranges(
                 pending.remove(index)
             if pending:
                 time.sleep(min(0.02, max(0, until - clock())))
-        part_paths = [
-            _range_paths(parts, spec["index"])[0] for spec in expected["ranges"]
-        ]
-        with os.fdopen(
-            os.open(
-                partial, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600
-            ),
-            "wb",
-        ) as output:
-            os.fchmod(output.fileno(), 0o600)
-            for part in part_paths:
-                with part.open("rb") as stream:
-                    while chunk := stream.read(1024 * 1024):
+        part_fds = []
+        try:
+            for spec in expected["ranges"]:
+                fd = _open_regular_fd(
+                    _range_paths(parts, spec["index"])[0], 0o600
+                )
+                part_fds.append(fd)
+                actual_size, actual_digest, _ = _digest_fd(fd)
+                saved = completed_records[spec["index"]]
+                if (actual_size, actual_digest) != (
+                    spec["size"],
+                    saved["sha256"],
+                ):
+                    raise ValueError("range part changed during assembly")
+                os.lseek(fd, 0, os.SEEK_SET)
+            partial_fd = os.open(
+                partial,
+                os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                partial_status = os.fstat(partial_fd)
+                if (
+                    not stat.S_ISREG(partial_status.st_mode)
+                    or partial_status.st_uid != os.geteuid()
+                    or stat.S_IMODE(partial_status.st_mode) != 0o600
+                ):
+                    raise ValueError("partial file identity differs")
+                os.ftruncate(partial_fd, 0)
+                os.lseek(partial_fd, 0, os.SEEK_SET)
+                for fd in part_fds:
+                    while chunk := os.read(fd, 1024 * 1024):
                         if clock() >= until:
                             raise TimeoutError("range assembly deadline")
-                        output.write(chunk)
-            output.flush()
-            os.fsync(output.fileno())
+                        view = memoryview(chunk)
+                        while view:
+                            view = view[os.write(partial_fd, view) :]
+                os.fsync(partial_fd)
+                if receipt is not None:
+                    actual_size, actual_digest, _ = _digest_fd(partial_fd)
+                    if (actual_size, actual_digest) != (
+                        receipt["size"],
+                        receipt["sha256"],
+                    ):
+                        raise ValueError("assembled range hash differs")
+            finally:
+                os.close(partial_fd)
+        except (OSError, ValueError):
+            _quarantine_all_ranges(parts, len(expected["ranges"]))
+            raise
+        finally:
+            for fd in part_fds:
+                os.close(fd)
         _sync_directory(partial.parent)
-        if receipt is not None:
-            actual_size, actual_digest, _ = digest_file(partial)
-            if (actual_size, actual_digest) != (receipt["size"], receipt["sha256"]):
-                _quarantine_all_ranges(parts, len(expected["ranges"]))
-                raise ValueError("assembled range hash differs")
     finally:
         try:
             with defer_download_signals():
@@ -929,7 +1199,7 @@ def receive_ranges(
 
 def cleanup_parts(final, receipt):
     receipt = validate_receipt(receipt)
-    checked_final(final, receipt)
+    checked_published(final, receipt)
     parts = safe_path(str(final) + ".b2-parts")
     try:
         parts.lstat()
@@ -1088,17 +1358,8 @@ def receive(
             os.close(fd)
         if result is not None and (result.returncode != 0 or result.stdout != "200"):
             raise ValueError("HTTPS download failed")
-        checked_final(partial, receipt)
-        os.chown(partial, receipt["uid"], receipt["gid"], follow_symlinks=False)
-        os.chmod(partial, receipt["mode"])
-        with partial.open("rb") as stream:
-            os.fsync(stream.fileno())
-        try:
-            os.link(partial, final, follow_symlinks=False)
-        except FileExistsError:
-            checked_final(final, receipt)
-        partial.unlink()
-    checked_final(final, receipt)
+        _publish_partial(partial, final, receipt)
+    checked_published(final, receipt)
     pending = safe_path(str(final) + ".b2-ack.json")
     payload = json.dumps(receipt, sort_keys=True) + "\n"
     temporary = None
@@ -1253,7 +1514,7 @@ def main(argv=None):
                 receipt = validate_receipt(
                     parse_json(safe_path(args.receipt).read_text())
                 )
-                checked_final(args.final, receipt)
+                checked_published(args.final, receipt)
                 print(json.dumps(receipt))
             else:
                 config = tomllib.loads(args.config.read_text())
