@@ -1,3 +1,6 @@
+import contextlib
+import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -15,6 +18,15 @@ from training_ops.tests.test_rollout_pull import RolloutPullTest, puller
 
 class Missing(Exception):
     response = {"ResponseMetadata": {"HTTPStatusCode": 404}}
+
+
+class ClientError(Exception):
+    def __init__(self, code, status, message="provider detail https://secret.invalid/key"):
+        super().__init__(message)
+        self.response = {
+            "Error": {"Code": code, "Message": message},
+            "ResponseMetadata": {"HTTPStatusCode": status},
+        }
 
 
 class FakeS3:
@@ -50,6 +62,80 @@ class FakeS3:
         self.deletes.append(kwargs)
         if "VersionId" in kwargs:
             self.objects.pop((kwargs["Key"], kwargs["VersionId"]), None)
+
+
+class TransientPublishS3(FakeS3):
+    def __init__(self, *, committed=False, failures=1):
+        super().__init__()
+        self.committed = committed
+        self.failures = failures
+        self.attempts = 0
+
+    def upload_fileobj(self, stream, bucket, key, ExtraArgs, Config):
+        self.attempts += 1
+        if self.failures:
+            self.failures -= 1
+            if self.committed:
+                super().upload_fileobj(stream, bucket, key, ExtraArgs, Config)
+            raise ClientError("SlowDown", 503)
+        super().upload_fileobj(stream, bucket, key, ExtraArgs, Config)
+
+
+class MultipartS3(FakeS3):
+    def __init__(self, *, complete_error=False):
+        super().__init__()
+        self.uploads_by_id = {}
+        self.aborts = []
+        self.multipart_creates = 0
+        self.multipart_completes = 0
+        self.complete_error = complete_error
+
+    def create_multipart_upload(self, **kwargs):
+        self.multipart_creates += 1
+        upload_id = f"upload-{self.multipart_creates}"
+        self.uploads_by_id[upload_id] = {"kwargs": kwargs, "parts": {}}
+        return {"UploadId": upload_id}
+
+    def upload_part(self, **kwargs):
+        upload = self.uploads_by_id[kwargs["UploadId"]]
+        upload["parts"][kwargs["PartNumber"]] = kwargs["Body"]
+        return {"ETag": f'"part-{kwargs["PartNumber"]}"'}
+
+    def complete_multipart_upload(self, **kwargs):
+        self.multipart_completes += 1
+        upload = self.uploads_by_id.pop(kwargs["UploadId"])
+        body = b"".join(upload["parts"][part["PartNumber"]] for part in kwargs["MultipartUpload"]["Parts"])
+        key = kwargs["Key"]
+        self.objects[key, "version-1"] = {
+            "ContentLength": len(body),
+            "Metadata": upload["kwargs"]["Metadata"],
+            "VersionId": "version-1",
+        }
+        if self.complete_error:
+            raise ClientError("ServiceUnavailable", 503)
+        return {"VersionId": "version-1"}
+
+    def abort_multipart_upload(self, **kwargs):
+        self.aborts.append(kwargs)
+        self.uploads_by_id.pop(kwargs["UploadId"], None)
+
+
+class DeleteErrorS3(FakeS3):
+    def __init__(self, *, remove=False, failures=1, code="SlowDown", status=503):
+        super().__init__()
+        self.remove = remove
+        self.failures = failures
+        self.code = code
+        self.status = status
+
+    def delete_object(self, **kwargs):
+        self.deletes.append(kwargs)
+        if self.remove:
+            self.objects.pop((kwargs["Key"], kwargs["VersionId"]), None)
+        if self.failures:
+            self.failures -= 1
+            raise ClientError(self.code, self.status)
+        self.objects.pop((kwargs["Key"], kwargs["VersionId"]), None)
 
 
 class B2RolloutTest(unittest.TestCase):
@@ -108,6 +194,103 @@ class B2RolloutTest(unittest.TestCase):
             [dict(Bucket="fixture", Key=value["key"], VersionId="version-1")],
         )
         self.assertIn((value["key"], "unrelated-version"), self.client.objects)
+
+    def test_transient_publish_after_commit_reuses_exact_object_once(self):
+        client = TransientPublishS3(committed=True)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            value = tool.publish(client, "fixture", self.source, self.runs)
+        self.assertEqual(client.attempts, 1)
+        self.assertEqual(client.uploads, 1)
+        self.assertEqual(value["version_id"], "version-1")
+        self.assertEqual(client.signed["VersionId"], value["version_id"])
+        telemetry = output.getvalue()
+        self.assertIn('"operation": "publish.upload"', telemetry)
+        self.assertIn('"error_code": "SlowDown"', telemetry)
+        self.assertIn('"retry": true', telemetry)
+        self.assertNotIn(self.source.name, telemetry)
+        self.assertNotIn(value["key"], telemetry)
+        self.assertNotIn("https://secret.invalid", telemetry)
+
+    def test_transient_publish_without_commit_retries_once(self):
+        client = TransientPublishS3(committed=False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            value = tool.publish(client, "fixture", self.source, self.runs)
+        self.assertEqual(client.attempts, 2)
+        self.assertEqual(client.uploads, 1)
+        self.assertEqual(value["version_id"], "version-1")
+
+    def test_permanent_publish_error_is_terminal_and_sanitized(self):
+        client = TransientPublishS3(committed=False, failures=2)
+        client.error_code = "AccessDenied"
+
+        def denied(stream, bucket, key, ExtraArgs, Config):
+            client.attempts += 1
+            raise ClientError("AccessDenied", 403)
+
+        client.upload_fileobj = denied
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaises(ClientError):
+            tool.publish(client, "fixture", self.source, self.runs)
+        self.assertEqual(client.attempts, 1)
+        telemetry = output.getvalue()
+        self.assertIn('"error_code": "AccessDenied"', telemetry)
+        self.assertIn('"retry": false', telemetry)
+        self.assertNotIn("fixture", telemetry)
+        self.assertNotIn("https://secret.invalid", telemetry)
+
+    def test_second_transient_publish_error_is_terminal(self):
+        client = TransientPublishS3(committed=False, failures=2)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaises(ClientError):
+            tool.publish(client, "fixture", self.source, self.runs)
+        self.assertEqual(client.attempts, 2)
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual([record["retry"] for record in records], [True, False])
+
+    def test_multipart_complete_transient_does_not_duplicate_object(self):
+        client = MultipartS3(complete_error=True)
+        config = SimpleNamespace(multipart_threshold=1024, multipart_chunksize=1024)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            value = tool.publish(
+                client, "fixture", self.source, self.runs, transfer_config=config
+            )
+        self.assertEqual(client.multipart_creates, 1)
+        self.assertEqual(client.multipart_completes, 1)
+        self.assertEqual(client.aborts, [
+            {"Bucket": "fixture", "Key": value["key"], "UploadId": "upload-1"}
+        ])
+        self.assertEqual(value["version_id"], "version-1")
+        self.assertEqual(client.signed["VersionId"], "version-1")
+        self.assertNotIn("https://secret.invalid", output.getvalue())
+
+    def test_transient_delete_retries_exact_version_and_confirms_absence(self):
+        client = DeleteErrorS3(remove=True)
+        self.client = client
+        value = self.publish()
+        receipt = {key: item for key, item in value.items() if key not in {"url", "expires_at"}}
+        Path(str(self.source) + ".delivered").write_text(receipt["sha256"])
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            tool.acknowledge(client, "fixture", receipt, self.runs)
+        self.assertEqual(client.deletes, [
+            {"Bucket": "fixture", "Key": value["key"], "VersionId": "version-1"},
+            {"Bucket": "fixture", "Key": value["key"], "VersionId": "version-1"},
+        ])
+        self.assertNotIn("https://secret.invalid", output.getvalue())
+
+    def test_permanent_delete_error_stays_terminal_when_object_remains(self):
+        client = DeleteErrorS3(remove=False, code="AccessDenied", status=403)
+        value = tool.publish(client, "fixture", self.source, self.runs)
+        receipt = {key: item for key, item in value.items() if key not in {"url", "expires_at"}}
+        Path(str(self.source) + ".delivered").write_text(receipt["sha256"])
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaises(ClientError):
+            tool.acknowledge(client, "fixture", receipt, self.runs)
+        self.assertEqual(len(client.deletes), 1)
+        self.assertIn('"error_code": "AccessDenied"', output.getvalue())
+        self.assertIn('"retry": false', output.getvalue())
 
     def test_root_receiver_publishes_directories_readable_by_trainer(self):
         # A normal root Docker container can exercise the actual UID transition;

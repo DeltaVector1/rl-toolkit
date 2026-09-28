@@ -25,6 +25,137 @@ import time
 import tomllib
 from urllib.parse import urlsplit
 
+try:
+    from botocore.exceptions import ClientError
+except ImportError:  # pragma: no cover - the host venv provides botocore.
+    ClientError = None
+
+
+_TRANSIENT_ERROR_CODES = frozenset(
+    {
+        "InternalError",
+        "InternalFailure",
+        "PriorRequestNotComplete",
+        "RequestLimitExceeded",
+        "RequestTimeout",
+        "RequestTimeoutException",
+        "ServiceUnavailable",
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+        "TooManyRequestsException",
+    }
+)
+_KNOWN_ERROR_CODES = _TRANSIENT_ERROR_CODES | frozenset(
+    {
+        "AccessDenied",
+        "AuthorizationHeaderMalformed",
+        "Conflict",
+        "EntityTooSmall",
+        "ExpiredToken",
+        "InvalidAccessKeyId",
+        "InvalidBucketName",
+        "InvalidPart",
+        "InvalidPartOrder",
+        "InvalidRequest",
+        "MethodNotAllowed",
+        "NoSuchBucket",
+        "NoSuchKey",
+        "NoSuchUpload",
+        "NotFound",
+        "PermanentRedirect",
+        "PreconditionFailed",
+        "RequestTimeTooSkewed",
+        "SignatureDoesNotMatch",
+    }
+)
+_API_OPERATIONS = frozenset(
+    {
+        "publish.head",
+        "publish.upload",
+        "publish.multipart.create",
+        "publish.multipart.part",
+        "publish.multipart.complete",
+        "publish.multipart.abort",
+        "publish.sign",
+        "ack.head",
+        "ack.delete",
+    }
+)
+
+
+def _client_error_details(error):
+    """Return safe SDK error facts, or None for local/non-SDK errors."""
+    candidate = ClientError
+    is_client_error = candidate is not None and isinstance(error, candidate)
+    # Tests and the host preflight can use a botocore-shaped error without
+    # importing botocore in the repository test environment.
+    if not is_client_error and error.__class__.__name__ == "ClientError":
+        is_client_error = isinstance(getattr(error, "response", None), dict)
+    if not is_client_error:
+        return None
+    response = getattr(error, "response", {})
+    if not isinstance(response, dict):
+        response = {}
+    metadata = response.get("ResponseMetadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    status = metadata.get("HTTPStatusCode")
+    if type(status) is not int or not 100 <= status <= 599:
+        status = None
+    provider_error = response.get("Error", {})
+    provider_code = (
+        provider_error.get("Code") if isinstance(provider_error, dict) else None
+    )
+    if not isinstance(provider_code, str):
+        provider_code = None
+    if provider_code in _KNOWN_ERROR_CODES:
+        code = provider_code
+    elif status is not None and 500 <= status <= 599:
+        code = f"http_{status}"
+    else:
+        code = "unknown"
+    return dict(
+        code=code,
+        status=status,
+        retryable=provider_code in _TRANSIENT_ERROR_CODES
+        or (status is not None and 500 <= status <= 599),
+    )
+
+
+def _api_telemetry(operation, details, attempt, retry):
+    operation = operation if operation in _API_OPERATIONS else "unknown"
+    print(
+        json.dumps(
+            {
+                "b2_api_error": True,
+                "operation": operation,
+                "error_code": details["code"],
+                "status": details["status"],
+                "attempt": attempt,
+                "retry": retry,
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+    )
+
+
+def _api_call(operation, call):
+    """Call one API operation with at most one explicit transient retry."""
+    for attempt in (1, 2):
+        try:
+            return call()
+        except Exception as error:
+            details = _client_error_details(error)
+            if details is None:
+                raise
+            retry = bool(details["retryable"] and attempt == 1)
+            _api_telemetry(operation, details, attempt, retry)
+            if not retry:
+                raise
+
+
 
 def safe_path(path):
     path = Path(path)
@@ -158,15 +289,16 @@ def validate_receipt(value):
     return value
 
 
-def matching_object(client, bucket, receipt):
+def matching_object(client, bucket, receipt, *, operation="publish.head"):
     arguments = dict(Bucket=bucket, Key=receipt["key"])
     if "version_id" in receipt:
         arguments["VersionId"] = receipt["version_id"]
     try:
-        head = client.head_object(**arguments)
+        head = _api_call(operation, lambda: client.head_object(**arguments))
     except Exception as error:
         response = getattr(error, "response", {})
-        if response.get("ResponseMetadata", {}).get("HTTPStatusCode") == 404:
+        metadata = response.get("ResponseMetadata", {}) if isinstance(response, dict) else {}
+        if isinstance(metadata, dict) and metadata.get("HTTPStatusCode") == 404:
             return False
         raise
     if (
@@ -184,27 +316,158 @@ def matching_object(client, bucket, receipt):
     return head
 
 
+def _metadata(receipt):
+    return {"sha256": receipt["sha256"], "size": str(receipt["size"])}
+
+
+def _multipart_settings(transfer_config):
+    threshold = getattr(transfer_config, "multipart_threshold", 8 * 1024 * 1024)
+    chunksize = getattr(transfer_config, "multipart_chunksize", 8 * 1024 * 1024)
+    if type(threshold) is not int or threshold <= 0:
+        threshold = 8 * 1024 * 1024
+    if type(chunksize) is not int or chunksize <= 0:
+        chunksize = 8 * 1024 * 1024
+    return threshold, chunksize
+
+
+def _open_source(source):
+    return os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb")
+
+
+def _abort_multipart(client, bucket, key, upload_id):
+    try:
+        client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+    except Exception as error:
+        details = _client_error_details(error)
+        if details is not None:
+            _api_telemetry("publish.multipart.abort", details, 1, False)
+
+
+def _multipart_upload_once(client, bucket, receipt, source, stamp, chunksize):
+    upload_id = None
+    parts = []
+    try:
+        created = client.create_multipart_upload(
+            Bucket=bucket,
+            Key=receipt["key"],
+            ACL="private",
+            Metadata=_metadata(receipt),
+        )
+        upload_id = created.get("UploadId") if isinstance(created, dict) else None
+        if not isinstance(upload_id, str) or not upload_id:
+            raise ValueError("multipart upload identity missing")
+        with _open_source(source) as stream:
+            if identity(os.fstat(stream.fileno())) != stamp:
+                raise ValueError("source changed before multipart upload")
+            part_number = 1
+            while True:
+                body = stream.read(chunksize)
+                if not body:
+                    break
+                if identity(os.fstat(stream.fileno())) != stamp:
+                    raise ValueError("source changed during multipart upload")
+                response = client.upload_part(
+                    Bucket=bucket,
+                    Key=receipt["key"],
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=body,
+                )
+                etag = response.get("ETag") if isinstance(response, dict) else None
+                if not isinstance(etag, str) or not etag:
+                    raise ValueError("multipart part identity missing")
+                parts.append({"PartNumber": part_number, "ETag": etag})
+                part_number += 1
+            if not parts:
+                raise ValueError("empty multipart upload")
+            if identity(os.fstat(stream.fileno())) != stamp:
+                raise ValueError("source changed after multipart upload")
+        client.complete_multipart_upload(
+            Bucket=bucket,
+            Key=receipt["key"],
+            UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+        # A successful completion consumes the upload id. Do not issue an
+        # abort for this accepted object if a later local check fails.
+        upload_id = None
+    except Exception:
+        if upload_id is not None:
+            _abort_multipart(client, bucket, receipt["key"], upload_id)
+        raise
+
+
+def _upload_fileobj_once(client, bucket, receipt, source, stamp, transfer_config):
+    with _open_source(source) as stream:
+        if identity(os.fstat(stream.fileno())) != stamp:
+            raise ValueError("source changed before upload")
+        client.upload_fileobj(
+            stream,
+            bucket,
+            receipt["key"],
+            ExtraArgs={"ACL": "private", "Metadata": _metadata(receipt)},
+            Config=transfer_config,
+        )
+        if identity(os.fstat(stream.fileno())) != stamp:
+            raise ValueError("source changed during upload")
+
+
+def _upload_once(client, bucket, receipt, source, stamp, transfer_config):
+    threshold, chunksize = _multipart_settings(transfer_config)
+    if receipt["size"] >= threshold:
+        _multipart_upload_once(
+            client, bucket, receipt, source, stamp, chunksize
+        )
+    else:
+        _upload_fileobj_once(
+            client, bucket, receipt, source, stamp, transfer_config
+        )
+
+
+def _revalidate_source(source, run_root, receipt, stamp):
+    current, current_stamp = source_info(source, run_root)
+    if current != receipt or current_stamp != stamp:
+        raise ValueError("source changed during publish")
+
+
+def _upload_with_retry(
+    client, bucket, receipt, source, run_root, stamp, transfer_config
+):
+    for attempt in (1, 2):
+        try:
+            _upload_once(
+                client, bucket, receipt, source, stamp, transfer_config
+            )
+            return
+        except Exception as error:
+            details = _client_error_details(error)
+            if details is None:
+                raise
+            retry = bool(details["retryable"] and attempt == 1)
+            _api_telemetry("publish.upload", details, attempt, retry)
+            if not retry:
+                raise
+            # A completed multipart upload or a successful small upload can
+            # be hidden by a lost response. Accept only the exact object;
+            # never publish a second accepted version for the same receipt.
+            _revalidate_source(source, run_root, receipt, stamp)
+            if matching_object(client, bucket, receipt):
+                return
+    raise AssertionError("bounded publish retry loop did not return")
+
+
 def publish(client, bucket, source, run_root, transfer_config=None):
     receipt, stamp = source_info(source, run_root)
     if not matching_object(client, bucket, receipt):
-        with os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
-            if identity(os.fstat(stream.fileno())) != stamp:
-                raise ValueError("source changed before upload")
-            client.upload_fileobj(
-                stream,
-                bucket,
-                receipt["key"],
-                ExtraArgs={
-                    "ACL": "private",
-                    "Metadata": {
-                        "sha256": receipt["sha256"],
-                        "size": str(receipt["size"]),
-                    },
-                },
-                Config=transfer_config,
-            )
-            if identity(os.fstat(stream.fileno())) != stamp:
-                raise ValueError("source changed during upload")
+        _upload_with_retry(
+            client,
+            bucket,
+            receipt,
+            source,
+            run_root,
+            stamp,
+            transfer_config,
+        )
     current, current_stamp = source_info(source, run_root)
     if current != receipt or current_stamp != stamp:
         raise ValueError("source changed after upload")
@@ -213,14 +476,17 @@ def publish(client, bucket, source, run_root, transfer_config=None):
         raise ValueError("uploaded object is absent")
     receipt["version_id"] = head.get("VersionId")
     validate_receipt(receipt)
-    url = client.generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": bucket,
-            "Key": receipt["key"],
-            "VersionId": receipt["version_id"],
-        },
-        ExpiresIn=600,
+    url = _api_call(
+        "publish.sign",
+        lambda: client.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": bucket,
+                "Key": receipt["key"],
+                "VersionId": receipt["version_id"],
+            },
+            ExpiresIn=600,
+        ),
     )
     return dict(receipt, url=url, expires_at=int(time.time()) + 600)
 
@@ -233,11 +499,31 @@ def acknowledge(client, bucket, receipt, run_root):
     marker = safe_path(receipt["source"] + ".delivered")
     if not marker.is_file() or marker.read_text().strip() != receipt["sha256"]:
         raise ValueError("verified delivery marker required before deletion")
-    if matching_object(client, bucket, receipt):
-        client.delete_object(
-            Bucket=bucket, Key=receipt["key"], VersionId=receipt["version_id"]
-        )
-    if matching_object(client, bucket, receipt):
+    delete_attempted = False
+    try:
+        if matching_object(client, bucket, receipt, operation="ack.head"):
+            delete_attempted = True
+            _api_call(
+                "ack.delete",
+                lambda: client.delete_object(
+                    Bucket=bucket,
+                    Key=receipt["key"],
+                    VersionId=receipt["version_id"],
+                ),
+            )
+    except Exception as error:
+        # Delete of an exact version is idempotent. If a response was lost or
+        # the provider reports that the version is already gone, accept only
+        # after a fresh exact-version absence check. Other faults remain
+        # terminal and retain their original error.
+        if delete_attempted and _client_error_details(error) is not None:
+            try:
+                if not matching_object(client, bucket, receipt, operation="ack.head"):
+                    return
+            except Exception:
+                pass
+        raise
+    if matching_object(client, bucket, receipt, operation="ack.head"):
         raise ValueError("object deletion was not confirmed")
 
 
