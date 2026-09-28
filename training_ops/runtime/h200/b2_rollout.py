@@ -949,13 +949,16 @@ def receive_ranges(
     *,
     receipt=None,
     hold_lock=False,
+    lock_fd=None,
     clock=time.monotonic,
 ):
     until = clock() + 300
     ranges = download_ranges(size, workers)
     parts = safe_path(str(final) + ".b2-parts")
     expected = _range_manifest(receipt, size, workers, ranges)
-    lock_fd = _prepare_parts(parts, expected)
+    owns_lock = lock_fd is None
+    if owns_lock:
+        lock_fd = _prepare_parts(parts, expected)
     children, records = [], [None] * len(ranges)
     attempts = [0] * len(ranges)
     max_attempts = 2
@@ -1202,7 +1205,7 @@ def receive_ranges(
         finally:
             for number, handler in previous.items():
                 signal.signal(number, handler)
-            if not handed_off:
+            if owns_lock and not handed_off:
                 _release_parts_lock(lock_fd)
 
 
@@ -1309,24 +1312,36 @@ def receive(
     # Create public traversal first: partial parents may share the run root.
     publication_directory(final.parent)
     partial.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parallel = (
+        download_workers > 1
+        and receipt["size"] >= download_threshold_bytes
+    )
+    parts = safe_path(str(final) + ".b2-parts")
+    expected = _range_manifest(
+        receipt,
+        receipt["size"],
+        download_workers,
+        download_ranges(receipt["size"], download_workers),
+    )
     publication_lock = None
     try:
         final_ready = final.exists()
         if not final_ready:
-            parallel = (
-                download_workers > 1
-                and receipt["size"] >= download_threshold_bytes
-            )
-            if parallel:
-                publication_lock, final_ready = receive_ranges(
+            publication_lock = _prepare_parts(parts, expected)
+            # A concurrent receiver may have published while this receiver
+            # waited for the lock. Re-check before touching the partial file.
+            final_ready = final.exists()
+            if not final_ready and parallel:
+                receive_ranges(
                     url,
                     receipt["size"],
                     partial,
                     final,
                     download_workers,
                     receipt=receipt,
-                    hold_lock=True,
+                    lock_fd=publication_lock,
                 )
+                final_ready = final.exists()
             if not final_ready:
                 fd = os.open(
                     partial,
