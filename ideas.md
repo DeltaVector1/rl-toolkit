@@ -1419,3 +1419,24 @@ only after measured learning.
   lowest reliable connection count for rollout transport from these bounded
   trials. Adapter transport design remains a separate task. This record
   precedes live testing; this documentation change performs no live action.
+
+## Temporary authenticated HTTPS transport experiment
+
+- **Test limits.** Use one fresh disposable incompressible `16777216`-byte
+  file, one direct HTTPS GET, and one attempt. Set a `300s` total limit and
+  a `60s` no-progress limit. Use no redirects, resume, or SSH data tunnel.
+- **User-approved experiment.** Provision a temporary H200 HTTPS endpoint
+  reachable only from `n82` if available controls permit that restriction.
+  Verify the TLS server identity and require client authentication scoped to
+  this test. Prefer an ephemeral CA, server certificate, and client
+  certificate with restrictive file modes. Do not expose the existing
+  unauthenticated loopback relay or touch production artifacts.
+- **Measurements and stop rules.** Record source and destination byte counts
+  and SHA-256, TLS handshake time, connect time, time to first byte, transfer
+  time, goodput, and errors. Stop on any authentication, TLS, redirect,
+  connection reset, timeout, size, or hash fault. A pass qualifies only a
+  later full-size test; it does not qualify production transport.
+- **Cleanup.** After preserving evidence, remove the exact temporary endpoint,
+  certificates and private keys, source file, and destination file. Verify
+  that no test process or listener remains. This entry precedes live action;
+  this documentation task performs no live or network action.
