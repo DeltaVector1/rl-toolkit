@@ -1509,3 +1509,24 @@ only after measured learning.
   paths and object version, and verify absence. A pass qualifies the first
   production run only, not `50`-step acceptance. This entry precedes live
   work; this documentation task performs no live or network action.
+
+## Second production-size B2 qualification: controller lifetime correction
+
+- **Measured failure.** The first `350074342`-byte attempt stopped after
+  H200 upload and before `n82` receive because the local operator wrapper
+  ended. Destination bytes were `0`. The exact object version was deleted;
+  the version-specific check returned `404`. No test processes or files
+  remained. This attempt did not qualify the receive path.
+- **Required correction.** Start a distinct qualification only after the
+  harness uses a managed foreground session whose controller/API bound
+  exceeds the existing remote `300s` data bound plus cleanup time. Do not
+  change the remote `300s` hard or `60s` download low-speed limits. Use no
+  internal retry.
+- **New experiment.** Use a fresh incompressible `350074342`-byte synthetic
+  source and a fresh object key, with one attempt per leg and no production
+  or cached rollout data. Keep the deployed H200 publish/presign to guarded
+  `n82` receive path, exact byte counts and SHA-256, upload/download/delete
+  timings, goodput, error records, stop-on-fault rules, exact version
+  deletion, and exact-path cleanup and absence checks from the first plan.
+  A pass qualifies the first production run, not `50` steps. This record
+  precedes a second experiment; this task performs no live or network action.
