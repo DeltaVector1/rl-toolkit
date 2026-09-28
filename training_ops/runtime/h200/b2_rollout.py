@@ -46,6 +46,56 @@ _TRANSIENT_ERROR_CODES = frozenset(
         "TooManyRequestsException",
     }
 )
+_TERMINAL_ERROR_CODES = frozenset(
+    {
+        "AccessDenied",
+        "AccountProblem",
+        "AllAccessDisabled",
+        "AuthorizationHeaderMalformed",
+        "BucketAlreadyExists",
+        "BucketNotEmpty",
+        "Conflict",
+        "EntityTooSmall",
+        "ExpiredToken",
+        "InvalidAccessKeyId",
+        "InvalidBucketName",
+        "InvalidClientTokenId",
+        "InvalidDigest",
+        "InvalidObjectState",
+        "InvalidPart",
+        "InvalidPartOrder",
+        "InvalidRequest",
+        "InvalidSecurityToken",
+        "InvalidToken",
+        "InvalidRange",
+        "MethodNotAllowed",
+        "MissingAuthenticationToken",
+        "NoSuchBucket",
+        "NoSuchKey",
+        "NoSuchUpload",
+        "NoSuchVersion",
+        "NotFound",
+        "PermanentRedirect",
+        "RequestTimeTooSkewed",
+        "RequestExpired",
+        "SignatureDoesNotMatch",
+        "TokenRefreshRequired",
+        "UnrecognizedClientException",
+        "PreconditionFailed",
+    }
+)
+_TERMINAL_ERROR_MARKERS = (
+    "access",
+    "auth",
+    "credential",
+    "forbidden",
+    "identity",
+    "notfound",
+    "nosuch",
+    "permission",
+    "signature",
+    "unauthorized",
+)
 _KNOWN_ERROR_CODES = _TRANSIENT_ERROR_CODES | frozenset(
     {
         "AccessDenied",
@@ -80,8 +130,32 @@ _API_OPERATIONS = frozenset(
         "publish.sign",
         "ack.head",
         "ack.delete",
+        "publish.multipart.list",
     }
 )
+
+
+class _MultipartCreateUnconfirmed(Exception):
+    """The create request may have succeeded, but its upload ID was lost."""
+
+    def __init__(self, error):
+        super().__init__("multipart upload identity was not confirmed")
+        self.error = error
+
+
+class _MultipartCleanupFailed(Exception):
+    """Abort or exact absence verification failed; never retry the upload."""
+
+    def __init__(self, error):
+        super().__init__("multipart cleanup was not confirmed")
+        self.error = error
+
+
+def _is_terminal_error_code(provider_code):
+    if provider_code in _TERMINAL_ERROR_CODES:
+        return True
+    lowered = provider_code.casefold() if isinstance(provider_code, str) else ""
+    return any(marker in lowered for marker in _TERMINAL_ERROR_MARKERS)
 
 
 def _client_error_details(error):
@@ -109,7 +183,7 @@ def _client_error_details(error):
     )
     if not isinstance(provider_code, str):
         provider_code = None
-    if provider_code in _KNOWN_ERROR_CODES:
+    if provider_code in _KNOWN_ERROR_CODES or provider_code in _TERMINAL_ERROR_CODES:
         code = provider_code
     elif status is not None and 500 <= status <= 599:
         code = f"http_{status}"
@@ -118,8 +192,13 @@ def _client_error_details(error):
     return dict(
         code=code,
         status=status,
-        retryable=provider_code in _TRANSIENT_ERROR_CODES
-        or (status is not None and 500 <= status <= 599),
+        retryable=(
+            not _is_terminal_error_code(provider_code)
+            and (
+                provider_code in _TRANSIENT_ERROR_CODES
+                or (status is not None and 500 <= status <= 599)
+            )
+        ),
     )
 
 
@@ -334,25 +413,70 @@ def _open_source(source):
     return os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb")
 
 
+def _verify_multipart_absent(client, bucket, key, upload_id):
+    response = _api_call(
+        "publish.multipart.list",
+        lambda: client.list_multipart_uploads(Bucket=bucket, Prefix=key),
+    )
+    if not isinstance(response, dict) or response.get("IsTruncated", False):
+        raise ValueError("multipart absence is not proven")
+    uploads = response.get("Uploads", [])
+    if uploads is None:
+        uploads = []
+    if not isinstance(uploads, list):
+        raise ValueError("multipart listing is invalid")
+    for upload in uploads:
+        if not isinstance(upload, dict):
+            raise ValueError("multipart listing is invalid")
+        if upload.get("Key") == key and upload.get("UploadId") == upload_id:
+            raise ValueError("multipart upload was not aborted")
+
+
 def _abort_multipart(client, bucket, key, upload_id):
     try:
-        client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+        _api_call(
+            "publish.multipart.abort",
+            lambda: client.abort_multipart_upload(
+                Bucket=bucket, Key=key, UploadId=upload_id
+            ),
+        )
     except Exception as error:
-        details = _client_error_details(error)
-        if details is not None:
-            _api_telemetry("publish.multipart.abort", details, 1, False)
+        # A failed abort is not safe to ignore. A fresh exact listing can
+        # prove that the attempt-owned upload is already gone; otherwise the
+        # operation fails closed and never starts a replacement upload.
+        try:
+            _verify_multipart_absent(client, bucket, key, upload_id)
+        except Exception as verification_error:
+            raise _MultipartCleanupFailed(error) from verification_error
+        return
+    try:
+        _verify_multipart_absent(client, bucket, key, upload_id)
+    except Exception as verification_error:
+        raise _MultipartCleanupFailed(verification_error) from verification_error
+
+
+def _create_multipart(client, bucket, receipt):
+    try:
+        return client.create_multipart_upload(
+            Bucket=bucket,
+            Key=receipt["key"],
+            ACL="private",
+            Metadata=_metadata(receipt),
+        )
+    except Exception as error:
+        if _client_error_details(error) is not None:
+            # The server may have created an upload whose ID was lost. There
+            # is no safe identity to abort or retry, so fail closed instead
+            # of creating a second attempt that could orphan more state.
+            raise _MultipartCreateUnconfirmed(error) from error
+        raise
 
 
 def _multipart_upload_once(client, bucket, receipt, source, stamp, chunksize):
     upload_id = None
     parts = []
     try:
-        created = client.create_multipart_upload(
-            Bucket=bucket,
-            Key=receipt["key"],
-            ACL="private",
-            Metadata=_metadata(receipt),
-        )
+        created = _create_multipart(client, bucket, receipt)
         upload_id = created.get("UploadId") if isinstance(created, dict) else None
         if not isinstance(upload_id, str) or not upload_id:
             raise ValueError("multipart upload identity missing")
@@ -439,6 +563,13 @@ def _upload_with_retry(
                 client, bucket, receipt, source, stamp, transfer_config
             )
             return
+        except _MultipartCleanupFailed:
+            raise
+        except _MultipartCreateUnconfirmed as error:
+            details = _client_error_details(error.error)
+            if details is not None:
+                _api_telemetry("publish.multipart.create", details, attempt, False)
+            raise error.error
         except Exception as error:
             details = _client_error_details(error)
             if details is None:

@@ -82,18 +82,30 @@ class TransientPublishS3(FakeS3):
 
 
 class MultipartS3(FakeS3):
-    def __init__(self, *, complete_error=False):
+    def __init__(
+        self,
+        *,
+        complete_error=False,
+        create_error=False,
+        abort_failures=0,
+        retain_on_complete_error=False,
+    ):
         super().__init__()
         self.uploads_by_id = {}
         self.aborts = []
         self.multipart_creates = 0
         self.multipart_completes = 0
         self.complete_error = complete_error
+        self.create_error = create_error
+        self.abort_failures = abort_failures
+        self.retain_on_complete_error = retain_on_complete_error
 
     def create_multipart_upload(self, **kwargs):
         self.multipart_creates += 1
         upload_id = f"upload-{self.multipart_creates}"
         self.uploads_by_id[upload_id] = {"kwargs": kwargs, "parts": {}}
+        if self.create_error:
+            raise ClientError("ServiceUnavailable", 503)
         return {"UploadId": upload_id}
 
     def upload_part(self, **kwargs):
@@ -103,7 +115,10 @@ class MultipartS3(FakeS3):
 
     def complete_multipart_upload(self, **kwargs):
         self.multipart_completes += 1
-        upload = self.uploads_by_id.pop(kwargs["UploadId"])
+        if self.complete_error and self.retain_on_complete_error:
+            upload = self.uploads_by_id[kwargs["UploadId"]]
+        else:
+            upload = self.uploads_by_id.pop(kwargs["UploadId"])
         body = b"".join(upload["parts"][part["PartNumber"]] for part in kwargs["MultipartUpload"]["Parts"])
         key = kwargs["Key"]
         self.objects[key, "version-1"] = {
@@ -117,7 +132,18 @@ class MultipartS3(FakeS3):
 
     def abort_multipart_upload(self, **kwargs):
         self.aborts.append(kwargs)
+        if self.abort_failures:
+            self.abort_failures -= 1
+            raise ClientError("SlowDown", 503)
         self.uploads_by_id.pop(kwargs["UploadId"], None)
+
+    def list_multipart_uploads(self, **kwargs):
+        return {
+            "Uploads": [
+                {"Key": item["kwargs"]["Key"], "UploadId": upload_id}
+                for upload_id, item in self.uploads_by_id.items()
+            ]
+        }
 
 
 class DeleteErrorS3(FakeS3):
@@ -239,6 +265,25 @@ class B2RolloutTest(unittest.TestCase):
         self.assertNotIn("fixture", telemetry)
         self.assertNotIn("https://secret.invalid", telemetry)
 
+    def test_terminal_identity_codes_override_server_error_retry(self):
+        for code in (
+            "AccessDenied",
+            "SignatureDoesNotMatch",
+            "InvalidAccessKeyId",
+            "NoSuchKey",
+            "NoSuchUpload",
+            "AuthorizationHeaderMalformed",
+            "InvalidBucketName",
+            "AccessDeniedException",
+            "NotFoundException",
+            "PermissionDenied",
+        ):
+            with self.subTest(code=code):
+                details = tool._client_error_details(ClientError(code, 503))
+                self.assertFalse(details["retryable"])
+                expected = code if code in tool._KNOWN_ERROR_CODES else "http_503"
+                self.assertEqual(details["code"], expected)
+
     def test_second_transient_publish_error_is_terminal(self):
         client = TransientPublishS3(committed=False, failures=2)
         output = io.StringIO()
@@ -264,6 +309,61 @@ class B2RolloutTest(unittest.TestCase):
         self.assertEqual(value["version_id"], "version-1")
         self.assertEqual(client.signed["VersionId"], "version-1")
         self.assertNotIn("https://secret.invalid", output.getvalue())
+
+    def test_multipart_create_response_loss_does_not_retry_unknown_upload(self):
+        client = MultipartS3(create_error=True)
+        config = SimpleNamespace(multipart_threshold=1024, multipart_chunksize=1024)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaises(ClientError):
+            tool.publish(
+                client, "fixture", self.source, self.runs, transfer_config=config
+            )
+        self.assertEqual(client.multipart_creates, 1)
+        self.assertEqual(client.aborts, [])
+        self.assertEqual(set(client.uploads_by_id), {"upload-1"})
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(records[-1]["operation"], "publish.multipart.create")
+        self.assertFalse(records[-1]["retry"])
+        self.assertNotIn("https://secret.invalid", output.getvalue())
+
+    def test_multipart_abort_retries_and_verifies_exact_absence(self):
+        client = MultipartS3(complete_error=True, abort_failures=1)
+        config = SimpleNamespace(multipart_threshold=1024, multipart_chunksize=1024)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            value = tool.publish(
+                client, "fixture", self.source, self.runs, transfer_config=config
+            )
+        self.assertEqual(value["version_id"], "version-1")
+        self.assertEqual(len(client.aborts), 2)
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(
+            [(record["operation"], record["retry"]) for record in records],
+            [("publish.multipart.abort", True), ("publish.upload", True)],
+        )
+
+    def test_multipart_abort_failure_is_fail_closed_without_replacement(self):
+        client = MultipartS3(
+            complete_error=True,
+            abort_failures=2,
+            retain_on_complete_error=True,
+        )
+        config = SimpleNamespace(multipart_threshold=1024, multipart_chunksize=1024)
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output), self.assertRaises(
+            tool._MultipartCleanupFailed
+        ):
+            tool.publish(
+                client, "fixture", self.source, self.runs, transfer_config=config
+            )
+        self.assertEqual(client.multipart_creates, 1)
+        self.assertEqual(len(client.aborts), 2)
+        self.assertEqual(set(client.uploads_by_id), {"upload-1"})
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(
+            [(record["operation"], record["retry"]) for record in records],
+            [("publish.multipart.abort", True), ("publish.multipart.abort", False)],
+        )
 
     def test_transient_delete_retries_exact_version_and_confirms_absence(self):
         client = DeleteErrorS3(remove=True)
