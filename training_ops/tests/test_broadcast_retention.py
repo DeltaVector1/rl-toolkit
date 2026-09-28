@@ -59,19 +59,25 @@ class BroadcastRetentionTest(unittest.TestCase):
             chunks = []
             for index, value in enumerate(model):
                 name = f"adapter_model.safetensors.transport-full-zstd-{index:06d}"
-                payload = bytes([value])
+                payload = subprocess.run(
+                    ["zstd", "-q", "-c"],
+                    input=bytes([value]),
+                    capture_output=True,
+                    check=True,
+                ).stdout
                 (path / name).write_bytes(payload)
                 chunks.append({
                     "file": name,
                     "offset": index,
                     "raw_size": 1,
-                    "wire_size": 1,
+                    "wire_size": len(payload),
                     "wire_sha256": hashlib.sha256(payload).hexdigest(),
-                    "raw_sha256": hashlib.sha256(payload).hexdigest(),
+                    "raw_sha256": hashlib.sha256(bytes([value])).hexdigest(),
                     "codec": "zstd",
                 })
             manifest.update({
                 "transport": "chunked-full-zstd",
+                "encoded_size": sum(item["wire_size"] for item in chunks),
                 "chunk_count": len(chunks),
                 "chunks": chunks,
             })
@@ -155,9 +161,31 @@ class BroadcastRetentionTest(unittest.TestCase):
         active = self._step(2)
         chunk = self.broadcasts / "step_0" / "adapter_model.safetensors.transport-full-zstd-000000"
         chunk.write_bytes(b"changed")
-        report = retention.inventory(self.root, self._evidence(active, old, active), max_bytes=1000000)
+        report = retention.inventory(self.root, self._evidence(active, old, active), keep_latest=1, max_bytes=1000000)
         self.assertNotIn(str(self.broadcasts / "step_0"), {item["path"] for item in report["selected"]})
         self.assertTrue(any("transport chunk identity differs" in item["reason"] for item in report["invalid"]))
+
+        shutil.rmtree(self.broadcasts / "step_0")
+        old = self._step(0, transport=True)
+        manifest_path = self.broadcasts / "step_0" / "adapter_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["chunks"][0]["raw_sha256"] = "0" * 64
+        manifest_path.write_text(json.dumps(manifest))
+        report = retention.inventory(self.root, self._evidence(active, old, active), max_bytes=1000000)
+        self.assertTrue(any("raw identity differs" in item["reason"] for item in report["invalid"]))
+
+        shutil.rmtree(self.broadcasts / "step_0")
+        old = self._step(0, transport=True)
+        manifest_path = self.broadcasts / "step_0" / "adapter_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["version"] = 2
+        manifest["mode"] = "delta"
+        manifest["transport"] = "chunked-bf16-linear-zigzag-sparse-zstd"
+        for chunk in manifest["chunks"]:
+            chunk["data_offset"] = 0
+        manifest_path.write_text(json.dumps(manifest))
+        report = retention.inventory(self.root, self._evidence(active, old, active), keep_latest=1, max_bytes=1000000)
+        self.assertIn(str(self.broadcasts / "step_0"), {item["path"] for item in report["selected"]})
 
         shutil.rmtree(self.broadcasts / "step_0")
         old = self._step(0, transport=True)
@@ -230,6 +258,13 @@ class BroadcastRetentionTest(unittest.TestCase):
         report = retention.inventory(self.root, self._evidence(active, active), partial_age_seconds=0)
         self.assertEqual(report["selected"], [])
         self.assertEqual(report["partials"][0]["reason"], "protected-checkpoint-or-transfer")
+
+        shutil.rmtree(partial)
+        partial.mkdir()
+        (partial / ".adapter_model.safetensors.123.partial").write_bytes(b"pending")
+        self._age(partial)
+        report = retention.inventory(self.root, self._evidence(active, active), partial_age_seconds=0)
+        self.assertEqual(report["selected"], [])
 
     def test_lock_race_and_crash_quarantine_recovery_free_space(self):
         active = self._step(2)

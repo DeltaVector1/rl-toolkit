@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
+import ctypes.util
 import fcntl
 import hashlib
 import json
@@ -99,6 +101,7 @@ _PROTECTED_FILE_NAMES = frozenset(
         "optimizer.bin",
     }
 )
+_PROTECTED_SUFFIXES = (".parts", ".assembling", ".partial")
 
 
 @dataclass(frozen=True)
@@ -181,6 +184,31 @@ def _sha256(path: Path, label: str) -> str:
     except OSError as error:
         _fail(f"{label} cannot be read: {error}")
     return digest.hexdigest()
+
+
+def _zstd_raw(path: Path, expected_size: int) -> bytes:
+    """Decode one transport chunk with the same system zstd library as the producer."""
+    if type(expected_size) is not int or expected_size <= 0:
+        _fail("adapter transport raw size is invalid")
+    try:
+        payload = path.read_bytes()
+        library = ctypes.CDLL(ctypes.util.find_library("zstd") or "libzstd.so.1")
+        function = library.ZSTD_decompress
+        function.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+        function.restype = ctypes.c_size_t
+        source = ctypes.create_string_buffer(payload)
+        destination = ctypes.create_string_buffer(expected_size)
+        result = function(destination, expected_size, source, len(payload))
+        is_error = library.ZSTD_isError
+        is_error.argtypes = [ctypes.c_size_t]
+        is_error.restype = ctypes.c_uint
+        if is_error(result) or result != expected_size:
+            _fail(f"adapter transport chunk decompression differs: {path}")
+        return destination.raw[:result]
+    except OSError as error:
+        _fail(f"adapter transport chunk cannot be decoded: {error}")
+    except MemoryError as error:
+        _fail(f"adapter transport raw chunk is too large: {error}")
 
 
 def _json(path: Path, label: str) -> dict[str, Any]:
@@ -327,10 +355,13 @@ def _manifest_identity(path: Path, step: int) -> tuple[dict[str, Any], set[str]]
             _fail(f"adapter manifest chunk transport is invalid: {path}")
     expected_offset = 0
     wire_total = 0
+    predictive_chunks = mode == "predictive" or any(
+        isinstance(item, Mapping) and "data_offset" in item for item in chunks
+    )
     expected_chunk_keys = {
         "file", "offset", "raw_size", "wire_size", "wire_sha256", "raw_sha256", "codec"
     }
-    if mode == "predictive":
+    if predictive_chunks:
         expected_chunk_keys.add("data_offset")
     for index, item in enumerate(chunks):
         if not isinstance(item, Mapping) or set(item) != expected_chunk_keys:
@@ -359,7 +390,7 @@ def _manifest_identity(path: Path, step: int) -> tuple[dict[str, Any], set[str]]
             or item.get("codec") != "zstd"
         ):
             _fail(f"adapter manifest chunk identity is invalid: {path}")
-        if mode == "predictive" and (
+        if predictive_chunks and (
             type(item.get("data_offset")) is not int
             or item["data_offset"] < 0
             or item["data_offset"] > model_size
@@ -369,6 +400,9 @@ def _manifest_identity(path: Path, step: int) -> tuple[dict[str, Any], set[str]]
         chunk_info = _regular(chunk_path, "adapter transport chunk")
         if chunk_info.st_size != item["wire_size"] or _sha256(chunk_path, "adapter transport chunk") != item["wire_sha256"]:
             _fail(f"adapter transport chunk identity differs: {path}")
+        raw = _zstd_raw(chunk_path, item["raw_size"])
+        if hashlib.sha256(raw).hexdigest() != item["raw_sha256"]:
+            _fail(f"adapter transport chunk raw identity differs: {path}")
         extras.add(name)
         expected_offset += item["raw_size"]
         wire_total += item["wire_size"]
@@ -482,7 +516,12 @@ def _partial(path: Path, step: int | None, reason: str) -> _Partial:
     bytes_used, newest = _tree_size_and_mtime(path)
     protected = False
     for entry in (path, *path.rglob("*")):
-        if entry.name in _PROTECTED_NAMES or entry.name in _PROTECTED_FILE_NAMES or entry.name.endswith(".b2-ack.json"):
+        if (
+            entry.name in _PROTECTED_NAMES
+            or entry.name in _PROTECTED_FILE_NAMES
+            or entry.name.endswith(".b2-ack.json")
+            or entry.name.endswith(_PROTECTED_SUFFIXES)
+        ):
             protected = True
             break
     if protected:

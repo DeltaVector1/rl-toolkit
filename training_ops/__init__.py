@@ -75,6 +75,7 @@ from training_ops.runtime.adapter_cache_cleanup import (
     validate_metrics as _validate_adapter_cache_metrics,
     validate_status as _validate_adapter_cache_status,
 )
+from training_ops.runtime.broadcast_retention import cleanup as _broadcast_retention_cleanup
 
 repo_root = Path(__file__).resolve().parents[1]
 nodes_path = repo_root / "configs" / "nodes.toml"
@@ -12803,6 +12804,60 @@ def _remove_adapter_cache_action(arguments: list[str]):
     return result
 
 
+def _broadcast_retention_action(arguments: list[str]):
+    """Inventory or explicitly apply local broadcast retention."""
+    values: dict[str, object] = {"keep_latest": 2, "partial_age_seconds": 1800.0, "max_entries": 8, "max_bytes": 50 * 1024**3}
+    positional: list[str] = []
+    options = {
+        "--evidence": "evidence",
+        "--keep-latest": "keep_latest",
+        "--partial-age-seconds": "partial_age_seconds",
+        "--max-entries": "max_entries",
+        "--max-bytes": "max_bytes",
+    }
+    apply = False
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--apply":
+            apply = True
+        elif argument in options:
+            index += 1
+            if index >= len(arguments):
+                raise Refused(f"{argument} requires a value")
+            raw = arguments[index]
+            key = options[argument]
+            if key == "evidence":
+                values[key] = raw
+            else:
+                try:
+                    values[key] = float(raw) if key == "partial_age_seconds" else int(raw)
+                except ValueError as error:
+                    raise Refused(f"{argument} must be numeric") from error
+        elif argument.startswith("--"):
+            raise Refused(f"unknown retention option {argument}")
+        else:
+            positional.append(argument)
+        index += 1
+    if len(positional) > 2:
+        raise Refused("retention accepts RUN_DIR and EVIDENCE")
+    if len(positional) == 2 and "evidence" in values:
+        raise Refused("retention evidence was provided twice")
+    if not positional or "evidence" not in values:
+        raise Refused("retention requires RUN_DIR and --evidence EVIDENCE")
+    result = _broadcast_retention_cleanup(
+        positional[0],
+        values["evidence"],
+        keep_latest=values["keep_latest"],
+        partial_age_seconds=values["partial_age_seconds"],
+        max_entries=values["max_entries"],
+        max_bytes=values["max_bytes"],
+        dry_run=not apply,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return result
+
+
 def _stop_action(arguments: list[str]):
     if arguments:
         raise Refused("stop does not accept arguments")
@@ -12825,6 +12880,7 @@ actions = {
     "start": _start_action,
     "archive": _archive_action,
     "remove-adapter-cache": _remove_adapter_cache_action,
+    "retention": _broadcast_retention_action,
     "qualify": _qualify_action,
     "load-policy0": _load_policy0_action,
     "load-qualified-adapter": _qualified_adapter_load_action,
@@ -12864,6 +12920,9 @@ usage = f"""training-ops <action> [args]
                                 remove one exact unloaded adapter cache entry
   remove-adapter-cache --source-url URL --lora-name NAME
                                 remove one exact unloaded adapter cache entry
+  retention RUN_DIR --evidence EVIDENCE [--apply]
+                                inventory or apply guarded broadcast retention;
+                                dry-run is the default
   qualify <name> [mode] [config-dir]  start a trainer-only config directory
   load-policy0 [config-dir] [plan|apply] \
     --source-run RUN --source-adapter-dir DIR --qualification-slot NAME
