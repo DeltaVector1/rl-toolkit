@@ -364,12 +364,20 @@ import os,sys
 from pathlib import Path
 assert sys.argv[1]=="--disable"
 assert "secret-signed-url" in sys.stdin.read()
-Path(sys.argv[sys.argv.index("--output")+1]).write_bytes(Path(os.environ["B2_TEST_SOURCE"]).read_bytes())
-print("200",end="")
+body=Path(os.environ["B2_TEST_SOURCE"]).read_bytes()
+if "--range" in sys.argv:
+ start,end=map(int,sys.argv[sys.argv.index("--range")+1].split("-"))
+ Path(sys.argv[sys.argv.index("--dump-header")+1]).write_text(f"HTTP/1.1 206 OK\\nContent-Range: bytes {start}-{end}/{len(body)}\\n\\n")
+ body=body[start:end+1]
+ print(f"206\\t192.0.2.1\\t1.1\\t0.01\\t0.02\\t0.03\\t{len(body)}",end="")
+else: print("200",end="")
+Path(sys.argv[sys.argv.index("--output")+1]).write_bytes(body)
 """)
             curl.chmod(0o755)
             env.update(
                 ROLLOUT_TRANSFER_BACKEND="b2_s3",
+                B2_DOWNLOAD_WORKERS="8",
+                B2_DOWNLOAD_THRESHOLD_BYTES="1",
                 B2_ROLLOUT_PYTHON=str(interpreter),
                 B2_TEST_SOURCE=str(binary),
                 B2_TEST_ACK=str(root / "acked"),

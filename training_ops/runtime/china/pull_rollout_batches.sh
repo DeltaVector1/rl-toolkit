@@ -27,6 +27,10 @@ case "$rollout_backend" in ssh|b2_s3) ;; *) echo "invalid rollout backend" >&2; 
 b2_python=${B2_ROLLOUT_PYTHON:-/data/trinity/b2-transport-venv/bin/python}
 b2_helper=${B2_ROLLOUT_HELPER:-${script%/china/*}/h200/b2_rollout.py}
 b2_local_helper=${script%/china/*}/h200/b2_rollout.py
+b2_download_workers=${B2_DOWNLOAD_WORKERS:-1}
+b2_download_threshold=${B2_DOWNLOAD_THRESHOLD_BYTES:-67108864}
+[[ "$b2_download_workers" =~ ^([1-9]|[12][0-9]|3[0-2])$ ]] || { echo "invalid B2 download workers" >&2; exit 2; }
+[[ "$b2_download_threshold" =~ ^[1-9][0-9]{0,12}$ ]] && [ "$b2_download_threshold" -le 1099511627776 ] || { echo "invalid B2 download threshold" >&2; exit 2; }
 pid_file="$dest_dir/.rollout-pull.pid"
 lock_file="$dest_dir/.rollout-pull.lock"
 log_file=${LOG_FILE:-"${dest_dir%/*}/rollout-pull.log"}
@@ -103,9 +107,17 @@ process_matches() {
 }
 
 status() {
-  local pid proc candidate count=0
+  local pid proc candidate count=0 environment workers threshold
   pid=$(cat "$pid_file" 2>/dev/null || true)
   process_matches "$pid" || return 1
+  # Desired tuning is not process ownership: stop can replace older settings.
+  if [ "$rollout_backend" = b2_s3 ]; then
+    environment=$(tr '\0' '\n' <"/proc/$pid/environ") || return 1
+    workers=$(sed -n 's/^B2_DOWNLOAD_WORKERS=//p' <<<"$environment")
+    threshold=$(sed -n 's/^B2_DOWNLOAD_THRESHOLD_BYTES=//p' <<<"$environment")
+    [ "${workers:-1}" = "$b2_download_workers" ] || return 1
+    [ "${threshold:-67108864}" = "$b2_download_threshold" ] || return 1
+  fi
   for proc in /proc/[0-9]*; do
     candidate=${proc##*/}
     process_matches "$candidate" && count=$((count + 1))
@@ -219,6 +231,7 @@ start() {
     ROLLOUT_TRANSFER_DIRECTION=trainer_pull \
     ROLLOUT_TRANSFER_BACKEND="$rollout_backend" \
     B2_ROLLOUT_PYTHON="$b2_python" B2_ROLLOUT_HELPER="$b2_helper" \
+    B2_DOWNLOAD_WORKERS="$b2_download_workers" B2_DOWNLOAD_THRESHOLD_BYTES="$b2_download_threshold" \
     SOURCE_RUN_DIR="$source_dir" DEST_RUN_DIR="$dest_dir" \
     SOURCE_HOST="$source_host" SOURCE_PORT="$source_port" SOURCE_USER="$source_user" \
     SOURCE_IDENTITY_FILE="$source_identity" SOURCE_KNOWN_HOSTS_FILE="$source_known_hosts" \
@@ -316,6 +329,7 @@ b2_finish() {
   digest=$(sha256sum -- "$final" | awk '{print $1}') || return 76
   write_receipt "$source" "$digest" || return 76
   b2_remote ack --receipt "$receipt" || return 76
+  python3 "$b2_local_helper" cleanup-parts --receipt "$pending" --final "$final" || return 76
   rm -- "$pending"
 }
 
@@ -329,7 +343,8 @@ pull_b2() {
   local_path_safe "$partial" || return 76
   metadata=$(b2_remote publish --source "$source") || return 76
   printf '%s' "$metadata" | python3 "$b2_local_helper" receive \
-    --source "$source" --partial "$partial" --final "$final" || return 76
+    --source "$source" --partial "$partial" --final "$final" \
+    --download-workers "$b2_download_workers" --download-threshold-bytes "$b2_download_threshold" || return 76
   unset metadata
   b2_finish "$final.b2-ack.json" || return 76
   echo "pulled $relative via b2_s3"

@@ -97,6 +97,22 @@ paths = nodes["paths"]
 containers = nodes["containers"]
 models = nodes["models"]
 inference_settings = nodes["inference"]
+
+
+def _rollout_download_settings(settings):
+    allowed = {"direction", "backend", "b2_python", "download_workers", "download_threshold_bytes"}
+    if not isinstance(settings, dict) or set(settings) - allowed:
+        raise RuntimeError("unknown rollout transfer setting")
+    workers = settings.get("download_workers", 1)
+    threshold = settings.get("download_threshold_bytes", 64 * 1024 * 1024)
+    if type(workers) is not int or not 1 <= workers <= 32:
+        raise RuntimeError("rollout download_workers must be an integer from 1 to 32")
+    if type(threshold) is not int or not 1 <= threshold <= 2**40:
+        raise RuntimeError("rollout download_threshold_bytes must be a positive bounded integer")
+    return workers, threshold
+
+
+rollout_download_workers, rollout_download_threshold_bytes = _rollout_download_settings(nodes.get("rollout_transfer", {}))
 rollout_transfer_direction = nodes.get("rollout_transfer", {}).get(
     "direction", "orchestrator_push"
 )
@@ -668,6 +684,8 @@ def _rollout_pull_environment(run_dir: str) -> dict[str, str]:
         "ROLLOUT_TRANSFER_DIRECTION": "trainer_pull",
         "ROLLOUT_TRANSFER_BACKEND": rollout_transfer_backend,
         "B2_ROLLOUT_PYTHON": rollout_b2_python,
+        "B2_DOWNLOAD_WORKERS": str(rollout_download_workers),
+        "B2_DOWNLOAD_THRESHOLD_BYTES": str(rollout_download_threshold_bytes),
         "B2_ROLLOUT_HELPER": f"{runtime_root}/h200/b2_rollout.py",
         "RUN": PurePosixPath(run_dir).parent.name,
         "TRAINER_ADDRESSES": " ".join(trainer_lan[host] for host in active_trainers),

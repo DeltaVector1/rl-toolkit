@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import hashlib
+import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -264,7 +266,289 @@ def publication_directory(directory):
             current.chmod(0o755)
 
 
-def receive(value, source, partial, final, run_curl=subprocess.run):
+def download_settings(workers=1, threshold=64 * 1024 * 1024):
+    if type(workers) is not int or not 1 <= workers <= 32:
+        raise ValueError("download_workers must be an integer from 1 to 32")
+    if type(threshold) is not int or not 1 <= threshold <= 2**40:
+        raise ValueError("download_threshold_bytes must be a positive bounded integer")
+    return workers, threshold
+
+
+def validate_ranges(ranges, size):
+    if type(size) is not int or size <= 0 or not ranges:
+        raise ValueError("positive download size and nonempty ranges required")
+    position = 0
+    for start, end in ranges:
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or start != position
+            or end < start
+        ):
+            raise ValueError("download ranges overlap or have a gap")
+        position = end + 1
+    if position != size:
+        raise ValueError("download ranges do not cover the object")
+
+
+def download_ranges(size, workers):
+    download_settings(workers)
+    if type(size) is not int or size <= 0:
+        raise ValueError("positive download size required")
+    width, extra = divmod(size, min(size, workers))
+    ranges, position = [], 0
+    for index in range(min(size, workers)):
+        end = position + width + (index < extra) - 1
+        ranges.append((position, end))
+        position = end + 1
+    validate_ranges(ranges, size)
+    return ranges
+
+
+def range_result(headers, metrics, start, end, size):
+    # No server strings are included in logs. Accept only the final HTTP block.
+    if headers.stat().st_size > 128 * 1024 or metrics.stat().st_size > 4096:
+        raise ValueError("range response metadata too large")
+    blocks = headers.read_text(encoding="iso-8859-1").strip().split("\n\n")
+    lines = blocks[-1].splitlines()
+    if not lines or not re.fullmatch(r"HTTP/(?:1\.[01]|2|3) 206(?: .*)?", lines[0]):
+        raise ValueError("range HTTP status differs")
+    values = [
+        line.split(":", 1)[1].strip()
+        for line in lines[1:]
+        if line.lower().startswith("content-range:")
+    ]
+    if values != [f"bytes {start}-{end}/{size}"]:
+        raise ValueError("Content-Range differs")
+    fields = metrics.read_text().split("\t")
+    if (
+        len(fields) != 7
+        or fields[0] != "206"
+        or fields[2] not in {"1.0", "1.1", "2", "3"}
+    ):
+        raise ValueError("range metrics differ")
+    remote_ip = str(ipaddress.ip_address(fields[1]))
+    times = [float(value) for value in fields[3:6]]
+    if any(not math.isfinite(value) or value < 0 for value in times):
+        raise ValueError("invalid range timing")
+    if not re.fullmatch(r"[0-9]+", fields[6]) or int(fields[6]) != end - start + 1:
+        raise ValueError("range byte count differs")
+    return dict(
+        remote_ip=remote_ip,
+        protocol=fields[2],
+        connect_s=times[0],
+        first_byte_s=times[1],
+        total_s=times[2],
+        bytes=int(fields[6]),
+    )
+
+
+def stop_downloads(children):
+    # Each curl owns a new process group; stop only groups created here.
+    for child in children:
+        if child.poll() is None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+    until = time.monotonic() + 1
+    for child in children:
+        try:
+            child.wait(timeout=max(0, until - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+        finally:
+            if child.stdin is not None and not child.stdin.closed:
+                try:
+                    child.stdin.close()
+                except OSError:
+                    pass
+
+
+@contextmanager
+def defer_download_signals():
+    previous = signal.pthread_sigmask(
+        signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT, signal.SIGALRM}
+    )
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
+    until = clock() + 300
+    ranges = download_ranges(size, workers)
+    parts = safe_path(str(final) + ".b2-parts")
+    # Exclusive creation prevents reuse of stale or foreign range evidence.
+    parts.mkdir(mode=0o700)
+    children, records = [], []
+
+    def interrupted(*_):
+        raise InterruptedError("range download interrupted")
+
+    previous = {
+        number: signal.signal(number, interrupted)
+        for number in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        for index, (start, end) in enumerate(ranges):
+            remaining = until - clock()
+            if remaining <= 0:
+                raise TimeoutError("range download deadline")
+            part = parts / f"{index}.part"
+            headers = parts / f"{index}.headers"
+            metrics = parts / f"{index}.metrics"
+            with part.open("xb") as body, headers.open("xb") as head, metrics.open(
+                "xb"
+            ) as output:
+                for stream in (body, head, output):
+                    os.fchmod(stream.fileno(), 0o600)
+                command = [
+                    "curl",
+                    "--disable",
+                    "--config",
+                    "-",
+                    "--proto",
+                    "=https",
+                    "--retry",
+                    "0",
+                    "--max-redirs",
+                    "0",
+                    "--max-time",
+                    f"{remaining:.6f}",
+                    "--speed-limit",
+                    "1",
+                    "--speed-time",
+                    "60",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--range",
+                    f"{start}-{end}",
+                    "--output",
+                    f"/proc/self/fd/{body.fileno()}",
+                    "--dump-header",
+                    f"/proc/self/fd/{head.fileno()}",
+                    "--write-out",
+                    "%{http_code}\t%{remote_ip}\t%{http_version}\t%{time_connect}\t%{time_starttransfer}\t%{time_total}\t%{size_download}",
+                ]
+                with defer_download_signals():
+                    child = subprocess.Popen(
+                        command,
+                        stdin=subprocess.PIPE,
+                        stdout=output,
+                        stderr=subprocess.DEVNULL,
+                        pass_fds=(body.fileno(), head.fileno()),
+                        start_new_session=True,
+                        # Unmask in the new process; parent masks only registration.
+                        restore_signals=True,
+                        preexec_fn=lambda: signal.pthread_sigmask(
+                            signal.SIG_SETMASK, set()
+                        ),
+                    )
+                    children.append(child)
+                records.append((part, headers, metrics, start, end))
+                child.stdin.write(("url = " + json.dumps(url) + "\n").encode())
+                child.stdin.close()
+        pending = set(range(len(children)))
+        while pending:
+            if clock() >= until:
+                raise TimeoutError("range download deadline")
+            for index in sorted(pending):
+                code = children[index].poll()
+                if code is None:
+                    continue
+                part, headers, metrics, start, end = records[index]
+                if code != 0:
+                    print(
+                        json.dumps(dict(range_index=index, curl_exit=code)),
+                        file=sys.stderr,
+                    )
+                    raise ValueError("HTTPS range download failed")
+                report = range_result(headers, metrics, start, end, size)
+                if part.stat().st_size != end - start + 1:
+                    raise ValueError("range file size differs")
+                print(json.dumps(dict(range_index=index, **report)), file=sys.stderr)
+                pending.remove(index)
+            if pending:
+                time.sleep(min(0.02, max(0, until - clock())))
+        with os.fdopen(
+            os.open(
+                partial, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+            ),
+            "wb",
+        ) as output:
+            os.fchmod(output.fileno(), 0o600)
+            for part, _, _, _, _ in records:
+                with part.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        if clock() >= until:
+                            raise TimeoutError("range assembly deadline")
+                        output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+    finally:
+        try:
+            with defer_download_signals():
+                cleanup_started = time.monotonic()
+                timer = signal.setitimer(signal.ITIMER_REAL, 0)
+                try:
+                    stop_downloads(children)
+                finally:
+                    if timer[0]:
+                        signal.setitimer(
+                            signal.ITIMER_REAL,
+                            max(0.001, timer[0] - (time.monotonic() - cleanup_started)),
+                            timer[1],
+                        )
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
+
+
+def cleanup_parts(final, receipt):
+    checked_final(final, validate_receipt(receipt))
+    parts = safe_path(str(final) + ".b2-parts")
+    if not parts.exists():
+        return
+    status = parts.stat()
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or status.st_uid != os.geteuid()
+        or stat.S_IMODE(status.st_mode) != 0o700
+    ):
+        raise ValueError("range directory ownership differs")
+    files = list(parts.iterdir())
+    for path in files:
+        if (
+            not re.fullmatch(
+                r"(?:[0-9]|[12][0-9]|3[01])\.(?:part|headers|metrics)", path.name
+            )
+            or path.is_symlink()
+            or not path.is_file()
+        ):
+            raise ValueError("unexpected range evidence file")
+    for path in files:
+        path.unlink()
+    parts.rmdir()
+
+
+def receive(
+    value,
+    source,
+    partial,
+    final,
+    run_curl=subprocess.run,
+    *,
+    download_workers=1,
+    download_threshold_bytes=64 * 1024 * 1024,
+):
+    download_settings(download_workers, download_threshold_bytes)
     if not isinstance(value, dict) or set(value) != {
         "source",
         "key",
@@ -305,46 +589,55 @@ def receive(value, source, partial, final, run_curl=subprocess.run):
     publication_directory(final.parent)
     partial.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not final.exists():
+        parallel = download_workers > 1 and receipt["size"] >= download_threshold_bytes
+        if parallel:
+            receive_ranges(url, receipt["size"], partial, final, download_workers)
         fd = os.open(
-            partial, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+            partial,
+            os.O_WRONLY | os.O_NOFOLLOW | (0 if parallel else os.O_CREAT | os.O_TRUNC),
+            0o600,
         )
         try:
             os.fchmod(fd, 0o600)
-            result = run_curl(
-                [
-                    "curl",
-                    "--disable",
-                    "--config",
-                    "-",
-                    "--proto",
-                    "=https",
-                    "--retry",
-                    "0",
-                    "--max-redirs",
-                    "0",
-                    "--max-time",
-                    "300",
-                    "--speed-limit",
-                    "1",
-                    "--speed-time",
-                    "60",
-                    "--fail",
-                    "--silent",
-                    "--show-error",
-                    "--output",
-                    f"/proc/self/fd/{fd}",
-                    "--write-out",
-                    "%{http_code}",
-                ],
-                input="url = " + json.dumps(url) + "\n",
-                text=True,
-                capture_output=True,
-                timeout=300,
-                pass_fds=(fd,),
+            result = (
+                None
+                if parallel
+                else run_curl(
+                    [
+                        "curl",
+                        "--disable",
+                        "--config",
+                        "-",
+                        "--proto",
+                        "=https",
+                        "--retry",
+                        "0",
+                        "--max-redirs",
+                        "0",
+                        "--max-time",
+                        "300",
+                        "--speed-limit",
+                        "1",
+                        "--speed-time",
+                        "60",
+                        "--fail",
+                        "--silent",
+                        "--show-error",
+                        "--output",
+                        f"/proc/self/fd/{fd}",
+                        "--write-out",
+                        "%{http_code}",
+                    ],
+                    input="url = " + json.dumps(url) + "\n",
+                    text=True,
+                    capture_output=True,
+                    timeout=300,
+                    pass_fds=(fd,),
+                )
             )
         finally:
             os.close(fd)
-        if result.returncode != 0 or result.stdout != "200":
+        if result is not None and (result.returncode != 0 or result.stdout != "200"):
             raise ValueError("HTTPS download failed")
         checked_final(partial, receipt)
         os.chown(partial, receipt["uid"], receipt["gid"], follow_symlinks=False)
@@ -481,6 +774,13 @@ def main(argv=None):
     receiver.add_argument("--source", required=True)
     receiver.add_argument("--partial", required=True)
     receiver.add_argument("--final", required=True)
+    receiver.add_argument("--download-workers", type=int, default=1)
+    receiver.add_argument(
+        "--download-threshold-bytes", type=int, default=64 * 1024 * 1024
+    )
+    cleaner = sub.add_parser("cleanup-parts")
+    cleaner.add_argument("--receipt", required=True)
+    cleaner.add_argument("--final", required=True)
     pending = sub.add_parser("ack-json")
     pending.add_argument("--receipt", required=True)
     pending.add_argument("--final", required=True)
@@ -493,6 +793,12 @@ def main(argv=None):
                     args.source,
                     args.partial,
                     args.final,
+                    download_workers=args.download_workers,
+                    download_threshold_bytes=args.download_threshold_bytes,
+                )
+            elif args.command == "cleanup-parts":
+                cleanup_parts(
+                    args.final, parse_json(safe_path(args.receipt).read_text())
                 )
             elif args.command == "ack-json":
                 receipt = validate_receipt(
