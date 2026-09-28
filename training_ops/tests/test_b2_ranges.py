@@ -2,20 +2,19 @@ import contextlib
 import io
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import training_ops
+import training_ops.tests
 from training_ops.runtime.h200 import b2_rollout as tool
-import training_ops.tests  # noqa: F401 - local-only network guard
 from training_ops.tests import test_b2_rollout as fixtures
-
 
 fake_curl = r"""
 import json,os,signal,sys,time
@@ -141,7 +140,7 @@ class RangeReceiveTest(unittest.TestCase):
         self.assertEqual(fixture.final.stat().st_uid, fixture.source.stat().st_uid)
         parts = Path(str(fixture.final) + ".b2-parts")
         self.assertEqual(parts.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(len(list(parts.iterdir())), 24)
+        self.assertEqual(len(list(parts.iterdir())), 34)
         pending = Path(str(fixture.final) + ".b2-ack.json")
         receipt = tool.parse_json(pending.read_text())
         Path(str(fixture.source) + ".delivered").write_text(receipt["sha256"])
@@ -175,6 +174,134 @@ class RangeReceiveTest(unittest.TestCase):
             )
             self.assertEqual(child.returncode, 0, child.stderr)
             self.assertEqual(int(child.stdout), len(fixture.body))
+
+    def test_restart_reuses_verified_ranges_and_fresh_url(self):
+        self.receive()
+        fixture = self.fixture
+        fixture.final.unlink()
+        fixture.partial.unlink(missing_ok=True)
+        self.commands.clear()
+        self.value = dict(self.value, url="https://example.invalid/fresh-temporary-url")
+        with patch.object(
+            tool.subprocess,
+            "Popen",
+            side_effect=AssertionError("verified ranges must be reused"),
+        ):
+            self.receive()
+        self.assertEqual(fixture.final.read_bytes(), fixture.body)
+        self.assertEqual(self.commands, [])
+
+    def test_process_crash_reuses_a_fsynced_range_record(self):
+        original_publish = tool._publish_range_record
+
+        def crash_after_first_record(parts, spec, report):
+            original_publish(parts, spec, report)
+            if spec["index"] == 0:
+                os._exit(19)
+
+        with patch.object(tool, "_publish_range_record", crash_after_first_record):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    with patch.object(tool.subprocess, "Popen", self.spawn):
+                        self.receive()
+                except BaseException:
+                    os._exit(20)
+                os._exit(21)
+            _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 19)
+        time.sleep(0.1)
+        self.commands.clear()
+        with patch.object(tool.subprocess, "Popen", self.spawn):
+            self.receive()
+        self.assertEqual(self.fixture.final.read_bytes(), self.fixture.body)
+        self.assertNotIn(
+            "0-511",
+            [command[command.index("--range") + 1] for command in self.commands],
+        )
+
+    def test_restart_redownloads_only_a_mutated_range(self):
+        self.receive()
+        fixture = self.fixture
+        fixture.final.unlink()
+        fixture.partial.unlink(missing_ok=True)
+        mutated = Path(str(fixture.final) + ".b2-parts/0.part")
+        mutated.write_bytes(b"bad")
+        self.commands.clear()
+        self.receive()
+        self.assertEqual(fixture.final.read_bytes(), fixture.body)
+        self.assertEqual(
+            [
+                command[command.index("--range") + 1]
+                for command in self.commands
+            ],
+            ["0-511"],
+        )
+
+    def test_restart_discards_special_file_evidence(self):
+        self.receive()
+        fixture = self.fixture
+        fixture.final.unlink()
+        fixture.partial.unlink(missing_ok=True)
+        special = Path(str(fixture.final) + ".b2-parts/0.part")
+        special.unlink()
+        os.mkfifo(special)
+        self.addCleanup(lambda: special.exists() and special.unlink())
+        self.commands.clear()
+        self.receive()
+        self.assertEqual(fixture.final.read_bytes(), fixture.body)
+        self.assertEqual(len(self.commands), 1)
+
+    def test_restart_refuses_changed_object_identity(self):
+        self.receive()
+        fixture = self.fixture
+        fixture.final.unlink()
+        fixture.partial.unlink(missing_ok=True)
+        changed = dict(self.value, version_id="version-2")
+        command_count = len(self.commands)
+        with self.assertRaisesRegex(ValueError, "durable range identity differs"):
+            tool.receive(
+                changed,
+                str(fixture.source),
+                fixture.partial,
+                fixture.final,
+                download_workers=8,
+                download_threshold_bytes=1,
+            )
+        self.assertEqual(len(self.commands), command_count)
+
+    def test_restart_full_hash_failure_keeps_parts_for_recovery(self):
+        self.receive()
+        fixture = self.fixture
+        fixture.final.unlink()
+        fixture.partial.unlink(missing_ok=True)
+        mutated = Path(str(fixture.final) + ".b2-parts/0.part")
+        mutated.write_bytes(bytes(32))
+        self.case = "hash"
+        with self.assertRaisesRegex(ValueError, "assembled range hash differs"):
+            self.receive()
+        self.assertFalse(fixture.final.exists())
+        self.case = "ok"
+        self.receive()
+        self.assertEqual(fixture.final.read_bytes(), fixture.body)
+        receipt = tool.parse_json(
+            Path(str(fixture.final) + ".b2-ack.json").read_text()
+        )
+        tool.cleanup_parts(fixture.final, receipt)
+        self.assertFalse(Path(str(fixture.final) + ".b2-parts").exists())
+
+    def test_concurrent_receiver_is_refused(self):
+        self.receive()
+        fixture = self.fixture
+        fixture.final.unlink()
+        fixture.partial.unlink(missing_ok=True)
+        parts = Path(str(fixture.final) + ".b2-parts")
+        lock_fd = tool._parts_lock(parts)
+        self.addCleanup(lambda: tool._release_parts_lock(lock_fd))
+        self.commands.clear()
+        with self.assertRaisesRegex(ValueError, "already active"):
+            self.receive()
+        self.assertEqual(self.commands, [])
 
     def test_faults_preserve_evidence_without_publication(self):
         for case in ["status", "header", "short", "hash"]:

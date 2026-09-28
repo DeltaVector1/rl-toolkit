@@ -7,13 +7,12 @@ Only publisher commands read /data/trinity/training.env. Never log publish JSON.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+import fcntl
 import hashlib
 import ipaddress
 import json
 import math
 import os
-from pathlib import Path
 import re
 import shlex
 import signal
@@ -23,6 +22,8 @@ import sys
 import tempfile
 import time
 import tomllib
+from contextlib import contextmanager
+from pathlib import Path
 from urllib.parse import urlsplit
 
 
@@ -380,12 +381,343 @@ def defer_download_signals():
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
-def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
+_PARTS_SCHEMA = 1
+_RANGE_RECORD_KEYS = {
+    "schema",
+    "index",
+    "start",
+    "end",
+    "size",
+    "sha256",
+    "http_status",
+    "content_range",
+    "report",
+}
+_REPORT_KEYS = {
+    "remote_ip",
+    "protocol",
+    "connect_s",
+    "first_byte_s",
+    "total_s",
+    "bytes",
+}
+
+
+def _sync_directory(directory):
+    directory = safe_path(directory)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _owned_regular(path, mode=0o600):
+    path = safe_path(path)
+    status = path.lstat()
+    if (
+        not stat.S_ISREG(status.st_mode)
+        or status.st_uid != os.geteuid()
+        or stat.S_IMODE(status.st_mode) != mode
+    ):
+        raise ValueError("range evidence file identity differs")
+    return status
+
+
+def _part_path(parts, index, suffix):
+    return parts / f"{index}.{suffix}"
+
+
+def _range_paths(parts, index):
+    return tuple(
+        _part_path(parts, index, suffix)
+        for suffix in ("part", "headers", "metrics", "record")
+    )
+
+
+def _quarantine_entry(parts, path):
+    """Move one untrusted entry below the locked private quarantine."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return
+    quarantine = parts / "quarantine"
+    try:
+        status = quarantine.lstat()
+    except FileNotFoundError:
+        quarantine.mkdir(mode=0o700)
+        status = quarantine.lstat()
+        _sync_directory(parts)
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or status.st_uid != os.geteuid()
+        or stat.S_IMODE(status.st_mode) != 0o700
+    ):
+        raise ValueError("range quarantine identity differs")
+    destination = quarantine / f"{time.time_ns()}-{os.getpid()}-{path.name}"
+    os.rename(path, destination)
+    _sync_directory(quarantine)
+    _sync_directory(parts)
+
+
+def _quarantine_range(parts, index):
+    for path in _range_paths(parts, index):
+        _quarantine_entry(parts, path)
+
+
+def _quarantine_all_ranges(parts, count):
+    for index in range(count):
+        _quarantine_range(parts, index)
+
+
+def _atomic_json(path, value):
+    path = safe_path(path)
+    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}-", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if path.read_bytes() != payload:
+                raise ValueError("durable range record differs")
+        _sync_directory(path.parent)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _parts_lock(parts):
+    """Return a process-safe lock for one final path's range directory."""
+    lock_path = parts / "receiver.lock"
+    try:
+        status = lock_path.lstat()
+    except FileNotFoundError:
+        status = None
+    if status is not None and (
+        not stat.S_ISREG(status.st_mode) or status.st_uid != os.geteuid()
+    ):
+        raise ValueError("range lock identity differs")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    locked = False
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locked = True
+        _sync_directory(parts)
+    except BlockingIOError:
+        os.close(fd)
+        raise ValueError("range receive already active")
+    except BaseException:
+        if locked:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        raise
+    return fd
+
+
+def _release_parts_lock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _range_identity(receipt, size):
+    if receipt is None:
+        # Direct unit callers do not have a publish receipt. Production calls
+        # always pass the validated receipt from receive().
+        return {"size": size}
+    validated = validate_receipt(receipt)
+    if validated["size"] != size:
+        raise ValueError("range receipt size differs")
+    return dict(validated)
+
+
+def _range_manifest(receipt, size, workers, ranges):
+    return {
+        "schema": _PARTS_SCHEMA,
+        "identity": _range_identity(receipt, size),
+        "workers": workers,
+        "ranges": [
+            {
+                "index": index,
+                "start": start,
+                "end": end,
+                "size": end - start + 1,
+                "total_size": size,
+            }
+            for index, (start, end) in enumerate(ranges)
+        ],
+    }
+
+
+def _read_json(path):
+    _owned_regular(path)
+    return parse_json(path.read_text())
+
+
+def _prepare_parts(parts, expected):
+    try:
+        status = parts.lstat()
+    except FileNotFoundError:
+        try:
+            parts.mkdir(mode=0o700)
+        except FileExistsError:
+            status = parts.lstat()
+        else:
+            status = parts.lstat()
+            _sync_directory(parts.parent)
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or status.st_uid != os.geteuid()
+        or stat.S_IMODE(status.st_mode) != 0o700
+    ):
+        raise ValueError("range directory identity differs")
+    lock_fd = _parts_lock(parts)
+    try:
+        known = {"manifest.json", "receiver.lock", "quarantine"}
+        for index in range(len(expected["ranges"])):
+            known.update(path.name for path in _range_paths(parts, index))
+        for path in list(parts.iterdir()):
+            if path.name not in known:
+                _quarantine_entry(parts, path)
+        manifest_path = parts / "manifest.json"
+        try:
+            manifest_path.lstat()
+        except FileNotFoundError:
+            _atomic_json(manifest_path, expected)
+        else:
+            if _read_json(manifest_path) != expected:
+                # The old receipt or range layout is never safe to reuse. Keep it
+                # intact for diagnosis and force the caller to choose a new path.
+                raise ValueError("durable range identity differs")
+    except BaseException:
+        _release_parts_lock(lock_fd)
+        raise
+    return lock_fd
+
+
+def _record_report(report, expected_size):
+    if set(report) != _REPORT_KEYS or report["bytes"] != expected_size:
+        raise ValueError("range report differs")
+    if not isinstance(report["remote_ip"], str):
+        raise ValueError("range report differs")
+    if report["protocol"] not in {"1.0", "1.1", "2", "3"}:
+        raise ValueError("range report differs")
+    if any(
+        not isinstance(report[name], (int, float))
+        or isinstance(report[name], bool)
+        or not math.isfinite(report[name])
+        or report[name] < 0
+        for name in ("connect_s", "first_byte_s", "total_s")
+    ):
+        raise ValueError("range report differs")
+
+
+def _valid_range_record(parts, spec):
+    index, start, end, expected_size, total_size = (
+        spec["index"],
+        spec["start"],
+        spec["end"],
+        spec["size"],
+        spec["total_size"],
+    )
+    part, headers, metrics, record = _range_paths(parts, index)
+    present = []
+    for path in (part, headers, metrics, record):
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        present.append(path)
+    if not present:
+        return False
+    try:
+        for path in (part, headers, metrics, record):
+            _owned_regular(path)
+        value = _read_json(record)
+        if set(value) != _RANGE_RECORD_KEYS:
+            raise ValueError("range record schema differs")
+        if value["schema"] != _PARTS_SCHEMA or value["index"] != index:
+            raise ValueError("range record identity differs")
+        if (value["start"], value["end"], value["size"]) != (start, end, expected_size):
+            raise ValueError("range record layout differs")
+        if (
+            value["http_status"] != 206
+            or value["content_range"] != f"bytes {start}-{end}/{total_size}"
+        ):
+            raise ValueError("range record response differs")
+        if not isinstance(value["sha256"], str) or not re.fullmatch(
+            r"[a-f0-9]{64}", value["sha256"]
+        ):
+            raise ValueError("range record hash differs")
+        _record_report(value["report"], expected_size)
+        actual_size, actual_digest, _ = digest_file(part)
+        if (actual_size, actual_digest) != (expected_size, value["sha256"]):
+            raise ValueError("range part hash differs")
+    except (OSError, ValueError, TypeError, KeyError):
+        _quarantine_range(parts, index)
+        return False
+    return True
+
+
+def _publish_range_record(parts, spec, report):
+    index, start, end, expected_size, total_size = (
+        spec["index"],
+        spec["start"],
+        spec["end"],
+        spec["size"],
+        spec["total_size"],
+    )
+    _record_report(report, expected_size)
+    part, headers, metrics, record = _range_paths(parts, index)
+    for path in (part, headers, metrics):
+        _owned_regular(path)
+        with path.open("rb") as stream:
+            os.fsync(stream.fileno())
+    actual_size, actual_digest, _ = digest_file(part)
+    if actual_size != expected_size:
+        raise ValueError("range file size differs")
+    value = {
+        "schema": _PARTS_SCHEMA,
+        "index": index,
+        "start": start,
+        "end": end,
+        "size": expected_size,
+        "sha256": actual_digest,
+        "http_status": 206,
+        "content_range": f"bytes {start}-{end}/{total_size}",
+        "report": report,
+    }
+    _atomic_json(record, value)
+
+
+def receive_ranges(
+    url,
+    size,
+    partial,
+    final,
+    workers,
+    *,
+    receipt=None,
+    clock=time.monotonic,
+):
     until = clock() + 300
     ranges = download_ranges(size, workers)
     parts = safe_path(str(final) + ".b2-parts")
-    # Exclusive creation prevents reuse of stale or foreign range evidence.
-    parts.mkdir(mode=0o700)
+    expected = _range_manifest(receipt, size, workers, ranges)
+    lock_fd = _prepare_parts(parts, expected)
     children, records = [], [None] * len(ranges)
     attempts = [0] * len(ranges)
     max_attempts = 2
@@ -398,85 +730,88 @@ def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
         for number in (signal.SIGTERM, signal.SIGINT)
     }
 
-    def start_range(index, start, end):
-        """Start one range with a fresh connection and clean evidence files."""
-        remaining = until - clock()
-        if remaining <= 0:
-            raise TimeoutError("range download deadline")
-        part = parts / f"{index}.part"
-        headers = parts / f"{index}.headers"
-        metrics = parts / f"{index}.metrics"
-        # A retry may replace only this range's unverified files. O_NOFOLLOW
-        # keeps a stale or substituted evidence path from being opened.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
-        if attempts[index] == 0:
-            flags |= os.O_EXCL
-        else:
-            flags |= os.O_TRUNC
-        opened = []
-        try:
-            for path in (part, headers, metrics):
-                fd = os.open(path, flags, 0o600)
-                opened.append(os.fdopen(fd, "wb"))
-            body, head, output = opened
-            for stream in opened:
-                os.fchmod(stream.fileno(), 0o600)
-            command = [
-                "curl",
-                "--disable",
-                "--config",
-                "-",
-                "--proto",
-                "=https",
-                "--retry",
-                "0",
-                "--max-redirs",
-                "0",
-                "--max-time",
-                f"{remaining:.6f}",
-                "--speed-limit",
-                "1",
-                "--speed-time",
-                "60",
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--range",
-                f"{start}-{end}",
-                "--output",
-                f"/proc/self/fd/{body.fileno()}",
-                "--dump-header",
-                f"/proc/self/fd/{head.fileno()}",
-                "--write-out",
-                "%{http_code}\t%{remote_ip}\t%{http_version}\t%{time_connect}\t%{time_starttransfer}\t%{time_total}\t%{size_download}",
-            ]
-            with defer_download_signals():
-                child = subprocess.Popen(
-                    command,
-                    stdin=subprocess.PIPE,
-                    stdout=output,
-                    stderr=subprocess.DEVNULL,
-                    pass_fds=(body.fileno(), head.fileno()),
-                    start_new_session=True,
-                    # Unmask in the new process; parent masks only registration.
-                    restore_signals=True,
-                    preexec_fn=lambda: signal.pthread_sigmask(
-                        signal.SIG_SETMASK, set()
-                    ),
-                )
-                children.append(child)
-            records[index] = (part, headers, metrics, start, end, child)
-            child.stdin.write(("url = " + json.dumps(url) + "\n").encode())
-            child.stdin.close()
-        finally:
-            for stream in opened:
-                if not stream.closed:
-                    stream.close()
-
     try:
+        completed = {
+            spec["index"]
+            for spec in expected["ranges"]
+            if _valid_range_record(parts, spec)
+        }
+
+        def start_range(index, start, end):
+            """Start one range with a fresh connection and clean evidence files."""
+            remaining = until - clock()
+            if remaining <= 0:
+                raise TimeoutError("range download deadline")
+            _quarantine_range(parts, index)
+            part, headers, metrics, _ = _range_paths(parts, index)
+            opened = []
+            try:
+                for path in (part, headers, metrics):
+                    fd = os.open(
+                        path,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                    )
+                    opened.append(os.fdopen(fd, "wb"))
+                body, head, output = opened
+                for stream in opened:
+                    os.fchmod(stream.fileno(), 0o600)
+                command = [
+                    "curl",
+                    "--disable",
+                    "--config",
+                    "-",
+                    "--proto",
+                    "=https",
+                    "--retry",
+                    "0",
+                    "--max-redirs",
+                    "0",
+                    "--max-time",
+                    f"{remaining:.6f}",
+                    "--speed-limit",
+                    "1",
+                    "--speed-time",
+                    "60",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--range",
+                    f"{start}-{end}",
+                    "--output",
+                    f"/proc/self/fd/{body.fileno()}",
+                    "--dump-header",
+                    f"/proc/self/fd/{head.fileno()}",
+                    "--write-out",
+                    "%{http_code}\t%{remote_ip}\t%{http_version}\t%{time_connect}\t%{time_starttransfer}\t%{time_total}\t%{size_download}",
+                ]
+                with defer_download_signals():
+                    child = subprocess.Popen(
+                        command,
+                        stdin=subprocess.PIPE,
+                        stdout=output,
+                        stderr=subprocess.DEVNULL,
+                        pass_fds=(body.fileno(), head.fileno()),
+                        start_new_session=True,
+                        # Unmask in the new process; parent masks only registration.
+                        restore_signals=True,
+                        preexec_fn=lambda: signal.pthread_sigmask(
+                            signal.SIG_SETMASK, set()
+                        ),
+                    )
+                    children.append(child)
+                records[index] = (part, headers, metrics, start, end, child)
+                child.stdin.write(("url = " + json.dumps(url) + "\n").encode())
+                child.stdin.close()
+            finally:
+                for stream in opened:
+                    if not stream.closed:
+                        stream.close()
+
+        pending = set(range(len(ranges))) - completed
         for index, (start, end) in enumerate(ranges):
-            start_range(index, start, end)
-        pending = set(range(len(ranges)))
+            if index not in completed:
+                start_range(index, start, end)
         while pending:
             if clock() >= until:
                 raise TimeoutError("range download deadline")
@@ -490,6 +825,7 @@ def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
                     # Retry only connection/partial-transfer failures. Do not
                     # repeat HTTP authentication or local-output failures.
                     if code not in {6, 7, 18, 28, 52, 55, 56}:
+                        _quarantine_range(parts, index)
                         print(
                             json.dumps(
                                 dict(
@@ -510,6 +846,7 @@ def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
                     except (OSError, ValueError):
                         error = "range validation"
                 if error is not None:
+                    _quarantine_range(parts, index)
                     if attempts[index] + 1 >= max_attempts:
                         print(
                             json.dumps(
@@ -537,10 +874,18 @@ def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
                     )
                     start_range(index, start, end)
                     continue
+                _publish_range_record(
+                    parts,
+                    expected["ranges"][index],
+                    report,
+                )
                 print(json.dumps(dict(range_index=index, **report)), file=sys.stderr)
                 pending.remove(index)
             if pending:
                 time.sleep(min(0.02, max(0, until - clock())))
+        part_paths = [
+            _range_paths(parts, spec["index"])[0] for spec in expected["ranges"]
+        ]
         with os.fdopen(
             os.open(
                 partial, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600
@@ -548,7 +893,7 @@ def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
             "wb",
         ) as output:
             os.fchmod(output.fileno(), 0o600)
-            for part, _, _, _, _, _ in records:
+            for part in part_paths:
                 with part.open("rb") as stream:
                     while chunk := stream.read(1024 * 1024):
                         if clock() >= until:
@@ -556,6 +901,12 @@ def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
                         output.write(chunk)
             output.flush()
             os.fsync(output.fileno())
+        _sync_directory(partial.parent)
+        if receipt is not None:
+            actual_size, actual_digest, _ = digest_file(partial)
+            if (actual_size, actual_digest) != (receipt["size"], receipt["sha256"]):
+                _quarantine_all_ranges(parts, len(expected["ranges"]))
+                raise ValueError("assembled range hash differs")
     finally:
         try:
             with defer_download_signals():
@@ -573,33 +924,60 @@ def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
         finally:
             for number, handler in previous.items():
                 signal.signal(number, handler)
+            _release_parts_lock(lock_fd)
 
 
 def cleanup_parts(final, receipt):
-    checked_final(final, validate_receipt(receipt))
+    receipt = validate_receipt(receipt)
+    checked_final(final, receipt)
     parts = safe_path(str(final) + ".b2-parts")
-    if not parts.exists():
+    try:
+        parts.lstat()
+    except FileNotFoundError:
         return
-    status = parts.stat()
+    status = parts.lstat()
     if (
         not stat.S_ISDIR(status.st_mode)
         or status.st_uid != os.geteuid()
         or stat.S_IMODE(status.st_mode) != 0o700
     ):
         raise ValueError("range directory ownership differs")
-    files = list(parts.iterdir())
-    for path in files:
-        if (
-            not re.fullmatch(
-                r"(?:[0-9]|[12][0-9]|3[01])\.(?:part|headers|metrics)", path.name
-            )
-            or path.is_symlink()
-            or not path.is_file()
-        ):
-            raise ValueError("unexpected range evidence file")
-    for path in files:
-        path.unlink()
-    parts.rmdir()
+    lock_fd = _parts_lock(parts)
+    try:
+        manifest = _read_json(parts / "manifest.json")
+        ranges = manifest.get("ranges")
+        layout = [(item["start"], item["end"]) for item in ranges]
+        expected = _range_manifest(
+            receipt, receipt["size"], manifest.get("workers"), layout
+        )
+        if manifest != expected:
+            raise ValueError("durable range identity differs")
+        allowed = {"manifest.json", "receiver.lock", "quarantine"}
+        for index in range(len(ranges)):
+            allowed.update(path.name for path in _range_paths(parts, index))
+        for path in parts.iterdir():
+            if path.name not in allowed:
+                raise ValueError("unexpected range evidence file")
+            if path.name == "quarantine":
+                status = path.lstat()
+                if (
+                    not stat.S_ISDIR(status.st_mode)
+                    or status.st_uid != os.geteuid()
+                    or stat.S_IMODE(status.st_mode) != 0o700
+                ):
+                    raise ValueError("range quarantine identity differs")
+                for child in path.iterdir():
+                    _owned_regular(child)
+                    child.unlink()
+                path.rmdir()
+            elif path.name != "receiver.lock":
+                _owned_regular(path)
+                path.unlink()
+        (parts / "receiver.lock").unlink()
+        parts.rmdir()
+        _sync_directory(parts.parent)
+    finally:
+        _release_parts_lock(lock_fd)
 
 
 def receive(
@@ -655,7 +1033,14 @@ def receive(
     if not final.exists():
         parallel = download_workers > 1 and receipt["size"] >= download_threshold_bytes
         if parallel:
-            receive_ranges(url, receipt["size"], partial, final, download_workers)
+            receive_ranges(
+                url,
+                receipt["size"],
+                partial,
+                final,
+                download_workers,
+                receipt=receipt,
+            )
         fd = os.open(
             partial,
             os.O_WRONLY | os.O_NOFOLLOW | (0 if parallel else os.O_CREAT | os.O_TRUNC),
