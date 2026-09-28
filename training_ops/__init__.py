@@ -76,6 +76,7 @@ from training_ops.runtime.adapter_cache_cleanup import (
     validate_status as _validate_adapter_cache_status,
 )
 from training_ops.runtime.broadcast_retention import cleanup as _broadcast_retention_cleanup
+from training_ops.runtime import rollout_retention as _rollout_retention
 
 repo_root = Path(__file__).resolve().parents[1]
 nodes_path = repo_root / "configs" / "nodes.toml"
@@ -12858,6 +12859,132 @@ def _broadcast_retention_action(arguments: list[str]):
     return result
 
 
+def _rollout_retention_action(arguments: list[str]):
+    """Preflight and, explicitly, apply consumed rollout retention on trainers."""
+    values: dict[str, object] = {"evidence": None, "apply": False}
+    positional: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--apply":
+            values["apply"] = True
+        elif argument == "--evidence":
+            index += 1
+            if index >= len(arguments):
+                raise Refused("--evidence requires a value")
+            if values["evidence"] is not None:
+                raise Refused("rollout-retention evidence was provided twice")
+            values["evidence"] = arguments[index]
+        elif argument.startswith("--"):
+            raise Refused(f"unknown rollout-retention option {argument}")
+        else:
+            positional.append(argument)
+        index += 1
+    if len(positional) != 1 or values["evidence"] is None:
+        raise Refused("rollout-retention requires RUN and --evidence EVIDENCE")
+    run = positional[0]
+    try:
+        _runs_path, _run_parent, run_dir = _cold_run_paths(run)
+        active_nodes = [host for host in trainer_hosts if host not in blocked_hosts]
+        evidence = _rollout_retention.validate_evidence(
+            values["evidence"], nodes=active_nodes
+        )
+        if evidence["run_name"] != run:
+            raise _rollout_retention.RetentionError("retention evidence run differs from requested run")
+        for host, record in evidence["nodes"].items():
+            if record["run_dir"] != run_dir:
+                raise _rollout_retention.RetentionError(
+                    f"retention evidence path differs from configured run on {host}"
+                )
+    except (_rollout_retention.RetentionError, Refused) as error:
+        raise Refused(str(error)) from error
+    encoded = base64.b64encode(
+        json.dumps(evidence, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+
+    def command(host: str, apply: bool = False) -> str:
+        option = " --apply" if apply else ""
+        return (
+            "set -euo pipefail; "
+            f"sudo -n python3 {shlex.quote(remote_repo + '/training_ops/runtime/rollout_retention.py')} "
+            f"{shlex.quote(run_dir)} --node {shlex.quote(host)} "
+            f"--evidence-b64 {shlex.quote(encoded)}{option}"
+        )
+
+    def run_phase(apply: bool) -> dict[str, tuple[int, str]]:
+        return _fan(
+            active_nodes,
+            lambda host: _ssh(host, command(host, apply), timeout=900),
+        )
+
+    def parse_phase(results: dict[str, tuple[int, str]], phase: str) -> dict[str, dict[str, object]]:
+        parsed: dict[str, dict[str, object]] = {}
+        failures: dict[str, str] = {}
+        for host, (code, output) in results.items():
+            if code:
+                failures[host] = output.strip() or f"exit {code}"
+                continue
+            records = []
+            try:
+                candidate = json.loads(output)
+                if isinstance(candidate, dict) and candidate.get("node") == host:
+                    records.append(candidate)
+            except (TypeError, ValueError):
+                for line in reversed(output.splitlines()):
+                    try:
+                        candidate = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(candidate, dict) and candidate.get("node") == host:
+                        records.append(candidate)
+                        break
+            if not records:
+                failures[host] = "no rollout-retention JSON result"
+            else:
+                parsed[host] = records[0]
+        if failures:
+            raise Refused(f"rollout-retention {phase} failed: {failures}")
+        expected_steps = None
+        expected_bytes = None
+        for host, record in parsed.items():
+            steps = record.get("selected_steps")
+            bytes_used = record.get("selected_bytes")
+            if not isinstance(steps, list) or not all(type(item) is int for item in steps) or type(bytes_used) is not int or bytes_used < 0:
+                raise Refused(f"rollout-retention {phase} result is invalid on {host}")
+            if expected_steps is None:
+                expected_steps, expected_bytes = steps, bytes_used
+            elif steps != expected_steps or bytes_used != expected_bytes:
+                raise Refused(f"rollout-retention {phase} nodes disagree on steps or bytes")
+        return parsed
+
+    preview = parse_phase(run_phase(False), "dry-run")
+    result: dict[str, object] = {
+        "run": run,
+        "dry_run": not bool(values["apply"]),
+        "nodes": preview,
+        "selected_steps": next(iter(preview.values()))["selected_steps"] if preview else [],
+        "selected_bytes": next(iter(preview.values()))["selected_bytes"] if preview else 0,
+        "selected_bytes_total": sum(
+            int(record["selected_bytes"]) for record in preview.values()
+        ),
+        "exact_bytes_total": sum(
+            int(record["selected_bytes"]) for record in preview.values()
+        ),
+    }
+    if values["apply"]:
+        applied = parse_phase(run_phase(True), "apply")
+        result["dry_run"] = False
+        result["nodes"] = applied
+        result["removed_steps"] = next(iter(applied.values()))["selected_steps"] if applied else []
+        result["freed_bytes"] = sum(
+            int(record.get("freed_bytes", 0)) for record in applied.values()
+        )
+        result["freed_bytes_total"] = result["freed_bytes"]
+        result["exact_bytes_total"] = result["freed_bytes"]
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return result
+
+
 def _stop_action(arguments: list[str]):
     if arguments:
         raise Refused("stop does not accept arguments")
@@ -12881,6 +13008,7 @@ actions = {
     "archive": _archive_action,
     "remove-adapter-cache": _remove_adapter_cache_action,
     "retention": _broadcast_retention_action,
+    "rollout-retention": _rollout_retention_action,
     "qualify": _qualify_action,
     "load-policy0": _load_policy0_action,
     "load-qualified-adapter": _qualified_adapter_load_action,
@@ -12922,6 +13050,9 @@ usage = f"""training-ops <action> [args]
                                 remove one exact unloaded adapter cache entry
   retention RUN_DIR --evidence EVIDENCE [--apply]
                                 inventory or apply guarded broadcast retention;
+                                dry-run is the default
+  rollout-retention RUN --evidence EVIDENCE [--apply]
+                                preflight and apply consumed rollout retention;
                                 dry-run is the default
   qualify <name> [mode] [config-dir]  start a trainer-only config directory
   load-policy0 [config-dir] [plan|apply] \
