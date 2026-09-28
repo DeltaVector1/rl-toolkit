@@ -1660,3 +1660,35 @@ only after measured learning.
   run `broadcasts` directory. Provide inventory and dry-run output; actual
   deletion is explicit and bounded by a maximum number of entries and bytes.
   This design performs no live host action and does not touch `n79`.
+
+## Durable B2 range parts across a process timeout
+
+- **Problem.** A bounded parallel B2 receive can be terminated after some
+  ranges pass validation. The current receiver leaves unlabelled range files
+  and then refuses the directory on restart, forcing a full download or
+  risking unsafe reuse of stale bytes.
+- **Design.** Create a private `.b2-parts` directory with an atomically
+  published receipt binding the source path, object key and version, source
+  SHA-256 and size, and the exact contiguous range layout. Store one durable
+  record per range with its index, offsets, byte count, SHA-256, and validated
+  `206`/`Content-Range` identity. Write each record only after fsyncing its
+  part and metadata; fsync the directory after every publish. Reopen only
+  canonical regular files owned by the receiver, with exact modes and names.
+- **Restart gate.** The caller must provide a fresh publish receipt and
+  presigned URL. Compare its immutable source/object identity and exact range
+  layout with the durable receipt. Refuse a changed key, version, size, hash,
+  source, or layout. Reuse only complete records whose part size and stored
+  SHA-256 still match; quarantine incompatible or partial evidence and fetch
+  only missing ranges. Never reuse an old signed URL or trust a file without
+  its record.
+- **Completion.** Assemble in range order, fsync, verify full size and
+  SHA-256, publish the final file atomically with the existing owner/mode
+  rules, then retain the exact current receipt for acknowledgement and delete
+  the parts directory only after the existing delivery marker and exact
+  object-version acknowledgement. Keep the shared `300s` deadline, per
+  range `60s` low-speed limit, one bounded reconnect, signal cleanup, and
+  secret-free logs unchanged.
+- **Checks.** Add deterministic crash/restart reuse, partial-range discard,
+  source/object mismatch, changed layout, special-file/symlink, concurrent
+  receiver, and full-hash-failure tests, plus the existing B2 and rollout
+  regressions. This task performs no live or network action.
