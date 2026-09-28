@@ -240,6 +240,14 @@ no fixed prefill, TailRL, staged ratios, group filters, or held-out split wiring
   `unlinkat`. Write leases protect inode contents, not directory names. Keep
   the action fail-closed until writer quiescence or a kernel primitive that
   binds removal to the held inode is available.
+- **Quiescent cleanup experiment.** Require the active trainer writer to stop
+  and acquire its existing `.microbatch-sync.lock` namespace lock before the
+  final inventory, inode/size/mtime recheck, quarantine, and unlink. Require
+  verified process identity and an explicit restart responsibility record;
+  refuse an alive writer, missing or busy lock, changed lock identity, unknown
+  files, symlinks, nonregular entries, or any concurrent rename. Release the
+  lock only after the cleanup result and directory fsync are recorded. This is
+  the bounded fallback because leases alone do not protect directory names.
 
 ## Measured long-haul evidence
 
