@@ -109,6 +109,41 @@ class B2RolloutTest(unittest.TestCase):
         )
         self.assertIn((value["key"], "unrelated-version"), self.client.objects)
 
+    def test_root_receiver_publishes_directories_readable_by_trainer(self):
+        # A normal root Docker container can exercise the actual UID transition;
+        # an unprivileged local run still checks every new directory's other bits.
+        self.root.chmod(0o755)
+        self.source.chmod(0o600)
+        if os.geteuid() == 0:
+            os.chown(self.source, 1000, 1000)
+        value = self.publish()
+        previous_mask = os.umask(0o077)
+        try:
+            tool.receive(value, str(self.source), self.partial, self.final, self.curl)
+        finally:
+            os.umask(previous_mask)
+        for directory in (
+            self.final.parent,
+            self.final.parent.parent,
+            self.root / "destination",
+        ):
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.partial.parent.stat().st_mode & 0o777, 0o700)
+        if os.geteuid() == 0:
+            child = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os,sys; from pathlib import Path; os.setgroups([]); os.setgid(1000); os.setuid(1000); print(len(Path(sys.argv[1]).read_bytes()))",
+                    str(self.final),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(child.returncode, 0, child.stderr)
+            self.assertEqual(int(child.stdout), len(self.body))
+
     def test_source_paths_and_mutation_fail_closed(self):
         link = self.source.parent / "link"
         link.symlink_to(self.source)
@@ -271,7 +306,11 @@ class B2RolloutTest(unittest.TestCase):
         )
 
     def test_config_environment_and_inventory(self):
-        self.assertEqual(training_ops.rollout_transfer_backend, "ssh")
+        with patch.object(training_ops, "rollout_transfer_backend", "ssh"):
+            env = training_ops._rollout_pull_environment(
+                str(self.runs / "alpha/run_alpha")
+            )
+            self.assertEqual(env["ROLLOUT_TRANSFER_BACKEND"], "ssh")
         with patch.object(training_ops, "rollout_transfer_backend", "b2_s3"):
             env = training_ops._rollout_pull_environment(
                 str(self.runs / "alpha/run_alpha")

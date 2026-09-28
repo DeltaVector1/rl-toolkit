@@ -245,6 +245,25 @@ def checked_final(final, receipt):
         raise ValueError("delivered file size or hash differs")
 
 
+def publication_directory(directory):
+    """Match SSH's readable publication tree, even with a private host umask."""
+    directory = safe_path(directory)
+    missing = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for current in reversed(missing):
+        try:
+            current.mkdir(mode=0o755)
+        except FileExistsError:
+            if current.is_symlink() or not current.is_dir():
+                raise ValueError("publication directory changed")
+        else:
+            # Only adjust directories created by this call, not existing paths.
+            current.chmod(0o755)
+
+
 def receive(value, source, partial, final, run_curl=subprocess.run):
     if not isinstance(value, dict) or set(value) != {
         "source",
@@ -282,8 +301,9 @@ def receive(value, source, partial, final, run_curl=subprocess.run):
     ):
         raise ValueError("invalid URL expiry")
     partial, final = safe_path(partial), safe_path(final)
-    for directory in (partial.parent, final.parent):
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Create public traversal first: partial parents may share the run root.
+    publication_directory(final.parent)
+    partial.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if not final.exists():
         fd = os.open(
             partial, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600

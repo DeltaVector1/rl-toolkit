@@ -19,6 +19,12 @@ puller = root / "training_ops/runtime/china/pull_rollout_batches.sh"
 
 
 class RolloutPullTest(unittest.TestCase):
+    def setUp(self):
+        # These are SSH-backend regression tests, independent of live selection.
+        previous = training_ops.rollout_transfer_backend
+        training_ops.rollout_transfer_backend = "ssh"
+        self.addCleanup(setattr, training_ops, "rollout_transfer_backend", previous)
+
     def tools(self, directory, *, fake_rsync=True):
         tools = Path(directory) / "tools"
         tools.mkdir()
