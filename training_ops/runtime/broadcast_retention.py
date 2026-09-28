@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import ctypes
-import ctypes.util
 import fcntl
 import hashlib
 import json
@@ -102,6 +101,9 @@ _PROTECTED_FILE_NAMES = frozenset(
     }
 )
 _PROTECTED_SUFFIXES = (".parts", ".assembling", ".partial")
+_ZSTD_LIBRARY = None
+_ZSTD_DECOMPRESS = None
+_ZSTD_IS_ERROR = None
 
 
 @dataclass(frozen=True)
@@ -190,19 +192,21 @@ def _zstd_raw(path: Path, expected_size: int) -> bytes:
     """Decode one transport chunk with the same system zstd library as the producer."""
     if type(expected_size) is not int or expected_size <= 0:
         _fail("adapter transport raw size is invalid")
+    global _ZSTD_LIBRARY, _ZSTD_DECOMPRESS, _ZSTD_IS_ERROR
     try:
         payload = path.read_bytes()
-        library = ctypes.CDLL(ctypes.util.find_library("zstd") or "libzstd.so.1")
-        function = library.ZSTD_decompress
-        function.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
-        function.restype = ctypes.c_size_t
+        if _ZSTD_LIBRARY is None:
+            _ZSTD_LIBRARY = ctypes.CDLL("libzstd.so.1")
+            _ZSTD_DECOMPRESS = _ZSTD_LIBRARY.ZSTD_decompress
+            _ZSTD_DECOMPRESS.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+            _ZSTD_DECOMPRESS.restype = ctypes.c_size_t
+            _ZSTD_IS_ERROR = _ZSTD_LIBRARY.ZSTD_isError
+            _ZSTD_IS_ERROR.argtypes = [ctypes.c_size_t]
+            _ZSTD_IS_ERROR.restype = ctypes.c_uint
         source = ctypes.create_string_buffer(payload)
         destination = ctypes.create_string_buffer(expected_size)
-        result = function(destination, expected_size, source, len(payload))
-        is_error = library.ZSTD_isError
-        is_error.argtypes = [ctypes.c_size_t]
-        is_error.restype = ctypes.c_uint
-        if is_error(result) or result != expected_size:
+        result = _ZSTD_DECOMPRESS(destination, expected_size, source, len(payload))
+        if _ZSTD_IS_ERROR(result) or result != expected_size:
             _fail(f"adapter transport chunk decompression differs: {path}")
         return destination.raw[:result]
     except OSError as error:
