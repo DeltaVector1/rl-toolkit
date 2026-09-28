@@ -386,7 +386,9 @@ def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
     parts = safe_path(str(final) + ".b2-parts")
     # Exclusive creation prevents reuse of stale or foreign range evidence.
     parts.mkdir(mode=0o700)
-    children, records = [], []
+    children, records = [], [None] * len(ranges)
+    attempts = [0] * len(ranges)
+    max_attempts = 2
 
     def interrupted(*_):
         raise InterruptedError("range download interrupted")
@@ -395,84 +397,146 @@ def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
         number: signal.signal(number, interrupted)
         for number in (signal.SIGTERM, signal.SIGINT)
     }
+
+    def start_range(index, start, end):
+        """Start one range with a fresh connection and clean evidence files."""
+        remaining = until - clock()
+        if remaining <= 0:
+            raise TimeoutError("range download deadline")
+        part = parts / f"{index}.part"
+        headers = parts / f"{index}.headers"
+        metrics = parts / f"{index}.metrics"
+        # A retry may replace only this range's unverified files. O_NOFOLLOW
+        # keeps a stale or substituted evidence path from being opened.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+        if attempts[index] == 0:
+            flags |= os.O_EXCL
+        else:
+            flags |= os.O_TRUNC
+        opened = []
+        try:
+            for path in (part, headers, metrics):
+                fd = os.open(path, flags, 0o600)
+                opened.append(os.fdopen(fd, "wb"))
+            body, head, output = opened
+            for stream in opened:
+                os.fchmod(stream.fileno(), 0o600)
+            command = [
+                "curl",
+                "--disable",
+                "--config",
+                "-",
+                "--proto",
+                "=https",
+                "--retry",
+                "0",
+                "--max-redirs",
+                "0",
+                "--max-time",
+                f"{remaining:.6f}",
+                "--speed-limit",
+                "1",
+                "--speed-time",
+                "60",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--range",
+                f"{start}-{end}",
+                "--output",
+                f"/proc/self/fd/{body.fileno()}",
+                "--dump-header",
+                f"/proc/self/fd/{head.fileno()}",
+                "--write-out",
+                "%{http_code}\t%{remote_ip}\t%{http_version}\t%{time_connect}\t%{time_starttransfer}\t%{time_total}\t%{size_download}",
+            ]
+            with defer_download_signals():
+                child = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=output,
+                    stderr=subprocess.DEVNULL,
+                    pass_fds=(body.fileno(), head.fileno()),
+                    start_new_session=True,
+                    # Unmask in the new process; parent masks only registration.
+                    restore_signals=True,
+                    preexec_fn=lambda: signal.pthread_sigmask(
+                        signal.SIG_SETMASK, set()
+                    ),
+                )
+                children.append(child)
+            records[index] = (part, headers, metrics, start, end, child)
+            child.stdin.write(("url = " + json.dumps(url) + "\n").encode())
+            child.stdin.close()
+        finally:
+            for stream in opened:
+                if not stream.closed:
+                    stream.close()
+
     try:
         for index, (start, end) in enumerate(ranges):
-            remaining = until - clock()
-            if remaining <= 0:
-                raise TimeoutError("range download deadline")
-            part = parts / f"{index}.part"
-            headers = parts / f"{index}.headers"
-            metrics = parts / f"{index}.metrics"
-            with part.open("xb") as body, headers.open("xb") as head, metrics.open(
-                "xb"
-            ) as output:
-                for stream in (body, head, output):
-                    os.fchmod(stream.fileno(), 0o600)
-                command = [
-                    "curl",
-                    "--disable",
-                    "--config",
-                    "-",
-                    "--proto",
-                    "=https",
-                    "--retry",
-                    "0",
-                    "--max-redirs",
-                    "0",
-                    "--max-time",
-                    f"{remaining:.6f}",
-                    "--speed-limit",
-                    "1",
-                    "--speed-time",
-                    "60",
-                    "--fail",
-                    "--silent",
-                    "--show-error",
-                    "--range",
-                    f"{start}-{end}",
-                    "--output",
-                    f"/proc/self/fd/{body.fileno()}",
-                    "--dump-header",
-                    f"/proc/self/fd/{head.fileno()}",
-                    "--write-out",
-                    "%{http_code}\t%{remote_ip}\t%{http_version}\t%{time_connect}\t%{time_starttransfer}\t%{time_total}\t%{size_download}",
-                ]
-                with defer_download_signals():
-                    child = subprocess.Popen(
-                        command,
-                        stdin=subprocess.PIPE,
-                        stdout=output,
-                        stderr=subprocess.DEVNULL,
-                        pass_fds=(body.fileno(), head.fileno()),
-                        start_new_session=True,
-                        # Unmask in the new process; parent masks only registration.
-                        restore_signals=True,
-                        preexec_fn=lambda: signal.pthread_sigmask(
-                            signal.SIG_SETMASK, set()
-                        ),
-                    )
-                    children.append(child)
-                records.append((part, headers, metrics, start, end))
-                child.stdin.write(("url = " + json.dumps(url) + "\n").encode())
-                child.stdin.close()
-        pending = set(range(len(children)))
+            start_range(index, start, end)
+        pending = set(range(len(ranges)))
         while pending:
             if clock() >= until:
                 raise TimeoutError("range download deadline")
             for index in sorted(pending):
-                code = children[index].poll()
+                part, headers, metrics, start, end, child = records[index]
+                code = child.poll()
                 if code is None:
                     continue
-                part, headers, metrics, start, end = records[index]
+                error = None
                 if code != 0:
+                    # Retry only connection/partial-transfer failures. Do not
+                    # repeat HTTP authentication or local-output failures.
+                    if code not in {6, 7, 18, 28, 52, 55, 56}:
+                        print(
+                            json.dumps(
+                                dict(
+                                    range_index=index,
+                                    attempt=attempts[index] + 1,
+                                    failed=True,
+                                )
+                            ),
+                            file=sys.stderr,
+                        )
+                        raise ValueError("HTTPS range download failed")
+                    error = "curl incomplete"
+                else:
+                    try:
+                        report = range_result(headers, metrics, start, end, size)
+                        if part.stat().st_size != end - start + 1:
+                            raise ValueError("range file size differs")
+                    except (OSError, ValueError):
+                        error = "range validation"
+                if error is not None:
+                    if attempts[index] + 1 >= max_attempts:
+                        print(
+                            json.dumps(
+                                dict(
+                                    range_index=index,
+                                    attempt=attempts[index] + 1,
+                                    failed=True,
+                                )
+                            ),
+                            file=sys.stderr,
+                        )
+                        raise ValueError("HTTPS range download failed")
+                    if clock() >= until:
+                        raise TimeoutError("range retry deadline")
+                    attempts[index] += 1
                     print(
-                        json.dumps(dict(range_index=index, curl_exit=code)),
+                        json.dumps(
+                            dict(
+                                range_index=index,
+                                attempt=attempts[index],
+                                retry=True,
+                            )
+                        ),
                         file=sys.stderr,
                     )
-                    raise ValueError("HTTPS range download failed")
-                report = range_result(headers, metrics, start, end, size)
-                if part.stat().st_size != end - start + 1:
-                    raise ValueError("range file size differs")
+                    start_range(index, start, end)
+                    continue
                 print(json.dumps(dict(range_index=index, **report)), file=sys.stderr)
                 pending.remove(index)
             if pending:
@@ -484,7 +548,7 @@ def receive_ranges(url, size, partial, final, workers, *, clock=time.monotonic):
             "wb",
         ) as output:
             os.fchmod(output.fileno(), 0o600)
-            for part, _, _, _, _ in records:
+            for part, _, _, _, _, _ in records:
                 with part.open("rb") as stream:
                     while chunk := stream.read(1024 * 1024):
                         if clock() >= until:

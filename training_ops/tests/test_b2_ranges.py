@@ -26,8 +26,15 @@ config=sys.stdin.read()
 assert config.startswith('url = "https://') and 'temporary' in config
 start,end=map(int,args[args.index('--range')+1].split('-'))
 if case=='slow' or (case=='fail' and start):
- signal.signal(signal.SIGTERM,signal.SIG_IGN)
- time.sleep(20)
+    signal.signal(signal.SIGTERM,signal.SIG_IGN)
+    time.sleep(20)
+if case=='straggler' and start==0:
+    marker=Path(str(Path(source).with_suffix('.straggler')))
+    if not marker.exists():
+        body=Path(source).read_bytes()[start:end+1]
+        Path(args[args.index('--output')+1]).write_bytes(body[:len(body)//2])
+        marker.write_text('failed')
+        sys.exit(28)
 if case=='fail': sys.exit(22)
 body=Path(source).read_bytes()[start:end+1]
 if case=='short': body=body[:-1]
@@ -183,6 +190,46 @@ class RangeReceiveTest(unittest.TestCase):
                 self.fixture.doCleanups()
                 self.fixture.setUp()
                 self.value = self.fixture.publish()
+
+    def test_one_straggler_reconnects_only_the_failed_range(self):
+        self.case = "straggler"
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log):
+            self.receive()
+        self.assertEqual(self.fixture.final.read_bytes(), self.fixture.body)
+        ranges = [
+            command[command.index("--range") + 1]
+            for command in self.commands
+        ]
+        self.assertEqual(len(ranges), 9)
+        counts = {value: ranges.count(value) for value in set(ranges)}
+        self.assertEqual(sorted(counts.values()), [1] * 7 + [2])
+        records = [json.loads(line) for line in log.getvalue().splitlines()]
+        self.assertEqual(
+            [record for record in records if record.get("retry")],
+            [{"range_index": 0, "attempt": 1, "retry": True}],
+        )
+        self.assertFalse(any(record.get("failed") for record in records))
+
+    def test_no_retry_after_shared_deadline(self):
+        fixture = self.fixture
+        fixture.final.parent.mkdir(parents=True)
+        fixture.partial.parent.mkdir(parents=True)
+        self.case = "straggler"
+        ticks = iter([0] + [0] * 8 + [300])
+        with patch.object(tool.subprocess, "Popen", self.spawn), self.assertRaises(
+            TimeoutError
+        ):
+            tool.receive_ranges(
+                self.value["url"],
+                len(fixture.body),
+                fixture.partial,
+                fixture.final,
+                8,
+                clock=lambda: next(ticks),
+            )
+        self.assertEqual(len(self.commands), 8)
+        self.assertTrue(all(child.poll() is not None for child in self.children))
 
     def test_failure_kills_and_reaps_hung_siblings(self):
         self.case = "fail"
