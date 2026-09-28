@@ -1576,6 +1576,25 @@ only after measured learning.
   path. This record precedes implementation and any new live qualification.
   This writer task performs no live or network action.
 
+## One bounded B2 range reconnection
+
+- **Problem.** A parallel receive can complete seven verified ranges while one
+  connection returns a short body, invalid `Content-Range`, or a curl timeout.
+  Failing the whole object wastes the verified ranges and can make a transient
+  straggler fail the shared transfer deadline.
+- **Experiment.** Permit one fresh-connection retry for each failed or invalid
+  range, using the same shared `300s` deadline and existing `60s` low-speed
+  limit. Truncate only that range's unverified files before retry; keep
+  verified ranges immutable. Do not enable curl's hidden retry or redirects.
+  Keep strict `206`, `Content-Range`, byte-count, final size, SHA-256, fsync,
+  atomic publication, and signal cleanup checks. Emit only the range index,
+  attempt, safe timing, and byte measurements.
+- **Gate.** Add deterministic local tests for one slow/failed range recovery,
+  invalid response rejection after the bounded retry, completed-range
+  preservation, and no retry after the shared deadline. A retry must remain
+  within the existing `300s` operation bound; no production or network action
+  is part of this task.
+
 ## Byte-identity-guarded broadcast retention
 
 - **Problem.** A live run can leave old stable adapter generations and failed
