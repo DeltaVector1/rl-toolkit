@@ -430,8 +430,8 @@ def _verify_multipart_absent(client, bucket, key, upload_id):
         raise ValueError("multipart listing identity differs")
     if type(response.get("IsTruncated")) is not bool:
         raise ValueError("multipart pagination flag is invalid")
-    uploads = response.get("Uploads")
-    if type(uploads) is not list:
+    uploads = response.get("Uploads", [])
+    if "Uploads" in response and type(uploads) is not list:
         raise ValueError("multipart listing is invalid")
     for marker in ("KeyMarker", "UploadIdMarker"):
         value = response.get(marker, "")

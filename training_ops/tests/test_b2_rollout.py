@@ -381,9 +381,6 @@ class B2RolloutTest(unittest.TestCase):
             page(Bucket="other"),
             page(Prefix="other"),
         ]
-        missing_uploads = page()
-        del missing_uploads["Uploads"]
-        cases.append(missing_uploads)
 
         class ListingClient:
             def __init__(self, value):
@@ -392,6 +389,11 @@ class B2RolloutTest(unittest.TestCase):
             def list_multipart_uploads(self, **kwargs):
                 return self.value
 
+        omitted_uploads = page()
+        del omitted_uploads["Uploads"]
+        tool._verify_multipart_absent(
+            ListingClient(omitted_uploads), "fixture", key, "upload-1"
+        )
         for value in cases:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 tool._verify_multipart_absent(
