@@ -226,6 +226,12 @@ no fixed prefill, TailRL, staged ratios, group filters, or held-out split wiring
   remove entries by descriptor-relative operations and verify actual freed
   bytes. Reusing unchanged evidence after removal fails before mutation;
   refreshed evidence with no candidates is a verified no-op.
+- **Deletion race experiment.** Before final content verification, acquire a
+  Linux `F_SETLEASE` write lease on every quarantined regular file and hold the
+  leases through descriptor-relative `unlinkat`. A lease conflict, unsupported
+  filesystem, or lease break fails closed and preserves the quarantine. Test
+  this with a bounded competing subprocess and an unsupported-lease fixture;
+  do not accept advisory flock as the race boundary.
 
 ## Measured long-haul evidence
 

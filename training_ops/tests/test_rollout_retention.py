@@ -1,7 +1,10 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -143,12 +146,12 @@ class RolloutRetentionTest(unittest.TestCase):
     def test_apply_race_after_final_fd_check_is_detected(self):
         original_remove = retention._remove_tree_at
 
-        def race(directory_fd, opened_files, expected):
+        def race(directory_fd, opened_files, expected, lease):
             directory = Path(os.readlink(f"/proc/self/fd/{directory_fd}"))
             (directory / "train_rollouts.bin").write_bytes(b"late-race")
-            return original_remove(directory_fd, opened_files, expected)
+            return original_remove(directory_fd, opened_files, expected, lease)
 
-        with mock.patch.object(retention, "_remove_tree_at", side_effect=race):
+        with mock.patch.object(retention._WriteLease, "acquire"), mock.patch.object(retention, "_remove_tree_at", side_effect=race):
             with self.assertRaisesRegex(retention.RetentionError, "content or delivery|identity changed"):
                 retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
         self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
@@ -162,13 +165,14 @@ class RolloutRetentionTest(unittest.TestCase):
             (directory / "train_rollouts.bin").write_bytes(b"between-check-and-unlink")
             return result
 
-        with mock.patch.object(retention, "_validate_held_contents", side_effect=race):
+        with mock.patch.object(retention._WriteLease, "acquire"), mock.patch.object(retention, "_validate_held_contents", side_effect=race):
             with self.assertRaisesRegex(retention.RetentionError, "contents changed|identity changed"):
                 retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
         self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
 
     def test_apply_race_after_per_entry_stat_before_unlink_fails(self):
         original_stat = retention.os.stat
+        child = {}
         calls = {"batch": 0}
 
         def race(path, *args, **kwargs):
@@ -177,12 +181,68 @@ class RolloutRetentionTest(unittest.TestCase):
                 calls["batch"] += 1
                 if calls["batch"] == 2:
                     directory = Path(os.readlink(f"/proc/self/fd/{kwargs['dir_fd']}"))
-                    (directory / "train_rollouts.bin").write_bytes(b"after-stat")
+                    script = (
+                        "from pathlib import Path; "
+                        f"p=Path({str(directory / 'train_rollouts.bin')!r}); "
+                        "stream=p.open('r+b'); stream.write(b'after-stat'); stream.flush()"
+                    )
+                    child["process"] = subprocess.Popen([sys.executable, "-c", script])
+                    time.sleep(0.2)
             return result
 
-        with mock.patch.object(retention.os, "stat", side_effect=race):
-            with self.assertRaisesRegex(retention.RetentionError, "changed"):
+        try:
+            with mock.patch.object(retention.os, "stat", side_effect=race):
+                with self.assertRaisesRegex(retention.RetentionError, "write lease"):
+                    retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
+        finally:
+            process = child.get("process")
+            if process is not None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=3)
+        self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
+
+    def test_competing_subprocess_writer_breaks_lease_and_preserves_quarantine(self):
+        original_validate = retention._validate_held_contents
+        child = {}
+
+        def race(opened, expected):
+            result = original_validate(opened, expected)
+            directory = Path(os.readlink(f"/proc/self/fd/{opened[0]}"))
+            script = (
+                "from pathlib import Path; "
+                f"p=Path({str(directory / 'train_rollouts.bin')!r}); "
+                "stream=p.open('r+b'); stream.write(b'writer'); stream.flush()"
+            )
+            child["process"] = subprocess.Popen([sys.executable, "-c", script])
+            time.sleep(0.2)
+            return result
+
+        with mock.patch.object(retention, "_validate_held_contents", side_effect=race):
+            with self.assertRaisesRegex(retention.RetentionError, "write lease"):
                 retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
+        process = child["process"]
+        try:
+            process.terminate()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
+        self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
+
+    def test_unsupported_write_lease_refuses_without_deleting(self):
+        with mock.patch.object(
+            retention._WriteLease,
+            "acquire",
+            side_effect=retention.RetentionError("Linux write leases are unsupported"),
+        ):
+            with self.assertRaisesRegex(retention.RetentionError, "unsupported"):
+                retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
+        self.assertFalse((self.run_dir / "rollouts" / "step_0").exists())
         self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
 
     def test_cross_node_disagreement_and_evidence_coverage_fail(self):

@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import stat
 import uuid
 from pathlib import Path
@@ -507,12 +508,55 @@ def _open_file_at(directory_fd: int, name: str, label: str) -> tuple[int, os.sta
     return descriptor, after
 
 
+class _WriteLease:
+    """Hold non-advisory Linux write leases through quarantine deletion."""
+
+    def __init__(self) -> None:
+        self._fds: list[int] = []
+        self._broken = False
+        self._old_handler = None
+
+    def _signal(self, _signum: int, _frame: object) -> None:
+        self._broken = True
+
+    def acquire(self, descriptors: list[int]) -> None:
+        required = ("F_SETLEASE", "F_WRLCK", "F_UNLCK", "F_SETOWN", "F_SETSIG")
+        if any(not hasattr(fcntl, name) for name in required):
+            _fail("Linux write leases are unsupported")
+        try:
+            self._old_handler = signal.getsignal(signal.SIGIO)
+            signal.signal(signal.SIGIO, self._signal)
+            for descriptor in descriptors:
+                fcntl.fcntl(descriptor, fcntl.F_SETOWN, os.getpid())
+                fcntl.fcntl(descriptor, fcntl.F_SETSIG, signal.SIGIO)
+                fcntl.fcntl(descriptor, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+                self._fds.append(descriptor)
+        except (OSError, ValueError) as error:
+            self.close()
+            _fail(f"Linux write lease cannot be acquired: {error}")
+
+    def check(self) -> None:
+        if self._broken:
+            _fail("Linux write lease was broken by a competing writer")
+
+    def close(self) -> None:
+        for descriptor in reversed(self._fds):
+            try:
+                fcntl.fcntl(descriptor, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+            except OSError:
+                pass
+        self._fds.clear()
+        if self._old_handler is not None:
+            signal.signal(signal.SIGIO, self._old_handler)
+            self._old_handler = None
+
+
 def _final_quarantine_check(
     quarantine: Path,
     expected: Mapping[str, Any],
     owner_uid: int,
     owner_gid: int,
-) -> tuple[int, int, int, list[int]]:
+) -> tuple[int, int, int, list[int], _WriteLease]:
     """Hold directory and file descriptors through final removal."""
     if _open_fd_targets(quarantine, ignore_pid=os.getpid()):
         _fail("quarantined rollout has an open writer or consumer descriptor")
@@ -521,6 +565,7 @@ def _final_quarantine_check(
     except OSError as error:
         _fail(f"quarantine cannot be opened: {error}")
     opened: list[int] = [directory_fd]
+    lease = _WriteLease()
     try:
         directory_info = os.fstat(directory_fd)
         if (
@@ -555,6 +600,8 @@ def _final_quarantine_check(
                 _fail("quarantined rollout file lock is open")
             except OSError as error:
                 _fail(f"quarantined rollout file lock cannot be checked: {error}")
+        lease.acquire([batch_fd, marker_fd])
+        lease.check()
         if any(info.st_uid != owner_uid or info.st_gid != owner_gid for info in (batch_info, marker_info)):
             _fail("quarantined rollout ownership changed")
         payload = _read_fd(batch_fd)
@@ -566,10 +613,17 @@ def _final_quarantine_check(
             expected["device"], expected["inode"], expected["mtime_ns"]
         ):
             _fail("quarantined rollout batch identity changed")
-        return directory_fd, batch_info.st_size + marker_info.st_size, batch_info.st_size, opened
+        return directory_fd, batch_info.st_size + marker_info.st_size, batch_info.st_size, opened, lease
     except UnicodeError as error:
+        lease.close()
+        for descriptor in reversed(opened):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         _fail(f"quarantined delivery marker is invalid: {error}")
     except Exception:
+        lease.close()
         for descriptor in reversed(opened):
             try:
                 os.close(descriptor)
@@ -597,7 +651,12 @@ def _validate_held_contents(opened: list[int], expected: Mapping[str, Any]) -> t
     return batch_info, marker_info
 
 
-def _remove_tree_at(directory_fd: int, opened_files: list[int], expected: Mapping[str, Any]) -> int:
+def _remove_tree_at(
+    directory_fd: int,
+    opened_files: list[int],
+    expected: Mapping[str, Any],
+    lease: _WriteLease,
+) -> int:
     """Remove one already validated tree using its held directory descriptor."""
     directory_info = os.fstat(directory_fd)
     if (directory_info.st_dev, directory_info.st_ino, directory_info.st_uid, directory_info.st_gid) != (
@@ -605,6 +664,7 @@ def _remove_tree_at(directory_fd: int, opened_files: list[int], expected: Mappin
     ):
         _fail("quarantined rollout directory identity changed at deletion")
     validated_batch, validated_marker = _validate_held_contents([directory_fd, *opened_files], expected)
+    lease.check()
     expected_fds = {opened_files[0]: validated_batch, opened_files[1]: validated_marker}
     try:
         names = sorted(os.listdir(directory_fd))
@@ -625,35 +685,24 @@ def _remove_tree_at(directory_fd: int, opened_files: list[int], expected: Mappin
             info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
         ):
             _fail(f"quarantined entry contents changed at deletion: {name}")
-        current_fd, current_info = _open_file_at(directory_fd, name, f"quarantined entry {name}")
+        lease.check()
         try:
-            if (current_info.st_dev, current_info.st_ino, current_info.st_size, current_info.st_mtime_ns) != (
-                held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns
-            ):
-                _fail(f"quarantined entry changed before unlink: {name}")
-            payload = _read_fd(current_fd)
-            if name == "train_rollouts.bin":
-                if hashlib.sha256(payload).hexdigest() != expected["sha256"] or len(payload) != expected["size"]:
-                    _fail(f"quarantined batch content changed before unlink: {name}")
-            elif payload.decode("ascii") != expected["sha256"] + "\n":
-                _fail(f"quarantined delivery marker changed before unlink: {name}")
-            try:
-                library = ctypes.CDLL(None, use_errno=True)
-                unlinkat = library.unlinkat
-                unlinkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-                unlinkat.restype = ctypes.c_int
-                if unlinkat(directory_fd, os.fsencode(name), 0) != 0:
-                    error_number = ctypes.get_errno()
-                    raise OSError(error_number, os.strerror(error_number), name)
-            except OSError as error:
-                _fail(f"quarantined entry cannot be removed: {error}")
-        finally:
-            os.close(current_fd)
+            library = ctypes.CDLL(None, use_errno=True)
+            unlinkat = library.unlinkat
+            unlinkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+            unlinkat.restype = ctypes.c_int
+            if unlinkat(directory_fd, os.fsencode(name), 0) != 0:
+                error_number = ctypes.get_errno()
+                raise OSError(error_number, os.strerror(error_number), name)
+        except OSError as error:
+            _fail(f"quarantined entry cannot be removed: {error}")
+        lease.check()
     try:
         if os.listdir(directory_fd):
             _fail("quarantined rollout gained a file at deletion")
     except OSError as error:
         _fail(f"quarantined rollout cannot be checked after deletion: {error}")
+    lease.check()
     return sum(info.st_size for info in expected_fds.values())
 
 
@@ -663,7 +712,7 @@ def _delete_quarantine(
     owner_uid: int,
     owner_gid: int,
 ) -> int:
-    directory_fd, bytes_used, _batch_bytes, opened = _final_quarantine_check(
+    directory_fd, bytes_used, _batch_bytes, opened, lease = _final_quarantine_check(
         quarantine, expected, owner_uid, owner_gid
     )
     try:
@@ -678,7 +727,7 @@ def _delete_quarantine(
         # of pathname replacement.
         if _open_fd_targets(quarantine, ignore_pid=os.getpid()):
             _fail("quarantined rollout has an open writer or consumer descriptor")
-        actual = _remove_tree_at(directory_fd, opened[1:], expected)
+        actual = _remove_tree_at(directory_fd, opened[1:], expected, lease)
         if actual != bytes_used:
             _fail("actual freed bytes differ from the validated quarantine")
         try:
@@ -688,6 +737,7 @@ def _delete_quarantine(
         return actual
     finally:
         os.close(parent_fd)
+        lease.close()
         for descriptor in reversed(opened):
             try:
                 os.close(descriptor)
