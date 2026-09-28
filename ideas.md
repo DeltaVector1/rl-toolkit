@@ -1595,6 +1595,25 @@ only after measured learning.
   within the existing `300s` operation bound; no production or network action
   is part of this task.
 
+## Current step 9 rollout: bounded SSH fallback
+
+- **Measured failure and source identity.** Two B2 attempts for the exact
+  current production step 9 failed at the final `24.9 MB` under the existing
+  `300s` limit. The source is `665,806,291` bytes with SHA-256 prefix
+  `cf18...`. Preserve both B2 failure evidence and the exact B2 object for
+  later cleanup.
+- **Bounded fallback.** Before live execution, use the existing
+  `training_ops/runtime/pull_rollout_batches.sh` SSH backend with `16`
+  streams and its current `300s` per-part limit. The expected overall time is
+  below `600s`. Pull a fresh exact step-9 batch; do not use a cached prior
+  batch, add a new transport, or change an RL or configuration setting.
+- **Publication gates.** Require strict source and destination byte-count and
+  SHA-256 equality. Keep the existing atomic final publication and owner/mode
+  handling, and publish no file when any integrity or transfer check fails.
+- **Rollback.** Keep the SSH fallback as the selected path until the bounded
+  result is reviewed. Return to B2 only after reviewed fixes; do not switch
+  back based on an unreviewed failure or expectation.
+
 ## Byte-identity-guarded broadcast retention
 
 - **Problem.** A live run can leave old stable adapter generations and failed
