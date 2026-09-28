@@ -21,10 +21,10 @@ import json,os,signal,sys,time
 from pathlib import Path
 case,source=sys.argv[1:3]
 args=sys.argv[3:]
+start,end=map(int,args[args.index('--range')+1].split('-'))
 config=sys.stdin.read()
 assert config.startswith('url = "https://') and 'temporary' in config
-start,end=map(int,args[args.index('--range')+1].split('-'))
-if case=='slow' or (case=='fail' and start):
+if case=='slow' or (case=='timeout_after' and start) or (case=='fail' and start):
     signal.signal(signal.SIGTERM,signal.SIG_IGN)
     time.sleep(20)
 if case=='straggler' and start==0:
@@ -238,6 +238,74 @@ class RangeReceiveTest(unittest.TestCase):
             "0-511",
             [command[command.index("--range") + 1] for command in self.commands],
         )
+
+    def test_transient_publish_then_timeout_resumes_verified_ranges(self):
+        """API retry and range recovery must preserve one exact artifact."""
+        client = fixtures.TransientPublishS3(committed=False)
+        with contextlib.redirect_stderr(io.StringIO()):
+            value = tool.publish(
+                client, "fixture", self.fixture.source, self.fixture.runs
+            )
+        self.assertEqual(client.attempts, 2)
+        self.assertEqual(client.uploads, 1)
+        receipt = {
+            key: item
+            for key, item in value.items()
+            if key not in {"url", "expires_at"}
+        }
+
+        fixture = self.fixture
+        fixture.final.parent.mkdir(parents=True)
+        fixture.partial.parent.mkdir(parents=True)
+        self.case = "timeout_after"
+        clock_calls = [0]
+
+        def clock():
+            clock_calls[0] += 1
+            if clock_calls[0] == 10:
+                self.children[0].wait(timeout=2)
+            return 0 if clock_calls[0] <= 10 else 300
+
+        with patch.object(tool.subprocess, "Popen", self.spawn), self.assertRaises(
+            TimeoutError
+        ):
+            tool.receive_ranges(
+                value["url"],
+                len(fixture.body),
+                fixture.partial,
+                fixture.final,
+                8,
+                receipt=receipt,
+                clock=clock,
+            )
+
+        parts = Path(str(fixture.final) + ".b2-parts")
+        self.assertTrue((parts / "0.record").exists())
+        self.assertFalse(fixture.final.exists())
+
+        self.case = "ok"
+        self.commands.clear()
+        self.value = dict(value, url="https://example.invalid/fresh-temporary-url")
+        self.receive()
+        self.assertEqual(
+            sorted(command[command.index("--range") + 1] for command in self.commands),
+            [
+                "1024-1535",
+                "1536-2047",
+                "2048-2559",
+                "2560-3071",
+                "3072-3583",
+                "3584-4095",
+                "512-1023",
+            ],
+        )
+        self.assertEqual(fixture.final.read_bytes(), fixture.body)
+        self.assertEqual(
+            tool.parse_json(Path(str(fixture.final) + ".b2-ack.json").read_text()),
+            receipt,
+        )
+        tool.cleanup_parts(fixture.final, receipt)
+        self.assertFalse(parts.exists())
 
     def test_restart_redownloads_only_a_mutated_range(self):
         self.receive()
