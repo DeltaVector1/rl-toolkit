@@ -12958,7 +12958,7 @@ def _rollout_retention_action(arguments: list[str]):
                 raise Refused(f"rollout-retention {phase} {label} candidates are invalid")
             fields = (
                 "step", "bytes", "sha256", "path", "size", "device", "inode",
-                "mtime_ns", "dir_device", "dir_inode", "dir_mtime_ns",
+                "mtime_ns", "dir_device", "dir_inode", "dir_mtime_ns", "dir_uid", "dir_gid",
             )
             result = []
             for item in value:

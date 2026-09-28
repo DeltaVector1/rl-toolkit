@@ -159,6 +159,7 @@ def _load_evidence(value: Mapping[str, Any] | str | Path) -> dict[str, Any]:
             fields = {
                 "step", "size", "sha256", "delivered_sha256", "owner_uid", "owner_gid",
                 "device", "inode", "mtime_ns", "dir_device", "dir_inode", "dir_mtime_ns",
+                "dir_uid", "dir_gid",
             }
             if not isinstance(item, Mapping) or set(item) != fields:
                 _fail(f"retention batch evidence fields are invalid on {node}")
@@ -171,11 +172,17 @@ def _load_evidence(value: Mapping[str, Any] | str | Path) -> dict[str, Any]:
             delivered_sha = item["delivered_sha256"]
             if not isinstance(sha, str) or _DIGEST.fullmatch(sha) is None or delivered_sha != sha:
                 _fail(f"retention batch delivery identity is invalid on {node}")
-            if item["owner_uid"] != owner_uid or item["owner_gid"] != owner_gid:
+            if (
+                item["owner_uid"] != owner_uid
+                or item["owner_gid"] != owner_gid
+                or item["dir_uid"] != owner_uid
+                or item["dir_gid"] != owner_gid
+            ):
                 _fail(f"retention batch ownership disagrees on {node}")
             values = {name: _safe_int(item[name], f"retention batch {name}") for name in (
                 "device", "inode", "mtime_ns", "dir_device", "dir_inode", "dir_mtime_ns"
             )}
+            values.update({name: _safe_int(item[name], f"retention batch {name}") for name in ("dir_uid", "dir_gid")})
             normalized_item = {
                 "step": step, "size": size, "sha256": sha, "delivered_sha256": sha,
                 "owner_uid": owner_uid, "owner_gid": owner_gid, **values,
@@ -316,7 +323,16 @@ def _batch_record(path: Path, item: Mapping[str, Any], owner_uid: int, owner_gid
     delivered = path / "train_rollouts.bin.delivered"
     batch_info = _regular(batch, f"rollout batch {step}")
     delivered_info = _regular(delivered, f"rollout delivery marker {step}")
-    if batch_info.st_uid != owner_uid or batch_info.st_gid != owner_gid or delivered_info.st_uid != owner_uid or delivered_info.st_gid != owner_gid:
+    if (
+        info.st_uid != owner_uid
+        or info.st_gid != owner_gid
+        or batch_info.st_uid != owner_uid
+        or batch_info.st_gid != owner_gid
+        or delivered_info.st_uid != owner_uid
+        or delivered_info.st_gid != owner_gid
+        or info.st_uid != item["dir_uid"]
+        or info.st_gid != item["dir_gid"]
+    ):
         _fail(f"rollout step {step} ownership changed")
     digest = _digest(batch, f"rollout batch {step}")
     try:
@@ -345,6 +361,8 @@ def _batch_record(path: Path, item: Mapping[str, Any], owner_uid: int, owner_gid
         "dir_device": info.st_dev,
         "dir_inode": info.st_ino,
         "dir_mtime_ns": info.st_mtime_ns,
+        "dir_uid": info.st_uid,
+        "dir_gid": info.st_gid,
     }
 
 
@@ -504,10 +522,22 @@ def _final_quarantine_check(
     opened: list[int] = [directory_fd]
     try:
         directory_info = os.fstat(directory_fd)
-        if (directory_info.st_dev, directory_info.st_ino, directory_info.st_mtime_ns) != (
-            expected["dir_device"], expected["dir_inode"], expected["dir_mtime_ns"]
+        if (
+            directory_info.st_dev,
+            directory_info.st_ino,
+            directory_info.st_mtime_ns,
+            directory_info.st_uid,
+            directory_info.st_gid,
+        ) != (
+            expected["dir_device"],
+            expected["dir_inode"],
+            expected["dir_mtime_ns"],
+            expected["dir_uid"],
+            expected["dir_gid"],
         ):
             _fail("quarantined rollout directory identity changed")
+        if directory_info.st_uid != owner_uid or directory_info.st_gid != owner_gid:
+            _fail("quarantined rollout directory ownership changed")
         try:
             names = set(os.listdir(directory_fd))
         except OSError as error:
@@ -547,7 +577,7 @@ def _final_quarantine_check(
         raise
 
 
-def _validate_held_contents(opened: list[int], expected: Mapping[str, Any]) -> None:
+def _validate_held_contents(opened: list[int], expected: Mapping[str, Any]) -> tuple[os.stat_result, os.stat_result]:
     batch_fd, marker_fd = opened[1:]
     batch_info = os.fstat(batch_fd)
     marker_info = os.fstat(marker_fd)
@@ -563,15 +593,18 @@ def _validate_held_contents(opened: list[int], expected: Mapping[str, Any]) -> N
         expected["device"], expected["inode"], expected["size"], expected["mtime_ns"]
     ) or marker_info.st_size != len(marker.encode("ascii")):
         _fail("quarantined rollout identity changed at deletion")
+    return batch_info, marker_info
 
 
 def _remove_tree_at(directory_fd: int, opened_files: list[int], expected: Mapping[str, Any]) -> int:
     """Remove one already validated tree using its held directory descriptor."""
     directory_info = os.fstat(directory_fd)
-    if (directory_info.st_dev, directory_info.st_ino) != (expected["dir_device"], expected["dir_inode"]):
+    if (directory_info.st_dev, directory_info.st_ino, directory_info.st_uid, directory_info.st_gid) != (
+        expected["dir_device"], expected["dir_inode"], expected["dir_uid"], expected["dir_gid"]
+    ):
         _fail("quarantined rollout directory identity changed at deletion")
-    _validate_held_contents([directory_fd, *opened_files], expected)
-    expected_fds = {fd: os.fstat(fd) for fd in opened_files}
+    validated_batch, validated_marker = _validate_held_contents([directory_fd, *opened_files], expected)
+    expected_fds = {opened_files[0]: validated_batch, opened_files[1]: validated_marker}
     try:
         names = sorted(os.listdir(directory_fd))
     except OSError as error:
@@ -586,7 +619,7 @@ def _remove_tree_at(directory_fd: int, opened_files: list[int], expected: Mappin
         matching = [fd for fd, held in expected_fds.items() if (held.st_dev, held.st_ino) == (info.st_dev, info.st_ino)]
         if not matching:
             _fail(f"quarantined entry identity changed at deletion: {name}")
-        held = os.fstat(matching[0])
+        held = expected_fds[matching[0]]
         if (held.st_dev, held.st_ino, held.st_size, held.st_mtime_ns) != (
             info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
         ):
@@ -717,6 +750,8 @@ def build_node_evidence(run_dir: str | Path, *, node: str, run_name: str, active
             "dir_device": entry.stat(follow_symlinks=False).st_dev,
             "dir_inode": entry.stat(follow_symlinks=False).st_ino,
             "dir_mtime_ns": entry.stat(follow_symlinks=False).st_mtime_ns,
+            "dir_uid": entry.stat(follow_symlinks=False).st_uid,
+            "dir_gid": entry.stat(follow_symlinks=False).st_gid,
         })
     return {"run_dir": str(path), "owner_uid": info.st_uid, "owner_gid": info.st_gid,
             "active_step": active_step, "required_steps": required, "batches": batches}

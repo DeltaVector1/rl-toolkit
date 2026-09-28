@@ -153,6 +153,20 @@ class RolloutRetentionTest(unittest.TestCase):
                 retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
         self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
 
+    def test_apply_race_after_content_check_before_first_unlink_fails(self):
+        original_validate = retention._validate_held_contents
+
+        def race(opened, expected):
+            result = original_validate(opened, expected)
+            directory = Path(os.readlink(f"/proc/self/fd/{opened[0]}"))
+            (directory / "train_rollouts.bin").write_bytes(b"between-check-and-unlink")
+            return result
+
+        with mock.patch.object(retention, "_validate_held_contents", side_effect=race):
+            with self.assertRaisesRegex(retention.RetentionError, "contents changed|identity changed"):
+                retention.cleanup(self.run_dir, self._evidence(), node="n76", dry_run=False)
+        self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
+
     def test_cross_node_disagreement_and_evidence_coverage_fail(self):
         other = json.loads(json.dumps(self.evidence))
         other["batches"][0]["sha256"] = "0" * 64
@@ -165,6 +179,12 @@ class RolloutRetentionTest(unittest.TestCase):
             retention.validate_evidence(self._evidence(nodes={"n76": self.evidence, "n77": other}))
         with self.assertRaisesRegex(retention.RetentionError, "exactly the configured"):
             retention.validate_evidence(self._evidence(), nodes=["n76", "n77"])
+
+    def test_step_directory_ownership_is_checked(self):
+        evidence = json.loads(json.dumps(self.evidence))
+        evidence["batches"][0]["dir_uid"] += 1
+        with self.assertRaisesRegex(retention.RetentionError, "ownership disagrees"):
+            retention.validate_evidence(self._evidence(nodes={"n76": evidence}))
 
 
 if __name__ == "__main__":

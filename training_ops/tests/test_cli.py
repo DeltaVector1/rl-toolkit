@@ -23,6 +23,8 @@ class CliTest(unittest.TestCase):
             "dir_device": 1,
             "dir_inode": 4,
             "dir_mtime_ns": 5,
+            "dir_uid": 1000,
+            "dir_gid": 1000,
         }
         result = {
             "node": host,
