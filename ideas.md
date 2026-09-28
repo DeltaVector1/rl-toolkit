@@ -1575,3 +1575,31 @@ only after measured learning.
   workers only after local tests pass; local checks do not qualify the live
   path. This record precedes implementation and any new live qualification.
   This writer task performs no live or network action.
+
+## Byte-identity-guarded broadcast retention
+
+- **Problem.** A live run can leave old stable adapter generations and failed
+  uncommitted build directories below the trainer run. These files can fill
+  the run filesystem. Retention must not remove the current policy, a policy
+  that is still in use, a new publication, or transfer/checkpoint evidence.
+- **Design.** Add a local, dry-run-first retention inventory for one exact
+  configured run directory. Validate every stable candidate with a regular
+  empty `STABLE`, `adapter_manifest.json`, `adapter_config.json`, model size,
+  model SHA-256, config size, config SHA-256, and checksum sidecar. Require a
+  JSON evidence snapshot that contains the exact H200 loaded receipt and the
+  exact orchestrator acknowledgement identity. Remove a stable generation
+  only when its complete identity matches an acknowledged H200 receipt, its
+  step is below the loaded step, and it is outside the bounded newest-step
+  retention window. Keep the newest two stable generations by default.
+- **Partials.** Inventory directories with a step name but no `STABLE`, and
+  known temporary marker/files separately. Remove a partial only when it is
+  older than the explicit age bound, has no writer marker, is not a symlink,
+  and is not named as a protected transfer, checkpoint, receipt, or model
+  path. Never treat a partial as an acknowledged stable generation.
+- **Safety.** Use a per-run lock, revalidate identities immediately before an
+  atomic rename to a private quarantine name, then delete only that pinned
+  directory. Refuse symlink ancestors, unknown manifest fields, missing
+  evidence, identity changes, active markers, and any path outside the exact
+  run `broadcasts` directory. Provide inventory and dry-run output; actual
+  deletion is explicit and bounded by a maximum number of entries and bytes.
+  This design performs no live host action and does not touch `n79`.
