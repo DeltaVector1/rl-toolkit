@@ -163,6 +163,37 @@ The active selection is plain GRPO on the pre-difficulty
 `NewEden/RL-seed-Decensor` dataset with one `decensor` environment. It has
 no fixed prefill, TailRL, staged ratios, group filters, or held-out split wiring.
 
+## H200 watchdog exit during saturated generation
+
+- **Measured state (2026-09-28).** On `h200b`, the exact engine container was
+  running since `13:25:30Z`, with 128 running requests and
+  `generation_tokens_total=3.083033e+06`. An `engines()` probe measured
+  `0/1` completion probes in `25,116ms`, GPU use 100%, and `2,660.1 tok/s`,
+  while the exact watchdog process was present in its own process group with
+  identity `engine-watchdog:h200b:trinity-decensor-experimental-parity:8000`.
+  The watchdog log had a start at `13:25:36Z`, one liveness deferral at
+  `13:35:51Z`, and a new start at `13:53:23Z`; it had no probe failure or
+  `RESTARTING ENGINE` record. Kernel, Docker, audit, and start logs had no
+  matching kill or engine restart record.
+- **Current conclusion.** The evidence proves an external watchdog replacement
+  or process loss, but does not prove that saturated generation caused a shell
+  exit. The current script has no unguarded saturation-specific exit path:
+  liveness, staging, metrics, and failed curl calls are bounded or guarded, and
+  active requests with a rising generation counter reset misses. Do not change
+  restart semantics or hide a dead engine from status without an exit signal.
+- **Required experiment.** During one saturated generation window, sample the
+  exact watchdog PID, process-group ID, `/proc/$pid/environ`, engine container
+  ID, request count, generation counter, and watchdog log every 5 seconds. If
+  the PID disappears, collect `journalctl -k`, Docker events, audit records,
+  and the supervisor command result at the same timestamp. Reproduce the
+  first exit with a disposable fake curl/metrics fixture and assert the shell
+  exit status and final log line before proposing a narrow code fix. If the
+  process remains but status reports `watchdog=no`, fix only the identity
+  probe and add a status regression; if the process receives a signal, fix the
+  responsible supervisor or launch path instead. Keep active-generation
+  deferral only when liveness or a rising token counter proves the engine is
+  alive.
+
 ## Measured long-haul evidence
 
 Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
