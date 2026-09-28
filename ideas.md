@@ -1491,3 +1491,21 @@ only after measured learning.
   files, dependency deployment, and absent-credential preflight. Enable a
   production selection only after these checks pass; local checks do not
   qualify the live data path.
+
+## Production-size B2 rollout qualification
+
+- **Test limits.** Create one fresh disposable incompressible file of exactly
+  `350074342` bytes, named `train_rollouts.bin` in a unique synthetic run.
+  Use no production or cached rollout data. Allow one attempt per leg and
+  no retries. Keep the existing `300s` hard and `60s` download low-speed
+  limits unchanged.
+- **Experiment and measurements.** Use the deployed helper path: H200
+  publish and presign, guarded `n82` receive, exact source/destination size
+  and SHA-256 checks, then deletion of the exact returned object version.
+  Record upload, download, and deletion times, transfer goodput, and errors.
+  Keep credentials and signed URLs out of logs. Stop on any authentication,
+  TLS, connection, timeout, source mutation, size, hash, or deletion fault.
+- **Cleanup and decision.** Preserve evidence, remove only the exact test
+  paths and object version, and verify absence. A pass qualifies the first
+  production run only, not `50`-step acceptance. This entry precedes live
+  work; this documentation task performs no live or network action.
