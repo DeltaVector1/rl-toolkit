@@ -127,6 +127,24 @@ class RangeReceiveTest(unittest.TestCase):
                 download_threshold_bytes=1,
             )
 
+    def single_run(self, command, **_kwargs):
+        output = command[command.index("--output") + 1]
+        fd = int(output.rsplit("/", 1)[1])
+        os.write(fd, self.fixture.body)
+        return subprocess.CompletedProcess(command, 0, stdout="200", stderr="")
+
+    def receive_single(self):
+        fixture = self.fixture
+        tool.receive(
+            self.value,
+            str(fixture.source),
+            fixture.partial,
+            fixture.final,
+            self.single_run,
+            download_workers=8,
+            download_threshold_bytes=len(fixture.body) + 1,
+        )
+
     def test_parallel_exact_publish_ack_cleanup(self):
         fixture = self.fixture
         log = io.StringIO()
@@ -331,7 +349,7 @@ class RangeReceiveTest(unittest.TestCase):
         tool.cleanup_parts(fixture.final, receipt)
         self.assertFalse(Path(str(fixture.final) + ".b2-parts").exists())
 
-    def test_concurrent_receiver_waits_for_publication(self):
+    def assert_concurrent_receiver_waits_for_publication(self, receive):
         fixture = self.fixture
         pause = fixture.root / "publish-paused"
         release = fixture.root / "publish-release"
@@ -350,8 +368,7 @@ class RangeReceiveTest(unittest.TestCase):
 
             try:
                 with patch.object(tool, "_publish_partial", pause_before_publish):
-                    with patch.object(tool.subprocess, "Popen", self.spawn):
-                        self.receive()
+                    receive()
             except BaseException:
                 os._exit(20)
             os._exit(0)
@@ -368,8 +385,7 @@ class RangeReceiveTest(unittest.TestCase):
             second = os.fork()
             if second == 0:
                 try:
-                    with patch.object(tool.subprocess, "Popen", self.spawn):
-                        self.receive()
+                    receive()
                 except BaseException:
                     os._exit(21)
                 os._exit(0)
@@ -399,6 +415,94 @@ class RangeReceiveTest(unittest.TestCase):
             self.assertEqual(fixture.final.read_bytes(), fixture.body)
         finally:
             release.touch()
+            for pid in [first, second]:
+                if pid is None:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
+    def test_concurrent_receiver_waits_for_publication(self):
+        self.assert_concurrent_receiver_waits_for_publication(self.receive)
+
+    def test_concurrent_single_receiver_waits_for_publication(self):
+        self.assert_concurrent_receiver_waits_for_publication(self.receive_single)
+
+    def test_single_receiver_signal_releases_publication_lock(self):
+        fixture = self.fixture
+        pause = fixture.root / "publish-paused"
+        second_started = fixture.root / "second-started"
+
+        def pause_before_publish(partial, final, receipt):
+            pause.write_text("ready")
+            while True:
+                time.sleep(1)
+
+        first = os.fork()
+        if first == 0:
+            try:
+                with patch.object(tool, "_publish_partial", pause_before_publish):
+                    self.receive_single()
+            except BaseException:
+                os._exit(20)
+            os._exit(0)
+
+        second = None
+        try:
+            until = time.monotonic() + 5
+            while not pause.exists() and time.monotonic() < until:
+                if os.waitpid(first, os.WNOHANG) != (0, 0):
+                    break
+                time.sleep(0.01)
+            self.assertTrue(pause.exists())
+
+            def receive_second():
+                second_started.write_text("started")
+                self.receive_single()
+
+            second = os.fork()
+            if second == 0:
+                try:
+                    receive_second()
+                except BaseException:
+                    os._exit(21)
+                os._exit(0)
+
+            until = time.monotonic() + 5
+            while not second_started.exists() and time.monotonic() < until:
+                time.sleep(0.01)
+            self.assertTrue(second_started.exists())
+            time.sleep(0.1)
+            self.assertEqual(os.waitpid(second, os.WNOHANG), (0, 0))
+
+            os.kill(first, signal.SIGTERM)
+            until = time.monotonic() + 5
+            first_status = second_status = None
+            while time.monotonic() < until and (
+                first_status is None or second_status is None
+            ):
+                if first_status is None:
+                    waited, status = os.waitpid(first, os.WNOHANG)
+                    if waited:
+                        first_status = status
+                if second_status is None:
+                    waited, status = os.waitpid(second, os.WNOHANG)
+                    if waited:
+                        second_status = status
+                time.sleep(0.01)
+            self.assertIsNotNone(first_status)
+            self.assertIsNotNone(second_status)
+            self.assertEqual(
+                os.waitstatus_to_exitcode(first_status), -signal.SIGTERM
+            )
+            self.assertEqual(os.waitstatus_to_exitcode(second_status), 0)
+            self.assertEqual(fixture.final.read_bytes(), fixture.body)
+        finally:
             for pid in [first, second]:
                 if pid is None:
                     continue
@@ -590,6 +694,11 @@ class RangeReceiveTest(unittest.TestCase):
                 download_workers=8,
             )
         self.assertEqual(fixture.final.read_bytes(), fixture.body)
+        receipt = tool.parse_json(
+            Path(str(fixture.final) + ".b2-ack.json").read_text()
+        )
+        tool.cleanup_parts(fixture.final, receipt)
+        self.assertFalse(Path(str(fixture.final) + ".b2-parts").exists())
 
     def external_term(self, repeat):
         fixture = self.fixture
