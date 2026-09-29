@@ -314,39 +314,74 @@ write_receipt() {
 }
 
 b2_remote() {
-  local command
+  local command status
   printf -v command '%q ' timeout --signal=TERM --kill-after=5s 300s "$b2_python" "$b2_helper" "$@"
-  timeout --signal=TERM --kill-after=5s 310s ssh -n "${ssh_opts[@]}" "$source_target" "$command"
+  if timeout --signal=TERM --kill-after=5s 310s ssh -n "${ssh_opts[@]}" "$source_target" "$command"; then
+    return 0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 124 ] && return 75
+  return "$status"
+}
+
+b2_retry() {
+  local label=$1; shift
+  local attempt status started elapsed bytes
+  for attempt in 1 2 3; do
+    started=$(date +%s)
+    if "$@"; then
+      return 0
+    else
+      status=$?
+    fi
+    [ "$status" -eq 75 ] || return "$status"
+    elapsed=$(( $(date +%s) - started ))
+    bytes=0
+    if [ -n "${b2_retry_partial:-}" ] && [ -f "$b2_retry_partial" ]; then
+      bytes=$(stat -c %s -- "$b2_retry_partial" 2>/dev/null || echo 0)
+    fi
+    echo "B2 transient failure label=$label attempt=$attempt elapsed=${elapsed}s bytes=$bytes error=timeout" >&2
+    [ "$attempt" -lt 3 ] || return 75
+    sleep "$attempt"
+  done
+  return 75
 }
 
 b2_finish() {
-  local pending=$1 final=${1%.b2-ack.json} receipt digest relative source
+  local pending=$1 final=${1%.b2-ack.json} receipt digest relative source status
   local_path_safe "$pending" || return 76
-  receipt=$(python3 "$b2_local_helper" ack-json --receipt "$pending" --final "$final") || return 76
+  receipt=$(python3 "$b2_local_helper" ack-json --receipt "$pending" --final "$final") || { status=$?; [ "$status" -eq 75 ] && return 75; return 76; }
   relative=${final#"$dest_dir"/}
   [[ "$relative" =~ ^rollouts/step_[0-9]+/train_rollouts\.bin$ ]] || return 76
   source="$source_dir/$relative"
   digest=$(sha256sum -- "$final" | awk '{print $1}') || return 76
   write_receipt "$source" "$digest" || return 76
-  b2_remote ack --receipt "$receipt" || return 76
-  python3 "$b2_local_helper" cleanup-parts --receipt "$pending" --final "$final" || return 76
+  b2_remote ack --receipt "$receipt" || { status=$?; [ "$status" -eq 75 ] && return 75; return 76; }
+  python3 "$b2_local_helper" cleanup-parts --receipt "$pending" --final "$final" || { status=$?; [ "$status" -eq 75 ] && return 75; return 76; }
   rm -- "$pending"
 }
 
 pull_b2() {
   # Presigned URLs must not enter shell tracing, command arguments, or logs.
   set +x
-  local source=$1 relative=${1#"$source_dir"/} final partial metadata
+  local source=$1 relative=${1#"$source_dir"/} final partial metadata pending
   final="$dest_dir/$relative"
   partial="$dest_dir/.incoming/$relative"
+  pending="$final.b2-ack.json"
   local_path_safe "$final" || return 76
   local_path_safe "$partial" || return 76
-  metadata=$(b2_remote publish --source "$source") || return 76
+  if [ -f "$pending" ]; then
+    b2_finish "$pending" || return $?
+    echo "pulled $relative via b2_s3"
+    return 0
+  fi
+  metadata=$(b2_remote publish --source "$source") || { local status=$?; [ "$status" -eq 75 ] && return 75; return 76; }
   printf '%s' "$metadata" | python3 "$b2_local_helper" receive \
     --source "$source" --partial "$partial" --final "$final" \
-    --download-workers "$b2_download_workers" --download-threshold-bytes "$b2_download_threshold" || return 76
+    --download-workers "$b2_download_workers" --download-threshold-bytes "$b2_download_threshold" || { local status=$?; [ "$status" -eq 75 ] && return 75; return 76; }
   unset metadata
-  b2_finish "$final.b2-ack.json" || return 76
+  b2_finish "$final.b2-ack.json" || return $?
   echo "pulled $relative via b2_s3"
 }
 
@@ -464,7 +499,7 @@ scan() {
   local -a rollout_files=()
   if [ "$rollout_backend" = b2_s3 ] && [ -d "$dest_dir/rollouts" ]; then
     while IFS= read -r -d '' local_file; do
-      b2_finish "$local_file" || return 76
+      b2_retry_partial="${local_file%.b2-ack.json}" b2_retry "ack:${local_file#"$dest_dir"/}" b2_finish "$local_file" || return $?
     done < <(find "$dest_dir/rollouts" -type f -name 'train_rollouts.bin.b2-ack.json' -print0)
   fi
   while IFS= read -r -d '' local_file; do
@@ -493,7 +528,11 @@ scan() {
   [ "$status" = 0 ] || return "$status"
   while IFS=$'\t' read -r step remote_file; do
     [ -n "$remote_file" ] || continue
-    pull_one "$remote_file" || return $?
+    if [[ "$remote_file" =~ /rollouts/step_[0-9]+/train_rollouts\.bin$ ]] && [ "$rollout_backend" = b2_s3 ]; then
+      b2_retry_partial="$dest_dir/.incoming/${remote_file#"$source_dir"/}" b2_retry "pull:${remote_file#"$source_dir"/}" pull_one "$remote_file" || return $?
+    else
+      pull_one "$remote_file" || return $?
+    fi
   done < <(
     for remote_file in "${rollout_files[@]}"; do
       step=${remote_file##*/step_}
@@ -588,13 +627,17 @@ health_remote() {
 if [ "$rollout_backend" = b2_s3 ]; then
   [ -f "$b2_local_helper" ] || { echo "B2 receiver helper is missing" >&2; exit 76; }
   command -v curl >/dev/null || { echo "curl is missing" >&2; exit 76; }
-  b2_remote preflight >/dev/null || exit 76
+  b2_retry preflight b2_remote preflight >/dev/null || { status=$?; exit "$status"; }
 fi
 start_health_lease
 while true; do
   status=0
   scan || {
     failure=$?
+    if [ "$failure" = 75 ]; then
+      echo "B2 rollout transfer exhausted its bounded timeout retries" >&2
+      exit 75
+    fi
     if [ "$failure" = 76 ]; then
       echo "B2 rollout transfer failed; stopped without retry" >&2
       exit 76

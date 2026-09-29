@@ -1572,6 +1572,8 @@ def receive_ranges(
                             ),
                             file=sys.stderr,
                         )
+                        if code == 28:
+                            raise TimeoutError("HTTPS range download timeout")
                         raise ValueError("HTTPS range download failed")
                     if clock() >= until:
                         raise TimeoutError("range retry deadline")
@@ -1856,6 +1858,8 @@ def receive(
                     )
                 finally:
                     os.close(fd)
+                if result is not None and result.returncode == 28:
+                    raise TimeoutError("HTTPS download timeout")
                 if result is not None and (
                     result.returncode != 0 or result.stdout != "200"
                 ):
@@ -2045,6 +2049,15 @@ def main(argv=None):
                     )
                 else:
                     print('{"ready":true}')
+    except (TimeoutError, subprocess.TimeoutExpired) as error:
+        # Timeout is a bounded transport failure. The shell caller owns the
+        # finite retry budget; do not print exception text because it may
+        # contain a presigned URL or credential detail.
+        print(
+            json.dumps({"b2_transient_failure": True, "error": type(error).__name__}),
+            file=sys.stderr,
+        )
+        return 75
     except Exception as error:
         # SDK/curl error strings can contain URLs or credential identifiers.
         print(f"B2 rollout operation failed ({type(error).__name__})", file=sys.stderr)
