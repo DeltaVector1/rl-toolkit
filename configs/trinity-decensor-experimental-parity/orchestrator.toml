@@ -1,7 +1,7 @@
 # Hugging Face revision: 6412c1ad1588c664977b0f830b80a20273173318
 
 output_dir = "/data/glm52-rl/runs/trinity-decensor-experimental-parity/run_trinity-decensor-experimental-parity"
-max_steps = 50
+max_steps = 244
 seq_len = 32768
 batch_size = 1024
 group_size = 16
