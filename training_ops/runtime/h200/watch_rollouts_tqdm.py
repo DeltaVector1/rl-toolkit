@@ -7,7 +7,18 @@ from tqdm import tqdm
 
 
 batch_pattern = re.compile(r"Train batch\s+(\d+)/(\d+)")
+telemetry_pattern = re.compile(
+    r"PIPELINE_TELEMETRY.*?\baccepted_buffer=(\d+)\s+accepted_target=(\d+)"
+)
 success_pattern = re.compile(r"SUCCESS\s+Step\s+(\d+)")
+
+
+def _parse_progress(line: str) -> tuple[int, int] | None:
+    for pattern in (telemetry_pattern, batch_pattern):
+        match = pattern.search(line)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    return None
 
 
 def main() -> None:
@@ -28,10 +39,10 @@ def main() -> None:
                 previous = 0
                 continue
 
-            batch = batch_pattern.search(line)
-            if not batch:
+            progress = _parse_progress(line)
+            if progress is None:
                 continue
-            current, total = map(int, batch.groups())
+            current, total = progress
             if bar is None or bar.total != total or current < previous:
                 if bar:
                     bar.close()
