@@ -5533,6 +5533,8 @@ def repair(what: str) -> str:
         return _repair_engine(host, config_dir=config_dir if separator else None)
     if what == "supervisors":
         return _repair_supervisors()
+    if what == "rollout-puller":
+        return _repair_rollout_puller()
     if what == "microbatch-sync":
         return _repair_microbatch_sync()
     if what == "adapter-update":
@@ -5558,8 +5560,53 @@ def repair(what: str) -> str:
             raise Refused("adapter-tunnels-reset requires a run config directory")
         return _repair_adapter_tunnels(config_dir, reset=True)
     raise Refused(
-        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>[:config-dir], supervisors, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, adapter-tunnels[:config-dir], or adapter-tunnels-reset[:config-dir]."
+        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>[:config-dir], supervisors, rollout-puller, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, adapter-tunnels[:config-dir], or adapter-tunnels-reset[:config-dir]."
     )
+
+
+def _repair_rollout_puller() -> str:
+    """Restart only the exact trainer-side rollout puller."""
+    if rollout_transfer_direction != "trainer_pull":
+        raise Refused("rollout-puller repair requires trainer_pull")
+    run = current_run()
+    before = status(run, quiet=True)
+    if before.run != run:
+        raise Refused("rollout-puller repair status is not for the current run")
+    if not before.trainer_up or before.trainer_failed or before.trainer_finished:
+        raise Refused("rollout-puller repair requires a healthy active trainer")
+    if not before.orch_up or before.orch_failed:
+        raise Refused("rollout-puller repair requires a healthy active orchestrator")
+    if before.legacy_batch_sync:
+        raise Refused("rollout-puller repair refuses a legacy batch publisher")
+    if before.batch_sync:
+        raise Refused("rollout puller is already healthy; duplicate launch refused")
+    if rollout_transfer_backend != "b2_s3":
+        raise Refused("rollout-puller repair requires b2_s3")
+    run_dir = _cold_run_paths(run)[2]
+    helper_path = "training_ops/runtime/h200/b2_rollout.py"
+    if not deploy(helper_path, nodes=[orchestrator_host, trainer_head]):
+        raise Refused(f"rollout-puller repair deployment failed: {helper_path}")
+    script_path = "training_ops/runtime/china/pull_rollout_batches.sh"
+    if not deploy(script_path, nodes=[trainer_head]):
+        raise Refused(f"rollout-puller repair deployment failed: {script_path}")
+    _remote_ok(
+        trainer_head,
+        _rollout_pull_command(run_dir, "start"),
+        "rollout puller repair",
+        timeout=60,
+    )
+    after = status(run, quiet=True)
+    if (
+        after.run != run
+        or not after.trainer_up
+        or after.trainer_failed
+        or after.trainer_finished
+        or not after.orch_up
+        or after.orch_failed
+        or not after.batch_sync
+    ):
+        raise Refused("rollout-puller repair did not verify healthy exact-run state")
+    return f"rollout puller repaired for {run}; trainer and orchestrator were not restarted"
 
 
 def _repair_adapter_server(force: bool = False) -> str:
@@ -12934,7 +12981,7 @@ usage = f"""training-ops <action> [args]
   versions [package ...]        show installed package versions
   watch [hours] [seconds]       monitor in the foreground
   watch-rollouts                 stream H200 rollout progress in the foreground
-  repair <name>                 repair an engine, adapter server, orchestrator, supervisors, or microbatch sync
+  repair <name>                 repair an engine, adapter server, orchestrator, supervisors, rollout-puller, or microbatch sync
   deploy <path>                 copy one repository file
   start <run> [cold|fresh|restart] [config-dir]  start one run config directory
   archive <run> [step ...]      upload stable old LoRA adapters

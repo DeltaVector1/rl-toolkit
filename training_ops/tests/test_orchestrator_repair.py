@@ -38,6 +38,102 @@ def _load_function(path, name, namespace=None):
 
 
 class OrchestratorRepairTest(unittest.TestCase):
+    @staticmethod
+    def _puller_status(*, batch_sync=False, trainer_up=True, orch_up=True):
+        return SimpleNamespace(
+            run="active-run",
+            trainer_up=trainer_up,
+            trainer_failed=False,
+            trainer_finished=False,
+            orch_up=orch_up,
+            orch_failed=False,
+            batch_sync=batch_sync,
+            legacy_batch_sync=False,
+        )
+
+    def test_rollout_puller_repair_starts_only_exact_puller_and_verifies_health(self):
+        before = self._puller_status()
+        after = self._puller_status(batch_sync=True)
+        with mock.patch.object(training_ops, "rollout_transfer_direction", "trainer_pull"), mock.patch.object(
+            training_ops, "rollout_transfer_backend", "b2_s3"
+        ), mock.patch.object(
+            training_ops, "current_run", return_value="active-run"
+        ), mock.patch.object(training_ops, "status", side_effect=[before, after]), mock.patch.object(
+            training_ops, "_cold_run_paths", return_value=("/runs", "/runs", "/runs/active-run/run_active-run")
+        ), mock.patch.object(training_ops, "deploy") as deploy, mock.patch.object(
+            training_ops, "_remote_ok"
+        ) as remote:
+            result = training_ops.repair("rollout-puller")
+        self.assertIn("rollout puller repaired", result)
+        remote.assert_called_once()
+        command = remote.call_args.args[1]
+        self.assertIn("pull_rollout_batches.sh start", command)
+        self.assertNotIn("direct_adapter_route", command)
+        self.assertEqual(
+            deploy.call_args_list,
+            [
+                mock.call(
+                    "training_ops/runtime/h200/b2_rollout.py",
+                    nodes=[training_ops.orchestrator_host, training_ops.trainer_head],
+                ),
+                mock.call("training_ops/runtime/china/pull_rollout_batches.sh", nodes=[training_ops.trainer_head]),
+            ],
+        )
+
+    def test_rollout_puller_repair_refuses_duplicate_launch(self):
+        with mock.patch.object(training_ops, "rollout_transfer_direction", "trainer_pull"), mock.patch.object(
+            training_ops, "rollout_transfer_backend", "b2_s3"
+        ), mock.patch.object(
+            training_ops, "current_run", return_value="active-run"
+        ), mock.patch.object(
+            training_ops, "status", return_value=self._puller_status(batch_sync=True)
+        ), mock.patch.object(training_ops, "_remote_ok") as remote:
+            with self.assertRaisesRegex(training_ops.Refused, "already healthy"):
+                training_ops.repair("rollout-puller")
+        remote.assert_not_called()
+
+    def test_rollout_puller_repair_refuses_helper_deploy_failure(self):
+        with mock.patch.object(training_ops, "rollout_transfer_direction", "trainer_pull"), mock.patch.object(
+            training_ops, "rollout_transfer_backend", "b2_s3"
+        ), mock.patch.object(
+            training_ops, "current_run", return_value="active-run"
+        ), mock.patch.object(
+            training_ops, "status", return_value=self._puller_status()
+        ), mock.patch.object(training_ops, "deploy", return_value=False) as deploy, mock.patch.object(
+            training_ops, "_remote_ok"
+        ) as remote:
+            with self.assertRaisesRegex(training_ops.Refused, "b2_rollout.py"):
+                training_ops.repair("rollout-puller")
+        deploy.assert_called_once()
+        remote.assert_not_called()
+
+    def test_rollout_puller_repair_refuses_script_deploy_failure(self):
+        with mock.patch.object(training_ops, "rollout_transfer_direction", "trainer_pull"), mock.patch.object(
+            training_ops, "rollout_transfer_backend", "b2_s3"
+        ), mock.patch.object(
+            training_ops, "current_run", return_value="active-run"
+        ), mock.patch.object(
+            training_ops, "status", return_value=self._puller_status()
+        ), mock.patch.object(
+            training_ops, "deploy", side_effect=[True, False]
+        ) as deploy, mock.patch.object(training_ops, "_remote_ok") as remote:
+            with self.assertRaisesRegex(training_ops.Refused, "pull_rollout_batches.sh"):
+                training_ops.repair("rollout-puller")
+        self.assertEqual(deploy.call_count, 2)
+        remote.assert_not_called()
+
+    def test_rollout_puller_repair_refuses_unhealthy_active_state(self):
+        with mock.patch.object(training_ops, "rollout_transfer_direction", "trainer_pull"), mock.patch.object(
+            training_ops, "rollout_transfer_backend", "b2_s3"
+        ), mock.patch.object(
+            training_ops, "current_run", return_value="active-run"
+        ), mock.patch.object(
+            training_ops, "status", return_value=self._puller_status(trainer_up=False)
+        ), mock.patch.object(training_ops, "_remote_ok") as remote:
+            with self.assertRaisesRegex(training_ops.Refused, "healthy active trainer"):
+                training_ops.repair("rollout-puller")
+        remote.assert_not_called()
+
     def test_orchestrator_image_preflight_returns_immutable_id(self):
         image_id = "sha256:" + "d" * 64
         with mock.patch.object(

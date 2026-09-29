@@ -184,6 +184,28 @@ class B2RolloutTest(unittest.TestCase):
         self.partial = self.root / "destination/.incoming/step_2/train_rollouts.bin"
         self.final = self.root / "destination/rollouts/step_2/train_rollouts.bin"
 
+    def test_main_maps_timeout_to_typed_transient_exit_without_details(self):
+        for error in (TimeoutError("url=https://secret.invalid"), subprocess.TimeoutExpired("curl", 300)):
+            with self.subTest(error=type(error).__name__), patch.object(tool, "receive", side_effect=error), patch.object(
+                sys, "stdin", io.StringIO("{}")
+            ), contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(
+                    tool.main(
+                        [
+                            "receive",
+                            "--source",
+                            str(self.source),
+                            "--partial",
+                            str(self.partial),
+                            "--final",
+                            str(self.final),
+                        ]
+                    ),
+                    75,
+                )
+                self.assertIn('"b2_transient_failure": true', stderr.getvalue())
+                self.assertNotIn("secret.invalid", stderr.getvalue())
+
     def publish(self):
         return tool.publish(self.client, "fixture", self.source, self.runs)
 
@@ -525,7 +547,8 @@ class B2RolloutTest(unittest.TestCase):
             SimpleNamespace(returncode=28, stdout="000"),
             SimpleNamespace(returncode=0, stdout="302"),
         ):
-            with self.subTest(result=result), self.assertRaises(ValueError):
+            error = TimeoutError if result.returncode == 28 else ValueError
+            with self.subTest(result=result), self.assertRaises(error):
                 tool.receive(
                     value,
                     str(self.source),
@@ -706,10 +729,17 @@ from pathlib import Path
 operation=sys.argv[2]
 source=Path(os.environ["B2_TEST_SOURCE"])
 digest=hashlib.sha256(source.read_bytes()).hexdigest()
+operations_name=os.environ.get("B2_TEST_OPS")
+if operations_name:
+ operations=Path(operations_name)
+ with operations.open("a") as stream: stream.write(operation+"\\n")
 if operation=="publish":
  print(json.dumps(dict(source=str(source),size=source.stat().st_size,sha256=digest,uid=source.stat().st_uid,gid=source.stat().st_gid,mode=source.stat().st_mode&0o777,key="rollout-transfer/v1/alpha/"+"a"*32+"/step_0/"+digest+".bin",version_id="version-1",url="https://example.invalid/secret-signed-url",expires_at=int(time.time())+600)))
 elif operation=="ack":
  assert Path(str(source)+".delivered").read_text().strip()==digest
+ if os.environ.get("B2_TEST_ACK_FAIL_ONCE") and not Path(os.environ["B2_TEST_ACK_FAIL_ONCE"]).exists():
+  Path(os.environ["B2_TEST_ACK_FAIL_ONCE"]).write_text("remote object deleted")
+  raise SystemExit(75)
  Path(os.environ["B2_TEST_ACK"]).write_text("deleted exact version")
 elif operation=="preflight": pass
 else: raise SystemExit(1)
@@ -761,6 +791,87 @@ Path(sys.argv[sys.argv.index("--output")+1]).write_bytes(body)
             self.assertNotIn("train_rollouts.bin", (root / "rsync").read_text())
             self.assertNotIn("secret-signed-url", result.stdout + result.stderr)
             self.assertFalse(list(destination.rglob("*.b2-ack.json")))
+
+    def test_ack_timeout_reuses_pending_ack_without_republishing(self):
+        fixture = RolloutPullTest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            binary = source / "rollouts/step_0/train_rollouts.bin"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"ack retry payload")
+            control = source / "control/orch.toml"
+            control.parent.mkdir()
+            control.write_text("control")
+            os.utime(control, (time.time() - 5, time.time() - 5))
+            env = fixture.environment(source, destination, fixture.tools(directory))
+            interpreter = root / "tools/b2-python"
+            interpreter.write_text(
+                """#!/usr/bin/env python3
+import hashlib,json,os,sys,time
+from pathlib import Path
+operation=sys.argv[2]
+source=Path(os.environ["B2_TEST_SOURCE"])
+digest=hashlib.sha256(source.read_bytes()).hexdigest()
+operations=Path(os.environ["B2_TEST_OPS"])
+with operations.open("a") as stream: stream.write(operation+"\\n")
+if operation=="publish":
+ print(json.dumps(dict(source=str(source),size=source.stat().st_size,sha256=digest,uid=source.stat().st_uid,gid=source.stat().st_gid,mode=source.stat().st_mode&0o777,key="rollout-transfer/v1/alpha/"+"a"*32+"/step_0/"+digest+".bin",version_id="version-1",url="https://example.invalid/secret-signed-url",expires_at=int(time.time())+600)))
+elif operation=="ack":
+ assert Path(str(source)+".delivered").read_text().strip()==digest
+ if not Path(os.environ["B2_TEST_ACK_FAIL_ONCE"]).exists():
+  Path(os.environ["B2_TEST_ACK_FAIL_ONCE"]).write_text("remote object deleted")
+  raise SystemExit(75)
+ Path(os.environ["B2_TEST_ACK"]).write_text("deleted exact version")
+elif operation=="preflight": pass
+else: raise SystemExit(1)
+"""
+            )
+            interpreter.chmod(0o755)
+            curl = root / "tools/curl"
+            curl.write_text(
+                """#!/usr/bin/env python3
+import os,sys
+from pathlib import Path
+assert sys.argv[1]=="--disable"
+assert "secret-signed-url" in sys.stdin.read()
+body=Path(os.environ["B2_TEST_SOURCE"]).read_bytes()
+if "--range" in sys.argv:
+ start,end=map(int,sys.argv[sys.argv.index("--range")+1].split("-"))
+ Path(sys.argv[sys.argv.index("--dump-header")+1]).write_text(f"HTTP/1.1 206 OK\\nContent-Range: bytes {start}-{end}/{len(body)}\\nContent-Length: {end-start+1}\\n\\n")
+ body=body[start:end+1]
+ print(f"206\\t192.0.2.1\\t1.1\\t0.01\\t0.02\\t0.03\\t{len(body)}",end="")
+else: print("200",end="")
+Path(sys.argv[sys.argv.index("--output")+1]).write_bytes(body)
+"""
+            )
+            curl.chmod(0o755)
+            operations = root / "operations"
+            env.update(
+                ROLLOUT_TRANSFER_BACKEND="b2_s3",
+                B2_DOWNLOAD_WORKERS="8",
+                B2_DOWNLOAD_THRESHOLD_BYTES="1",
+                B2_ROLLOUT_PYTHON=str(interpreter),
+                B2_TEST_SOURCE=str(binary),
+                B2_TEST_ACK=str(root / "acked"),
+                B2_TEST_ACK_FAIL_ONCE=str(root / "ack-failed"),
+                B2_TEST_OPS=str(operations),
+                ONCE="1",
+            )
+            result = subprocess.run(
+                ["bash", str(puller), "run"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(operations.read_text().splitlines().count("publish"), 1)
+            self.assertEqual(operations.read_text().splitlines().count("ack"), 2)
+            self.assertTrue((root / "acked").exists())
+            self.assertFalse(list(destination.rglob("*.b2-ack.json")))
+            self.assertNotIn("secret-signed-url", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
