@@ -22,7 +22,7 @@ class ResumeStartTest(unittest.TestCase):
         with (config_dir / "inference.toml").open("rb") as stream:
             inference = tomllib.load(stream)
 
-        self.assertEqual(trainer["max_steps"], 50)
+        self.assertEqual(trainer["max_steps"], 244)
         self.assertEqual(
             trainer["parity_guard"],
             {
@@ -33,7 +33,7 @@ class ResumeStartTest(unittest.TestCase):
         )
         self.assertTrue(trainer["enable_router_replay"])
         self.assertTrue(inference["enable_return_routed_experts"])
-        self.assertEqual(orchestrator["max_steps"], 50)
+        self.assertEqual(orchestrator["max_steps"], 244)
         self.assertEqual(orchestrator["renderer"]["reasoning_parser"], "think")
         self.assertEqual(
             trainer["output_dir"],
