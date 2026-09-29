@@ -19,6 +19,26 @@
   multipart cleanup; no duplicate accepted artifact; no URL, key, bucket, or
   credential leakage; and the unchanged shared deadline.
 
+## B2 rollout-puller timeout recovery
+
+- **Measured failure.** The B2 helper returned exit 1 for its operation
+  `TimeoutError`; the puller mapped every helper, receive, and acknowledgement
+  error to exit 76, so a timeout stopped the puller without bounded recovery.
+- **Plan.** Return a typed transient exit 75 only for `TimeoutError` and
+  `subprocess.TimeoutExpired`; preserve it through receive, acknowledgement,
+  scan, and the shell launcher. Retry a failed B2 item at most three total
+  attempts with short bounded backoff and the existing 300-second deadline per
+  attempt. Keep integrity, authentication, unknown, and signal failures
+  terminal. Preserve durable partial range records and pending ACKs, and log
+  only attempt, elapsed time, bytes, and sanitized error type.
+- **Repair gate.** Add `repair('rollout-puller')` for the exact current run
+  only. Require `trainer_pull`, healthy active trainer and orchestrator,
+  inactive batch sync, exact launcher state, and verified post-start health;
+  use the existing puller launcher directly and never restart trainer,
+  orchestrator, engine, or adapter routing. Tests cover transient recovery,
+  exhausted retries, permanent errors, ACK idempotency, duplicate launch
+  refusal, and command scope.
+
 ## Pre-batch group progress telemetry
 
 - **Measured production baseline.** The `h200b` snapshot contained 849 trace
