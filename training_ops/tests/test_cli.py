@@ -1,7 +1,9 @@
 import contextlib
 import io
+import shlex
 import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import training_ops
@@ -80,6 +82,69 @@ class CliTest(unittest.TestCase):
                 training_ops.cli()
         self.assertEqual(exited.exception.code, 2)
         cleanup.assert_not_called()
+
+    def test_watch_rollouts_builds_exact_h200_foreground_command(self):
+        options = ["-p", "20099", "-i", "/tmp/h200-key"]
+        destination = "root@38.255.28.19"
+        with mock.patch.object(
+            training_ops,
+            "_ssh_destination",
+            return_value=(options, [], destination),
+        ) as ssh_destination, mock.patch.object(
+            training_ops.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=0),
+        ) as run_process:
+            self.assertEqual(training_ops._watch_rollouts_action([]), 0)
+
+        ssh_destination.assert_called_once_with(training_ops.orchestrator_host)
+        remote_script = shlex.join(
+            [
+                "bash",
+                f"{training_ops.runtime_root}/h200/watch_rollouts.sh",
+                training_ops.orchestrator_container,
+                f"{training_ops.runtime_root}/h200/watch_rollouts_tqdm.py",
+            ]
+        )
+        run_process.assert_called_once_with(
+            training_ops.ssh_command + options + ["-tt", destination, remote_script],
+            check=False,
+        )
+
+    def test_watch_rollouts_rejects_arguments(self):
+        with self.assertRaisesRegex(training_ops.Refused, "does not accept arguments"):
+            training_ops._watch_rollouts_action(["10m"])
+
+    def test_watch_rollouts_propagates_remote_failure(self):
+        with mock.patch.object(
+            training_ops.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=17),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exit code 17"):
+                training_ops._watch_rollouts_action([])
+
+    def test_watch_rollouts_propagates_keyboard_interrupt(self):
+        with mock.patch.object(
+            training_ops.subprocess,
+            "run",
+            side_effect=KeyboardInterrupt,
+        ) as run_process:
+            with self.assertRaises(KeyboardInterrupt):
+                training_ops._watch_rollouts_action([])
+        run_process.assert_called_once()
+
+    def test_watch_rollouts_fallback_uses_deployed_repository_root(self):
+        script_path = (
+            training_ops.repo_root / "training_ops/runtime/h200/watch_rollouts.sh"
+        )
+        script = script_path.read_text(encoding="utf-8")
+        self.assertIn(
+            'repository=$(cd -- "$runtime_dir/../../.." && pwd)',
+            script,
+        )
+        runtime_dir = Path(training_ops.remote_repo) / "training_ops/runtime/h200"
+        self.assertEqual((runtime_dir / "../../..").resolve(), Path(training_ops.remote_repo))
 
 
 if __name__ == "__main__":

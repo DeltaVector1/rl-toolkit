@@ -12864,6 +12864,27 @@ def _stop_action(arguments: list[str]):
     return stop()
 
 
+def _watch_rollouts_action(arguments: list[str]):
+    if arguments:
+        raise Refused("watch-rollouts does not accept arguments")
+    ssh_options, _, destination = _ssh_destination(orchestrator_host)
+    remote_script = shlex.join(
+        [
+            "bash",
+            f"{runtime_root}/h200/watch_rollouts.sh",
+            orchestrator_container,
+            f"{runtime_root}/h200/watch_rollouts_tqdm.py",
+        ]
+    )
+    command = ssh_command + ssh_options + ["-tt", destination, remote_script]
+    result = subprocess.run(command, check=False)
+    if result.returncode:
+        raise RuntimeError(
+            f"watch-rollouts failed on {orchestrator_host} with exit code {result.returncode}"
+        )
+    return result.returncode
+
+
 actions = {
     "status": lambda a: status(*a),
     "acceptance": lambda a: acceptance(*a),
@@ -12875,6 +12896,7 @@ actions = {
     "remote": _remote_action,
     "versions": lambda a: package_versions(*a),
     "watch": lambda a: watch(*[float(x) for x in a]),
+    "watch-rollouts": _watch_rollouts_action,
     "repair": lambda a: repair(*a),
     "deploy": lambda a: deploy(*a),
     "start": _start_action,
@@ -12911,6 +12933,7 @@ usage = f"""training-ops <action> [args]
   remote <group> <command>      run on trainer, inference, or all hosts
   versions [package ...]        show installed package versions
   watch [hours] [seconds]       monitor in the foreground
+  watch-rollouts                 stream H200 rollout progress in the foreground
   repair <name>                 repair an engine, adapter server, orchestrator, supervisors, or microbatch sync
   deploy <path>                 copy one repository file
   start <run> [cold|fresh|restart] [config-dir]  start one run config directory
