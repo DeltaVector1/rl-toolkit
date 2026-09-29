@@ -72,6 +72,9 @@ class WatchRolloutsScriptTest(unittest.TestCase):
         follow_exit=0,
         progress_lines=True,
         marker_final_state=None,
+        seed_log="",
+        stale_seed_log="",
+        real_renderer=False,
     ):
         script_path = Path(__file__).parents[1] / "runtime/h200/watch_rollouts.sh"
         def normalize_state(value):
@@ -106,16 +109,28 @@ class WatchRolloutsScriptTest(unittest.TestCase):
                 "    case \"$*\" in\n"
                 "      *'-c import tqdm'*) exit 0 ;;\n"
                 "    esac\n"
+                "    if [ \"${REAL_RENDERER:-0}\" = 1 ]; then\n"
+                "      python3 \"$REAL_RENDERER_PATH\" \"${@: -1}\"\n"
+                "      exit $?\n"
+                "    fi\n"
                 "    cat >/dev/null\n"
+                "    printf 'RENDERER_STEP %s\\n' \"${@: -1}\"\n"
                 "    exit \"${RENDERER_EXIT:-0}\"\n"
                 "    ;;\n"
                 "  logs)\n"
                 "    case \"$*\" in\n"
                 "      *'--tail 20000'*)\n"
+                "        if [[ \"$*\" == *'--since '* ]]; then\n"
+                "          [ -z \"${SEED_LOG:-}\" ] || printf '%s\\n' \"$SEED_LOG\"\n"
+                "        else\n"
+                "          [ -z \"${STALE_SEED_LOG:-}\" ] || printf '%s\\n' \"$STALE_SEED_LOG\"\n"
+                "          [ -z \"${SEED_LOG:-}\" ] || printf '%s\\n' \"$SEED_LOG\"\n"
+                "        fi\n"
                 "        if [ \"${CLEAN_MARKER:-0}\" = 1 ]; then printf '%s\\n' 'Orchestrator finished.'; fi\n"
                 "        exit 0\n"
                 "        ;;\n"
                 "      *'--tail 200'*)\n"
+                "        if [[ \"$*\" != *'--since '* ]] && [ -n \"${STALE_SEED_LOG:-}\" ]; then printf '%s\\n' \"$STALE_SEED_LOG\"; fi\n"
                 "        if [ \"${PROGRESS_LINES:-1}\" = 1 ]; then printf '%s\\n' 'PIPELINE_TELEMETRY accepted_buffer=1 accepted_target=2'; fi\n"
                 "        ;;\n"
                 "      *'--follow'*)\n"
@@ -145,6 +160,12 @@ class WatchRolloutsScriptTest(unittest.TestCase):
                     "CLEAN_MARKER": "1" if clean_marker else "0",
                     "FOLLOW_EXIT": str(follow_exit),
                     "PROGRESS_LINES": "1" if progress_lines else "0",
+                    "SEED_LOG": seed_log,
+                    "STALE_SEED_LOG": stale_seed_log,
+                    "REAL_RENDERER": "1" if real_renderer else "0",
+                    "REAL_RENDERER_PATH": str(
+                        Path(__file__).parents[1] / "runtime/h200/watch_rollouts_tqdm.py"
+                    ),
                 }
             )
             return subprocess.run(
@@ -375,16 +396,76 @@ class WatchRolloutsScriptTest(unittest.TestCase):
         self.assertIn("status=exited exit_code=0 oom_killed=false", result.stdout)
         self.assertIn("completed normally", result.stdout)
 
+    def test_resume_marker_seeds_step(self):
+        result = self.run_script(
+            "true|running|0|false|",
+            "true|running|0|false|",
+            seed_log="Resuming orchestrator at rollout batch 48 from policy v47",
+        )
+
+        self.assertIn("RENDERER_STEP 48", result.stdout)
+
+    def test_success_after_resume_advances_step(self):
+        result = self.run_script(
+            "true|running|0|false|",
+            "true|running|0|false|",
+            seed_log=(
+                "Resuming orchestrator at rollout batch 48 from policy v47\n"
+                "SUCCESS Step 48"
+            ),
+        )
+
+        self.assertIn("RENDERER_STEP 49", result.stdout)
+
+    def test_pre_start_resume_marker_is_excluded(self):
+        result = self.run_script(
+            "true|running|0|false|",
+            "true|running|0|false|",
+            stale_seed_log="Resuming orchestrator at rollout batch 99 from policy v98",
+        )
+
+        self.assertIn("RENDERER_STEP 1", result.stdout)
+
+    def test_malformed_resume_marker_is_ignored(self):
+        result = self.run_script(
+            "true|running|0|false|",
+            "true|running|0|false|",
+            seed_log="Resuming orchestrator at rollout batch 48 from policy v47oops",
+        )
+
+        self.assertIn("RENDERER_STEP 1", result.stdout)
+
+    def test_real_renderer_ignores_old_success_for_current_resume(self):
+        result = self.run_script(
+            "true|running|0|false|",
+            "true|running|0|false|",
+            seed_log="Resuming orchestrator at rollout batch 48 from policy v47",
+            stale_seed_log="SUCCESS Step 99",
+            real_renderer=True,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Step 48 rollouts", result.stdout)
+        self.assertNotIn("Step 100 rollouts", result.stdout)
+
+    def test_cold_start_uses_step_one(self):
+        result = self.run_script(
+            "true|running|0|false|",
+            "true|running|0|false|",
+        )
+
+        self.assertIn("RENDERER_STEP 1", result.stdout)
+
     def test_seeds_tail_only_and_bounds_completed_step_scan(self):
         script = (
             Path(__file__).parents[1] / "runtime/h200/watch_rollouts.sh"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            'docker logs --tail 20000 "$container"',
+            'docker logs --since "$initial_container_started_at" --tail 20000 "$container_id"',
             script,
         )
         self.assertIn(
-            'docker logs --tail 200 "$container"',
+            'docker logs --since "$initial_container_started_at" --tail 200 "$container_id"',
             script,
         )
         self.assertNotIn(
@@ -404,6 +485,7 @@ class WatchRolloutsScriptTest(unittest.TestCase):
             script,
         )
         self.assertIn("Orchestrator finished", script)
+        self.assertIn("Resuming orchestrator at rollout batch", script)
         self.assertIn(
             'docker logs --since "$initial_container_started_at" --tail 20000 "$container_id"',
             script,

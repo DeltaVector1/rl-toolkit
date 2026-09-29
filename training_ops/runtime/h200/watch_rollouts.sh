@@ -103,17 +103,22 @@ fi
 sudo docker exec "$container" /app/.venv/bin/python -c 'import tqdm'
 
 stream_since=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')
-completed_step=$(
-  sudo docker logs --tail 20000 "$container" 2>&1 |
+step_event=$(
+  sudo docker logs --since "$initial_container_started_at" --tail 20000 "$container_id" 2>&1 |
     sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' |
-    grep -aE 'SUCCESS[[:space:]]+Step' |
+    grep -aE 'SUCCESS[[:space:]]+Step[[:space:]]+[0-9]+|Resuming orchestrator at rollout batch[[:space:]]+[0-9]+[[:space:]]+from policy v[0-9]+[[:space:]]*$' |
     tail -1 |
-    sed -nE 's/.*SUCCESS[[:space:]]+Step[[:space:]]+([0-9]+).*/\1/p' || true
+    sed -nE \
+      -e 's/.*SUCCESS[[:space:]]+Step[[:space:]]+([0-9]+).*/success \1/p' \
+      -e 's/.*Resuming orchestrator at rollout batch[[:space:]]+([0-9]+)[[:space:]]+from policy v[0-9]+[[:space:]]*$/resume \1/p' || true
 )
-completed_step=${completed_step:-0}
-collecting_step=$((completed_step + 1))
+collecting_step=1
+case "$step_event" in
+  success\ *) collecting_step=$(( ${step_event#success } + 1 )) ;;
+  resume\ *) collecting_step=${step_event#resume } ;;
+esac
 latest_line=$(
-  sudo docker logs --tail 200 "$container" 2>&1 |
+  sudo docker logs --since "$initial_container_started_at" --tail 200 "$container_id" 2>&1 |
     sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' |
     grep -aE 'PIPELINE_TELEMETRY[[:space:]]|Train batch|SUCCESS[[:space:]]+Step' |
     tail -1 || true
