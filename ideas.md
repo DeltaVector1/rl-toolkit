@@ -1738,3 +1738,22 @@ only after measured learning.
   source/object mismatch, changed layout, special-file/symlink, concurrent
   receiver, and full-hash-failure tests, plus the existing B2 and rollout
   regressions. This task performs no live or network action.
+
+## Current active parity reward correction (2026-09-29)
+
+- **Current status.** The active `trinity-decensor-experimental-parity` profile
+  selects `decensor-experimental-v1` and uses the refusal-primary additive
+  tie-break `base_reward + 0.01 * secondary_quality`. This behavior was
+  introduced by commit `42d182be`.
+- The local experimental scorer is
+  `environments/decensor-experimental/src/decensor_experimental_v1/scoring.py`
+  with SHA-256
+  `752d8d658abb2f6dff0125359a3033bfe09090c39c8c3678ab540707e6c6ff90`.
+  The old `environments/decensor/src/decensor_v1/scoring.py` remains the
+  multiplicative reward implementation. At 05:01 UTC, H200 verification
+  matched the scoring SHA `752d8d...6ff90` and taskset SHA `41ea22...e970`;
+  the deployed orchestrator config was `54a655...fdf6`, and the active
+  container command used the parity config.
+- Earlier statements near ideas lines 151, 162, and 467 are historical and
+  stale for this active parity run. Keep their historical measurements
+  unchanged; they do not describe the current profile selection or formula.
