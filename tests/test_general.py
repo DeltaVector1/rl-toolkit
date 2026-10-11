@@ -100,6 +100,102 @@ def test_loading_preserves_prompt_and_is_lazy(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_terminal_native_selection_worker_rebuild_and_execution_limits(monkeypatch):
+    import verifiers.v1 as vf
+    import xiaomi_general.taskset as module
+    from verifiers.v1.agent import resolve_rollout_timeouts
+    from verifiers.v1.configs.agent import TimeoutConfig
+    from verifiers.v1.runtimes.prime import PrimeConfig, PrimeRuntime
+    from verifiers.v1.serve.server import EnvServer
+    from verifiers.v1.utils.compile import resolve_runtime_config
+
+    instance = {
+        "dataset_type": "terminal_bench", "instance_id": "terminal-test",
+        "docker_image": "image", "agent_timeout_sec": 900,
+        "cpus": 1, "memory_mb": 2048, "storage_mb": 10240,
+        "allow_internet": False, "verifier_timeout_sec": 120,
+        "tests_files": {"test.sh": base64.b64encode(b"exit 0").decode()},
+    }
+    monkeypatch.setattr(module, "load_rows", lambda *_: [
+        {"prompt": "Repair the tree", "extra_info": {"instance_json": json.dumps(instance)}}
+    ])
+    monkeypatch.setattr(module, "resolve_image", lambda *_: "published-image")
+    taskset = GeneralTaskset(GeneralConfig())
+    task = next(iter(taskset.include(ids=["terminal-test"])))
+    server = SimpleNamespace(
+        task_cls=taskset.task_type(), data_cls=taskset.task_type().data_type(),
+        env=SimpleNamespace(config=SimpleNamespace(taskset=taskset.config)),
+    )
+    rebuilt = EnvServer._build_task(server, task.data.model_dump(mode="json"))
+    assert type(task) is type(rebuilt) is GeneralTask
+    for current in (task, rebuilt):
+        assert current.toolsets(current.config) == []
+        assert current.data.agent_user is None
+        assert current.data.resources == vf.TaskResources(cpu=1, memory=2, disk=10)
+        assert current.data.network_allow == []
+        assert resolve_rollout_timeouts(TimeoutConfig(), current).agent == 900
+        assert resolve_rollout_timeouts(TimeoutConfig(rollout=30), current).agent == 30
+    assert len(GeneralTask.toolsets(taskset.config.task)) == 1  # Native class discovery.
+    general = GeneralTask(GeneralData(instance={"dataset_type": "general_agent"}))
+    assert len(general.toolsets(general.config)) == 1
+    config = resolve_runtime_config(PrimeConfig(), rebuilt)
+    assert (config.cpu, config.memory, config.disk, config.workdir) == (1, 2, 10, "/app")
+    assert config.allow == [] and config.block == ["*"]
+    override = resolve_runtime_config(PrimeConfig(cpu=3, memory=4, disk=20), rebuilt)
+    assert (override.cpu, override.memory, override.disk) == (3, 4, 20)
+
+    policies = []
+
+    class Client:
+        async def set_network(self, sandbox, **policy):
+            policies.append(policy)
+            return SimpleNamespace(applied=True)
+
+    runtime = object.__new__(PrimeRuntime)
+    vf.Runtime.__init__(runtime)
+    runtime.config = config
+    runtime.info = SimpleNamespace(id="fixture")
+    runtime._client = Client()
+    await runtime.prepare_execution(["https://model.fixture/v1"])
+    assert policies == [{"allow": ["model.fixture"]}]
+
+
+@pytest.mark.asyncio
+async def test_terminal_setup_and_native_bash_assets_stay_outside_workspace(tmp_path):
+    import verifiers.v1 as vf
+    from pathlib import PurePosixPath
+    from verifiers.v1.harnesses.bash.harness import BashHarness, BashHarnessConfig
+    from verifiers.v1.runtimes.prime import PrimeRuntime
+
+    writes, calls = [], []
+
+    class Runtime(PrimeRuntime):
+        async def write(self, path, data):
+            writes.append(path)
+            local = tmp_path / path.lstrip("/")
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_bytes(data)
+
+        async def run(self, argv, env):
+            calls.append((argv, self.process_env(env)))
+            return ProgramResult(0, "/opt/xiaomi-uv-cache/fixture/bin/python\n", "")
+
+    runtime = object.__new__(Runtime)
+    vf.Runtime.__init__(runtime)
+    task = GeneralTask(GeneralData(instance={
+        "dataset_type": "terminal_bench",
+        "tests_files": {"test.sh": base64.b64encode(b"exit 0").decode()},
+    }, workdir="/app"))
+    runtime.env = task.runtime_env()
+    await task.setup(SimpleNamespace(info={}), runtime)
+    assert not writes and not calls  # No common package or hidden verifier uploads.
+    await BashHarness(BashHarnessConfig()).setup(runtime)
+    assert writes and all(not PurePosixPath(p).is_relative_to("/app") for p in writes)
+    assert calls[0][1]["UV_CACHE_DIR"] == "/opt/xiaomi-uv-cache"
+    assert calls[0][1]["UV_PYTHON_INSTALL_DIR"] == "/opt/xiaomi-python"
+
+
+@pytest.mark.asyncio
 async def test_native_tools_keep_names_signatures_and_task_caps(tmp_path, monkeypatch):
     import inspect
     import verifiers.v1 as vf
@@ -347,7 +443,7 @@ def test_submission_paths_keep_regular_files_and_internal_links(tmp_path):
 
 
 @pytest.mark.parametrize("name", ["answer.md", ".hidden", ".vf-venv"])
-def test_submission_paths_reject_private_aliases_including_hidden_names(tmp_path, name):
+def test_submission_paths_remove_private_aliases_including_hidden_names(tmp_path, name):
     import subprocess
     import sys
 
@@ -360,8 +456,8 @@ def test_submission_paths_reject_private_aliases_including_hidden_names(tmp_path
         [sys.executable, "-I", "-c", VALIDATE_SUBMISSION, str(workspace)],
         capture_output=True, text=True,
     )
-    assert result.returncode == 42
-    assert name in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (workspace / name).is_symlink()
     assert private.read_text() == "private fixture"
 
 
@@ -379,7 +475,34 @@ def test_submission_paths_do_not_skip_writable_native_named_directories(tmp_path
         [sys.executable, "-I", "-c", VALIDATE_SUBMISSION, str(workspace)],
         capture_output=True, text=True,
     )
-    assert result.returncode == 42
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (native / "alias").is_symlink()
+    assert (tmp_path / "private").read_text() == "private fixture"
+
+
+def test_submission_keeps_answer_with_real_venv_and_dangling_link(tmp_path):
+    import subprocess
+    import sys
+    import venv
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "answer.md").write_text("ordinary answer")
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(workspace / ".venv")
+    (workspace / "dangling").symlink_to("missing")
+    (workspace / "internal").symlink_to("answer.md")
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", VALIDATE_SUBMISSION, str(workspace)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (workspace / "answer.md").read_text() == "ordinary answer"
+    assert (workspace / "internal").is_symlink()
+    assert not (workspace / "dangling").is_symlink()
+    assert (workspace / ".venv" / "pyvenv.cfg").is_file()
+    for link in workspace.rglob("*"):
+        if link.is_symlink():
+            assert link.resolve(strict=True).is_relative_to(workspace)
 
 
 @pytest.mark.parametrize("stuck", [False, True])
@@ -432,7 +555,7 @@ async def test_invalid_submission_scores_zero_without_privileged_upload_or_fallb
         async def run(self, argv, env):
             calls.append((self.user, argv))
             if VALIDATE_SUBMISSION in argv:
-                return ProgramResult(42, "Submission path is outside the workspace: answer.md", "")
+                return ProgramResult(42, "Submission path is not a regular file or directory: answer.md", "")
             return ProgramResult(0, "", "")
 
         async def write(self, *args):

@@ -36,6 +36,8 @@ user switching is rejected. Do not run these tasks on the host subprocess runtim
 After the native harness and tool servers close, finalization stops remaining
 agent-user processes before checking submission files as that user. Files must
 be readable and resolve inside the workspace; internal symlinks are allowed.
+External, dangling, or cyclic symlinks are removed before grading, so an ordinary
+workspace virtualenv does not invalidate the answer or expose protected files.
 Only the protected root-owned `.vf-src` and `.vf-venv` installation directories
 are excluded. Invalid submissions receive zero with a reason in verifier trace
 info; process-control or validation-execution failures remain infrastructure errors.
@@ -54,7 +56,10 @@ malformed, nonfinite, or out-of-range rewards raise infrastructure errors rather
 than silently grading the policy zero. Binary full-score threshold remains
 `1 - 1e-6`. Verifier details and return code are retained in trace info.
 
-The 64 terminal rows have no released environment wrapper. Their supplied inline
+The 64 terminal rows have no released environment wrapper and start no MCP server.
+This choice is derived from each row when constructing `GeneralTask`, including
+native worker and replay reconstruction. No state-server credential is installed
+in the root agent's sandbox. The supplied inline
 base64 `tests_files` are staged under `/tests` only for grading, then the original
 `bash /tests/test.sh` runs in the task image. The adapter reads
 `/logs/verifier/reward.txt`, independently of command exit status: the anti-hack
@@ -62,6 +67,18 @@ guard can exit zero while explicitly writing zero reward. No replacement tests
 or inferred scores are used. This released inline-verifier contract is the port's
 basis for those rows.
 
-General uses the pinned native MCP package bundler to stage the local
+Terminal setup installs no `xiaomi-common` package. The pinned Bash harness stages
+its scripts under `/tmp/vf-scripts`, with the task's uv cache and Python installs
+under `/opt`, outside `/app`. It therefore leaves the task's pristine-tree guard
+intact without deleting workspace files. Each terminal row declares one CPU,
+2048 MiB memory, 10240 MiB disk, a 900-second agent timeout, and no internet.
+These map to native task resources (1 CPU, 2 GB, 10 GB), timeout, and an empty
+network allowlist. Prime applies that policy after trusted setup while retaining
+framework model routes. Explicit native runtime resource and timeout overrides
+retain their normal precedence; a runtime without network-policy support rejects
+the task rather than executing it unrestricted.
+
+General-agent rows use the pinned native MCP package bundler to stage the local
 `xiaomi-common` dependency before Verifiers stages its tool server; this is needed
-because that sibling package has not been published to a package index.
+because that sibling package has not been published to a package index. Its private
+bundler helpers match both supported Verifiers pins; recheck them on an upgrade.

@@ -91,6 +91,16 @@ try:
                     and not entry.st_mode & 0o022):
                 dirs.remove(name)
                 continue
+            if path.is_symlink():
+                try:
+                    resolved = path.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    resolved = None
+                if resolved is None or not resolved.is_relative_to(root):
+                    path.unlink()
+                    if name in dirs:
+                        dirs.remove(name)
+                    continue
             resolved = path.resolve(strict=True)
             if not resolved.is_relative_to(root) or not os.access(path, os.R_OK):
                 invalid('Submission path is outside the workspace or unreadable: ' + str(path.relative_to(root)))
@@ -177,6 +187,7 @@ def agent_message_writes(runtime: vf.Runtime, trace_id: str) -> None:
 
 async def install_common(runtime: vf.Runtime) -> None:
     # Native toolset bundling ships its own package only; common is a local sibling.
+    # shortcut: private bundler helpers match both pinned runtimes; revisit on a Verifiers upgrade.
     from verifiers.v1.mcp.launch import _cached_package, _package_dir
 
     name, archive = await _cached_package(Path(_package_dir(XiaomiTasksetConfig)))
@@ -215,6 +226,12 @@ class GeneralConfig(XiaomiTasksetConfig):
 
 class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
     NEEDS_CONTAINER = True
+
+    def __init__(self, data: GeneralData, config: GeneralTaskConfig | None = None) -> None:
+        super().__init__(data, config)
+        if data.instance["dataset_type"] == "terminal_bench":
+            # Workers/replay reconstruct GeneralTask; a loader-only subclass loses this.
+            self.toolsets = lambda config: []
 
     def runtime_env(self):
         return {
@@ -269,7 +286,6 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
 
     async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
         if self.data.instance["dataset_type"] == "terminal_bench":
-            await install_common(runtime)
             inline_tests(self.data.instance)
             return
         if not runtime.supports_user:
@@ -484,8 +500,17 @@ class GeneralTaskset(vf.Taskset[GeneralTask, GeneralConfig]):
                     agent_user="xiaomi_agent" if kind == "general_agent" else None,
                     timeout=vf.TaskTimeout(
                         setup=900,
+                        agent=instance.get("agent_timeout_sec"),
                         scoring=(instance.get("verifier_timeout_sec") or 900) + 120,
                     ),
+                    resources=vf.TaskResources(
+                        cpu=instance.get("cpus"),
+                        memory=instance["memory_mb"] / 1024
+                        if instance.get("memory_mb") else None,
+                        disk=instance["storage_mb"] / 1024
+                        if instance.get("storage_mb") else None,
+                    ),
+                    network_allow=[] if instance.get("allow_internet") is False else ["*"],
                     revision=self.config.revision,
                     task_root=self.config.task_root,
                 ),
