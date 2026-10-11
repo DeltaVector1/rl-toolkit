@@ -20,16 +20,20 @@ PATCH_PATH = "/tmp/_opensource_code_test.patch"
 
 
 def touched_files(patch: str) -> list[str]:
-    """Original two-sided diff-header parsing, with path-boundary validation."""
+    """Read both sides of unquoted Git diff headers, validating path boundaries."""
     paths = []
     for line in patch.splitlines():
-        match = re.match(r"^diff --git a/(.+?) b/(.+)$", line)
-        if match:
-            for path in match.groups():
-                if PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts or "\x00" in path:
-                    raise ValueError(f"Unsafe test patch path: {path!r}")
-                if path not in paths:
-                    paths.append(path)
+        if not line.startswith("diff --git "):
+            continue
+        # Published patches include an ab/ prefix; Git strips one component.
+        match = re.match(r'^diff --git [^/\s"]+/(.+?) [^/\s"]+/(.+)$', line)
+        if not match:
+            raise ValueError(f"Unsupported test patch header: {line!r}")
+        for path in match.groups():
+            if PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts or "\x00" in path:
+                raise ValueError(f"Unsafe test patch path: {path!r}")
+            if path not in paths:
+                paths.append(path)
     return paths
 
 

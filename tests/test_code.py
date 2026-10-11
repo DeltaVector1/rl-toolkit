@@ -57,6 +57,29 @@ def test_patch_paths_cannot_escape():
         touched_files("diff --git a/../../outside b/../../outside")
 
 
+def test_reset_covers_published_nonstandard_prefix(repo):
+    name = "balance_strategy_roundrobin_global_test.go"
+    patch = PATCH.replace("check.txt", name).replace("diff --git a/", "diff --git ab/")
+    base = git(repo, "rev-parse", "HEAD")
+    (repo / name).write_text("agent planted\n")
+    for _ in range(2):
+        subprocess.run(["bash", "-c", reset_command(patch, base)], cwd=repo, check=True)
+        assert not (repo / name).exists()
+        subprocess.run(["git", "apply", "-"], input=patch, text=True, cwd=repo, check=True)
+        assert (repo / name).read_text() == "hidden\n"
+    subprocess.run(["bash", "-c", reset_command(patch, base)], cwd=repo, check=True)
+    assert not (repo / name).exists()
+
+
+@pytest.mark.parametrize("header", [
+    'diff --git "a/quoted\\tpath" "b/quoted\\tpath"',
+    "diff --git missing-prefix missing-prefix",
+])
+def test_unsupported_patch_headers_fail_instead_of_resetting_partial_paths(header):
+    with pytest.raises(ValueError, match="Unsupported test patch header"):
+        touched_files(PATCH + header + "\n")
+
+
 class RecordingRuntime:
     def __init__(self, verifier_rc=0, apply_rc=0, transport_error=False):
         self.calls = []
