@@ -84,6 +84,15 @@ all 925 General-agent manifests: every manifest matched its dataset task
 directory and the adapter's upload/setup/verifier contract. This checked
 metadata compatibility, not execution of all 925 task payloads.
 
+After the Ponytail fixes, the integrated workspace suite passed all 59 tests.
+The Code row `format-code-task-000121` completed in 53 turns with
+`finish_reason=stop`, `agent_completed`, and reward 1.0. Its original verifier
+returned 0; both the base and injected Go tests passed with empty stderr. The
+replay transcript is under
+`outputs/live-code-format-code-task-000121-ponytail/`.
+An earlier replay of this row returned 127 because the image omitted Go from
+`PATH`; the installed-toolchain setup repair made the final replay pass.
+
 The Music row `gK-0768` completed with an untruncated ABC response containing
 56 bars in each of the three voices (`finish_reason=stop`). Its task scorer
 returned `music_score=0.0` with empty stderr, so completion confirms runtime and
@@ -95,12 +104,13 @@ three MIDI channels, no channel conflicts); the scorer rejects responses at
 
 The General accounting review row
 `s3k_0000_accounting_audit_tax_en_t1_rl_008` completed in 9 turns without
-runtime errors, truncation, or timeout. Its original verifier returned 0 and
-rewarded 4 of 6 checks (0.8); the two misses were `protection_statuses` and
-`readiness_conclusion`. The first attempt exposed a sticky-workspace prompt-file
-ownership error before any model turn; after the General fix, the same row ran
-through the original verifier. Its transcript is under
-`outputs/live-general-accounting-audit-fixed/`.
+runtime errors, truncation, or timeout, with `finish_reason=stop` and
+`agent_completed`. Its original verifier returned 0 and scored 0.875 (5 of 6
+checks); `protection_statuses` failed. The first attempt exposed a
+sticky-workspace prompt-file ownership error before any model turn; after the
+General fix, the same row ran through the original verifier. The audited
+transcript is under
+`outputs/live-general-accounting-audit-ponytail/`.
 
 For Xiaomi General, configure the external judge in the controller environment
 before starting the run: `GA_JUDGE_KEY`, `GA_JUDGE_URL`, `GA_JUDGE_MODEL`, and
