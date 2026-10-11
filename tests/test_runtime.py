@@ -8,7 +8,7 @@ from xiaomi_common.runtime import run_shell
 
 
 @pytest.mark.parametrize("timeout", [None, 5.0])
-async def test_shell_preserves_image_path_workdir_and_process_env(tmp_path, timeout):
+async def test_nonlogin_shell_preserves_runtime_path_workdir_and_process_env(tmp_path, timeout):
     tool_dir = tmp_path / "image-bin"
     tool_dir.mkdir()
     tool = tool_dir / "fixture-task-tool"
@@ -24,7 +24,7 @@ async def test_shell_preserves_image_path_workdir_and_process_env(tmp_path, time
             if timeout is not None:
                 assert argv[:3] == ["timeout", "--kill-after=5", "5.0"]
                 argv = argv[3:]  # Run the inner command without requiring GNU timeout on macOS.
-            # Login profiles can replace the container image's configured PATH.
+            # Login profiles can replace the runtime's task or image PATH.
             assert argv[:2] == ["bash", "-c"]
             result = subprocess.run(
                 argv, capture_output=True, text=True,

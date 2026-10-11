@@ -20,22 +20,55 @@ PATCH_PATH = "/tmp/_opensource_code_test.patch"
 
 
 def touched_files(patch: str) -> list[str]:
-    """Read both sides of unquoted Git diff headers, validating path boundaries."""
+    """Read Git and unified file headers, excluding header-like hunk payload."""
     paths = []
-    for line in patch.splitlines():
-        if not line.startswith("diff --git "):
+    old_left = new_left = 0
+    lines = iter(patch.splitlines())
+    for line in lines:
+        if old_left or new_left:
+            if line.startswith("\\"):
+                continue  # Git's "No newline at end of file" marker consumes no lines.
+            if not line or line[0] not in " +-":
+                raise ValueError(f"Unsupported test patch hunk: {line!r}")
+            old_left -= line[0] in " -"
+            new_left -= line[0] in " +"
+            if old_left < 0 or new_left < 0:
+                raise ValueError(f"Invalid test patch hunk length: {line!r}")
             continue
-        # Published patches include an ab/ prefix; Git strips one component.
-        match = re.match(r'^diff --git [^/\s"]+/(.+?) [^/\s"]+/(.+)$', line)
-        if not match:
-            raise ValueError(f"Unsupported test patch header: {line!r}")
-        for path in match.groups():
+        if line.startswith("@@ "):
+            match = re.match(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@", line)
+            if not match:
+                raise ValueError(f"Unsupported test patch hunk: {line!r}")
+            old_left, new_left = (int(count) if count is not None else 1 for count in match.groups())
+            continue
+        if line.startswith("diff --git "):
+            match = re.fullmatch(r'diff --git ([^\s"]+) ([^\s"]+)', line)
+            if not match:
+                raise ValueError(f"Unsupported test patch header: {line!r}")
+            headers = match.groups()
+        elif line.startswith("--- "):
+            new = next(lines, "")
+            if not new.startswith("+++ "):
+                raise ValueError(f"Unsupported test patch header: {line!r}")
+            headers = (line[4:].split("\t", 1)[0], new[4:].split("\t", 1)[0])
+        else:
+            continue
+        for header in headers:
+            if header == "/dev/null":
+                continue
+            # Published patches include an ab/ prefix; git apply strips one component.
+            match = re.fullmatch(r'[^/\s"]+/([^\s"]+)', header)
+            if not match:
+                raise ValueError(f"Unsupported test patch header: {header!r}")
+            path = match[1]
             if PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts or "\x00" in path:
                 raise ValueError(f"Unsafe test patch path: {path!r}")
             if path not in paths:
                 paths.append(path)
+    if old_left or new_left:
+        raise ValueError("Incomplete test patch hunk")
     if not paths:
-        raise ValueError("Test patch has no resettable Git diff headers")
+        raise ValueError("Test patch has no resettable file headers")
     return paths
 
 
@@ -68,14 +101,12 @@ class CodeState(vf.State):
 class XiaomiCodeTask(vf.Task[CodeData, CodeState]):
     NEEDS_CONTAINER = True
 
+    def runtime_env(self) -> dict[str, str]:
+        # Flattened Code images omit ENV; supply the default PATH Docker would give them.
+        return {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+
     async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
         cwd = self.data.workdir
-        # shortcut: Published Go images omit its PATH; remove when those images export it.
-        go_path = await run_shell(runtime, 'if ! command -v go >/dev/null 2>&1 && test -x /usr/local/go/bin/go; then printf %s "/usr/local/go/bin:$PATH"; fi')
-        if go_path.exit_code:
-            raise RuntimeError(f"Cannot inspect task Go environment: {go_path.stderr}")
-        if go_path.stdout:
-            runtime.env["PATH"] = go_path.stdout
         await checked_run(runtime, ["git", "config", "--global", "--add", "safe.directory", cwd])
         exists = await run_shell(runtime, "git rev-parse --git-dir", cwd)
         if exists.exit_code != 0:
@@ -117,8 +148,8 @@ class XiaomiCodeTask(vf.Task[CodeData, CodeState]):
                 "resolved": bool(reward),
                 "test_duration": time.monotonic() - started,
                 "test_command": self.data.test_command,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
+                "stdout": result.stdout[-10000:],
+                "stderr": result.stderr[-4000:],
             }
             return reward
         except Exception as exc:

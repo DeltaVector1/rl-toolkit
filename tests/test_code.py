@@ -58,18 +58,75 @@ def test_patch_paths_cannot_escape():
 
 
 def test_empty_patch_cannot_be_reset():
-    with pytest.raises(ValueError, match="no resettable Git diff headers"):
+    with pytest.raises(ValueError, match="no resettable file headers"):
         reset_command("", "a" * 40)
 
 
-def test_headerless_unified_patch_is_valid_git_but_cannot_be_reset(repo):
-    patch = "--- /dev/null\n+++ b/check.txt\n@@ -0,0 +1 @@\n+hidden\n"
+@pytest.mark.parametrize("mixed", [False, True])
+def test_reset_covers_headerless_file_before_git_headers(repo, mixed):
+    # The released 000989 patch starts with this file and then a Git-header script.
+    name = "pkg/common/moerr/error_wrapping_test.go"
+    patch = f"--- /dev/null\n+++ b/{name}\n@@ -0,0 +1 @@\n+hidden\n"
+    if mixed:
+        patch += PATCH
     base = git(repo, "rev-parse", "HEAD")
+    hidden = repo / name
+    hidden.parent.mkdir(parents=True)
+    hidden.write_text("agent planted\n")
+    (repo / "solution.txt").write_text("model fix\n")
+    git(repo, "add", ".")
+    for _ in range(2):
+        subprocess.run(["bash", "-c", reset_command(patch, base)], cwd=repo, check=True)
+        assert not hidden.exists()
+        subprocess.run(["git", "apply", "-"], input=patch, text=True, cwd=repo, check=True)
+        assert hidden.read_text() == "hidden\n"
+    subprocess.run(["bash", "-c", reset_command(patch, base)], cwd=repo, check=True)
+    assert not hidden.exists()
+    assert not (repo / "check.txt").exists()
+    assert (repo / "solution.txt").read_text() == "model fix\n"
 
+
+def test_headerless_deletion_resets_old_path(repo):
+    patch = "--- a/solution.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-before\n"
+    base = git(repo, "rev-parse", "HEAD")
     subprocess.run(["git", "apply", "-"], input=patch, text=True, cwd=repo, check=True)
-    assert (repo / "check.txt").read_text() == "hidden\n"
-    with pytest.raises(ValueError, match="no resettable Git diff headers"):
-        reset_command(patch, base)
+    subprocess.run(["bash", "-c", reset_command(patch, base)], cwd=repo, check=True)
+    assert (repo / "solution.txt").read_text() == "before\n"
+
+
+def test_header_like_hunk_payload_does_not_reset_solution(repo):
+    (repo / "check.txt").write_text("-- a/solution.txt\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "test fixture")
+    base = git(repo, "rev-parse", "HEAD")
+    patch = "--- a/check.txt\n+++ b/check.txt\n@@ -1 +1 @@\n--- a/solution.txt\n+++ b/solution.txt\n"
+    assert touched_files(patch) == ["check.txt"]
+    subprocess.run(["git", "apply", "-"], input=patch, text=True, cwd=repo, check=True)
+    (repo / "solution.txt").write_text("model fix\n")
+    subprocess.run(["bash", "-c", reset_command(patch, base)], cwd=repo, check=True)
+    assert (repo / "check.txt").read_text() == "-- a/solution.txt\n"
+    assert (repo / "solution.txt").read_text() == "model fix\n"
+
+
+@pytest.mark.parametrize("old,new", [
+    ("a/../../outside", "b/check.txt"),
+    ("a/check.txt", "b/../../outside"),
+    ("/dev/null", "b//absolute"),
+    ("a/check.txt", "b/null\x00byte"),
+])
+def test_unified_patch_validates_both_paths_even_after_git_headers(old, new):
+    with pytest.raises(ValueError, match="Unsafe test patch path"):
+        touched_files(f"diff --git a/check.txt b/check.txt\n--- {old}\n+++ {new}\n")
+
+
+@pytest.mark.parametrize("old,new", [
+    ('"a/quoted\\tpath"', "b/check.txt"),
+    ("/dev/null", '"b/quoted\\tpath"'),
+    ("a/check.txt", "missing-prefix"),
+])
+def test_unsupported_unified_headers_fail(old, new):
+    with pytest.raises(ValueError, match="Unsupported test patch header"):
+        touched_files(f"--- {old}\n+++ {new}\n")
 
 
 def test_reset_covers_published_nonstandard_prefix(repo):
@@ -194,41 +251,18 @@ def test_taskset_load_and_default_agent_tools(monkeypatch):
     assert harness.id == 'bash' and harness.edit
 
 
-@pytest.mark.parametrize("installed,visible", [(True, False), (True, True), (False, False)])
-async def test_setup_repairs_only_missing_installed_go_for_agent_and_grader(tmp_path, installed, visible):
-    import os
-    import shlex
-
+async def test_docker_default_path_reaches_agent_and_verifier():
     from verifiers.v1.rollout import agent_runtime
     from verifiers.v1.runtimes.base import Runtime as BaseRuntime
     from verifiers.v1.runtimes.prime import PrimeRuntime
-
-    image_bin = tmp_path / "image-bin"
-    image_bin.mkdir()
-    installed_go = tmp_path / "installed-go"
-    for path, enabled in [(installed_go, installed), (image_bin / "go", visible)]:
-        if enabled:
-            path.write_text("#!/bin/sh\nexit 0\n")
-            path.chmod(0o755)
-    image_path = f"{image_bin}:/usr/bin:/bin"
 
     class Runtime(PrimeRuntime):
         def __init__(self):
             BaseRuntime.__init__(self)
             self.calls = []
-            self.env = {"TASK_ENV": "preserved"}
 
         async def run(self, argv, env):
-            effective = self.process_env(env)
-            self.calls.append((argv, effective))
-            if "command -v go" in argv[-1]:
-                # Exercise the actual shell condition with a harmless fixture binary.
-                command = argv[-1].replace("/usr/local/go/bin/go", shlex.quote(str(installed_go)))
-                result = subprocess.run(
-                    [*argv[:-1], command], capture_output=True, text=True,
-                    env={**os.environ, "PATH": image_path, **effective},
-                )
-                return ProgramResult(result.returncode, result.stdout, result.stderr)
+            self.calls.append((argv, self.process_env(env)))
             if "rev-parse HEAD" in argv[-1]:
                 return ProgramResult(0, "a" * 40 + "\n", "")
             return ProgramResult(0, "", "")
@@ -238,14 +272,33 @@ async def test_setup_repairs_only_missing_installed_go_for_agent_and_grader(tmp_
 
     task, trace = task_and_trace()
     runtime = Runtime()
+    # Rollout installs the task environment before setup and creating the agent view.
+    runtime.env = dict(task.runtime_env())
     await task.setup(trace, runtime)
     harness_runtime = await agent_runtime(runtime, task.data.agent_user)
-    await harness_runtime.run(["bash", "-c", "go version"], {})
+    await harness_runtime.run(["bash", "-c", "npm --version; go version"], {})
     assert await task.verified(trace, runtime) == 1
-    expected_env = {"TASK_ENV": "preserved"}
-    if installed and not visible:
-        expected_env["PATH"] = f"/usr/local/go/bin:{image_path}"
-    assert runtime.env == expected_env
-    agent_env = next(env for argv, env in runtime.calls if argv[-1] == "go version")
+    expected = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+    agent_env = next(env for argv, env in runtime.calls if argv[-1] == "npm --version; go version")
     grader_env = next(env for argv, env in runtime.calls if argv[0] == "timeout")
-    assert agent_env == grader_env == expected_env
+    assert agent_env == grader_env == expected
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_verifier_trace_keeps_output_tails_without_changing_reward(returncode):
+    task, trace = task_and_trace()
+    runtime = RecordingRuntime()
+    original_run = runtime.run
+    stdout = "discarded prefix" + "output" * 2000 + "final stdout"
+    stderr = "discarded prefix" + "error" * 1000 + "final stderr"
+
+    async def run(argv, env):
+        if argv[0] == "timeout":
+            return ProgramResult(returncode, stdout, stderr)
+        return await original_run(argv, env)
+
+    runtime.run = run
+    assert await task.verified(trace, runtime) == float(returncode == 0)
+    assert trace.info["verifier"]["stdout"] == stdout[-10000:]
+    assert trace.info["verifier"]["stderr"] == stderr[-4000:]
+    assert "git cat-file" in runtime.calls[-1][1][-1]

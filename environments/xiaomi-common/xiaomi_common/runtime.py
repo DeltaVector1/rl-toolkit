@@ -22,7 +22,7 @@ async def run_shell(
 ) -> ProgramResult:
     if cwd is not None:
         command = f"cd {shlex.quote(cwd)} && {command}"
-    # Match upstream execution without login profiles replacing the image environment.
+    # Non-login shells preserve the runtime environment (upstream Docker uses -c, Kubernetes -lc).
     argv = ["bash", "-c", command]
     if timeout is not None:
         if not math.isfinite(timeout) or timeout <= 0:
