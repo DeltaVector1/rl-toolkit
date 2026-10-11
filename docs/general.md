@@ -78,6 +78,58 @@ framework model routes. Explicit native runtime resource and timeout overrides
 retain their normal precedence; a runtime without network-policy support rejects
 the task rather than executing it unrestricted.
 
+Three terminal rows have known missing verifier dependencies in the published
+images. On untouched images, the original pytest verifier fails during collection
+with `ModuleNotFoundError` and writes reward zero:
+
+| Task ID | Dataset image | Missing module |
+| --- | --- | --- |
+| `candidate-2376-security-cryptography` | `general-agent-env-50:oss` | `cryptography`, imported by vendored `authlib.jose` |
+| `candidate-0260-security-appsec` | `general-agent-env-3:oss` | `stevedore`, imported by vendored `bandit` |
+| `candidate-0674-ml-evaluation` | `general-agent-env-9:oss` | `torch`, imported by `/tests/test_outputs.py` |
+
+All three prompts prohibit installing dependencies, and their task metadata
+disables internet access. Their intended mutable source files do not supply these
+dependencies; this is separate from installing the controller's Verifiers packages
+or staging the Bash harness. Do not install missing verifier dependencies during
+setup, which would change the released image contract. These are observed verifier
+dependency failures, not a proof that every possible source edit fails. Upstream
+released no terminal wrapper, so a separate upstream verifier image is unconfirmed.
+
+Exclude these IDs from training and reported model scores. The loader deliberately
+retains all 989 released rows for reproduction. Add this native selection option to
+the `vf-eval xiaomi-general` or pinned Prime RL `eval xiaomi-general` command in
+[evaluation.md](evaluation.md):
+
+```sh
+--select.exclude.ids candidate-2376-security-cryptography \
+  candidate-0260-security-appsec candidate-0674-ml-evaluation
+```
+
+With no other selection limits, this retains 986 rows: 925 general-agent and 61
+terminal rows. Record the exclusions and denominator with reported scores; the
+remaining 61 rows have not all been demonstrated solvable. For pinned Prime RL
+training, set the exclusion on the General source in the run's TOML:
+
+```toml
+[[orchestrator.train.source]]
+[orchestrator.train.source.env.taskset]
+id = "xiaomi-general"
+[orchestrator.train.source.select.exclude]
+ids = [
+  "candidate-2376-security-cryptography",
+  "candidate-0260-security-appsec",
+  "candidate-0674-ml-evaluation",
+]
+```
+
+Merge this into the existing General source rather than adding a duplicate source.
+To reproduce a released row, remove its exclusion and use, for example,
+`--select.include.ids candidate-2376-security-cryptography`; native exclusion takes
+precedence over inclusion. `candidate-1634-software-databases` is not excluded:
+its Python 3.12 `collections.Callable` import failure is in the mutable
+`vendor/peewee/peewee.py`, so it can be repaired as part of the source task.
+
 General-agent rows use the pinned native MCP package bundler to stage the local
 `xiaomi-common` dependency before Verifiers stages its tool server; this is needed
 because that sibling package has not been published to a package index. Its private
