@@ -1,0 +1,22 @@
+This project adapts the public Xiaomi MiMo-V2.6 RL release to Verifiers v1.
+
+Dataset and image mapping:
+XiaomiMiMo/MiMo-V2.6-RL-oss, Apache-2.0,
+revision 639865fd3374018d6cb29b9fb82dd531406fcf5f.
+
+Xiaomi training recipes and music scorer:
+XiaomiMiMo/verl, Apache-2.0,
+revision a2ad9f6160b03ff2d47e59832bfb6b289f37c917.
+
+Code verifier adaptation:
+XiaomiMiMo/MiMo-Agent, MIT,
+revision 467f0a19016f0ac4d63b8d17a1f0da9ba07f232c.
+Copyright (c) 2026 Xiaomi Corporation
+Copyright (c) 2025 Kilian A. Lieret and Carlos E. Jimenez (mini-swe-agent)
+MIT license copies accompany the affected packages.
+
+Runtime dependency:
+PrimeIntellect-ai/verifiers, MIT,
+revision bf2834cac27d882b6edc9388835791a395361954.
+
+Dataset task assets and container contents retain their respective upstream licenses.
