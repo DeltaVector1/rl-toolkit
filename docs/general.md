@@ -20,6 +20,11 @@ server, and grading files; the harness executes as `xiaomi_agent`. Setup checks
 that this user cannot read the protected directories. The workspace root is
 root-owned with its sticky bit set, protecting the native server's root-owned
 installation directories from agent renames, while workspace files remain editable.
+The pinned Prime runtime uploads files as root even for an agent-user view. A
+per-runtime adapter writes only this trace's native harness transcript as
+`xiaomi_agent`, so the harness can consume and delete it in the sticky directory.
+Chunked writes also support resumed transcripts without shell argument-size limits;
+all other uploads retain their native behavior.
 Verifier paths are root-owned symlinks into a root-only directory, populated
 only when grading. Original basenames are preserved inside that private directory
 so verifiers resolving sibling metadata and helpers still work. Upload APIs cannot

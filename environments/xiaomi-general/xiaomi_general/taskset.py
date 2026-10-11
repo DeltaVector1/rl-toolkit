@@ -91,6 +91,41 @@ async def upload(runtime: vf.Runtime, source: Path, target: str) -> None:
         await runtime.write(target, source.read_bytes())
 
 
+def agent_message_writes(runtime: vf.Runtime, trace_id: str) -> None:
+    """Keep native harness transcripts agent-owned in the sticky workspace."""
+    from verifiers.v1.runtimes.prime import PrimeRuntime
+
+    if not isinstance(runtime, PrimeRuntime):
+        return
+    original_write = runtime.write
+    agent = runtime.with_user("xiaomi_agent")
+    name = f".vf-initial-messages-{trace_id}.json"
+    target = str(PurePosixPath(runtime.config.workdir) / name)
+
+    async def write(path: str, data: bytes) -> None:
+        if path not in (name, target):
+            await original_write(path, data)
+            return
+        # shortcut: Prime uploads ignore agent_user; remove when native writes honor it.
+        # Run as the agent so even a planted symlink cannot overwrite privileged files.
+        await checked_run(agent, ["sh", "-c", 'umask 077; : > "$1"', "write", target])
+        for offset in range(0, len(data), 32768):
+            encoded = base64.b64encode(data[offset : offset + 32768]).decode()
+            await checked_run(
+                agent,
+                [
+                    "sh",
+                    "-c",
+                    'printf %s "$2" | base64 -d >> "$1"',
+                    "write",
+                    target,
+                    encoded,
+                ],
+            )
+
+    runtime.write = write
+
+
 async def install_common(runtime: vf.Runtime) -> None:
     # Native toolset bundling ships its own package only; common is a local sibling.
     from verifiers.v1.mcp.launch import _cached_package, _package_dir
@@ -235,7 +270,8 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
             if PurePosixPath(target).parent != PurePosixPath("/work"):
                 raise ValueError("Verifier uploads must target root-owned /work files")
             await checked_run(
-                runtime, ["ln", "-sfn", f"/work/_verifier/{PurePosixPath(target).name}", target]
+                runtime,
+                ["ln", "-sfn", f"/work/_verifier/{PurePosixPath(target).name}", target],
             )
         # Fail before rollout if the permission boundary is ineffective.
         probe = await runtime.with_user("xiaomi_agent").run(
@@ -249,6 +285,7 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
         if probe.exit_code:
             raise RuntimeError("General protected assets are accessible to agent_user")
         await install_common(runtime)
+        agent_message_writes(runtime, trace.id)
         trace.info["general_isolation"] = (
             "root-owned assets; unprivileged xiaomi_agent; native colocated MCP"
         )

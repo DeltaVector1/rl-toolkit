@@ -200,7 +200,7 @@ async def test_general_verifier_payload_stays_private_and_judge_env_is_forwarded
         "dataset_type": "general_agent", "env_task_dir": "envs/test"
     }, task_root=str(tmp_path)))
     runtime = Runtime()
-    trace = SimpleNamespace(info={})
+    trace = SimpleNamespace(info={}, id="test-trace")
     await task.setup(trace, runtime)
     assert not writes
     assert (["ln", "-sfn", "/work/_verifier/run_verify.py", "/work/run_verify.py"], {}) in calls
@@ -226,3 +226,75 @@ async def test_general_verifier_payload_stays_private_and_judge_env_is_forwarded
     assert judge_env["GA_JUDGE_URL"] == "http://judge.invalid/v1"
     assert judge_env["GA_JUDGE_API"] == "chat"
     assert judge_env["VERIFY_AGENT_JUDGE"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_prime_harness_transcript_write_uses_agent_and_preserves_protected_uploads(
+    tmp_path,
+):
+    import os
+    import subprocess
+    from verifiers.v1.runtimes.base import Runtime
+    from verifiers.v1.runtimes.prime import PrimeRuntime
+    from xiaomi_general.taskset import agent_message_writes
+
+    class LocalPrime(PrimeRuntime):
+        def __init__(self):
+            Runtime.__init__(self)
+            self.config = SimpleNamespace(workdir=str(tmp_path))
+            self.uploads = []
+            self.commands = []
+
+        async def write(self, path, data):
+            # Prime's gateway ignores the view's user and creates root-owned files.
+            self.uploads.append((path, data, "root"))
+
+        async def run(self, argv, env):
+            self.commands.append((self.user, argv))
+            assert self.user == "xiaomi_agent"
+            result = subprocess.run(
+                argv, env={**os.environ, **env}, capture_output=True, text=True
+            )
+            return ProgramResult(result.returncode, result.stdout, result.stderr)
+
+    runtime = LocalPrime()
+    tmp_path.chmod(0o1777)
+    name = ".vf-initial-messages-trace.json"
+    # Reproduce the provider ownership mismatch even through with_user().
+    await runtime.with_user("xiaomi_agent").write(name, b"original")
+    assert runtime.uploads.pop() == (name, b"original", "root")
+    agent_message_writes(runtime, "trace")
+    agent = runtime.with_user("xiaomi_agent")
+    payload = json.dumps(
+        [{"role": "user", "content": "large ' $() prompt" * 10000}]
+    ).encode()
+    await agent.write(name, payload)
+    path = tmp_path / name
+    assert path.read_bytes() == payload
+    assert path.stat().st_mode & 0o777 == 0o600
+    path.unlink()  # The harness consumes and removes its own transcript.
+    await agent.write(str(path), b"resumed")
+    assert path.read_bytes() == b"resumed"
+    path.unlink()
+    assert not runtime.uploads
+    assert max(len(arg) for _, argv in runtime.commands for arg in argv) < 45000
+    await runtime.write(".vf-src/package.whl", b"protected")
+    await runtime.write(".vf-initial-messages-other.json", b"other trace")
+    assert runtime.uploads == [
+        (".vf-src/package.whl", b"protected", "root"),
+        (".vf-initial-messages-other.json", b"other trace", "root"),
+    ]
+    # Another sandbox instance keeps its provider implementation.
+    other = LocalPrime()
+    await other.with_user("xiaomi_agent").write(name, b"other runtime")
+    assert other.uploads == [(name, b"other runtime", "root")]
+
+    protected = tmp_path / "private.py"
+    protected.write_bytes(b"protected")
+    path.symlink_to(protected)
+    protected.chmod(0o400)
+    if os.geteuid() != 0:
+        with pytest.raises(RuntimeError):
+            await agent.write(name, b"overwrite")
+        assert protected.read_bytes() == b"protected"
+        assert len(runtime.uploads) == 2  # A denied agent write never retries as root.
