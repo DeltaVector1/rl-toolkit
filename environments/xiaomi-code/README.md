@@ -10,4 +10,4 @@ Setup captures the image's base commit and rejects reachable history outside its
 
 This preserves upstream's shared agent/grader filesystem design and image hygiene assumptions. The history assertion does not inspect unreachable objects or search the image for leaked answers. Tests use synthetic repositories and mocked runtimes; live sandbox evaluation is separate.
 
-Test patch headers support the released unquoted paths with any single-component Git prefix, including `ab/`. Unsupported headers, including quoted paths, fail when loading instead of leaving some test paths outside the reset.
+Test patch headers support the released unquoted paths with any single-component Git prefix, including `ab/`. Unsupported headers, including quoted paths and headerless unified patches, fail when loading instead of leaving test paths outside the reset.

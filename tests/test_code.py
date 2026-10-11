@@ -57,6 +57,21 @@ def test_patch_paths_cannot_escape():
         touched_files("diff --git a/../../outside b/../../outside")
 
 
+def test_empty_patch_cannot_be_reset():
+    with pytest.raises(ValueError, match="no resettable Git diff headers"):
+        reset_command("", "a" * 40)
+
+
+def test_headerless_unified_patch_is_valid_git_but_cannot_be_reset(repo):
+    patch = "--- /dev/null\n+++ b/check.txt\n@@ -0,0 +1 @@\n+hidden\n"
+    base = git(repo, "rev-parse", "HEAD")
+
+    subprocess.run(["git", "apply", "-"], input=patch, text=True, cwd=repo, check=True)
+    assert (repo / "check.txt").read_text() == "hidden\n"
+    with pytest.raises(ValueError, match="no resettable Git diff headers"):
+        reset_command(patch, base)
+
+
 def test_reset_covers_published_nonstandard_prefix(repo):
     name = "balance_strategy_roundrobin_global_test.go"
     patch = PATCH.replace("check.txt", name).replace("diff --git a/", "diff --git ab/")

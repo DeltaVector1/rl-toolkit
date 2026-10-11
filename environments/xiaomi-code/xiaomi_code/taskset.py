@@ -34,6 +34,8 @@ def touched_files(patch: str) -> list[str]:
                 raise ValueError(f"Unsafe test patch path: {path!r}")
             if path not in paths:
                 paths.append(path)
+    if not paths:
+        raise ValueError("Test patch has no resettable Git diff headers")
     return paths
 
 
