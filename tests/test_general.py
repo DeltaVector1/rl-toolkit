@@ -10,6 +10,8 @@ from xiaomi_general.taskset import (
     GeneralData,
     GeneralTask,
     GeneralTaskset,
+    QUIESCE_AGENT,
+    VALIDATE_SUBMISSION,
     inline_tests,
     parse_reward,
 )
@@ -168,7 +170,7 @@ async def test_general_verifier_payload_stays_private_and_judge_env_is_forwarded
     (root / "run_verify.py").write_text(verifier_code)
     (root / "verifier_meta.json").write_text('{"reward": 0.75}')
     (root / "manifest.json").write_text(json.dumps({
-        "verifier": {"uploads": [
+        "verifier": {"env": {"TMPDIR": "/tmp"}, "uploads": [
             {"source": name, "target": f"/work/{name}"}
             for name in ("run_verify.py", "verifier_meta.json")
         ]}
@@ -200,10 +202,11 @@ async def test_general_verifier_payload_stays_private_and_judge_env_is_forwarded
         "dataset_type": "general_agent", "env_task_dir": "envs/test"
     }, task_root=str(tmp_path)))
     runtime = Runtime()
-    trace = SimpleNamespace(info={}, id="test-trace")
+    trace = SimpleNamespace(info={}, id="test-trace", last_reply="")
     await task.setup(trace, runtime)
     assert not writes
     assert (["ln", "-sfn", "/work/_verifier/run_verify.py", "/work/run_verify.py"], {}) in calls
+    await task.finalize(trace, runtime)
     assert await task.verifier_reward(trace, runtime) == 0.75
     assert writes == {
         "/work/_verifier/run_verify.py": verifier_code.encode(),
@@ -226,6 +229,8 @@ async def test_general_verifier_payload_stays_private_and_judge_env_is_forwarded
     assert judge_env["GA_JUDGE_URL"] == "http://judge.invalid/v1"
     assert judge_env["GA_JUDGE_API"] == "chat"
     assert judge_env["VERIFY_AGENT_JUDGE"] == "1"
+    assert judge_env["TMPDIR"] == "/work/_verifier/tmp"
+    assert any("chmod 700 /tmp/agent_output /work/_verifier/tmp" in argv[-1] for argv, _ in calls)
 
 
 @pytest.mark.asyncio
@@ -298,3 +303,186 @@ async def test_prime_harness_transcript_write_uses_agent_and_preserves_protected
             await agent.write(name, b"overwrite")
         assert protected.read_bytes() == b"protected"
         assert len(runtime.uploads) == 2  # A denied agent write never retries as root.
+
+
+def test_submission_paths_keep_regular_files_and_internal_links(tmp_path):
+    import subprocess
+    import sys
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ordinary report")
+    (workspace / "alias.txt").symlink_to("report.txt")
+    (workspace / ".notes").write_text("ordinary hidden notes")
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", VALIDATE_SUBMISSION, str(workspace)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (workspace / "report.txt").read_text() == "ordinary report"
+
+
+@pytest.mark.parametrize("name", ["answer.md", ".hidden", ".vf-venv"])
+def test_submission_paths_reject_private_aliases_including_hidden_names(tmp_path, name):
+    import subprocess
+    import sys
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    private = tmp_path / "private.txt"
+    private.write_text("private fixture")
+    (workspace / name).symlink_to(private)
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", VALIDATE_SUBMISSION, str(workspace)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 42
+    assert name in result.stdout
+    assert private.read_text() == "private fixture"
+
+
+def test_submission_paths_do_not_skip_writable_native_named_directories(tmp_path):
+    import subprocess
+    import sys
+
+    workspace = tmp_path / "workspace"
+    native = workspace / ".vf-venv"
+    native.mkdir(parents=True)
+    native.chmod(0o777)
+    (native / "alias").symlink_to(tmp_path / "private")
+    (tmp_path / "private").write_text("private fixture")
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", VALIDATE_SUBMISSION, str(workspace)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 42
+
+
+@pytest.mark.parametrize("stuck", [False, True])
+def test_quiescence_rechecks_children_and_ignores_zombies(monkeypatch, stuck):
+    import os
+    import pathlib
+    import pwd
+    import signal
+    import time
+
+    class Status:
+        def __init__(self, pid, state="S"):
+            self.parent = SimpleNamespace(name=str(pid))
+            self.state = state
+
+        def read_text(self):
+            return f"State:\t{self.state}\nUid:\t12345 12345 12345 12345\n"
+
+    scans = iter([[Status(101)], [Status(102)], [Status(102, "Z")]])
+    monkeypatch.setattr(pathlib, "Path", lambda _: SimpleNamespace(
+        glob=lambda _: [Status(101)] if stuck else next(scans)
+    ))
+    monkeypatch.setattr(pwd, "getpwnam", lambda _: SimpleNamespace(pw_uid=12345))
+    signals = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    if stuck:
+        with pytest.raises(RuntimeError, match="did not stop"):
+            exec(QUIESCE_AGENT, {})
+        assert len(signals) == 40
+        return
+    exec(QUIESCE_AGENT, {})
+    assert signals == [(101, signal.SIGSTOP), (101, signal.SIGKILL),
+                       (102, signal.SIGSTOP), (102, signal.SIGKILL)]
+
+
+@pytest.mark.asyncio
+async def test_invalid_submission_scores_zero_without_privileged_upload_or_fallback(monkeypatch):
+    monkeypatch.setenv("GA_JUDGE_KEY", "test-key")
+    calls = []
+
+    class Runtime:
+        user = "root"
+
+        def with_user(self, user):
+            view = Runtime()
+            view.user = user
+            return view
+
+        async def run(self, argv, env):
+            calls.append((self.user, argv))
+            if VALIDATE_SUBMISSION in argv:
+                return ProgramResult(42, "Submission path is outside the workspace: answer.md", "")
+            return ProgramResult(0, "", "")
+
+        async def write(self, *args):
+            pytest.fail("Invalid submission must not trigger root writes")
+
+    task = GeneralTask(GeneralData(instance={"dataset_type": "general_agent"}))
+    trace = SimpleNamespace(info={}, last_reply="fallback answer")
+    await task.finalize(trace, Runtime())
+    assert await task.verifier_reward(trace, Runtime()) == 0
+    assert "answer.md" in trace.info["verifier"]["invalid_submission"]
+    assert [user for user, _ in calls] == ["root", "xiaomi_agent"]
+    assert QUIESCE_AGENT in calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_final_answer_uses_agent_chunk_writer(tmp_path):
+    import os
+    import subprocess
+
+    answer = tmp_path / "answer.md"
+    calls = []
+
+    class Runtime:
+        user = "root"
+
+        def with_user(self, user):
+            view = Runtime()
+            view.user = user
+            return view
+
+        async def run(self, argv, env):
+            calls.append((self.user, argv))
+            if QUIESCE_AGENT in argv or VALIDATE_SUBMISSION in argv:
+                return ProgramResult(0, "", "")
+            assert self.user == "xiaomi_agent"
+            argv = [str(answer) if arg == "/work/workspace/answer.md" else arg for arg in argv]
+            result = subprocess.run(argv, env={**os.environ, **env}, capture_output=True, text=True)
+            return ProgramResult(result.returncode, result.stdout, result.stderr)
+
+        async def write(self, *args):
+            pytest.fail("Fallback must never use provider root uploads")
+
+    task = GeneralTask(GeneralData(instance={"dataset_type": "general_agent"}))
+    payload = "large ' $() answer " * 10000
+    trace = SimpleNamespace(info={}, last_reply=payload)
+    await task.finalize(trace, Runtime())
+    assert answer.read_text() == payload
+    assert answer.stat().st_mode & 0o777 == 0o600
+    trace.last_reply = "replacement"
+    await task.finalize(trace, Runtime())
+    assert answer.read_text() == payload  # An existing nonempty answer wins.
+    assert all(user == "xiaomi_agent" for user, argv in calls if "sh" == argv[0])
+
+
+def test_private_temporary_scripts_do_not_import_shared_directory_modules(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    shared = tmp_path / "shared"
+    private = tmp_path / "private"
+    shared.mkdir()
+    private.mkdir(mode=0o700)
+    (shared / "json.py").write_text("# An ordinary module without dumps.\n")
+    script = (
+        "import tempfile, subprocess, sys\n"
+        "with tempfile.NamedTemporaryFile('w', suffix='.py') as f:\n"
+        "    f.write('import json; print(json.dumps(1))'); f.flush()\n"
+        "    result = subprocess.run([sys.executable, f.name], capture_output=True, text=True)\n"
+        "    print(result.returncode, result.stdout.strip())\n"
+    )
+    for directory, expected in [(shared, "1"), (private, "0 1")]:
+        result = subprocess.check_output(
+            [sys.executable, "-I", "-c", script],
+            env={**os.environ, "TMPDIR": str(directory)}, text=True,
+        )
+        assert result.strip() == expected

@@ -48,6 +48,58 @@ VERIFY_FORWARD = (
     "no_proxy",
 )
 
+QUIESCE_AGENT = """
+import os, pwd, signal, time
+from pathlib import Path
+uid = pwd.getpwnam('xiaomi_agent').pw_uid
+for attempt in range(20):
+    live = []
+    for path in Path('/proc').glob('[0-9]*/status'):
+        try:
+            fields = dict(line.split(':', 1) for line in path.read_text().splitlines())
+        except FileNotFoundError:
+            continue
+        if uid in map(int, fields['Uid'].split()) and not fields['State'].strip().startswith('Z'):
+            live.append(int(path.parent.name))
+    if not live:
+        break
+    for sig in (signal.SIGSTOP, signal.SIGKILL):
+        for pid in live:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+    time.sleep(0.05)
+else:
+    raise RuntimeError('Agent processes did not stop before grading')
+"""
+
+VALIDATE_SUBMISSION = """
+import os, stat, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+def invalid(error):
+    print(str(error))
+    raise SystemExit(42)
+try:
+    for folder, dirs, files in os.walk(root, onerror=invalid):
+        for name in dirs[:] + files:
+            path = Path(folder) / name
+            entry = path.lstat()
+            if (path.parent == root and name in {'.vf-src', '.vf-venv'}
+                    and stat.S_ISDIR(entry.st_mode) and entry.st_uid == 0
+                    and not entry.st_mode & 0o022):
+                dirs.remove(name)
+                continue
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(root) or not os.access(path, os.R_OK):
+                invalid('Submission path is outside the workspace or unreadable: ' + str(path.relative_to(root)))
+            if not (resolved.is_file() or resolved.is_dir()):
+                invalid('Submission path is not a regular file or directory: ' + str(path.relative_to(root)))
+except (OSError, RuntimeError) as exc:
+    invalid(exc)
+"""
+
 
 def parse_reward(raw: str, binary: bool = False) -> tuple[float, dict]:
     try:
@@ -91,6 +143,18 @@ async def upload(runtime: vf.Runtime, source: Path, target: str) -> None:
         await runtime.write(target, source.read_bytes())
 
 
+async def write_as_agent(runtime: vf.Runtime, target: str, data: bytes) -> None:
+    """Prime uploads ignore agent_user, so use bounded writes under that user."""
+    agent = runtime.with_user("xiaomi_agent")
+    await checked_run(agent, ["sh", "-c", 'umask 077; : > "$1"', "write", target])
+    for offset in range(0, len(data), 32768):
+        encoded = base64.b64encode(data[offset : offset + 32768]).decode()
+        await checked_run(
+            agent,
+            ["sh", "-c", 'printf %s "$2" | base64 -d >> "$1"', "write", target, encoded],
+        )
+
+
 def agent_message_writes(runtime: vf.Runtime, trace_id: str) -> None:
     """Keep native harness transcripts agent-owned in the sticky workspace."""
     from verifiers.v1.runtimes.prime import PrimeRuntime
@@ -98,7 +162,6 @@ def agent_message_writes(runtime: vf.Runtime, trace_id: str) -> None:
     if not isinstance(runtime, PrimeRuntime):
         return
     original_write = runtime.write
-    agent = runtime.with_user("xiaomi_agent")
     name = f".vf-initial-messages-{trace_id}.json"
     target = str(PurePosixPath(runtime.config.workdir) / name)
 
@@ -107,21 +170,7 @@ def agent_message_writes(runtime: vf.Runtime, trace_id: str) -> None:
             await original_write(path, data)
             return
         # shortcut: Prime uploads ignore agent_user; remove when native writes honor it.
-        # Run as the agent so even a planted symlink cannot overwrite privileged files.
-        await checked_run(agent, ["sh", "-c", 'umask 077; : > "$1"', "write", target])
-        for offset in range(0, len(data), 32768):
-            encoded = base64.b64encode(data[offset : offset + 32768]).decode()
-            await checked_run(
-                agent,
-                [
-                    "sh",
-                    "-c",
-                    'printf %s "$2" | base64 -d >> "$1"',
-                    "write",
-                    target,
-                    encoded,
-                ],
-            )
+        await write_as_agent(runtime, target, data)
 
     runtime.write = write
 
@@ -291,11 +340,25 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
         )
 
     async def finalize(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
-        if self.data.instance["dataset_type"] == "general_agent" and trace.last_reply:
-            exists = await runtime.run(["test", "-s", "/work/workspace/answer.md"], {})
+        if self.data.instance["dataset_type"] != "general_agent":
+            return
+        # Native rollout.close has closed the harness and tool servers already.
+        await checked_run(runtime, ["python3", "-I", "-c", QUIESCE_AGENT])
+        submission = await runtime.with_user("xiaomi_agent").run(
+            ["python3", "-I", "-c", VALIDATE_SUBMISSION, "/work/workspace"], {}
+        )
+        if submission.exit_code == 42:
+            trace.info["verifier"] = {"invalid_submission": submission.stdout[-2000:]}
+            trace.info["general_submission_validated"] = False
+            return
+        if submission.exit_code:
+            raise RuntimeError(f"Submission validation failed: {submission.stderr[-2000:]}")
+        trace.info["general_submission_validated"] = True
+        if trace.last_reply:
+            exists = await runtime.with_user("xiaomi_agent").run(["test", "-s", "/work/workspace/answer.md"], {})
             if exists.exit_code:
-                await runtime.write(
-                    "/work/workspace/answer.md", trace.last_reply.encode()
+                await write_as_agent(
+                    runtime, "/work/workspace/answer.md", trace.last_reply.encode()
                 )
 
     @vf.reward
@@ -334,6 +397,10 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
             return reward
         if not os.environ.get("GA_JUDGE_KEY"):
             raise RuntimeError("judge_key_missing")
+        if "general_submission_validated" not in trace.info:
+            raise RuntimeError("General submission was not validated before grading")
+        if not trace.info["general_submission_validated"]:
+            return 0.0
         manifest = self.manifest()
         verifier = manifest.get("verifier", {})
         if verifier.get("container", "sidecar") == "main":
@@ -355,6 +422,8 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
         env.update(
             {key: str(value) for key, value in (verifier.get("env") or {}).items()}
         )
+        # Rule subprocesses import from their script directory; shared /tmp is agent-writable.
+        env["TMPDIR"] = "/work/_verifier/tmp"
         reward_path = verifier.get("reward_file", "/logs/verifier/reward.json")
         detail_path = verifier.get(
             "reward_detail_file", "/logs/verifier/reward_detail.json"
@@ -364,7 +433,7 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
             [
                 "sh",
                 "-c",
-                f"mkdir -p {shlex.quote(str(PurePosixPath(reward_path).parent))} /tmp/agent_output; rm -f {shlex.quote(reward_path)} {shlex.quote(detail_path or '')}; chmod 700 /tmp/agent_output",
+                f"mkdir -p {shlex.quote(str(PurePosixPath(reward_path).parent))} /tmp/agent_output /work/_verifier/tmp; rm -f {shlex.quote(reward_path)} {shlex.quote(detail_path or '')}; chmod 700 /tmp/agent_output /work/_verifier/tmp",
             ],
         )
         result = await run_shell(

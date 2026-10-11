@@ -24,13 +24,23 @@ The pinned Prime runtime uploads files as root even for an agent-user view. A
 per-runtime adapter writes only this trace's native harness transcript as
 `xiaomi_agent`, so the harness can consume and delete it in the sticky directory.
 Chunked writes also support resumed transcripts without shell argument-size limits;
-all other uploads retain their native behavior.
+the final-answer fallback uses the same unprivileged writer. Other uploads retain
+their native behavior.
 Verifier paths are root-owned symlinks into a root-only directory, populated
 only when grading. Original basenames are preserved inside that private directory
 so verifiers resolving sibling metadata and helpers still work. Upload APIs cannot
 expose payloads by replacing file modes. This is not equivalent to physical container isolation and
 assumes the image provides a sound unprivileged-user boundary. A runtime without
 user switching is rejected. Do not run these tasks on the host subprocess runtime.
+
+After the native harness and tool servers close, finalization stops remaining
+agent-user processes before checking submission files as that user. Files must
+be readable and resolve inside the workspace; internal symlinks are allowed.
+Only the protected root-owned `.vf-src` and `.vf-venv` installation directories
+are excluded. Invalid submissions receive zero with a reason in verifier trace
+info; process-control or validation-execution failures remain infrastructure errors.
+The grader's temporary scripts use `/work/_verifier/tmp`, overriding manifest
+`TMPDIR`, so agent-created modules in shared `/tmp` cannot change their imports.
 
 Set `GA_JUDGE_KEY`, `GA_JUDGE_URL`, `GA_JUDGE_MODEL`, and `GA_JUDGE_API=chat` in the
 controller environment for the hosted judge. Credentials are forwarded only to
