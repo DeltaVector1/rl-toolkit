@@ -41,6 +41,8 @@ are excluded. Invalid submissions receive zero with a reason in verifier trace
 info; process-control or validation-execution failures remain infrastructure errors.
 The grader's temporary scripts use `/work/_verifier/tmp`, overriding manifest
 `TMPDIR`, so agent-created modules in shared `/tmp` cannot change their imports.
+Grading also recreates `/tmp/agent_output` as an empty private directory, removing
+agent-created session logs or directory aliases before the released runner reads it.
 
 Set `GA_JUDGE_KEY`, `GA_JUDGE_URL`, `GA_JUDGE_MODEL`, and `GA_JUDGE_API=chat` in the
 controller environment for the hosted judge. Credentials are forwarded only to

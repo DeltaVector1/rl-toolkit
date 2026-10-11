@@ -433,7 +433,7 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
             [
                 "sh",
                 "-c",
-                f"mkdir -p {shlex.quote(str(PurePosixPath(reward_path).parent))} /tmp/agent_output /work/_verifier/tmp; rm -f {shlex.quote(reward_path)} {shlex.quote(detail_path or '')}; chmod 700 /tmp/agent_output /work/_verifier/tmp",
+                f"rm -rf -- /tmp/agent_output && mkdir -p {shlex.quote(str(PurePosixPath(reward_path).parent))} /tmp/agent_output /work/_verifier/tmp && rm -f {shlex.quote(reward_path)} {shlex.quote(detail_path or '')} && chmod 700 /tmp/agent_output /work/_verifier/tmp",
             ],
         )
         result = await run_shell(

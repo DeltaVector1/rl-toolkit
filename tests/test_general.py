@@ -231,6 +231,30 @@ async def test_general_verifier_payload_stays_private_and_judge_env_is_forwarded
     assert judge_env["VERIFY_AGENT_JUDGE"] == "1"
     assert judge_env["TMPDIR"] == "/work/_verifier/tmp"
     assert any("chmod 700 /tmp/agent_output /work/_verifier/tmp" in argv[-1] for argv, _ in calls)
+    # Execute the real preparation command only after mapping every path into this fixture.
+    import shlex
+
+    prepare = next(argv[-1] for argv, _ in calls if argv[-1].startswith("rm -rf -- /tmp/agent_output"))
+    agent_output = tmp_path / "agent_output"
+    private_logs = tmp_path / "private_logs"
+    private_logs.mkdir()
+    (private_logs / "keep.jsonl").write_text("ordinary private fixture")
+    prepare = prepare.replace("/tmp/agent_output", shlex.quote(str(agent_output)))
+    prepare = prepare.replace("/work/_verifier/tmp", shlex.quote(str(tmp_path / "verifier_tmp")))
+    prepare = prepare.replace("/logs/verifier", shlex.quote(str(tmp_path / "logs")))
+    for alias in (False, True):
+        if alias:
+            agent_output.rmdir()
+            agent_output.symlink_to(private_logs, target_is_directory=True)
+        else:
+            sessions = agent_output / "sessions"
+            sessions.mkdir(parents=True)
+            (sessions / "old.jsonl").write_text("ordinary prior session")
+        subprocess.run(["sh", "-c", prepare], check=True)
+        assert agent_output.is_dir() and not agent_output.is_symlink()
+        assert not list(agent_output.iterdir())
+        assert agent_output.stat().st_mode & 0o777 == 0o700
+        assert (private_logs / "keep.jsonl").read_text() == "ordinary private fixture"
 
 
 @pytest.mark.asyncio
