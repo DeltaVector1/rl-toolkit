@@ -70,6 +70,12 @@ class XiaomiCodeTask(vf.Task[CodeData, CodeState]):
 
     async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
         cwd = self.data.workdir
+        # shortcut: Published Go images omit its PATH; remove when those images export it.
+        go_path = await run_shell(runtime, 'if ! command -v go >/dev/null 2>&1 && test -x /usr/local/go/bin/go; then printf %s "/usr/local/go/bin:$PATH"; fi')
+        if go_path.exit_code:
+            raise RuntimeError(f"Cannot inspect task Go environment: {go_path.stderr}")
+        if go_path.stdout:
+            runtime.env["PATH"] = go_path.stdout
         await checked_run(runtime, ["git", "config", "--global", "--add", "safe.directory", cwd])
         exists = await run_shell(runtime, "git rev-parse --git-dir", cwd)
         if exists.exit_code != 0:

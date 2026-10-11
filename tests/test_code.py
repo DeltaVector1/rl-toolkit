@@ -192,3 +192,60 @@ def test_taskset_load_and_default_agent_tools(monkeypatch):
     assert task.NEEDS_CONTAINER
     harness = default_agent_harness('xiaomi-code')
     assert harness.id == 'bash' and harness.edit
+
+
+@pytest.mark.parametrize("installed,visible", [(True, False), (True, True), (False, False)])
+async def test_setup_repairs_only_missing_installed_go_for_agent_and_grader(tmp_path, installed, visible):
+    import os
+    import shlex
+
+    from verifiers.v1.rollout import agent_runtime
+    from verifiers.v1.runtimes.base import Runtime as BaseRuntime
+    from verifiers.v1.runtimes.prime import PrimeRuntime
+
+    image_bin = tmp_path / "image-bin"
+    image_bin.mkdir()
+    installed_go = tmp_path / "installed-go"
+    for path, enabled in [(installed_go, installed), (image_bin / "go", visible)]:
+        if enabled:
+            path.write_text("#!/bin/sh\nexit 0\n")
+            path.chmod(0o755)
+    image_path = f"{image_bin}:/usr/bin:/bin"
+
+    class Runtime(PrimeRuntime):
+        def __init__(self):
+            BaseRuntime.__init__(self)
+            self.calls = []
+            self.env = {"TASK_ENV": "preserved"}
+
+        async def run(self, argv, env):
+            effective = self.process_env(env)
+            self.calls.append((argv, effective))
+            if "command -v go" in argv[-1]:
+                # Exercise the actual shell condition with a harmless fixture binary.
+                command = argv[-1].replace("/usr/local/go/bin/go", shlex.quote(str(installed_go)))
+                result = subprocess.run(
+                    [*argv[:-1], command], capture_output=True, text=True,
+                    env={**os.environ, "PATH": image_path, **effective},
+                )
+                return ProgramResult(result.returncode, result.stdout, result.stderr)
+            if "rev-parse HEAD" in argv[-1]:
+                return ProgramResult(0, "a" * 40 + "\n", "")
+            return ProgramResult(0, "", "")
+
+        async def write(self, path, data):
+            pass
+
+    task, trace = task_and_trace()
+    runtime = Runtime()
+    await task.setup(trace, runtime)
+    harness_runtime = await agent_runtime(runtime, task.data.agent_user)
+    await harness_runtime.run(["bash", "-c", "go version"], {})
+    assert await task.verified(trace, runtime) == 1
+    expected_env = {"TASK_ENV": "preserved"}
+    if installed and not visible:
+        expected_env["PATH"] = f"/usr/local/go/bin:{image_path}"
+    assert runtime.env == expected_env
+    agent_env = next(env for argv, env in runtime.calls if argv[-1] == "go version")
+    grader_env = next(env for argv, env in runtime.calls if argv[0] == "timeout")
+    assert agent_env == grader_env == expected_env
