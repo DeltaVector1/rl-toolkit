@@ -22,7 +22,8 @@ async def run_shell(
 ) -> ProgramResult:
     if cwd is not None:
         command = f"cd {shlex.quote(cwd)} && {command}"
-    argv = ["bash", "-lc", command]
+    # Match upstream execution without login profiles replacing the image environment.
+    argv = ["bash", "-c", command]
     if timeout is not None:
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Command timeout must be positive and finite")
