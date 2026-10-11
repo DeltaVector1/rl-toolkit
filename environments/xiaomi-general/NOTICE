@@ -1,0 +1,7 @@
+General task lifecycle and reward parsing are adapted from XiaomiMiMo/verl,
+commit a2ad9f6160b03ff2d47e59832bfb6b289f37c917,
+recipes/general/general_agent/environment.py.
+Original source: Copyright 2026 Bytedance Ltd. and/or its affiliates.
+Licensed under the Apache License, Version 2.0; see LICENSE.
+Task-local tools and verifiers are fetched from the pinned XiaomiMiMo/MiMo-V2.6-RL-oss
+release and executed without rewriting their scoring logic.

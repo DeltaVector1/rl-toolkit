@@ -1,0 +1,6 @@
+The xiaomi_music/scorer directory is copied without modification from XiaomiMiMo/verl,
+commit a2ad9f6160b03ff2d47e59832bfb6b289f37c917,
+recipes/design/music/scorer, including baselines/ref_full4k.json.
+Original files: Copyright 2026 Bytedance Ltd. and/or its affiliates.
+Licensed under the Apache License, Version 2.0; see LICENSE.
+Task adapter code is new; the scorer and baseline are unchanged.
