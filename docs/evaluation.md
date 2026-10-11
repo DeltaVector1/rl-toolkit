@@ -12,7 +12,7 @@ uv run vf-eval xiaomi-code -n 1 -m MODEL \
   --client.api-key-var GLM_API_KEY \
   --select.include.ids format-code-task-001457 \
   --env.agent.runtime.type prime \
-  --env.agent.runtime.cpu 2 --env.agent.runtime.memory 4 --env.agent.runtime.disk 10
+  --env.agent.runtime.cpu 2 --env.agent.runtime.memory 4 --env.agent.runtime.disk 10 --no-push
 ```
 
 The image is read from the selected task's metadata unless you set

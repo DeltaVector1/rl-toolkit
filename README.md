@@ -27,7 +27,7 @@ uv run vf-eval xiaomi-code -n 1 -m MODEL \
   --client.base-url URL --client.api-key-var OPENAI_API_KEY \
   --select.include.ids format-code-task-001457 \
   --env.agent.runtime.type prime --env.agent.runtime.cpu 2 \
-  --env.agent.runtime.memory 4 --env.agent.runtime.disk 10
+  --env.agent.runtime.memory 4 --env.agent.runtime.disk 10 --no-push
 ```
 
 Set `OPENAI_API_KEY` only if the endpoint requires authentication. For Xiaomi
