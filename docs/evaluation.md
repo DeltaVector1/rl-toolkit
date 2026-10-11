@@ -91,7 +91,8 @@ returned 0; both the base and injected Go tests passed with empty stderr. The
 replay transcript is under
 `outputs/live-code-format-code-task-000121-ponytail/`.
 An earlier replay of this row returned 127 because the image omitted Go from
-`PATH`; the installed-toolchain setup repair made the final replay pass.
+`PATH`. That run used a Go-only setup repair, later replaced by the Docker-default
+`PATH` supplied to every Code task.
 
 The Music row `gK-0768` completed with an untruncated ABC response containing
 56 bars in each of the three voices (`finish_reason=stop`). Its task scorer
@@ -123,3 +124,39 @@ configuration, controller log, environment server log, episode transcript, and
 metrics under its unique run directory. Confirm completion from the final
 episode transcript and verifier reward fields, since a started process or
 created sandbox alone does not establish a successful evaluation.
+
+## Claude review follow-up (2026-10-11)
+
+The review fixes were integrated as commits `1afbd32f` and `0b6caef4`. The full
+workspace suite passed **72 tests** using the repository's absolute
+`.venv/bin/python`. Cross-review checked all 2,698 Code test patches against Git
+path handling and reconstructed all 989 General rows through the worker path.
+The 64 Terminal Bench guard checks used controlled task fixtures with the
+installer stubbed; they were separate from the one live Terminal Bench replay.
+
+The live `candidate-0036-software-data-engineering` replay completed with
+`finish_reason=stop`, `agent_completed`, reward **1.0**, verifier return code 0,
+five passing tests, and empty stderr. Its Prime sandbox reported 1 CPU, 2 GB
+memory, 10 GB disk, and an allowlist containing only the model tunnel host. The
+trace is under `outputs/review1-tb-0036-postfix/`.
+
+Live Code row `format-code-task-000604` confirmed the Docker-default `PATH`:
+both `npm` and `npx` resolved in the task image and all eight base tests passed.
+The rollout ended normally, but reward was **0.0** because two new Jest suites
+failed TypeScript compilation (`TS2345`: updater callbacks returned `void` where
+the setter type requires state). The model's final message claimed all tests
+passed, which contradicted the verifier. This run confirms tool availability,
+not a successful solution. Its trace is under `outputs/review1-code-000604/`.
+
+Live Code row `format-code-task-000121` completed in 33 turns with
+`finish_reason=stop`, `agent_completed`, reward **1.0**, and no timeout or
+runtime error. Its original verifier returned 0; the base test and all four
+injected Go tests passed with empty stderr. Inside the sandbox, `go` resolved to
+`/usr/local/bin/go` (Go 1.26.3). The trace is under
+`outputs/review1-code-000121/`.
+
+The older `path_probe.py` `port` mode still hard-codes the Go-only repair; after
+the Docker-default `PATH` change, compare against its `docker-c` mode. The
+General package's use of Verifiers' private `_cached_package` and `_package_dir`
+helpers remains pinned debt; those helpers were present at both supported
+Verifiers revisions and should be rechecked on upgrade.
