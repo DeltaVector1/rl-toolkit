@@ -224,6 +224,10 @@ class GeneralConfig(XiaomiTasksetConfig):
     """Local General directory containing envs/, otherwise fetch pinned task assets."""
 
 
+def _no_toolsets(config):
+    return []
+
+
 class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
     NEEDS_CONTAINER = True
 
@@ -231,7 +235,7 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
         super().__init__(data, config)
         if data.instance["dataset_type"] == "terminal_bench":
             # Workers/replay reconstruct GeneralTask; a loader-only subclass loses this.
-            self.toolsets = lambda config: []
+            self.toolsets = _no_toolsets
 
     def runtime_env(self):
         return {

@@ -1,5 +1,7 @@
 import base64
+import copy
 import json
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +21,18 @@ from xiaomi_general.taskset import (
 
 def test_native_package_loads():
     assert taskset_class("xiaomi-general") is GeneralTaskset
+
+
+def test_task_toolsets_survive_pickle_and_copy():
+    for dataset_type, expected_count in (("terminal_bench", 0), ("general_agent", 1)):
+        task = GeneralTask(GeneralData(instance={"dataset_type": dataset_type}))
+        for current in (
+            pickle.loads(pickle.dumps(task)),
+            task.with_data(),
+            copy.deepcopy(task),
+        ):
+            toolsets = current.toolsets(current.config)
+            assert len(toolsets) == expected_count
 
 
 @pytest.mark.parametrize(
