@@ -88,12 +88,13 @@ with `ModuleNotFoundError` and writes reward zero:
 | `candidate-0260-security-appsec` | `general-agent-env-3:oss` | `stevedore`, imported by vendored `bandit` |
 | `candidate-0674-ml-evaluation` | `general-agent-env-9:oss` | `torch`, imported by `/tests/test_outputs.py` |
 
-All three prompts prohibit installing dependencies, and their task metadata
-disables internet access. Their intended mutable source files do not supply these
-dependencies; this is separate from installing the controller's Verifiers packages
-or staging the Bash harness. Do not install missing verifier dependencies during
-setup, which would change the released image contract. These are observed verifier
-dependency failures, not a proof that every possible source edit fails. Upstream
+Their prompts restrict dependency additions or installation, and their task
+metadata disables internet access. Their intended mutable source files do not
+supply these dependencies; this is separate from installing the controller's
+Verifiers packages or staging the Bash harness. Do not install missing verifier
+dependencies during setup, which would change the released image contract. These
+are observed verifier dependency failures, not a proof that every possible source
+edit fails. Upstream
 released no terminal wrapper, so a separate upstream verifier image is unconfirmed.
 
 Exclude these IDs from training and reported model scores. The loader deliberately

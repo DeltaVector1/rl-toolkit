@@ -113,6 +113,22 @@ General fix, the same row ran through the original verifier. The audited
 transcript is under
 `outputs/live-general-accounting-audit-ponytail/`.
 
+Review 2 integrated the picklable no-toolsets function and documented the three
+Terminal Bench rows with missing verifier dependencies; all 989 rows remain
+loadable, with explicit native exclusions recommended for training and reported
+scores. The repo `.venv` suite passed 73 tests after the pickle fix. The post-fix
+Code probe covered 14 rows, including 11 of the 16 rows flagged by the
+older PATH probe; five were not rerun (`000169`, `000170`, `000305`, `000947`,
+`001576`). No Code implementation changed in Review 2. A fresh run of
+`s3k_0000_accounting_audit_tax_en_t1_rl_008` completed with final
+`finish_reason=stop`, `agent_completed`, submission validation true, 9 agent model
+calls, no timeout or trace errors, and original verifier return code 0 / reward
+0.875 (5/6). The verifier produced five actual one-vote LLM results (four pass,
+one fail on `protection_statuses`) plus one passing deterministic check, with
+empty stderr. This confirms the configured hosted judge returned votes; the
+nonempty `GA_JUDGE_KEY` requirement alone would only establish setup readiness.
+The run is under `outputs/review2-general-accounting-audit/`.
+
 For Xiaomi General, configure the external judge in the controller environment
 before starting the run: `GA_JUDGE_KEY`, `GA_JUDGE_URL`, `GA_JUDGE_MODEL`, and
 `GA_JUDGE_API=chat`. General tasks require a container runtime that supports an
