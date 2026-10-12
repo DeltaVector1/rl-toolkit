@@ -12,7 +12,7 @@ uv run vf-eval xiaomi-code -n 1 -m MODEL \
   --client.api-key-var GLM_API_KEY \
   --select.include.ids format-code-task-001457 \
   --env.agent.runtime.type prime \
-  --env.agent.runtime.cpu 2 --env.agent.runtime.memory 4 --env.agent.runtime.disk 10 --no-push
+  --env.agent.runtime.cpu 2 --env.agent.runtime.memory 8 --env.agent.runtime.disk 20 --no-push
 ```
 
 The image is read from the selected task's metadata unless you set
@@ -58,7 +58,7 @@ PATH="$PWD/.eval-venv/bin:$PATH" .eval-venv/bin/eval xiaomi-code -n 1 -r 1 -c 1 
   --client.api-key-var GLM_API_KEY \
   --select.include.ids format-code-task-001457 \
   --env.agent.runtime.type prime --env.agent.runtime.cpu 2 \
-  --env.agent.runtime.memory 4 --env.agent.runtime.disk 10 \
+  --env.agent.runtime.memory 8 --env.agent.runtime.disk 20 \
   --env.agent.max-turns 64 --sampling.max-tokens 16000
 ```
 
@@ -177,36 +177,46 @@ General package's use of Verifiers' private `_cached_package` and `_package_dir`
 helpers remains pinned debt; those helpers were present at both supported
 Verifiers revisions and should be rechecked on upgrade.
 
-## Review 3 Code verification plan
+## Review 3 live evidence
 
-The Code evidence and native row exclusions are documented in [code.md](code.md).
-Use the separate Python 3.12 Prime RL `.eval-venv` for the pinned Prime RL
-runner; the workspace `.venv` is Python 3.11 and uses the workspace Verifiers
-revision. A representative Code smoke command, prepared for the accepted Code
-changes, is:
+The Review 3 probes used the sibling Python 3.12 Prime RL environment at
+`../.eval-venv` from this repository, Prime RL 0.9.0 commit
+`ae28fb70c59197290defd3599dbf1cdddd3a1c40`, Verifiers
+`0.3.2.dev206` commit `2cb0a6d33a49de0752bbcf9e9a139104da9f5bc4`, and
+`zai-org/GLM-5.2-FP8` at `http://38.255.28.19:20003/v1`. The model key was
+unset. This local workspace layout is specific to the review environment; the
+clean-install recipe above uses in-repository `.eval-venv` paths.
 
-```sh
-PATH="$PWD/.eval-venv/bin:$PATH" .eval-venv/bin/eval xiaomi-code -n 1 -r 1 -c 1 \
-  -m zai-org/GLM-5.2-FP8 --client.base-url http://38.255.28.19:20003/v1 \
-  --client.api-key-var GLM_API_KEY \
-  --select.include.ids format-code-task-000820 \
-  --env.agent.runtime.type prime --env.agent.runtime.cpu 2 \
-  --env.agent.runtime.memory 8 --env.agent.runtime.disk 20 \
-  --env.agent.max-turns 64 --sampling.max-tokens 16000 --no-push
-```
+Code setup passed for `000820`, `001525`, `002737`, and `000121`, with
+`HEAD`/tree/status preserved. The bounded `fsck` on `000121` found no
+unreachable commits. Executable/version checks passed for Rust rows `000238`,
+`000681`, `000797`, `000798`, `001083`, `001540`, `001649`, `001652`, and
+`002793`, Java `003041`, and Go `002099`. Original verifiers were run on Rust
+examples `001083`, `001649`, `001652`, Java `003041`, and Go `002099` and
+reached their normal task outcomes.
+The examples `001072` and `001138` reached normal tests rather than missing
+Python/Django errors. Free-positive rows `001225` and `001597` still passed
+untouched; partial clone `002295` failed closed. Gradle row `001739` completed
+at native 8 GB memory with 20 GB disk requested.
 
-The endpoint used for Review 3 accepted an empty model API key, so `GLM_API_KEY`
-can remain unset there. `GA_JUDGE_KEY` is only for General scoring and is not
-used by Code. Keep the one-rollout caps and `--no-push` for these checks. Run
-setup/verifier probes on `000820`, `001525`, `002737`, `001072`, and `001138`,
-then one memory-heavy row; `docs/code.md` describes the checks and the bounded
-small-repository `fsck` case. No Review 3 fixes have yet been validated by a
-live run in this documentation state.
+The 16k Code run on `001138` ended with provider `finish_reason=length` and an
+empty final response; it is incomplete. The 32k rerun (`outputs/review3-code-001138-fixed-full/`)
+completed in 49 calls with `finish_reason=stop`, final response present, no
+trace errors, and no timeout or truncation. The eval requested runtime
+configuration of 2 CPU, 8 GB memory, and 20 GB disk. It scored 0: the original
+verifier ran eight tests, with seven passing and one failing because scalar
+`SimpleQueryString.fields` was emitted as `['name']` instead of `'name'`.
+This confirms a model contract failure, not a runtime or missing dependency issue.
 
-After the General trace-redaction change is accepted, use
-`s3k_0000_accounting_audit_tax_en_t1_rl_008` for one live redaction check. Set
-`GA_JUDGE_KEY` to a conspicuous fake sentinel, point the judge at the known
-GLM endpoint, and inspect the saved verifier stdout/stderr to confirm the
-sentinel is absent. The existing row used the policy model as its judge, so
-this checks trace handling only; it is not an independent score. Keep the
-actual judge credential unset for this check.
+The General redaction run on
+`s3k_0000_accounting_audit_tax_en_t1_rl_008` completed in eight model calls
+with `finish_reason=stop`, `agent_completed`, no timeout or trace errors, and
+the final response present. The original verifier returned 0 with reward 0.8
+(four of six checks passed); stderr was empty. The resolved runtime
+configuration requested 2 CPU, 4 GB memory, and 10 GB disk. The run used a conspicuous fake judge-key
+sentinel; a scan of the saved trace found it absent. No real judge credential
+was supplied. The policy model also served as the judge, so this validates the
+redaction path and judge integration, not an independent score. The trace is
+under `outputs/review3-general-redaction-fixed/`. The integrated workspace
+suite passed all 103 tests after the source fixes. The owned Prime sandboxes
+were cleaned up; `prime sandbox list` reported none remaining.
