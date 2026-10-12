@@ -220,3 +220,38 @@ redaction path and judge integration, not an independent score. The trace is
 under `outputs/review3-general-redaction-fixed/`. The integrated workspace
 suite passed all 103 tests after the source fixes. The owned Prime sandboxes
 were cleaned up; `prime sandbox list` reported none remaining.
+
+## Review 4 committed-source validation
+
+The supplied Review 4 full-pass file has 2,698 records: 2,693 immediate setup
+passes, four actual setup failures, and one transient sandbox error whose
+successful rerun brings the total to 2,694 setup passes. Its 85-row
+combined-fix check has 84 rows reaching verification after successful setup
+and the expected fail-closed `002295`. Both were against pre-fix source
+`4b5f3251`; the four fixes in the
+85-row check were in-memory patches. These results identify affected rows but
+do not validate the committed fixes. After integrating `83d17b2d` and
+`c163f87a`, the main Python 3.11 environment passed all **107 tests**.
+`git diff --check` passed at source hash
+`c163f87ac458d846357c783edf98f6442ce6f200`.
+
+Real-source setup and untouched verification ran on eight targeted rows:
+`000484`, `000820`, `001072`, `001166`, `002071`, `001621`, `001840`, and
+`000050`. All reached their original verifiers and retained the task-base
+`HEAD`; the pyc-only rows kept their two pytest bytecode files. Their reward
+was 0 because the untouched task tests fail (or, for `000050`, fail during
+pytest collection), as expected. The separate partial-clone row `002295`
+still failed closed during setup. Post-setup shell checks on `000484`,
+`000820`, and `001072` confirmed that child bash inherits a parent-added
+`PATH`, `bash -eu` runs, and the bootstrap does not leave `BASH_ENV` exported.
+On `000484`, `bash -lc true` took 0.4 seconds with no pyenv lock warning.
+
+The committed-source Prime RL run
+`outputs/review4-committed-000484-c163f87/` selected `000484` and completed one
+GLM-5.2-FP8 rollout in 20 turns, with 2 CPU, 8 GB memory, 20 GB disk, a
+32,000-token sampling cap, and a 64-turn limit requested. The final provider response had
+`finish_reason=stop`; the assistant returned a final answer, with no timeout or
+truncation. Reward was **1.0** and the original verifier exited 0 with all
+three injected tests passing. The trace records 27 tool invocations across 20
+provider responses (the harness exposes two tool schemas). Its sandbox is
+terminated. This targeted source check does not repeat the 2,698-row sweep.
