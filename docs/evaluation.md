@@ -176,3 +176,37 @@ the Docker-default `PATH` change, compare against its `docker-c` mode. The
 General package's use of Verifiers' private `_cached_package` and `_package_dir`
 helpers remains pinned debt; those helpers were present at both supported
 Verifiers revisions and should be rechecked on upgrade.
+
+## Review 3 Code verification plan
+
+The Code evidence and native row exclusions are documented in [code.md](code.md).
+Use the separate Python 3.12 Prime RL `.eval-venv` for the pinned Prime RL
+runner; the workspace `.venv` is Python 3.11 and uses the workspace Verifiers
+revision. A representative Code smoke command, prepared for the accepted Code
+changes, is:
+
+```sh
+PATH="$PWD/.eval-venv/bin:$PATH" .eval-venv/bin/eval xiaomi-code -n 1 -r 1 -c 1 \
+  -m zai-org/GLM-5.2-FP8 --client.base-url http://38.255.28.19:20003/v1 \
+  --client.api-key-var GLM_API_KEY \
+  --select.include.ids format-code-task-000820 \
+  --env.agent.runtime.type prime --env.agent.runtime.cpu 2 \
+  --env.agent.runtime.memory 8 --env.agent.runtime.disk 20 \
+  --env.agent.max-turns 64 --sampling.max-tokens 16000 --no-push
+```
+
+The endpoint used for Review 3 accepted an empty model API key, so `GLM_API_KEY`
+can remain unset there. `GA_JUDGE_KEY` is only for General scoring and is not
+used by Code. Keep the one-rollout caps and `--no-push` for these checks. Run
+setup/verifier probes on `000820`, `001525`, `002737`, `001072`, and `001138`,
+then one memory-heavy row; `docs/code.md` describes the checks and the bounded
+small-repository `fsck` case. No Review 3 fixes have yet been validated by a
+live run in this documentation state.
+
+After the General trace-redaction change is accepted, use
+`s3k_0000_accounting_audit_tax_en_t1_rl_008` for one live redaction check. Set
+`GA_JUDGE_KEY` to a conspicuous fake sentinel, point the judge at the known
+GLM endpoint, and inspect the saved verifier stdout/stderr to confirm the
+sentinel is absent. The existing row used the policy model as its judge, so
+this checks trace handling only; it is not an independent score. Keep the
+actual judge credential unset for this check.
