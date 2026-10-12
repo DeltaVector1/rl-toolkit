@@ -1,8 +1,10 @@
 """Synthetic repositories only; no published task commands run on the host."""
 
 import os
+import py_compile
 import shlex
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -205,16 +207,34 @@ async def test_broken_testbed_is_error_and_cleanup_runs(runtime):
     assert "git cat-file" in runtime.calls[-1][1][-1]
 
 
-async def test_history_leak_aborts_before_any_test_upload():
+@pytest.mark.parametrize("history", ["clean", "remaining_ref", "git_failure"])
+async def test_history_check_ignores_profile_output_and_fails_closed(repo, history):
     task, trace = task_and_trace()
+    task = XiaomiCodeTask(task.data.model_copy(update={"workdir": str(repo)}))
+    base = git(repo, "rev-parse", "HEAD")
+    if history == "remaining_ref":
+        git(repo, "commit", "--allow-empty", "-qm", "remaining future commit")
+    profile = repo / "chatty-profile"
+    profile.write_text("echo 'JAVA_HOME='\necho 'maven settings: fixture'\n" +
+                       ("git() { return 42; }\n" if history == "git_failure" else ""))
     runtime = RecordingRuntime()
     async def run(argv, env):
-        if "rev-parse HEAD" in argv[-1] or "rev-list" in argv[-1]:
-            return ProgramResult(0, "a" * 40 + "\n", "")
+        if "rev-parse HEAD" in argv[-1]:
+            return ProgramResult(0, base + "\n", "")
+        if "rev-list" in argv[-1]:
+            result = subprocess.run(argv, env={**os.environ, "BASH_ENV": str(profile)},
+                                    capture_output=True, text=True)
+            assert "maven settings: fixture" in result.stdout
+            return ProgramResult(result.returncode, result.stdout, result.stderr)
         return ProgramResult(0, "", "")
     runtime.run = run
-    with pytest.raises(RuntimeError, match="history"):
+    if history == "clean":
         await task.setup(trace, runtime)
+        assert trace.info["base_ref"] == base
+    else:
+        with pytest.raises(RuntimeError, match="history"):
+            await task.setup(trace, runtime)
+        assert "base_ref" not in trace.info
     assert runtime.calls == [("write", BASH_ENV_PATH, BASH_ENV_SCRIPT.encode())]
 
 
@@ -231,7 +251,7 @@ async def test_setup_captures_original_head_before_agent_moves_it():
     await task.setup(trace, runtime)
     assert trace.state.base_ref == 'b' * 40
     assert trace.info['base_ref'] == 'b' * 40
-    assert any('rev-list --all --not ' + 'b' * 40 in call[-1] for call in calls)
+    assert any('rev-list -n 1 --all --not ' + 'b' * 40 in call[-1] for call in calls)
     assert runtime.calls == [('write', BASH_ENV_PATH, BASH_ENV_SCRIPT.encode())]
 
 
@@ -338,7 +358,11 @@ def test_strip_removes_future_objects_but_preserves_ancestry_and_worktree(repo):
     (repo / "untracked.txt").write_text("keep\n")
     before = subprocess.run(["git", "--no-replace-objects", "status", "--porcelain"], cwd=repo,
                             capture_output=True, text=True, check=True).stdout
+    hook = repo / ".git/hooks/post-checkout"
+    hook.write_text("#!/bin/sh\necho ran > .git/hook-ran\nexit 1\n")
+    hook.chmod(0o755)
     subprocess.run(["bash", "-c", strip_history_command(base)], cwd=repo, check=True)
+    assert not (repo / ".git/hook-ran").exists()
     assert git(repo, "rev-parse", "HEAD") == base
     assert git(repo, "describe", "--tags", "--long").startswith("v1-1-g")
     assert git(repo, "rev-parse", "v1^{}") == ancestor
@@ -404,36 +428,65 @@ async def test_setup_gc_failure_is_fatal_before_agent():
 
 def test_cleanup_preserves_tracked_caches_and_build_environment(repo):
     for path in ("pkg/__pycache__/hidden.pyc", ".pytest_cache/test_names", ".jest/cache/test_names",
-                 ".build_env/__pycache__/required.pyc", "tracked/__pycache__/fixture.pyc",
-                 "tracked[fixture]/__pycache__/fixture.pyc"):
+                 ".build_env/.pytest_cache/required", "tracked/.pytest_cache/fixture",
+                 "tracked[fixture]/.jest/cache/fixture"):
         file = repo / path
         file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_text("keep only build and tracked\n")
+        file.write_text("fixture\n")
+    dependency = repo / ".venv/lib/site-packages/fixture_dep"
+    dependency.mkdir(parents=True)
+    source = dependency / "__init__.py"
+    source.write_text("value = 'bytecode dependency'\n")
+    bytecode = dependency / "__pycache__/__init__.pyc"
+    py_compile.compile(str(source), cfile=str(bytecode), doraise=True)
+    source.unlink()
     git(repo, "--literal-pathspecs", "add", "tracked", "tracked[fixture]")
     subprocess.run(["bash", "-c", CACHE_CLEANUP], cwd=repo, check=True)
-    assert not (repo / "pkg/__pycache__").exists()
+    assert (repo / "pkg/__pycache__/hidden.pyc").exists()
+    # Published verifier scripts relocate cached bytecode to import source-less packages.
+    (dependency / "__init__.pyc").write_bytes(bytecode.read_bytes())
+    subprocess.run([sys.executable, "-c", "import fixture_dep; assert fixture_dep.value == 'bytecode dependency'"],
+                   env={**os.environ, "PYTHONPATH": str(dependency.parent)}, check=True)
     assert not (repo / ".pytest_cache").exists()
     assert not (repo / ".jest/cache").exists()
-    assert (repo / ".build_env/__pycache__/required.pyc").exists()
-    assert (repo / "tracked/__pycache__/fixture.pyc").exists()
-    assert (repo / "tracked[fixture]/__pycache__/fixture.pyc").exists()
+    assert (repo / ".build_env/.pytest_cache/required").exists()
+    assert (repo / "tracked/.pytest_cache/fixture").exists()
+    assert (repo / "tracked[fixture]/.jest/cache/fixture").exists()
 
 
-def test_code_bootstrap_reaches_each_nested_shell_without_recursing(tmp_path):
+def test_code_bootstrap_loads_once_and_children_keep_parent_environment(tmp_path):
     bootstrap = tmp_path / "bootstrap with spaces"
     # Use fixture profiles, never source or modify the developer's login files.
     system_profile = tmp_path / "system-profile"
-    system_profile.write_text("export SYSTEM_PROFILE_LOADED=yes\nbash -c 'true'\n")
+    system_profile.write_text('export PATH=/usr/bin:/bin\necho loaded >> "$HOME/profile-count"\n'
+                              'export VIRTUAL_ENV=profile NODE_OPTIONS=profile GRADLE_OPTS=profile MAVEN_OPTS=profile\n'
+                              'test -z "$PS1"\nbash -c true\n')
     (tmp_path / ".bash_profile").write_text("export PROJECT_PYTHON=fixture\nbash -c 'true'\n")
-    script = BASH_ENV_SCRIPT.replace("/etc/profile", str(system_profile)).replace(
-        shlex.quote(BASH_ENV_PATH), shlex.quote(str(bootstrap)))
+    tool = tmp_path / "mytool"
+    tool.write_text("#!/bin/sh\necho tool-ok\n")
+    tool.chmod(0o755)
+    child = tmp_path / "child"
+    child.write_text('#!/bin/bash\nset -eu\nmytool\n'
+                     'test "$PROJECT_PYTHON" = parent\n'
+                     'test "$VIRTUAL_ENV:$NODE_OPTIONS:$GRADLE_OPTS:$MAVEN_OPTS" = parent:parent:parent:parent\n'
+                     'test -z "${BASH_ENV-}"\n')
+    child.chmod(0o755)
+    script = BASH_ENV_SCRIPT.replace("/etc/profile", str(system_profile))
     bootstrap.write_text(script)
     env = {**os.environ, "HOME": str(tmp_path), "BASH_ENV": str(bootstrap)}
-    result = subprocess.run(["bash", "-c", 'test "$SYSTEM_PROFILE_LOADED" = yes && '
-                             'test "$PROJECT_PYTHON" = fixture && '
-                             "unset PROJECT_PYTHON; bash -c 'test \"$PROJECT_PYTHON\" = fixture'"],
+    command = ('test "$PROJECT_PYTHON" = fixture && '
+               'export PATH="$HOME:$PATH" PROJECT_PYTHON=parent VIRTUAL_ENV=parent '
+               'NODE_OPTIONS=parent GRADLE_OPTS=parent MAVEN_OPTS=parent; '
+               '"$HOME/child" && /bin/bash -eu "$HOME/child"')
+    result = subprocess.run(["bash", "-c", command],
                             env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert result.stdout.splitlines() == ["tool-ok", "tool-ok"]
+    assert (tmp_path / "profile-count").read_text() == "loaded\n"
+    # A second command launched by the same Python harness still loads its own profile.
+    subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True, check=True)
+    assert (tmp_path / "profile-count").read_text() == "loaded\nloaded\n"
     from xiaomi_general.taskset import GeneralTask
     assert "BASH_ENV" not in GeneralTask.runtime_env(SimpleNamespace())
 
@@ -461,8 +514,9 @@ def test_bootstrap_recovers_only_missing_installed_tools(tmp_path, existing_carg
     bootstrap.write_text(script)
     env = {"HOME": str(tmp_path), "PATH": str(original_bin), "BASH_ENV": str(bootstrap),
            "CARGO_HOME": "original", "RUSTUP_HOME": "original"}
-    result = subprocess.run(["/bin/bash", "-c", 'command -v cargo; command -v javac; command -v okexchaincli; '
-                             'printf "%s\\n" "$CARGO_HOME" "$RUSTUP_HOME" "$JAVA_HOME"'],
+    child_command = ('command -v cargo; command -v javac; command -v okexchaincli; '
+                     'printf "%s\\n" "$CARGO_HOME" "$RUSTUP_HOME" "$JAVA_HOME"')
+    result = subprocess.run(["/bin/bash", "-c", "/bin/bash -eu -c " + shlex.quote(child_command)],
                             env=env, capture_output=True, text=True, check=True)
     assert result.stdout.splitlines() == [
         str(original_bin / "cargo" if existing_cargo else cargo_home / "bin/cargo"),

@@ -34,7 +34,7 @@ fi
 if ! command -v okexchaincli >/dev/null 2>&1 && [ -x "$HOME/go/bin/okexchaincli" ]; then
     export PATH="$PATH:$HOME/go/bin"
 fi
-""" + f"export BASH_ENV={shlex.quote(BASH_ENV_PATH)}\n"
+"""
 
 
 def strip_history_command(base_ref: str) -> str:
@@ -60,7 +60,7 @@ while IFS= read -r setting; do
         echo 'Cannot sanitize a partial clone: promisor objects are not pruned' >&2; exit 1
     fi
 done <<< "$promisors"
-git checkout --detach {base_ref}
+git -c core.hooksPath=/dev/null checkout --detach {base_ref}
 git for-each-ref --format='%(refname)' | while IFS= read -r ref; do
     case "$ref" in
         refs/tags/*) if git merge-base --is-ancestor "$ref" {base_ref}; then continue; fi ;;
@@ -77,10 +77,10 @@ git -c gc.pruneExpire=now -c gc.cruftPacks=false gc --prune=now
 '''
 
 
-# Remove only regenerated cache directories with no tracked contents. Build inputs stay.
+# Preserve Python bytecode: some images ship dependencies without their source.
 CACHE_CLEANUP = r"""set -euo pipefail
 find . -type d \( -name .git -o -name .build_env \) -prune -o \
-    -type d \( -name __pycache__ -o -name .pytest_cache -o -path '*/.jest/cache' \) -prune -print0 |
+    -type d \( -name .pytest_cache -o -path '*/.jest/cache' \) -prune -print0 |
 while IFS= read -r -d '' cache; do
     tracked=$(git --literal-pathspecs ls-files -- "$cache")
     [ -n "$tracked" ] || rm -rf -- "$cache"
@@ -191,8 +191,8 @@ class XiaomiCodeTask(vf.Task[CodeData, CodeState]):
         stripped = await run_shell(runtime, strip_history_command(trace.state.base_ref), cwd, 600)
         if stripped.exit_code != 0:
             raise RuntimeError(f"Cannot sanitize task Git history: {stripped.stdout}\n{stripped.stderr}")
-        history = await run_shell(runtime, f"git rev-list --all --not {trace.state.base_ref}", cwd)
-        if history.exit_code != 0 or history.stdout.strip():
+        history = await run_shell(runtime, f'remaining=$(git rev-list -n 1 --all --not {trace.state.base_ref}) && [ -z "$remaining" ]', cwd)
+        if history.exit_code != 0:
             raise RuntimeError("Image history is not truncated at the captured task base commit")
         cleaned = await run_shell(runtime, CACHE_CLEANUP, cwd)
         if cleaned.exit_code != 0:
