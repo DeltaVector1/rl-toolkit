@@ -1,12 +1,17 @@
 """Synthetic repositories only; no published task commands run on the host."""
 
+import os
+import shlex
 import subprocess
 from types import SimpleNamespace
 
 import pytest
 from verifiers.v1.runtimes import ProgramResult
 
-from xiaomi_code.taskset import CodeData, CodeState, XiaomiCodeTask, reset_command, touched_files
+from xiaomi_code.taskset import (
+    BASH_ENV_PATH, BASH_ENV_SCRIPT, CACHE_CLEANUP, CodeData, CodeState,
+    XiaomiCodeTask, reset_command, strip_history_command, touched_files,
+)
 
 PATCH = """diff --git a/check.txt b/check.txt
 new file mode 100644
@@ -183,9 +188,10 @@ async def test_original_exit_code_contract_and_late_patch(returncode, score):
     task, trace = task_and_trace()
     runtime = RecordingRuntime(verifier_rc=returncode)
     assert await task.verified(trace, runtime) == score
-    assert "git cat-file" in runtime.calls[0][1][-1]
-    assert runtime.calls[1][0] == "write"
-    assert "git apply" in runtime.calls[2][1][-1]
+    assert "git cat-file" in runtime.calls[1][1][-1]
+    assert runtime.calls[0] == ("write", BASH_ENV_PATH, BASH_ENV_SCRIPT.encode())
+    assert runtime.calls[2][0] == "write"
+    assert "git apply" in runtime.calls[3][1][-1]
     assert "git cat-file" in runtime.calls[-1][1][-1]
     assert trace.info["verifier"]["verifier_returncode"] == returncode
 
@@ -209,7 +215,7 @@ async def test_history_leak_aborts_before_any_test_upload():
     runtime.run = run
     with pytest.raises(RuntimeError, match="history"):
         await task.setup(trace, runtime)
-    assert runtime.calls == []
+    assert runtime.calls == [("write", BASH_ENV_PATH, BASH_ENV_SCRIPT.encode())]
 
 
 async def test_setup_captures_original_head_before_agent_moves_it():
@@ -225,8 +231,8 @@ async def test_setup_captures_original_head_before_agent_moves_it():
     await task.setup(trace, runtime)
     assert trace.state.base_ref == 'b' * 40
     assert trace.info['base_ref'] == 'b' * 40
-    assert 'rev-list --all --not ' + 'b' * 40 in calls[-1][-1]
-    assert not any(call[0] == 'write' for call in runtime.calls)
+    assert any('rev-list --all --not ' + 'b' * 40 in call[-1] for call in calls)
+    assert runtime.calls == [('write', BASH_ENV_PATH, BASH_ENV_SCRIPT.encode())]
 
 
 def test_taskset_load_and_default_agent_tools(monkeypatch):
@@ -245,6 +251,11 @@ def test_taskset_load_and_default_agent_tools(monkeypatch):
     assert task.data.id == 'example'
     assert task.data.prompt == instance['problem_statement']
     assert task.data.timeout.scoring == 1920
+    assert task.data.timeout.setup == 600
+    from verifiers.v1.runtimes import PrimeConfig
+    from verifiers.v1.utils.compile import resolve_runtime_config
+    assert resolve_runtime_config(PrimeConfig(), task).memory == 8
+    assert resolve_runtime_config(PrimeConfig(memory=16), task).memory == 16
     assert task.data.workdir == '/testbed'
     assert task.NEEDS_CONTAINER
     harness = default_agent_harness('xiaomi-code')
@@ -278,9 +289,9 @@ async def test_docker_default_path_reaches_agent_and_verifier():
     harness_runtime = await agent_runtime(runtime, task.data.agent_user)
     await harness_runtime.run(["bash", "-c", "npm --version; go version"], {})
     assert await task.verified(trace, runtime) == 1
-    expected = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+    expected = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "BASH_ENV": BASH_ENV_PATH}
     agent_env = next(env for argv, env in runtime.calls if argv[-1] == "npm --version; go version")
-    grader_env = next(env for argv, env in runtime.calls if argv[0] == "timeout")
+    grader_env = next(env for argv, env in runtime.calls if argv[0] == "timeout" and task.data.test_command in argv[-1])
     assert agent_env == grader_env == expected
 
 
@@ -302,3 +313,145 @@ async def test_verifier_trace_keeps_output_tails_without_changing_reward(returnc
     assert trace.info["verifier"]["stdout"] == stdout[-10000:]
     assert trace.info["verifier"]["stderr"] == stderr[-4000:]
     assert "git cat-file" in runtime.calls[-1][1][-1]
+
+
+def test_strip_removes_future_objects_but_preserves_ancestry_and_worktree(repo):
+    ancestor = git(repo, "rev-parse", "HEAD")
+    git(repo, "tag", "-a", "v1", "-m", "ancestor")
+    (repo / "solution.txt").write_text("base\n")
+    git(repo, "commit", "-qam", "task base")
+    base = git(repo, "rev-parse", "HEAD")
+    (repo / "future.txt").write_text("reference fix\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "future fix")
+    future = git(repo, "rev-parse", "HEAD")
+    git(repo, "tag", "future")
+    git(repo, "update-ref", "refs/custom/fix", future)
+    git(repo, "update-ref", "refs/remotes/origin/main", future)
+    git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/missing")
+    git(repo, "reset", "--hard", base)
+    # Replacement refs must not change the real task base tree or its ancestry.
+    git(repo, "replace", base, future)
+    (repo / "solution.txt").write_text("staged edit\n")
+    git(repo, "add", "solution.txt")
+    (repo / "solution.txt").write_text("working edit\n")
+    (repo / "untracked.txt").write_text("keep\n")
+    before = subprocess.run(["git", "--no-replace-objects", "status", "--porcelain"], cwd=repo,
+                            capture_output=True, text=True, check=True).stdout
+    subprocess.run(["bash", "-c", strip_history_command(base)], cwd=repo, check=True)
+    assert git(repo, "rev-parse", "HEAD") == base
+    assert git(repo, "describe", "--tags", "--long").startswith("v1-1-g")
+    assert git(repo, "rev-parse", "v1^{}") == ancestor
+    assert git(repo, "for-each-ref", "--format=%(refname)") == "refs/tags/v1"
+    assert git(repo, "status", "--porcelain") == before.strip()
+    assert (repo / "solution.txt").read_text() == "working edit\n"
+    assert git(repo, "show", ":solution.txt") == "staged edit"
+    assert not (repo / ".git/refs/remotes").exists()
+    assert not git(repo, "reflog", "--all")
+    assert "unreachable" not in git(repo, "fsck", "--unreachable", "--no-reflogs")
+    assert subprocess.run(["git", "cat-file", "-e", future], cwd=repo,
+                          capture_output=True).returncode != 0
+
+
+@pytest.mark.parametrize("marker", ["promisor", "keep", "config", "worktree", "linked"])
+def test_strip_rejects_unprunable_or_shared_repositories(repo, tmp_path, marker):
+    base = git(repo, "rev-parse", "HEAD")
+    if marker in {"promisor", "keep"}:
+        (repo / f".git/objects/pack/pack-future.{marker}").touch()
+    elif marker == "config":
+        git(repo, "config", "remote.origin.promisor", "true")
+    else:
+        git(repo, "worktree", "add", "--detach", str(tmp_path / "linked"), base)
+    result = subprocess.run(["bash", "-c", strip_history_command(base)], cwd=repo,
+                            capture_output=True, text=True)
+    if marker == "linked":
+        result = subprocess.run(["bash", "-c", strip_history_command(base)], cwd=tmp_path / "linked",
+                                capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "Cannot sanitize" in result.stderr
+    assert git(repo, "symbolic-ref", "HEAD").startswith("refs/heads/")
+
+
+async def test_setup_gc_failure_is_fatal_before_agent():
+    task, trace = task_and_trace()
+    runtime = RecordingRuntime()
+    async def run(argv, env):
+        if "rev-parse HEAD" in argv[-1]:
+            return ProgramResult(0, "a" * 40, "")
+        if "gc --prune=now" in argv[-1]:
+            return ProgramResult(128, "", "gc failed")
+        return ProgramResult(0, "", "")
+    runtime.run = run
+    with pytest.raises(RuntimeError, match="gc failed"):
+        await task.setup(trace, runtime)
+    assert "base_ref" not in trace.info
+
+
+def test_cleanup_preserves_tracked_caches_and_build_environment(repo):
+    for path in ("pkg/__pycache__/hidden.pyc", ".pytest_cache/test_names", ".jest/cache/test_names",
+                 ".build_env/__pycache__/required.pyc", "tracked/__pycache__/fixture.pyc",
+                 "tracked[fixture]/__pycache__/fixture.pyc"):
+        file = repo / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("keep only build and tracked\n")
+    git(repo, "--literal-pathspecs", "add", "tracked", "tracked[fixture]")
+    subprocess.run(["bash", "-c", CACHE_CLEANUP], cwd=repo, check=True)
+    assert not (repo / "pkg/__pycache__").exists()
+    assert not (repo / ".pytest_cache").exists()
+    assert not (repo / ".jest/cache").exists()
+    assert (repo / ".build_env/__pycache__/required.pyc").exists()
+    assert (repo / "tracked/__pycache__/fixture.pyc").exists()
+    assert (repo / "tracked[fixture]/__pycache__/fixture.pyc").exists()
+
+
+def test_code_bootstrap_reaches_each_nested_shell_without_recursing(tmp_path):
+    bootstrap = tmp_path / "bootstrap with spaces"
+    # Use fixture profiles, never source or modify the developer's login files.
+    system_profile = tmp_path / "system-profile"
+    system_profile.write_text("export SYSTEM_PROFILE_LOADED=yes\nbash -c 'true'\n")
+    (tmp_path / ".bash_profile").write_text("export PROJECT_PYTHON=fixture\nbash -c 'true'\n")
+    script = BASH_ENV_SCRIPT.replace("/etc/profile", str(system_profile)).replace(
+        shlex.quote(BASH_ENV_PATH), shlex.quote(str(bootstrap)))
+    bootstrap.write_text(script)
+    env = {**os.environ, "HOME": str(tmp_path), "BASH_ENV": str(bootstrap)}
+    result = subprocess.run(["bash", "-c", 'test "$SYSTEM_PROFILE_LOADED" = yes && '
+                             'test "$PROJECT_PYTHON" = fixture && '
+                             "unset PROJECT_PYTHON; bash -c 'test \"$PROJECT_PYTHON\" = fixture'"],
+                            env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    from xiaomi_general.taskset import GeneralTask
+    assert "BASH_ENV" not in GeneralTask.runtime_env(SimpleNamespace())
+
+
+@pytest.mark.parametrize("existing_cargo", [False, True])
+def test_bootstrap_recovers_only_missing_installed_tools(tmp_path, existing_cargo):
+    bootstrap = tmp_path / "bootstrap"
+    profile = tmp_path / "profile"
+    profile.write_text("")
+    cargo_home = tmp_path / "cargo"
+    rustup_home = tmp_path / "rustup"
+    java_home = tmp_path / "java"
+    original_bin = tmp_path / "bin"
+    original_bin.mkdir()
+    for binary in (cargo_home / "bin/cargo", java_home / "bin/javac", tmp_path / "go/bin/okexchaincli"):
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+    if existing_cargo:
+        (original_bin / "cargo").write_text("#!/bin/sh\nexit 0\n")
+        (original_bin / "cargo").chmod(0o755)
+    script = BASH_ENV_SCRIPT.replace("/etc/profile", str(profile)).replace(
+        "/usr/local/cargo", str(cargo_home)).replace("/usr/local/rustup", str(rustup_home)).replace(
+        "/opt/java/openjdk", str(java_home)).replace(BASH_ENV_PATH, str(bootstrap))
+    bootstrap.write_text(script)
+    env = {"HOME": str(tmp_path), "PATH": str(original_bin), "BASH_ENV": str(bootstrap),
+           "CARGO_HOME": "original", "RUSTUP_HOME": "original"}
+    result = subprocess.run(["/bin/bash", "-c", 'command -v cargo; command -v javac; command -v okexchaincli; '
+                             'printf "%s\\n" "$CARGO_HOME" "$RUSTUP_HOME" "$JAVA_HOME"'],
+                            env=env, capture_output=True, text=True, check=True)
+    assert result.stdout.splitlines() == [
+        str(original_bin / "cargo" if existing_cargo else cargo_home / "bin/cargo"),
+        str(java_home / "bin/javac"), str(tmp_path / "go/bin/okexchaincli"),
+        "original" if existing_cargo else str(cargo_home),
+        "original" if existing_cargo else str(rustup_home), str(java_home),
+    ]

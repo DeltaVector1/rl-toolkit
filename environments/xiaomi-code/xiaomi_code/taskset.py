@@ -17,6 +17,69 @@ from xiaomi_common.runtime import checked_run, run_shell
 
 ERROR_CATEGORY = "reward/testbed_corrupted"
 PATCH_PATH = "/tmp/_opensource_code_test.patch"
+BASH_ENV_PATH = "/tmp/_xiaomi_code_bash_env"
+# Unset first so profile subprocesses cannot recursively source this same file.
+BASH_ENV_SCRIPT = """unset BASH_ENV
+[ ! -r /etc/profile ] || . /etc/profile
+if [ -r "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile"
+elif [ -r "$HOME/.bash_login" ]; then . "$HOME/.bash_login"
+elif [ -r "$HOME/.profile" ]; then . "$HOME/.profile"
+fi
+if ! command -v cargo >/dev/null 2>&1 && [ -x /usr/local/cargo/bin/cargo ]; then
+    export PATH="/usr/local/cargo/bin:$PATH" CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup
+fi
+if ! command -v javac >/dev/null 2>&1 && [ -x /opt/java/openjdk/bin/javac ]; then
+    export JAVA_HOME=/opt/java/openjdk PATH="/opt/java/openjdk/bin:$PATH"
+fi
+if ! command -v okexchaincli >/dev/null 2>&1 && [ -x "$HOME/go/bin/okexchaincli" ]; then
+    export PATH="$PATH:$HOME/go/bin"
+fi
+""" + f"export BASH_ENV={shlex.quote(BASH_ENV_PATH)}\n"
+
+
+def strip_history_command(base_ref: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", base_ref):
+        raise ValueError("Missing or invalid captured base commit")
+    return f'''set -euo pipefail
+export GIT_NO_REPLACE_OBJECTS=1
+git_dir=$(git rev-parse --absolute-git-dir)
+common_dir=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)
+# A linked worktree or shared object store cannot safely be pruned in isolation.
+if [ "$git_dir" != "$common_dir" ] || [ -s "$git_dir/objects/info/alternates" ] || [ -d "$git_dir/worktrees" ]; then
+    echo 'Cannot sanitize a shared Git object store' >&2; exit 1
+fi
+if compgen -G "$git_dir/objects/pack/*.keep" >/dev/null; then
+    echo 'Cannot sanitize packs protected from garbage collection' >&2; exit 1
+fi
+if compgen -G "$git_dir/objects/pack/*.promisor" >/dev/null || git config --get-regexp '^(extensions\\.partialclone|remote\\..*\\.promisor)$' >/dev/null; then
+    echo 'Cannot sanitize a partial clone: promisor objects are not pruned' >&2; exit 1
+fi
+git checkout --detach {base_ref}
+git for-each-ref --format='%(refname)' | while IFS= read -r ref; do
+    case "$ref" in
+        refs/tags/*) if git merge-base --is-ancestor "$ref" {base_ref}; then continue; fi ;;
+    esac
+    git update-ref --no-deref -d "$ref"
+done
+# for-each-ref omits broken symbolic refs, including origin/HEAD.
+for namespace in "$git_dir"/refs/*; do
+    [ "$namespace" = "$git_dir/refs/tags" ] || rm -rf -- "$namespace"
+done
+git remote | while IFS= read -r remote; do git remote remove "$remote"; done
+git reflog expire --expire=now --all
+git -c gc.pruneExpire=now -c gc.cruftPacks=false gc --prune=now
+'''
+
+
+# Remove only regenerated cache directories with no tracked contents. Build inputs stay.
+CACHE_CLEANUP = r"""set -euo pipefail
+find . -type d \( -name .git -o -name .build_env \) -prune -o \
+    -type d \( -name __pycache__ -o -name .pytest_cache -o -path '*/.jest/cache' \) -prune -print0 |
+while IFS= read -r -d '' cache; do
+    tracked=$(git --literal-pathspecs ls-files -- "$cache")
+    [ -n "$tracked" ] || rm -rf -- "$cache"
+done
+"""
 
 
 def touched_files(patch: str) -> list[str]:
@@ -103,24 +166,31 @@ class XiaomiCodeTask(vf.Task[CodeData, CodeState]):
 
     def runtime_env(self) -> dict[str, str]:
         # Flattened Code images omit ENV; supply the default PATH Docker would give them.
-        return {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+        return {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "BASH_ENV": BASH_ENV_PATH}
 
     async def setup(self, trace: vf.Trace, runtime: vf.Runtime) -> None:
         cwd = self.data.workdir
+        await runtime.write(BASH_ENV_PATH, BASH_ENV_SCRIPT.encode())
         await checked_run(runtime, ["git", "config", "--global", "--add", "safe.directory", cwd])
         exists = await run_shell(runtime, "git rev-parse --git-dir", cwd)
         if exists.exit_code != 0:
             result = await run_shell(runtime, "git init -q && git add -A && git -c user.name=MiMo -c user.email=mimo@localhost commit -q -m baseline --allow-empty", cwd)
             if result.exit_code != 0:
                 raise RuntimeError(f"Cannot initialize task repository: {result.stdout}\n{result.stderr}")
-        result = await run_shell(runtime, "git rev-parse HEAD", cwd)
+        result = await run_shell(runtime, "GIT_NO_REPLACE_OBJECTS=1 git rev-parse HEAD", cwd)
         hashes = re.findall(r"(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])", result.stdout)
         if result.exit_code != 0 or not hashes:
             raise RuntimeError(f"Cannot capture task base commit: {result.stdout}\n{result.stderr}")
         trace.state.base_ref = hashes[-1]
+        stripped = await run_shell(runtime, strip_history_command(trace.state.base_ref), cwd, 600)
+        if stripped.exit_code != 0:
+            raise RuntimeError(f"Cannot sanitize task Git history: {stripped.stdout}\n{stripped.stderr}")
         history = await run_shell(runtime, f"git rev-list --all --not {trace.state.base_ref}", cwd)
         if history.exit_code != 0 or history.stdout.strip():
             raise RuntimeError("Image history is not truncated at the captured task base commit")
+        cleaned = await run_shell(runtime, CACHE_CLEANUP, cwd)
+        if cleaned.exit_code != 0:
+            raise RuntimeError(f"Cannot clear task caches: {cleaned.stdout}\n{cleaned.stderr}")
         trace.info["base_ref"] = trace.state.base_ref
 
     async def _reset(self, runtime: vf.Runtime, base_ref: str) -> None:
@@ -132,6 +202,8 @@ class XiaomiCodeTask(vf.Task[CodeData, CodeState]):
     async def verified(self, trace: vf.Trace, runtime: vf.Runtime) -> float:
         base_ref = trace.state.base_ref
         try:
+            # The agent can write /tmp; grading restores the port's bootstrap first.
+            await runtime.write(BASH_ENV_PATH, BASH_ENV_SCRIPT.encode())
             await self._reset(runtime, base_ref)
             await runtime.write(PATCH_PATH, self.data.test_patch.encode())
             try:
@@ -181,5 +253,6 @@ class XiaomiCodeTaskset(vf.Taskset[XiaomiCodeTask, XiaomiTasksetConfig]):
                 test_patch=instance["test_patch"],
                 test_command=instance["test_command"],
                 verifier_timeout_sec=instance["verifier_timeout_sec"],
-                timeout=vf.TaskTimeout(scoring=instance["verifier_timeout_sec"] + 120),
+                timeout=vf.TaskTimeout(setup=600, scoring=instance["verifier_timeout_sec"] + 120),
+                resources=vf.TaskResources(memory=8),
             ), self.config.task)
