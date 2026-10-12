@@ -372,6 +372,21 @@ def test_strip_rejects_unprunable_or_shared_repositories(repo, tmp_path, marker)
     assert git(repo, "symbolic-ref", "HEAD").startswith("refs/heads/")
 
 
+@pytest.mark.parametrize("value", ["false", "no", "off", "0", "invalid"])
+def test_strip_interprets_promisor_boolean_metadata(repo, value):
+    base = git(repo, "rev-parse", "HEAD")
+    git(repo, "config", "remote.origin.promisor", value)
+    result = subprocess.run(["bash", "-c", strip_history_command(base)], cwd=repo,
+                            capture_output=True, text=True)
+    if value == "invalid":
+        assert result.returncode != 0
+        assert "bad boolean" in result.stderr
+        assert git(repo, "symbolic-ref", "HEAD").startswith("refs/heads/")
+    else:
+        assert result.returncode == 0, result.stderr
+        assert git(repo, "rev-parse", "HEAD") == base
+
+
 async def test_setup_gc_failure_is_fatal_before_agent():
     task, trace = task_and_trace()
     runtime = RecordingRuntime()

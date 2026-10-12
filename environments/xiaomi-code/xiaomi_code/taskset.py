@@ -51,9 +51,15 @@ fi
 if compgen -G "$git_dir/objects/pack/*.keep" >/dev/null; then
     echo 'Cannot sanitize packs protected from garbage collection' >&2; exit 1
 fi
-if compgen -G "$git_dir/objects/pack/*.promisor" >/dev/null || git config --get-regexp '^(extensions\\.partialclone|remote\\..*\\.promisor)$' >/dev/null; then
+if compgen -G "$git_dir/objects/pack/*.promisor" >/dev/null || git config --get extensions.partialclone >/dev/null; then
     echo 'Cannot sanitize a partial clone: promisor objects are not pruned' >&2; exit 1
 fi
+promisors=$(git config --bool --get-regexp '^remote\\..*\\.promisor$') || [ "$?" -eq 1 ]
+while IFS= read -r setting; do
+    if [[ "$setting" == *" true" ]]; then
+        echo 'Cannot sanitize a partial clone: promisor objects are not pruned' >&2; exit 1
+    fi
+done <<< "$promisors"
 git checkout --detach {base_ref}
 git for-each-ref --format='%(refname)' | while IFS= read -r ref; do
     case "$ref" in
