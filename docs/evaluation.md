@@ -223,9 +223,9 @@ were cleaned up; `prime sandbox list` reported none remaining.
 
 ## Review 4 committed-source validation
 
-The supplied Review 4 full-pass file has 2,698 records: 2,693 immediate setup
+The Review 4 sweep at `4b5f3251` recorded 2,698 rows: 2,693 immediate setup
 passes, four actual setup failures, and one transient sandbox error whose
-successful rerun brings the total to 2,694 setup passes. Its 85-row
+successful rerun brought the total to 2,694 setup passes. Its 85-row
 combined-fix check has 84 rows reaching verification after successful setup
 and the expected fail-closed `002295`. Both were against pre-fix source
 `4b5f3251`; the four fixes in the
@@ -254,4 +254,48 @@ GLM-5.2-FP8 rollout in 20 turns, with 2 CPU, 8 GB memory, 20 GB disk, a
 truncation. Reward was **1.0** and the original verifier exited 0 with all
 three injected tests passing. The trace records 27 tool invocations across 20
 provider responses (the harness exposes two tool schemas). Its sandbox is
-terminated. This targeted source check does not repeat the 2,698-row sweep.
+terminated. At the time of Review 4, this targeted source check did not repeat
+the 2,698-row sweep; independently supplied Review 5 evidence now records that
+full pass below.
+
+## Review 5 full Code-image validation
+
+The independently supplied Review 5 sweep contains one raw JSONL record for
+each of the 2,698 Code images at `6d1030cda20256adf8cd1a16da737591b0ba8b21`.
+The records contain 2,698 distinct IDs and no probe errors. Setup passed on
+2,697 images; partial clone
+`format-code-task-002295` failed closed as expected. The probes recorded no
+changes to `HEAD` or its tree and no commits left outside the base on successful
+setups. Their status digest ignored `__pycache__`, `.pytest_cache`, and `.jest`
+paths, and their `git describe` value omitted the final commit hash; neither
+recorded a change. The `fsck` probe reported zero unreachable commits in 2,607
+repositories. It records the count but not whether
+`git fsck` completed successfully; 90 repositories at or above the 400 MB
+threshold were unmeasured. Every image resolved to 8 GB memory, 2 CPU, and
+20 GB disk.
+
+The child-shell checks recorded zero lost parent `PATH` entries, zero overwritten
+parent variables, and zero errors under `bash -e`, `bash -u`, or `bash -eu`.
+The maximum recorded per-row average across ten child launches was 3 ms. Of the
+118 pyenv rows, two took at least 124 seconds to grade. Six verifiers hit the
+300-second cap:
+`000252`, `000348`, `002606`, `002643`, `000797`, and `001540`. The first four
+were long-running rows; the two Rust rows had also needed longer caps in Review
+4. Nine of the eleven repaired rows (seven Rust, Java `003041`, and Go `002099`)
+reached their tests instead of exiting 127; the other two Rust rows hit this
+pass's cap. Exclusions behaved as documented: `001225` and `001597` passed
+untouched, `001227` and `002879` exited 127, `002295` failed closed, and flaky
+`001217` failed on this pass.
+
+The 2,691 completed verifier outcomes included the two expected positive
+untouched rewards (`001225`, `001597`) and 2,689 zero rewards reflecting task
+verifier outcomes. No new missing-command or missing-module signatures were
+reported.
+
+The full pass reports a 22.1-second median setup time, compared with 3.9 seconds
+in Review 4. A separate ten-row run with no probe commands measured setup at
+1.9–4.4 seconds and grading at 2.2–102.9 seconds, with no pyenv lock messages.
+This supports provider latency under concurrency as a possible explanation for
+the full-pass timing; it does not prove that attribution. The prior 0.4-second
+single-row result, 107-test result, and GLM-5.2-FP8 reward-1.0 run above remain
+historical Review 4 evidence.
