@@ -743,10 +743,45 @@ async def test_general_grading_exception_trace_does_not_retain_judge_key(monkeyp
     saved = "".join(traceback.format_exception(caught.value))
     assert key not in saved and "fake-private" not in saved
     assert str(caught.value) == (
-        "missing_or_invalid_reward_json" if failure in ("read", "reward")
-        else "HTTPError: rejected <redacted> key=<redacted>"
+        "RuntimeError: missing_or_invalid_reward_json" if failure in ("read", "reward")
+        else "ValueError: HTTPError: rejected <redacted> key=<redacted>"
     )
     assert "verifier" not in trace.info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [(TimeoutError(), "TimeoutError: "),
+     (KeyError("fake-private-credential"), "KeyError: '<redacted>'")],
+)
+async def test_general_non_native_grading_errors_keep_type_and_redact_key(
+    monkeypatch, error, expected
+):
+    import xiaomi_general.taskset as module
+
+    key = "fake-private-credential"
+    monkeypatch.setenv("GA_JUDGE_KEY", key)
+    monkeypatch.setattr(module.GeneralTask, "manifest", lambda _: {})
+
+    async def run_shell(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(module, "run_shell", run_shell)
+
+    class Runtime:
+        async def run(self, argv, env):
+            return ProgramResult(0, "", "")
+
+    task = GeneralTask(GeneralData(instance={"dataset_type": "general_agent"}))
+    trace = SimpleNamespace(info={"general_submission_validated": True})
+
+    with pytest.raises(RuntimeError) as caught:
+        await task.verifier_reward(trace, Runtime())
+
+    assert str(caught.value) == expected
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    assert key not in str(caught.value)
 
 
 @pytest.mark.asyncio

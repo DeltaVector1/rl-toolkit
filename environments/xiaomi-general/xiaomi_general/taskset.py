@@ -515,7 +515,7 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
             if isinstance(exc, RolloutError):
                 exc.args = (redact(str(exc)),)
                 raise exc from None
-            raise RuntimeError(redact(str(exc))) from None
+            raise RuntimeError(f"{type(exc).__name__}: {redact(str(exc))}") from None
 
 
 class GeneralTaskset(vf.Taskset[GeneralTask, GeneralConfig]):
