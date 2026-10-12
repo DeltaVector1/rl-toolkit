@@ -55,6 +55,10 @@ there. Original `run_verify.py` and `verify.py` calculate rewards. Missing,
 malformed, nonfinite, or out-of-range rewards raise infrastructure errors rather
 than silently grading the policy zero. Binary full-score threshold remains
 `1 - 1e-6`. Verifier details and return code are retained in trace info.
+Before trace storage or output clipping, General-agent grading redacts the original
+verifier's `key=` log fragments and full configured judge keys from stdout, stderr,
+reward details, and grading exceptions. Native error types and retry status codes
+are preserved. Judge credentials and original verifier inputs are unchanged. Terminal Bench output retains its original behavior.
 
 The 64 terminal rows have no released environment wrapper and start no MCP server.
 This choice is derived from each row when constructing `GeneralTask`, including

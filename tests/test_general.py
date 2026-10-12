@@ -66,7 +66,7 @@ def test_inline_paths_reject_escape():
 async def test_terminal_guard_reward_wins_over_successful_exit():
     class Runtime:
         async def run(self, argv, env):
-            return ProgramResult(0, "", "")
+            return ProgramResult(0, "key=terminal-output", "key=terminal-error")
 
         async def read(self, path):
             assert path == "/logs/verifier/reward.txt"
@@ -85,7 +85,11 @@ async def test_terminal_guard_reward_wins_over_successful_exit():
             }
         )
     )
-    assert await task.verifier_reward(SimpleNamespace(info={}), Runtime()) == 0
+    trace = SimpleNamespace(info={})
+    assert await task.verifier_reward(trace, Runtime()) == 0
+    assert trace.info["verifier"] == {
+        "returncode": 0, "stdout": "key=terminal-output", "stderr": "key=terminal-error",
+    }
 
 
 def test_loading_preserves_prompt_and_is_lazy(monkeypatch):
@@ -647,3 +651,154 @@ def test_private_temporary_scripts_do_not_import_shared_directory_modules(tmp_pa
             env={**os.environ, "TMPDIR": str(directory)}, text=True,
         )
         assert result.strip() == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_detail", [False, True])
+@pytest.mark.parametrize("clip", [False, True])
+async def test_general_trace_redacts_judge_keys_before_clipping(monkeypatch, raw_detail, clip):
+    import xiaomi_general.taskset as module
+
+    keys = {"GA_JUDGE_KEY": "fake-primary-credential", "GA_JUDGE_KEY2": "tiny",
+            "GA_JUDGE_KEY3": "fake-fallback-credential", "JUDGE_API_KEY": "fake-legacy-credential"}
+    monkeypatch.setenv("GA_JUDGE_KEY", keys["GA_JUDGE_KEY"])
+    monkeypatch.setattr(GeneralTask, "manifest", lambda _: {"verifier": {"env": keys}})
+    lines = ("[judge] chain[0]: model=fixture api=chat key=fake-primary...\n"
+             "[judge] chain[1]: model=fixture api=chat key=tiny...\n"
+             "[judge] switching e0->e1: model=fixture api=chat key=fake-fallbac... (last_err=HTTPError)\n")
+    clean = lines.replace("fake-primary...", "<redacted>").replace("tiny...", "<redacted>").replace("fake-fallbac...", "<redacted>")
+    full_error = "HTTPError: rejected " + " ".join(keys.values())
+    clean_error = "HTTPError: rejected " + " ".join(["<redacted>"] * len(keys))
+    stdout = lines + ("x" * 9997 if clip else full_error + "\n[verify] score=0.750")
+    stderr = lines + ("y" * 3997 if clip else full_error)
+    detail = {"reward": 0.75, "passed": True, "optional": None,
+              "results": [{"message": lines + full_error, "score": 1}]}
+    raw_prefix = "z" * 1990 + "\n"
+    detail_text = raw_prefix + "key=" + keys["GA_JUDGE_KEY"] + " " + lines + full_error if raw_detail else json.dumps(detail)
+
+    async def run_shell(runtime, command, **kwargs):
+        assert {name: kwargs["env"][name] for name in keys} == keys
+        return ProgramResult(0, stdout, stderr)
+
+    monkeypatch.setattr(module, "run_shell", run_shell)
+
+    class Runtime:
+        async def run(self, argv, env):
+            return ProgramResult(0, detail_text if argv[0] == "cat" else "", "")
+
+        async def read(self, path):
+            return b'{"reward": 0.75}'
+
+    task = GeneralTask(GeneralData(instance={"dataset_type": "general_agent"}))
+    trace = SimpleNamespace(info={"general_submission_validated": True})
+    assert await task.verifier_reward(trace, Runtime()) == 0.75
+    info = trace.info["verifier"]
+    assert info["stdout"] == (clean + ("x" * 9997 if clip else clean_error + "\n[verify] score=0.750"))[-10000:]
+    assert info["stderr"] == (clean + ("y" * 3997 if clip else clean_error))[-4000:]
+    assert info["verifier_returncode"] == 0
+    if raw_detail:
+        assert info["reward_detail_raw"] == (raw_prefix + "key=<redacted> " + clean + clean_error)[:2000]
+    else:
+        detail["results"][0]["message"] = clean + clean_error
+        assert info["reward_detail"] == detail
+    saved = json.dumps(trace.info)
+    for key in keys.values():
+        assert key not in saved
+    assert "fake-primary" not in saved and "fake-fallbac" not in saved
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["run", "read", "detail", "reward"])
+async def test_general_grading_exception_trace_does_not_retain_judge_key(monkeypatch, failure):
+    import traceback
+    import xiaomi_general.taskset as module
+
+    key = "fake-private-credential"
+    monkeypatch.setenv("GA_JUDGE_KEY", key)
+    monkeypatch.setattr(GeneralTask, "manifest", lambda _: {})
+    error = "HTTPError: rejected " + key + " key=fake-private..."
+
+    async def run_shell(*args, **kwargs):
+        if failure == "run":
+            raise ValueError(error)
+        return ProgramResult(1, "", "")
+
+    monkeypatch.setattr(module, "run_shell", run_shell)
+
+    class Runtime:
+        async def run(self, argv, env):
+            if failure == "detail" and argv[0] == "cat":
+                raise ValueError(error)
+            return ProgramResult(0, "", "")
+
+        async def read(self, path):
+            if failure == "read":
+                raise ValueError(error)
+            return json.dumps({"reward": key if failure == "reward" else 0.75}).encode()
+
+    task = GeneralTask(GeneralData(instance={"dataset_type": "general_agent"}))
+    trace = SimpleNamespace(info={"general_submission_validated": True})
+    with pytest.raises(RuntimeError) as caught:
+        await task.verifier_reward(trace, Runtime())
+    saved = "".join(traceback.format_exception(caught.value))
+    assert key not in saved and "fake-private" not in saved
+    assert str(caught.value) == (
+        "missing_or_invalid_reward_json" if failure in ("read", "reward")
+        else "HTTPError: rejected <redacted> key=<redacted>"
+    )
+    assert "verifier" not in trace.info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["run", "read", "detail"])
+@pytest.mark.parametrize("error_type", ["SandboxError", "ProviderError"])
+async def test_general_redaction_preserves_native_error_retries(monkeypatch, failure, error_type):
+    import verifiers.v1 as vf
+    import xiaomi_general.taskset as module
+    from verifiers.v1.configs.retries import RetryConfig, RetryRule
+    from verifiers.v1.errors import ProviderError, SandboxError
+    from verifiers.v1.utils.retries import RetryState
+
+    key = "fake-retry-credential"
+    monkeypatch.setenv("GA_JUDGE_KEY", key)
+    monkeypatch.setattr(GeneralTask, "manifest", lambda _: {})
+    message = "Runtime unavailable: " + key + " key=fake-retry-c..."
+    native_error = (SandboxError(message) if error_type == "SandboxError"
+                    else ProviderError(message, status_code=503))
+
+    async def run_shell(*args, **kwargs):
+        if failure == "run":
+            raise native_error from ValueError(message)
+        return ProgramResult(0, "", "")
+
+    monkeypatch.setattr(module, "run_shell", run_shell)
+
+    class Runtime:
+        async def run(self, argv, env):
+            if failure == "detail" and argv[0] == "cat":
+                raise native_error from ValueError(message)
+            return ProgramResult(0, "", "")
+
+        async def read(self, path):
+            if failure == "read":
+                raise native_error from ValueError(message)
+            return b'{"reward": 0.75}'
+
+    task = GeneralTask(GeneralData(instance={"dataset_type": "general_agent"}))
+    trace = vf.Trace(task={"type": "GeneralTask", "data": task.data},
+                     agent={"config": {}}, info={"general_submission_validated": True})
+    with pytest.raises(type(native_error)) as caught:
+        await task.score(trace, Runtime())
+    assert caught.value is native_error
+    assert caught.value.__cause__ is None and caught.value.__suppress_context__
+    trace.record_error(caught.value)
+    assert trace.last_error.type == error_type
+    assert trace.last_error.message == "Runtime unavailable: <redacted> key=<redacted>"
+    assert trace.stop_condition == ("sandbox_error" if error_type == "SandboxError" else "provider_error")
+    saved = trace.last_error.model_dump_json()
+    assert key not in saved and "fake-retry-c" not in saved
+    status = [503] if error_type == "ProviderError" else None
+    assert trace.last_error.status_code == (503 if status else None)
+    retry = RetryState(RetryConfig(rules=[RetryRule(type=error_type, status_code=status, max_retries=1)]))
+    assert retry.next_error(trace.errors) is trace.last_error
+    assert retry.next_error(trace.errors) is None

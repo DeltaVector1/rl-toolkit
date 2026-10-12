@@ -4,10 +4,12 @@ import base64
 import json
 import math
 import os
+import re
 import shlex
 from pathlib import Path, PurePosixPath
 
 import verifiers.v1 as vf
+from verifiers.v1.errors import RolloutError
 from xiaomi_common.data import (
     DATASET_REVISION,
     XiaomiTasksetConfig,
@@ -456,34 +458,64 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
                 f"rm -rf -- /tmp/agent_output && mkdir -p {shlex.quote(str(PurePosixPath(reward_path).parent))} /tmp/agent_output /work/_verifier/tmp && rm -f {shlex.quote(reward_path)} {shlex.quote(detail_path or '')} && chmod 700 /tmp/agent_output /work/_verifier/tmp",
             ],
         )
-        result = await run_shell(
-            runtime,
-            verifier.get("command", "python3 /work/run_verify.py"),
-            cwd="/work",
-            timeout=verifier.get("timeout_sec")
-            or instance.get("verifier_timeout_sec")
-            or 900,
-            env=env,
+        judge_keys = sorted(
+            {
+                env[name]
+                for name in ("GA_JUDGE_KEY", "GA_JUDGE_KEY2", "GA_JUDGE_KEY3", "JUDGE_API_KEY")
+                if env.get(name)
+            },
+            key=len,
+            reverse=True,
         )
+
+        def redact(value):
+            if isinstance(value, str):
+                for key in judge_keys:
+                    value = value.replace(key, "<redacted>")
+                return re.sub(r"\bkey=\S+", "key=<redacted>", value)
+            if isinstance(value, dict):
+                return {redact(key): redact(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+
         try:
-            raw = (await runtime.read(reward_path)).decode()
+            result = await run_shell(
+                runtime,
+                verifier.get("command", "python3 /work/run_verify.py"),
+                cwd="/work",
+                timeout=verifier.get("timeout_sec")
+                or instance.get("verifier_timeout_sec")
+                or 900,
+                env=env,
+            )
+            try:
+                raw = (await runtime.read(reward_path)).decode()
+            except RolloutError:
+                raise
+            except Exception as exc:
+                raise RuntimeError("missing_or_invalid_reward_json") from exc
+            reward, info = parse_reward(raw, bool(instance.get("reward_binary_fullscore")))
+            info.update(
+                verifier_returncode=result.exit_code,
+                stdout=redact(result.stdout)[-10000:],
+                stderr=redact(result.stderr)[-4000:],
+            )
+            if detail_path:
+                detail = await runtime.run(["cat", detail_path], {})
+                if detail.exit_code == 0:
+                    try:
+                        info["reward_detail"] = redact(json.loads(detail.stdout))
+                    except ValueError:
+                        info["reward_detail_raw"] = redact(detail.stdout)[:2000]
+            trace.info["verifier"] = info
+            return reward
         except Exception as exc:
-            raise RuntimeError("missing_or_invalid_reward_json") from exc
-        reward, info = parse_reward(raw, bool(instance.get("reward_binary_fullscore")))
-        info.update(
-            verifier_returncode=result.exit_code,
-            stdout=result.stdout[-10000:],
-            stderr=result.stderr[-4000:],
-        )
-        if detail_path:
-            detail = await runtime.run(["cat", detail_path], {})
-            if detail.exit_code == 0:
-                try:
-                    info["reward_detail"] = json.loads(detail.stdout)
-                except ValueError:
-                    info["reward_detail_raw"] = detail.stdout[:2000]
-        trace.info["verifier"] = info
-        return reward
+            # Keep native retry classification while removing secret-bearing chains.
+            if isinstance(exc, RolloutError):
+                exc.args = (redact(str(exc)),)
+                raise exc from None
+            raise RuntimeError(redact(str(exc))) from None
 
 
 class GeneralTaskset(vf.Taskset[GeneralTask, GeneralConfig]):
