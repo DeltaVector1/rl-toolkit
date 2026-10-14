@@ -16,7 +16,9 @@ error; invalid compositions retain the original zero scores.
 Tasks require a container, default `python:3.11-slim`. Setup installs Debian's
 `abcmidi` package if unavailable. The scorer and final response are staged at
 scoring time. A prebuilt image with `python3`, `abc2midi`, and `uv` can avoid setup
-installation. Runtime/CLI selection is the native Verifiers interface.
+installation. Runtime/CLI selection is the native Verifiers interface. Reasoning
+models may need a large `--sampling.max-tokens` cap for Music; GLM-5.2 was
+tested at 80,000, which still did not guarantee an untruncated reply.
 
 Tests cover ABC extraction, all score gates, missing converter handling, native
 loading/default harness, and a deterministic MIDI feature-pipeline fixture.

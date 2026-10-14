@@ -299,3 +299,33 @@ This supports provider latency under concurrency as a possible explanation for
 the full-pass timing; it does not prove that attribution. The prior 0.4-second
 single-row result, 107-test result, and GLM-5.2-FP8 reward-1.0 run above remain
 historical Review 4 evidence.
+
+## Review 6 evidence supplied at `27c2acd8`
+
+The independently supplied Review 6 records cover the unchanged source at
+`27c2acd87dd56bdddcc093c29c6a14013e95239b`. Full Code setup and connectivity-only `git fsck`
+records cover all 2,698 images: the expected partial-clone failure is
+`format-code-task-002295`; all 2,697 successful setups had zero unreachable
+objects. `git fsck` exited 0 on 2,693 and 16 on four images with stale
+commit-graph entries; none timed out. The 90 images at or above 400 MB all
+exited 0. The supplied records do not scan Git submodule directories.
+
+Of the six Code verifiers that previously hit the Review 5 time cap, five
+reached an outcome under their 1,800-second limits. `000252` timed out in
+three Review 6 runs at the external Maven mirror; across Reviews 3, 4, and 6
+it timed out in five of seven reported runs. One earlier
+timeout occurred while compiling, so the aggregate does not attribute every
+timeout to the mirror. It is excluded in the current Code selection guidance; all 2,698 dataset rows remain loadable.
+
+Review 6 reports a GLM-5.2 run scoring six Code tasks (five 1.0, one 0.0),
+two General tasks (1.0 and 0.8; the policy model also served as judge), and the
+first 60 Music tasks at an 80,000-token cap. Music mean reward was 0.296, best
+0.852, with 34 zero scores; 57 replies were reported as finishing normally, three hit
+the token cap, and two replies were empty. A completed agent status alone does
+not establish that the provider returned an untruncated reply. This sample
+shows that 80,000 is a tested budget, not a guarantee of complete Music output.
+The model-run traces were not available for independent inspection here; the
+supplied `abcmidi` comparison JSON records identical scores for 59 tunes across
+four images.
+These are limited samples, not a general compatibility or scorer benchmark;
+Review 6 also had no independent General judge.

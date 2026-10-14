@@ -1,8 +1,8 @@
 # Xiaomi Code
 
 The published dataset has 2,698 rows. Keep every row loadable and apply these
-native Verifiers exclusions when selecting training or scoring rows. The six
-excluded rows leave 2,692 eligible:
+native Verifiers exclusions when selecting training or scoring rows. The seven
+excluded rows leave 2,691 eligible:
 
 | ID | Reason |
 | --- | --- |
@@ -12,6 +12,7 @@ excluded rows leave 2,692 eligible:
 | `format-code-task-001597` | Untouched verifier passes (free positive). |
 | `format-code-task-002295` | Partial clone retains promisor residue; setup fails closed. |
 | `format-code-task-001217` | Untouched race test is flaky: it passed in 3 of 11 runs. |
+| `format-code-task-000252` | External Maven mirror stalls; the verifier timed out in 5 of 7 reported runs. |
 
 Use the same list for training and scoring:
 
@@ -19,13 +20,13 @@ Use the same list for training and scoring:
 uv run vf-eval xiaomi-code -n 1 -m MODEL \
   --select.exclude.ids format-code-task-001227 format-code-task-002879 \
     format-code-task-001225 format-code-task-001597 format-code-task-002295 \
-    format-code-task-001217 \
+    format-code-task-001217 format-code-task-000252 \
   --env.agent.runtime.type prime \
   --env.agent.runtime.memory 8 --env.agent.runtime.disk 20 --no-push
 ```
 
 For Prime RL training, set `orchestrator.train.source.select.exclude.ids` to
-the same six IDs; see [General](general.md) for the TOML form. Excluded rows
+the same seven IDs; see [General](general.md) for the TOML form. Excluded rows
 remain in `code.parquet` and `XiaomiCodeTaskset.load`.
 
 Code setup repairs missing Rust, Java, and Go tool paths in the published
