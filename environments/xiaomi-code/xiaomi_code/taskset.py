@@ -73,6 +73,8 @@ for namespace in "$git_dir"/refs/*; do
 done
 git remote | while IFS= read -r remote; do git remote remove "$remote"; done
 git reflog expire --expire=now --all
+rm -f -- "$git_dir/ORIG_HEAD" "$git_dir/FETCH_HEAD"
+rm -rf -- "$git_dir/objects/info/commit-graph" "$git_dir/objects/info/commit-graphs"
 git -c gc.pruneExpire=now -c gc.cruftPacks=false gc --prune=now
 '''
 

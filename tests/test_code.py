@@ -377,6 +377,54 @@ def test_strip_removes_future_objects_but_preserves_ancestry_and_worktree(repo):
                           capture_output=True).returncode != 0
 
 
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("retain_tag", [False, True])
+def test_strip_removes_future_metadata_and_stale_commit_graphs(repo, split, retain_tag):
+    base = git(repo, "rev-parse", "HEAD")
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    if retain_tag:
+        git(repo, "tag", "base")
+    (repo / "future.txt").write_text("reference fix\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "future fix")
+    future = git(repo, "rev-parse", "HEAD")
+    future_blob = git(repo, "rev-parse", "HEAD:future.txt")
+    git(repo, "config", "gc.writeCommitGraph", "true")
+    git(repo, "commit-graph", "write", "--reachable", *(["--split"] if split else []))
+    info = repo / ".git/objects/info"
+    graphs = list((info / "commit-graphs").glob("graph-*.graph")) if split else [info / "commit-graph"]
+    assert graphs and any(bytes.fromhex(future) in graph.read_bytes() for graph in graphs)
+    git(repo, "commit-graph", "verify")
+    git(repo, "reset", "--hard", base)
+    (repo / ".git/ORIG_HEAD").write_text(f"{future}\n")
+    (repo / ".git/FETCH_HEAD").write_text(f"{future}\t\tbranch 'main' of https://example.invalid/upstream\n")
+    (repo / "solution.txt").write_text("staged edit\n")
+    git(repo, "add", "solution.txt")
+    (repo / "solution.txt").write_text("working edit\n")
+    (repo / "untracked.txt").write_text("keep\n")
+    status = git(repo, "status", "--porcelain")
+
+    subprocess.run(["bash", "-c", strip_history_command(base)], cwd=repo, check=True)
+
+    assert git(repo, "rev-parse", "HEAD") == base
+    assert git(repo, "rev-parse", "HEAD^{tree}") == tree
+    assert git(repo, "status", "--porcelain") == status
+    assert git(repo, "show", ":solution.txt") == "staged edit"
+    assert (repo / "solution.txt").read_text() == "working edit\n"
+    assert (repo / "untracked.txt").read_text() == "keep\n"
+    assert git(repo, "for-each-ref", "--format=%(refname)") == ("refs/tags/base" if retain_tag else "")
+    assert not (repo / ".git/ORIG_HEAD").exists()
+    assert not (repo / ".git/FETCH_HEAD").exists()
+    # GC may write a fresh graph when an ancestor tag survives.
+    graphs = list(info.glob("commit-graph")) + list((info / "commit-graphs").glob("graph-*.graph"))
+    assert all(bytes.fromhex(future) not in graph.read_bytes() for graph in graphs)
+    git(repo, "commit-graph", "verify")
+    assert "unreachable" not in git(repo, "fsck", "--unreachable", "--no-reflogs")
+    for object_id in (future, future_blob):
+        assert subprocess.run(["git", "cat-file", "-e", object_id], cwd=repo,
+                              capture_output=True).returncode != 0
+
+
 @pytest.mark.parametrize("marker", ["promisor", "keep", "config", "worktree", "linked"])
 def test_strip_rejects_unprunable_or_shared_repositories(repo, tmp_path, marker):
     base = git(repo, "rev-parse", "HEAD")
