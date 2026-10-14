@@ -324,8 +324,31 @@ first 60 Music tasks at an 80,000-token cap. Music mean reward was 0.296, best
 the token cap, and two replies were empty. A completed agent status alone does
 not establish that the provider returned an untruncated reply. This sample
 shows that 80,000 is a tested budget, not a guarantee of complete Music output.
-The model-run traces were not available for independent inspection here; the
-supplied `abcmidi` comparison JSON records identical scores for 59 tunes across
-four images.
-These are limited samples, not a general compatibility or scorer benchmark;
-Review 6 also had no independent General judge.
+The original Review 6 model-run traces were not available for independent
+inspection here; the supplied `abcmidi` comparison JSON records identical scores
+for 59 tunes across four images. These are limited samples, not a general
+compatibility or scorer benchmark; Review 6 also had no independent General judge.
+
+## Committed-source validation after Review 6
+
+At source commit `4d5f97a6b59eb323edb60c62fa98fef7feee64e2`, the workspace test
+suite passed all 111 tests. Five native Prime setups (`001920`, `001321`,
+`000816`, `001800`, `002990`) preserved the input HEAD, tree, and working-tree
+status. After setup, `ORIG_HEAD` and `FETCH_HEAD` were absent, commit-graph
+verification and bounded connectivity-only `git fsck` exited 0, no unreachable
+or dangling objects remained, and the production history check found no commits
+beyond the captured task base. Each untouched verifier then completed with exit 1
+and reward 0.0, matching the known baseline test failures. The partial clone
+`002295` still failed closed during setup with the expected promisor-object
+error; its verifier was not called. The probe recorded each task ID and source
+hash before setup, then captured the Git checks and verifier outcome.
+
+A separate GLM-5.2-FP8 rollout on `000816` used 8 GB, 2 CPUs, 20 GB disk, a
+64-turn limit, and a 32,000-token per-response cap. The agent passed all 13
+facade tests and earned reward 1.0. The rollout stopped at `max_turns` with
+`truncated=true`: all 64 provider responses ended with `tool_calls`, and the
+agent did not produce a natural final response. It declared 83 tool calls
+(80 `bash`, 3 `edit`); 82 tool responses were recorded, and the last Bash call
+was not executed. The verifier itself exited 0. This is a passing verifier result from
+an incomplete rollout, not evidence of a normal agent completion. Its trace is in
+`outputs/review6-committed-000816/monitors/file/traces/stream/00000.jsonl.zst`.
