@@ -3,9 +3,10 @@
 Native Verifiers v1 package `xiaomi-general` exports `GeneralTaskset`. It loads the
 989 released General rows without filtering: 925 `general_agent` tasks and 64
 `terminal_bench` tasks. Prompts remain exact dataset messages; published image
-mapping and the pinned dataset revision come from `xiaomi-common`. Full General
-assets download only during selected task setup. `task_root` optionally points
-to an existing local General directory containing `envs/`.
+mapping and the pinned dataset revision are included in this environment
+package. Full General assets download only during selected task setup.
+`task_root` optionally points to an existing local General directory containing
+`envs/`.
 
 General-agent tasks use each row's original workspace, SQLite state, tool module,
 `mcp_http.py` signature inference/result-size caps, and verifier files. A native
@@ -71,8 +72,8 @@ guard can exit zero while explicitly writing zero reward. No replacement tests
 or inferred scores are used. This released inline-verifier contract is the port's
 basis for those rows.
 
-Terminal setup installs no `xiaomi-common` package. The pinned Bash harness stages
-its scripts under `/tmp/vf-scripts`, with the task's uv cache and Python installs
+Terminal tasks stage the pinned Bash harness scripts under `/tmp/vf-scripts`,
+with the task's uv cache and Python installs
 under `/opt`, outside `/app`. It therefore leaves the task's pristine-tree guard
 intact without deleting workspace files. Each terminal row declares one CPU,
 2048 MiB memory, 10240 MiB disk, a 900-second agent timeout, and no internet.
@@ -135,7 +136,4 @@ precedence over inclusion. `candidate-1634-software-databases` is not excluded:
 its Python 3.12 `collections.Callable` import failure is in the mutable
 `vendor/peewee/peewee.py`, so it can be repaired as part of the source task.
 
-General-agent rows use the pinned native MCP package bundler to stage the local
-`xiaomi-common` dependency before Verifiers stages its tool server; this is needed
-because that sibling package has not been published to a package index. Its private
-bundler helpers match both supported Verifiers pins; recheck them on an upgrade.
+General-agent rows use the native MCP package bundler to stage their tool server.

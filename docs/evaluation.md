@@ -43,7 +43,7 @@ git -C .references/prime-rl -c url."https://github.com/".insteadOf="git@github.c
 uv venv --python 3.12 .eval-venv
 uv pip install --python .eval-venv/bin/python -e .references/prime-rl
 uv pip install --python .eval-venv/bin/python --no-deps \
-  -e environments/xiaomi-common -e environments/xiaomi-code \
+  -e environments/xiaomi-code \
   -e environments/xiaomi-general -e environments/xiaomi-music
 ```
 
@@ -172,10 +172,7 @@ injected Go tests passed with empty stderr. Inside the sandbox, `go` resolved to
 `outputs/review1-code-000121/`.
 
 The older `path_probe.py` `port` mode still hard-codes the Go-only repair; after
-the Docker-default `PATH` change, compare against its `docker-c` mode. The
-General package's use of Verifiers' private `_cached_package` and `_package_dir`
-helpers remains pinned debt; those helpers were present at both supported
-Verifiers revisions and should be rechecked on upgrade.
+the Docker-default `PATH` change, compare against its `docker-c` mode.
 
 ## Review 3 live evidence
 
@@ -352,3 +349,28 @@ agent did not produce a natural final response. It declared 83 tool calls
 was not executed. The verifier itself exited 0. This is a passing verifier result from
 an incomplete rollout, not evidence of a normal agent completion. Its trace is in
 `outputs/review6-committed-000816/monitors/file/traces/stream/00000.jsonl.zst`.
+
+## Review 7 full Code pass
+
+At source commit `76084bedc19cf7003aa9a1035db566587bc7016d`, independently
+supplied Review 7 records cover all 2,698 Code images. Setup succeeded on
+2,697; partial clone `002295` failed closed as expected. All 2,697 successful
+setups retained the task-base HEAD and had clean `git fsck` and commit-graph
+verification with no stale hash references. The compared working-tree status
+matched after filtering disposable `__pycache__`, `.pytest_cache`, and `.jest`
+paths. The sweep recorded 2,697 verifier
+outcomes or caps; `000915` ran after its network-dependent `npm@12.2.0` install
+succeeded, following earlier network failures. This row remains eligible; its
+grader depends on network availability.
+
+The residue scan is limited to Git metadata and does not inspect the full image
+for answer content. Row `001621` had a raw before/after text difference while
+HEAD and filtered status stayed the same; a login-profile banner is the likely
+cause, but that attribution was not proven.
+
+The sweep also inspected all 40 images with submodule Git directories. Those
+directories and their shipped Git state remain outside setup sanitation. Two
+images retain future task-repository pointers in submodule storage: `002740`
+has eight, and `001802` has one of ten. Both are dependency-bump commits, not
+the requested task changes. These findings do not establish absence of every
+possible answer leak.

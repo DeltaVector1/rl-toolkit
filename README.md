@@ -1,8 +1,9 @@
 # Xiaomi RL Environments
 
 Native Verifiers v1 ports of Xiaomi MiMo's released Code, General, and Music
-tasksets. The workspace uses a pinned Verifiers revision and loads task data and
-images from the published Xiaomi assets.
+tasksets. Each environment declares Verifiers v1 and its direct data dependencies;
+the workspace pins a compatible Verifiers revision and loads task data and images
+from the published Xiaomi assets.
 
 ## Environments
 
@@ -19,6 +20,20 @@ Install the workspace with Python 3.11 or newer:
 ```sh
 uv sync
 ```
+
+Each environment can also be installed on its own in a fresh virtual environment.
+For example, install Code with:
+
+```sh
+uv venv /tmp/xiaomi-code-venv --python 3.12
+uv pip install --python /tmp/xiaomi-code-venv/bin/python ./environments/xiaomi-code
+```
+
+Use `./environments/xiaomi-general` or `./environments/xiaomi-music` instead to
+install either of the other packages. No repository workspace or sibling Xiaomi
+package is needed. Each package accepts Verifiers `0.3.2.dev206` through
+`0.3.2.dev208`; this range supports the standalone CLI and Prime RL's native MCP
+worker.
 
 Run one selected task against an OpenAI-compatible model endpoint:
 

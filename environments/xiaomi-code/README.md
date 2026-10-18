@@ -1,6 +1,13 @@
 # xiaomi-code
 
-Native Verifiers v1 taskset for the published Xiaomi MiMo Code tasks. Adapted from `XiaomiMiMo/MiMo-Agent` commit `467f0a19016f0ac4d63b8d17a1f0da9ba07f232c`, `opensource_code.py` and its base helpers; the MIT license is included in `xiaomi_code/LICENSE.mimoagent`. The root workspace pins Verifiers and the dataset revision. Install with `uv sync` from the repository root.
+Native Verifiers v1 taskset for the published Xiaomi MiMo Code tasks. Adapted from `XiaomiMiMo/MiMo-Agent` commit `467f0a19016f0ac4d63b8d17a1f0da9ba07f232c`, `opensource_code.py` and its base helpers; the MIT license is included in `xiaomi_code/LICENSE.mimoagent`. The taskset and data helpers are contained in this package. Its direct dependencies are Verifiers `>=0.3.2.dev206,<=0.3.2.dev208`, `huggingface-hub>=0.24`, and `pyarrow>=18`. Install it in a fresh environment from this directory:
+
+```sh
+uv venv /tmp/xiaomi-code-venv --python 3.12
+uv pip install --python /tmp/xiaomi-code-venv/bin/python .
+```
+
+No sibling Xiaomi package or repository checkout is required. The repository workspace separately pins its Verifiers revision.
 
 The standard Verifiers single-agent environment supplies the bash harness and its bash/edit tools. Select the Prime runtime in your evaluation configuration; each task supplies its published container image and working directory. `NEEDS_CONTAINER` requires container execution. The package does not execute task commands on the host.
 
@@ -10,7 +17,7 @@ Published Code images are flattened without an image environment. The task suppl
 
 Every setup captures the image's real base commit, disables Git replacements, detaches at the base, removes other refs except ancestor tags, expires reflogs, deletes `ORIG_HEAD`, `FETCH_HEAD` and existing monolithic/split commit-graphs, and runs strict `git gc --prune=now` with recent-object retention disabled. Git may rebuild commit-graphs from retained refs. The base ancestry and staged/working-tree edits are preserved. Setup fails if sanitation fails or the remaining history assertion fails; it also rejects partial/promisor clones, shared object stores/worktrees and packs protected from garbage collection. Production setup does not run `git fsck`.
 
-Setup removes only `.pytest_cache` and `.jest/cache` directories without tracked contents. It preserves `__pycache__` because some images ship bytecode-only dependencies, and skips `.git` and `.build_env`; other build artifacts and residue remain.
+Setup removes only `.pytest_cache` and `.jest/cache` directories without tracked contents. It preserves `__pycache__` because some images ship bytecode-only dependencies, and skips `.git` and `.build_env`; other build artifacts and residue remain. Submodule Git directories under `.git/modules` are left as each image ships them.
 
 Hidden test patches stay in host task data until scoring. Scoring restores both sides of paths touched by the patch, applies it, and runs the original command with its published timeout. Exit code zero earns 1; other exit codes earn 0. Reset, patch and transport failures raise an infrastructure error with `reward/testbed_corrupted` metadata. Test paths are restored afterward without resetting solution files. Traces retain the last 10,000 characters of verifier stdout and 4,000 of stderr. Unlike upstream’s zero reward plus infrastructure metadata, infrastructure failures raise so Verifiers can distinguish them from incorrect model answers.
 

@@ -2,8 +2,9 @@
 
 Native Verifiers v1 package `xiaomi-music` exports `MusicTaskset` and the stock
 `NullHarness`, so its default is text-only composition with the exact released
-prompt messages. It loads all 1,000 released rows from the pinned dataset through
-`xiaomi-common`; use native task selection for evaluation subsets.
+prompt messages. It loads all 1,000 released rows from the pinned dataset using
+data helpers included in the environment package; use native task selection for
+evaluation subsets.
 
 The scorer is the complete, unchanged Apache-2.0 source at XiaomiMiMo/verl commit
 `a2ad9f6160b03ff2d47e59832bfb6b289f37c917`, including `ref_full4k.json` (see package
