@@ -374,3 +374,37 @@ images retain future task-repository pointers in submodule storage: `002740`
 has eight, and `001802` has one of ten. Both are dependency-bump commits, not
 the requested task changes. These findings do not establish absence of every
 possible answer leak.
+
+## Review 7 standalone package validation
+
+At committed source `46cece1e` (integrated with documentation at
+`b165c046`), the workspace suite passed **131 tests** and `uv lock --check`
+passed. Three copied environment folders each installed and imported in an
+isolated venv with Python isolated mode, no repository paths, no `xiaomi-common`,
+Verifiers `0.3.2.dev208`, and one row loaded from a local published parquet.
+Wheels and source distributions built from the committed folders contain each
+package's required modules; General includes its colocated MCP server, and
+Music includes its scorer and reference JSON.
+
+For native Prime RL validation, the three wheels were installed without
+dependency resolution into the review-local sibling `.eval-venv`, preserving
+Prime RL `0.9.0` and Verifiers `0.3.2.dev206`. All taskset imports resolved
+under that environment's `site-packages`, and `xiaomi-common` was absent. The General
+Terminal Bench row `candidate-0036-software-data-engineering` completed in 21
+turns with `finish_reason=stop`, reward **1.0**, and five passing verifier tests.
+The trace is under `outputs/review7-terminal-0036-wheel/`.
+
+The General accounting MCP row
+`s3k_0000_accounting_audit_tax_en_t1_rl_008` completed in 10 provider calls
+(nine ending in `tool_calls`, then `stop`) with 32 native MCP tool calls across
+15 tool schemas, no
+timeout or trace errors, and submission validation true. Its original verifier
+returned 0 with reward **0.8** (4 of 6 checks passed); `protection_statuses`
+and `readiness_conclusion` failed. The colocated server started from the
+installed General wheel. A fake judge-key sentinel was used, and a scan of all
+saved run files, including the decompressed trace, found no occurrence. GLM-5.2
+served as both policy and judge, so this checks the judge integration and
+redaction path, not an independent score. The trace is under
+`outputs/review7-accounting-wheel-resources/`. Both completed runs used local
+file monitoring with Prime upload monitoring disabled; no owned sandboxes
+remain.
