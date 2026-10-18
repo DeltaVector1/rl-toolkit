@@ -16,7 +16,6 @@ members = ["environments/*"]
 
 [tool.uv.sources]
 verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "bf2834cac27d882b6edc9388835791a395361954" }
-xiaomi-common = { workspace = true }
 xiaomi-code = { workspace = true }
 xiaomi-general = { workspace = true }
 xiaomi-music = { workspace = true }

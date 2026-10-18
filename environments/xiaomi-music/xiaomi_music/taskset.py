@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 
 import verifiers.v1 as vf
-from xiaomi_common.data import XiaomiTasksetConfig, load_rows
-from xiaomi_common.runtime import checked_run
+from ._data import XiaomiTasksetConfig, load_rows
+from ._runtime import checked_run
 
 from .scorer.pipeline import Abc2MidiMissing
 

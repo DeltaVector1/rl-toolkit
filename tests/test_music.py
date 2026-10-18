@@ -9,6 +9,7 @@ from xiaomi_music.scorer import pipeline
 from xiaomi_music.scorer.feats import analyze
 from xiaomi_music.scorer.score import score
 from xiaomi_music.taskset import MusicTaskset
+from xiaomi_music._data import XiaomiTasksetConfig
 
 ABC = "X:1\nT:t\nM:4/4\nL:1/8\nK:C\nCDEF|GABc|c4|z4|"
 
@@ -75,3 +76,17 @@ def test_full_feature_pipeline_frozen_result(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline.sp, "run", convert)
     assert pipeline.compute_score("music", ABC) == 0.193
     assert pipeline.compute_score("music", ABC.replace("K:C", "\nK:C")) == 0
+
+
+def test_music_loads_local_parquet_with_own_config(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    row = {"prompt": [{"role": "user", "content": "Compose 原始 music"}], "extra_info": {"src_id": "published-music-id"}}
+    path = tmp_path / "music.parquet"
+    pq.write_table(pa.Table.from_pylist([row]), path)
+    task, = MusicTaskset(XiaomiTasksetConfig(dataset_path=str(path))).load()
+    assert task.data.id == "published-music-id"
+    assert [message.model_dump() for message in task.data.prompt] == row["prompt"]
+    assert task.data.extra_info == row["extra_info"]
+    assert task.data.image == "python:3.11-slim"

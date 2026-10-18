@@ -257,7 +257,7 @@ async def test_setup_captures_original_head_before_agent_moves_it():
 
 def test_taskset_load_and_default_agent_tools(monkeypatch):
     from xiaomi_code import taskset
-    from xiaomi_common.data import XiaomiTasksetConfig
+    from xiaomi_code._data import XiaomiTasksetConfig
     from verifiers.v1.configs.env import default_agent_harness
     from verifiers.v1.utils.loaders import load_taskset
     import json

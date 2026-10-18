@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 
 import verifiers.v1 as vf
 from verifiers.v1.errors import RolloutError
-from xiaomi_common.data import (
+from ._data import (
     DATASET_REVISION,
     XiaomiTasksetConfig,
     download_general_task,
@@ -18,7 +18,7 @@ from xiaomi_common.data import (
     load_rows,
     resolve_image,
 )
-from xiaomi_common.runtime import checked_run, run_shell
+from ._runtime import checked_run, run_shell
 
 from .servers.tool import GeneralTools
 
@@ -187,29 +187,6 @@ def agent_message_writes(runtime: vf.Runtime, trace_id: str) -> None:
     runtime.write = write
 
 
-async def install_common(runtime: vf.Runtime) -> None:
-    # Native toolset bundling ships its own package only; common is a local sibling.
-    # shortcut: private bundler helpers match both pinned runtimes; revisit on a Verifiers upgrade.
-    from verifiers.v1.mcp.launch import _cached_package, _package_dir
-
-    name, archive = await _cached_package(Path(_package_dir(XiaomiTasksetConfig)))
-    target = str(PurePosixPath(runtime.config.workdir) / ".vf-src" / name)
-    await runtime.write(target, archive)
-    venv = str(PurePosixPath(runtime.config.workdir) / ".vf-venv")
-    await runtime.prepare_uv_script(
-        '# /// script\n# requires-python = ">=3.11"\n# dependencies = []\n# ///\n'
-    )
-    await checked_run(
-        runtime,
-        [
-            "sh",
-            "-c",
-            'export PATH="$HOME/.local/bin:$PATH"; '
-            + f"uv venv --allow-existing {shlex.quote(venv)} && uv pip install --python {shlex.quote(venv)} --no-deps {shlex.quote(target)}",
-        ],
-    )
-
-
 class GeneralData(vf.TaskData):
     instance: dict
     revision: str = DATASET_REVISION
@@ -355,7 +332,6 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
         )
         if probe.exit_code:
             raise RuntimeError("General protected assets are accessible to agent_user")
-        await install_common(runtime)
         agent_message_writes(runtime, trace.id)
         trace.info["general_isolation"] = (
             "root-owned assets; unprivileged xiaomi_agent; native colocated MCP"

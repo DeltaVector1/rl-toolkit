@@ -308,10 +308,6 @@ async def test_general_verifier_payload_stays_private_and_judge_env_is_forwarded
         async def read(self, path):
             return b'{"reward": 0.75}'
 
-    async def install(runtime):
-        pass
-
-    monkeypatch.setattr(module, "install_common", install)
     task = GeneralTask(GeneralData(instance={
         "dataset_type": "general_agent", "env_task_dir": "envs/test"
     }, task_root=str(tmp_path)))

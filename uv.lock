@@ -11,7 +11,6 @@ resolution-markers = [
 [manifest]
 members = [
     "xiaomi-code",
-    "xiaomi-common",
     "xiaomi-general",
     "xiaomi-music",
     "xiaomi-rl-environments",
@@ -2877,21 +2876,6 @@ name = "xiaomi-code"
 version = "0.1.0"
 source = { editable = "environments/xiaomi-code" }
 dependencies = [
-    { name = "verifiers" },
-    { name = "xiaomi-common" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "verifiers", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=bf2834cac27d882b6edc9388835791a395361954" },
-    { name = "xiaomi-common", editable = "environments/xiaomi-common" },
-]
-
-[[package]]
-name = "xiaomi-common"
-version = "0.1.0"
-source = { editable = "environments/xiaomi-common" }
-dependencies = [
     { name = "huggingface-hub" },
     { name = "pyarrow" },
     { name = "verifiers" },
@@ -2909,14 +2893,16 @@ name = "xiaomi-general"
 version = "0.1.0"
 source = { editable = "environments/xiaomi-general" }
 dependencies = [
+    { name = "huggingface-hub" },
+    { name = "pyarrow" },
     { name = "verifiers" },
-    { name = "xiaomi-common" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=0.24" },
+    { name = "pyarrow", specifier = ">=18" },
     { name = "verifiers", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=bf2834cac27d882b6edc9388835791a395361954" },
-    { name = "xiaomi-common", editable = "environments/xiaomi-common" },
 ]
 
 [[package]]
@@ -2924,14 +2910,16 @@ name = "xiaomi-music"
 version = "0.1.0"
 source = { editable = "environments/xiaomi-music" }
 dependencies = [
+    { name = "huggingface-hub" },
+    { name = "pyarrow" },
     { name = "verifiers" },
-    { name = "xiaomi-common" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=0.24" },
+    { name = "pyarrow", specifier = ">=18" },
     { name = "verifiers", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=bf2834cac27d882b6edc9388835791a395361954" },
-    { name = "xiaomi-common", editable = "environments/xiaomi-common" },
 ]
 
 [[package]]

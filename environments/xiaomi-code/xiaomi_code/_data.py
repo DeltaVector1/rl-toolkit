@@ -2,16 +2,16 @@
 
 import json
 from functools import lru_cache
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import pyarrow.parquet as pq
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 
 import verifiers.v1 as vf
 
 DATASET_ID = "XiaomiMiMo/MiMo-V2.6-RL-oss"
 DATASET_REVISION = "639865fd3374018d6cb29b9fb82dd531406fcf5f"
-FILES = {"code": "code.parquet", "general": "general/train.parquet", "music": "music.parquet"}
+FILES = {"code": "code.parquet"}
 
 
 class XiaomiTasksetConfig(vf.TasksetConfig):
@@ -55,15 +55,3 @@ def resolve_image(dataset_image: str, revision: str = DATASET_REVISION) -> str:
         return _image_mapping(revision)[dataset_image]
     except KeyError as exc:
         raise ValueError(f"Image absent from published image mapping: {dataset_image!r}") from exc
-
-
-def download_general_task(env_task_dir: str, revision: str = DATASET_REVISION) -> Path:
-    path = PurePosixPath(env_task_dir)
-    if len(path.parts) != 2 or path.parts[0] != "envs" or path.parts[1] in {".", ".."}:
-        raise ValueError(f"Expected envs/<task-id>, got {env_task_dir!r}")
-    prefix = f"general/{path.as_posix()}"
-    root = snapshot_download(DATASET_ID, repo_type="dataset", revision=revision, allow_patterns=[f"{prefix}/**"])
-    task = Path(root) / prefix
-    if not (task / "manifest.json").is_file():
-        raise FileNotFoundError(f"Missing task manifest: {task}")
-    return task

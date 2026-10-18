@@ -12,8 +12,8 @@ from pathlib import PurePosixPath
 from pydantic import PositiveInt
 
 import verifiers.v1 as vf
-from xiaomi_common.data import XiaomiTasksetConfig, load_instance, load_rows, resolve_image
-from xiaomi_common.runtime import checked_run, run_shell
+from ._data import XiaomiTasksetConfig, load_instance, load_rows, resolve_image
+from ._runtime import checked_run, run_shell
 
 ERROR_CATEGORY = "reward/testbed_corrupted"
 PATCH_PATH = "/tmp/_opensource_code_test.patch"

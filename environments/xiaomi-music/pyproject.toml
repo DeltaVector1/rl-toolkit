@@ -3,7 +3,7 @@ name = "xiaomi-music"
 version = "0.1.0"
 description = "Native Verifiers tasks for Xiaomi Music"
 requires-python = ">=3.11"
-dependencies = ["verifiers", "xiaomi-common"]
+dependencies = ["verifiers>=0.3.2.dev206,<=0.3.2.dev208", "huggingface-hub>=0.24", "pyarrow>=18"]
 
 [build-system]
 requires = ["hatchling"]
