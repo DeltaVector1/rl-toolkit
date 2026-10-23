@@ -7,6 +7,8 @@ dest_host=${DEST_HOST:-china-trainer}
 interval=${INTERVAL:-5}
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=8)
 mkdir -p "$source_dir"
+exec 8<"$source_dir"
+flock -s 8
 exec 9>"$source_dir/.batch-sync.lock"
 flock -n 9 || exit 0
 echo "$$" >"$source_dir/.batch-sync.pid"

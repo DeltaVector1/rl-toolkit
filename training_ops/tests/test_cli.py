@@ -192,10 +192,12 @@ class CliTest(unittest.TestCase):
         with mock.patch.object(training_ops, "_cold_run_paths", return_value=("/tmp", "/tmp/demo", "/tmp/run_demo")), \
             mock.patch.object(training_ops._rollout_retention, "validate_evidence", return_value=evidence), \
             mock.patch.object(training_ops, "_fan", side_effect=fake_fan) as fan, \
+            mock.patch.object(training_ops, "_pause_rollout_puller") as pause, \
             mock.patch.object(sys, "argv", ["training-ops", "rollout-retention", "demo", "--evidence", "/tmp/evidence.json"]):
             with contextlib.redirect_stdout(io.StringIO()):
                 training_ops.cli()
         fan.assert_called_once()
+        pause.assert_not_called()
 
     def test_rollout_retention_apply_runs_preflight_then_apply(self):
         nodes = [host for host in training_ops.trainer_hosts if host not in training_ops.blocked_hosts]
@@ -212,13 +214,21 @@ class CliTest(unittest.TestCase):
             return {host: (0, json.dumps(self._rollout_result(host, apply=apply))) for host in hosts}
         fake_fan.calls = 0
 
+        puller_actions = iter(((0, "paused"), (0, "restored")))
         with mock.patch.object(training_ops, "_cold_run_paths", return_value=("/tmp", "/tmp/demo", "/tmp/run_demo")), \
             mock.patch.object(training_ops._rollout_retention, "validate_evidence", return_value=evidence), \
             mock.patch.object(training_ops, "_fan", side_effect=fake_fan) as fan, \
+            mock.patch.object(training_ops, "_ssh", side_effect=lambda *_args, **_kwargs: next(puller_actions)) as remote, \
             mock.patch.object(sys, "argv", ["training-ops", "rollout-retention", "demo", "--evidence", "/tmp/evidence.json", "--apply"]):
             with contextlib.redirect_stdout(io.StringIO()):
                 training_ops.cli()
         self.assertEqual(fan.call_count, 2)
+        self.assertEqual(
+            [call.args[1].split(" bash ", 1)[-1].split()[-2] for call in remote.call_args_list],
+            ["pause", "resume"],
+        )
+        self.assertEqual(remote.call_args_list[0].args[1].rsplit(" ", 1)[-1], remote.call_args_list[1].args[1].rsplit(" ", 1)[-1])
+        self.assertTrue(all(call.args[0] == training_ops.trainer_head for call in remote.call_args_list))
 
     def test_rollout_retention_cross_node_failure_blocks_apply(self):
         nodes = [host for host in training_ops.trainer_hosts if host not in training_ops.blocked_hosts]
@@ -235,6 +245,7 @@ class CliTest(unittest.TestCase):
         with mock.patch.object(training_ops, "_cold_run_paths", return_value=("/tmp", "/tmp/demo", "/tmp/run_demo")), \
             mock.patch.object(training_ops._rollout_retention, "validate_evidence", return_value=evidence), \
             mock.patch.object(training_ops, "_fan", side_effect=fake_fan) as fan, \
+            mock.patch.object(training_ops, "_pause_rollout_puller", return_value=None), \
             mock.patch.object(sys, "argv", ["training-ops", "rollout-retention", "demo", "--evidence", "/tmp/evidence.json", "--apply"]), \
             contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as exited:
@@ -256,6 +267,7 @@ class CliTest(unittest.TestCase):
         with mock.patch.object(training_ops, "_cold_run_paths", return_value=("/tmp", "/tmp/demo", "/tmp/run_demo")), \
             mock.patch.object(training_ops._rollout_retention, "validate_evidence", return_value=evidence), \
             mock.patch.object(training_ops, "_fan", side_effect=fake_fan) as fan, \
+            mock.patch.object(training_ops, "_pause_rollout_puller", return_value=None), \
             mock.patch.object(sys, "argv", ["training-ops", "rollout-retention", "demo", "--evidence", "/tmp/evidence.json", "--apply"]), \
             contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as exited:
@@ -299,6 +311,7 @@ class CliTest(unittest.TestCase):
         with mock.patch.object(training_ops, "_cold_run_paths", return_value=("/tmp", "/tmp/demo", "/tmp/run_demo")), \
             mock.patch.object(training_ops._rollout_retention, "validate_evidence", return_value=evidence), \
             mock.patch.object(training_ops, "_fan", side_effect=fake_fan) as fan, \
+            mock.patch.object(training_ops, "_pause_rollout_puller", return_value=None), \
             mock.patch.object(sys, "argv", ["training-ops", "rollout-retention", "demo", "--evidence", "/tmp/evidence.json", "--apply"]), \
             contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as exited:
@@ -318,6 +331,7 @@ class CliTest(unittest.TestCase):
         with mock.patch.object(training_ops, "_cold_run_paths", return_value=("/tmp", "/tmp/demo", "/tmp/run_demo")), \
             mock.patch.object(training_ops._rollout_retention, "validate_evidence", return_value=evidence), \
             mock.patch.object(training_ops, "_fan", side_effect=fake_fan) as fan, \
+            mock.patch.object(training_ops, "_pause_rollout_puller", return_value=None), \
             mock.patch.object(sys, "argv", ["training-ops", "rollout-retention", "demo", "--evidence", "/tmp/evidence.json", "--apply"]):
             with contextlib.redirect_stdout(io.StringIO()):
                 result = training_ops.run("rollout-retention demo --evidence /tmp/evidence.json --apply")

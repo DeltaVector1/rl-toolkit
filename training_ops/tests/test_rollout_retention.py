@@ -18,7 +18,6 @@ class RolloutRetentionTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.run_dir = Path(self.temp.name) / "run_demo"
         (self.run_dir / "rollouts").mkdir(parents=True)
-        (self.run_dir / ".microbatch-sync.lock").touch()
         for step in range(5):
             directory = self.run_dir / "rollouts" / f"step_{step}"
             directory.mkdir()
@@ -130,10 +129,17 @@ class RolloutRetentionTest(unittest.TestCase):
             with self.assertRaisesRegex(retention.RetentionError, "writer or consumer lock"):
                 retention.inventory(self.run_dir, self._evidence(), node="n76")
 
-    def test_namespace_lock_is_acquired_and_released(self):
+    def test_peer_without_publisher_lock_does_not_get_a_fabricated_lock(self):
         lock = self.run_dir / ".microbatch-sync.lock"
-        with retention._microbatch_namespace_lock(self.run_dir) as held:
-            self.assertEqual(held, lock)
+        with retention._writer_namespace_locks(self.run_dir) as held:
+            self.assertNotIn(lock, held)
+            self.assertFalse(lock.exists())
+
+    def test_rank_zero_existing_publisher_lock_is_held_and_released(self):
+        lock = self.run_dir / ".microbatch-sync.lock"
+        lock.touch()
+        with retention._writer_namespace_locks(self.run_dir) as held:
+            self.assertIn(lock, held)
             descriptor = os.open(lock, os.O_RDWR)
             try:
                 with self.assertRaises(BlockingIOError):
@@ -147,7 +153,40 @@ class RolloutRetentionTest(unittest.TestCase):
         finally:
             os.close(descriptor)
 
+    def test_existing_writer_lock_owner_group_and_mode_must_match_run(self):
+        lock = self.run_dir / ".microbatch-sync.lock"
+        lock.touch()
+        lock.chmod(0o400)
+        with self.assertRaisesRegex(retention.RetentionError, "ownership or mode"):
+            with retention._writer_namespace_locks(self.run_dir):
+                self.fail("unsafe writer lock was accepted")
+
+    def test_active_puller_blocks_nonmutating_preview(self):
+        lock = self.run_dir / ".rollout-pull.lock"
+        lock.touch()
+        namespace = os.open(self.run_dir, os.O_RDONLY | os.O_DIRECTORY)
+        fcntl.flock(namespace, fcntl.LOCK_SH)
+        with lock.open("r+") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            paths_before = sorted(path.name for path in self.run_dir.iterdir())
+            steps_before = sorted(path.name for path in (self.run_dir / "rollouts").iterdir())
+            with self.assertRaisesRegex(retention.RetentionError, "namespace is busy"):
+                retention.cleanup(self.run_dir, self._evidence(), node="n76")
+            self.assertEqual(
+                sorted(path.name for path in (self.run_dir / "rollouts").iterdir()),
+                steps_before,
+            )
+            self.assertEqual(sorted(path.name for path in self.run_dir.iterdir()), paths_before)
+            descriptor = os.open(lock, os.O_RDWR)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
+        os.close(namespace)
+
     def test_writer_alive_refuses_before_inventory(self):
+        (self.run_dir / ".microbatch-sync.lock").touch()
         script = (
             "import fcntl, os, pathlib, time; "
             f"p=pathlib.Path({str(self.run_dir / '.microbatch-sync.lock')!r}); "
@@ -158,7 +197,7 @@ class RolloutRetentionTest(unittest.TestCase):
         process = subprocess.Popen([sys.executable, "-c", script])
         try:
             time.sleep(0.15)
-            with self.assertRaisesRegex(retention.RetentionError, "writer is alive|lock is busy"):
+            with self.assertRaisesRegex(retention.RetentionError, "writer is alive|lock is busy|writer or consumer lock"):
                 retention.cleanup(self.run_dir, self._evidence(), node="n76")
         finally:
             process.terminate()
@@ -210,6 +249,7 @@ class RolloutRetentionTest(unittest.TestCase):
         self.assertTrue(list((self.run_dir / "rollouts").glob(".retention-quarantine-*")))
 
     def test_concurrent_rename_cannot_acquire_namespace_lock(self):
+        (self.run_dir / ".microbatch-sync.lock").touch()
         result_path = self.run_dir / "rename-result"
         source = self.run_dir / "rollouts" / "step_0"
         replacement = self.run_dir / "rollouts" / "step_0-renamed"

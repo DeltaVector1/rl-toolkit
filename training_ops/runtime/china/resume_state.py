@@ -343,9 +343,23 @@ def _publisher_locks(service_dir: str) -> list[int]:
     active = exact_run(service_dir)
     locks = []
     try:
+        lock_directory = os.open(active, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        locks.append(lock_directory)
+        directory_info = os.fstat(lock_directory)
+        fcntl.flock(lock_directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if _identity(active)[:2] != (directory_info.st_dev, directory_info.st_ino):
+            raise ValueError(f"rollout namespace changed during lock: {active}")
+        puller_pid = active / ".rollout-pull.pid"
+        if puller_pid.exists() or puller_pid.is_symlink():
+            raise ValueError(f"rollout puller identity remains after drain: {puller_pid}")
         for owner in (active.parent, active, active.parent / ".incoming", active / ".incoming"):
             if owner.is_symlink(): raise ValueError(f"publisher lock owner is a symlink: {owner}")  # noqa: E701
-            for name in (".batch-sync.lock", ".microbatch-sync.lock"):
+            for name in (
+                ".batch-sync.lock",
+                ".microbatch-sync.lock",
+                ".rollout-pull.lock",
+                ".rollout-pull-control.lock",
+            ):
                 lock = owner / name
                 if lock.is_symlink(): raise ValueError(f"publisher lock is a symlink: {lock}")  # noqa: E701
                 try: descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW); locks.append(descriptor)  # noqa: E701,E702

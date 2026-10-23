@@ -762,6 +762,42 @@ class ResumeStateTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "changed during lock"):
                 resume._publisher_locks(str(self.active))
 
+    def test_rollout_puller_lock_blocks_quarantine_until_exact_drain(self):
+        lock = self.active / ".rollout-pull.lock"
+        lock.touch()
+        namespace = os.open(self.active, os.O_RDONLY | os.O_DIRECTORY)
+        resume.fcntl.flock(namespace, resume.fcntl.LOCK_SH)
+        with lock.open("r+") as stream:
+            resume.fcntl.flock(stream.fileno(), resume.fcntl.LOCK_EX)
+            with self.assertRaises(BlockingIOError):
+                resume._publisher_locks(str(self.active))
+            self.assertTrue(lock.is_file())
+        os.close(namespace)
+        locks = resume._publisher_locks(str(self.active))
+        for descriptor in locks:
+            os.close(descriptor)
+
+    def test_rollout_namespace_lock_blocks_a_late_writer(self):
+        result = self.active / "namespace-result"
+        locks = resume._publisher_locks(str(self.active))
+        try:
+            script = (
+                "import fcntl, os, pathlib\n"
+                f"fd=os.open({str(self.active)!r}, os.O_RDONLY|os.O_DIRECTORY)\n"
+                "try:\n"
+                "    fcntl.flock(fd, fcntl.LOCK_SH|fcntl.LOCK_NB)\n"
+                "except BlockingIOError:\n"
+                f"    pathlib.Path({str(result)!r}).write_text('blocked')\n"
+                "else:\n"
+                f"    pathlib.Path({str(result)!r}).write_text('entered')\n"
+            )
+            child = subprocess.run([sys.executable, "-c", script], check=False, timeout=3)
+            self.assertEqual(child.returncode, 0)
+            self.assertEqual(result.read_text(), "blocked")
+        finally:
+            for descriptor in locks:
+                os.close(descriptor)
+
     def test_pinned_parent_replacement_is_refused_before_rename(self):
         source_parent = self.active / "source-root"
         destination_parent = self.active / "destination-root"

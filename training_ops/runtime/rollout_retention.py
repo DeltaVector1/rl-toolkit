@@ -308,8 +308,6 @@ def _check_locks(run_dir: Path, *, skip_paths: set[Path] | None = None) -> None:
     for path in sorted(candidates):
         if path in skip_paths:
             continue
-        if path == run_dir / ".rollout-retention.lock":
-            continue
         if _lock_is_busy(path):
             _fail(f"rollout writer or consumer lock is open: {path}")
 
@@ -377,6 +375,7 @@ def inventory(
     *,
     node: str | None = None,
     held_namespace_lock: Path | None = None,
+    held_namespace_locks: set[Path] | None = None,
 ) -> dict[str, Any]:
     """Return a strict, dry-run inventory for one trainer node."""
     loaded = _load_evidence(evidence)
@@ -396,7 +395,10 @@ def inventory(
         _fail(f"run directory ownership differs on {node}")
     rollouts = path / "rollouts"
     _directory(rollouts, "rollout directory")
-    _check_locks(path, skip_paths={held_namespace_lock} if held_namespace_lock is not None else None)
+    skip_paths = set(held_namespace_locks or ())
+    if held_namespace_lock is not None:
+        skip_paths.add(held_namespace_lock)
+    _check_locks(path, skip_paths=skip_paths)
     if _open_fd_targets(rollouts):
         _fail("rollout tree has an open writer or consumer file descriptor")
     expected = {int(item["step"]): item for item in record["batches"]}
@@ -459,29 +461,25 @@ def _fsync(path: Path) -> None:
 
 @contextlib.contextmanager
 def _retention_lock(run_dir: Path):
-    lock_path = run_dir / ".rollout-retention.lock"
     try:
-        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        descriptor = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as error:
-        _fail(f"retention lock cannot be opened: {error}")
+        _fail(f"rollout namespace cannot be opened for retention: {error}")
     lock_identity = os.fstat(descriptor)
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            _fail("another rollout retention action is open")
-        yield lock_path
+            _fail("rollout namespace is busy")
+        current = run_dir.lstat()
+        if (current.st_dev, current.st_ino) != (lock_identity.st_dev, lock_identity.st_ino):
+            _fail("rollout namespace changed during lock acquisition")
+        yield run_dir
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
-            try:
-                current = lock_path.lstat()
-                if (current.st_dev, current.st_ino) == (lock_identity.st_dev, lock_identity.st_ino):
-                    lock_path.unlink()
-            except FileNotFoundError:
-                pass
 
 
 def _process_has_inode(process: Path, identity: tuple[int, int]) -> bool:
@@ -554,45 +552,78 @@ def _verify_writer_quiescence(run_dir: Path, lock_info: os.stat_result) -> None:
 
 
 @contextlib.contextmanager
-def _microbatch_namespace_lock(run_dir: Path):
-    """Hold the publisher namespace lock through all retention mutations."""
+def _writer_namespace_locks(run_dir: Path):
+    """Hold every existing writer lock without creating locks on peer nodes."""
     run_info = _directory(run_dir, "run directory")
-    lock_path = run_dir / ".microbatch-sync.lock"
+    pid_names = {
+        ".batch-sync.lock": ".batch-sync.pid",
+        ".microbatch-sync.lock": ".microbatch-sync.pid",
+        ".rollout-pull.lock": ".rollout-pull.pid",
+        ".rollout-pull-control.lock": None,
+    }
+    descriptors: list[int] = []
+    locked_paths: set[Path] = set()
     try:
-        descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError as error:
-        _fail(f"microbatch namespace lock is missing: {error}")
-    except OSError as error:
-        _fail(f"microbatch namespace lock cannot be opened: {error}")
-    lock_info = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(lock_info.st_mode)
-        or lock_info.st_uid != run_info.st_uid
-        or lock_info.st_gid != run_info.st_gid
-        or not lock_info.st_mode & stat.S_IWUSR
-    ):
-        os.close(descriptor)
-        _fail("microbatch namespace lock ownership or type is unsafe")
-    try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            _fail(f"microbatch writer is alive or namespace lock is busy: {error}")
-        current = lock_path.lstat()
-        if (current.st_dev, current.st_ino, current.st_uid, current.st_gid) != (
-            lock_info.st_dev, lock_info.st_ino, lock_info.st_uid, lock_info.st_gid
-        ):
-            _fail("microbatch namespace lock changed during acquisition")
-        _verify_writer_quiescence(run_dir, lock_info)
-        external = _open_fd_targets(run_dir, ignore_pid=os.getpid())
-        if external:
-            _fail(f"microbatch writer or consumer remains alive: {external}")
-        yield lock_path
+        for lock_name, pid_name in pid_names.items():
+            lock_path = run_dir / lock_name
+            pid_path = run_dir / pid_name if pid_name is not None else None
+            try:
+                before = lock_path.lstat()
+            except FileNotFoundError:
+                if pid_path is not None and (pid_path.exists() or pid_path.is_symlink()):
+                    if pid_name == ".microbatch-sync.pid":
+                        _verify_writer_quiescence(run_dir, run_info)
+                    else:
+                        _fail(f"writer identity remains without its lock: {pid_path}")
+                continue
+            except OSError as error:
+                _fail(f"writer lock cannot be inspected: {error}")
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+                _fail(f"writer lock is not a regular file: {lock_path}")
+            if (
+                before.st_uid != run_info.st_uid
+                or before.st_gid != run_info.st_gid
+                or not before.st_mode & stat.S_IWUSR
+            ):
+                _fail(f"writer lock ownership or mode differs from the run directory: {lock_path}")
+            try:
+                descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+            except OSError as error:
+                _fail(f"writer lock cannot be opened: {error}")
+            lock_info = os.fstat(descriptor)
+            if (lock_info.st_dev, lock_info.st_ino) != (before.st_dev, before.st_ino):
+                os.close(descriptor)
+                _fail(f"writer lock changed before acquisition: {lock_path}")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                os.close(descriptor)
+                _fail(f"rollout writer or consumer lock is open: {lock_path}: {error}")
+            current = lock_path.lstat()
+            if (current.st_dev, current.st_ino) != (lock_info.st_dev, lock_info.st_ino):
+                os.close(descriptor)
+                _fail(f"writer lock changed during acquisition: {lock_path}")
+            if pid_name == ".microbatch-sync.pid":
+                _verify_writer_quiescence(run_dir, lock_info)
+            elif pid_path is not None and (pid_path.exists() or pid_path.is_symlink()):
+                os.close(descriptor)
+                _fail(f"writer identity remains after its lock became free: {pid_path}")
+            if (
+                lock_info.st_uid != run_info.st_uid
+                or lock_info.st_gid != run_info.st_gid
+                or not lock_info.st_mode & stat.S_IWUSR
+            ):
+                os.close(descriptor)
+                _fail(f"writer lock ownership or mode differs from the run directory: {lock_path}")
+            descriptors.append(descriptor)
+            locked_paths.add(lock_path)
+        yield locked_paths
     finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+        for descriptor in reversed(descriptors):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _read_fd(fd: int) -> bytes:
@@ -872,11 +903,11 @@ def cleanup(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, no
     removed: list[dict[str, Any]] = []
     freed = 0
     with _retention_lock(path):
-        with _microbatch_namespace_lock(path) as namespace_lock:
-            initial = inventory(path, loaded, node=node, held_namespace_lock=namespace_lock)
+        with _writer_namespace_locks(path) as namespace_locks:
+            initial = inventory(path, loaded, node=node, held_namespace_locks=namespace_locks)
             if dry_run or not initial["selected"]:
                 return {**initial, "dry_run": True, "removed": [], "freed_bytes": 0}
-            fresh = inventory(path, loaded, node=node, held_namespace_lock=namespace_lock)
+            fresh = inventory(path, loaded, node=node, held_namespace_locks=namespace_locks)
             for item in fresh["selected"]:
                 source = Path(item["path"])
                 if source.parent != path / "rollouts" or not _STEP.fullmatch(source.name):
@@ -892,7 +923,7 @@ def cleanup(run_dir: str | Path, evidence: Mapping[str, Any] | str | Path, *, no
                     _fail(f"rollout step {item['step']} changed before atomic quarantine: {error}")
                 _fsync(source.parent)
                 try:
-                    _check_locks(path, skip_paths={namespace_lock})
+                    _check_locks(path, skip_paths=namespace_locks)
                     removed_bytes = _delete_quarantine(
                         quarantine,
                         expected_item,

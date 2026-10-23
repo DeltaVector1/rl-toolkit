@@ -313,6 +313,37 @@ class OrchestratorRepairTest(unittest.TestCase):
         with self.assertRaisesRegex(training_ops.Refused, "requires RUN STEP ADAPTER"):
             training_ops.repair("rollout-quarantine", "run", "6")
 
+    def test_rollout_puller_pause_and_restore_are_exact_and_owned(self):
+        responses = iter(((0, "paused"), (0, "restored")))
+        with mock.patch.object(training_ops, "rollout_transfer_direction", "trainer_pull"), \
+            mock.patch.object(training_ops, "_ssh", side_effect=lambda *_args, **_kwargs: next(responses)) as remote:
+            token = training_ops._pause_rollout_puller("/tmp/run_demo")
+            self.assertRegex(token, r"^[a-f0-9]{32}$")
+            training_ops._restore_rollout_puller("/tmp/run_demo", token)
+        self.assertEqual(
+            [call.args[1].split(" bash ", 1)[-1].split()[-2] for call in remote.call_args_list],
+            ["pause", "resume"],
+        )
+        self.assertEqual(remote.call_args_list[0].args[1].rsplit(" ", 1)[-1], token)
+        self.assertEqual(remote.call_args_list[1].args[1].rsplit(" ", 1)[-1], token)
+        self.assertTrue(all(call.args[0] == training_ops.trainer_head for call in remote.call_args_list))
+
+    def test_rollout_puller_restore_does_not_start_when_not_owned(self):
+        with mock.patch.object(training_ops, "_ssh") as remote:
+            training_ops._restore_rollout_puller("/tmp/run_demo", None)
+        remote.assert_not_called()
+
+    def test_rollout_puller_pause_error_attempts_token_recovery(self):
+        responses = iter(((1, "pause stopped with an error"), (0, "restored")))
+        with mock.patch.object(training_ops, "rollout_transfer_direction", "trainer_pull"), \
+            mock.patch.object(training_ops, "_ssh", side_effect=lambda *_args, **_kwargs: next(responses)) as remote:
+            with self.assertRaisesRegex(training_ops.Refused, "pause is unresolved"):
+                training_ops._pause_rollout_puller("/tmp/run_demo")
+        commands = [call.args[1] for call in remote.call_args_list]
+        self.assertIn(" pause ", commands[0])
+        self.assertIn(" resume ", commands[1])
+        self.assertEqual(commands[0].rsplit(" ", 1)[-1], commands[1].rsplit(" ", 1)[-1])
+
     def test_rollout_quarantine_guard_has_service_publisher_and_lock_guards(self):
         script = training_ops._rollout_quarantine_guard("/data/glm52-rl/runs/run/run_run")
         for token in ("docker inspect", "drain_rollout_publisher.py", "sync_microbatches.sh", "sync_rollout_batches.sh", "--microbatch"):
@@ -350,13 +381,16 @@ class OrchestratorRepairTest(unittest.TestCase):
             training_ops, "_cold_run_paths", return_value=("", "", service_dir)
         ), mock.patch.object(training_ops, "_resume_repair_state", side_effect=state), mock.patch.object(
             training_ops, "_ssh", return_value=(0, "publisher drained\n")
-        ), mock.patch.object(training_ops, "_check_adapter_restart"), mock.patch.object(
+        ), mock.patch.object(training_ops, "_pause_rollout_puller", return_value="a" * 32), mock.patch.object(
+            training_ops, "_restore_rollout_puller"
+        ) as restore, mock.patch.object(training_ops, "_check_adapter_restart"), mock.patch.object(
             training_ops, "_fan", side_effect=AssertionError("quarantine must be deterministic")
         ):
             with self.assertRaisesRegex(training_ops.Refused, "completed=.*blocked=.*host cache changed"):
                 training_ops._repair_rollout_quarantine(
                     [run, "3", f"{service_dir}/broadcasts/step_3/adapter_model.safetensors"]
                 )
+        restore.assert_called_once_with(service_dir, "a" * 32)
         self.assertEqual([action for _, action, _ in calls].count("rollout"), len(training_ops.trainer_hosts) + 1)
         self.assertIn((training_ops.trainer_head, "rollout", "origin"), calls)
         self.assertTrue(all(role == ("orchestrator-cache" if host == training_ops.orchestrator_host else "cache") for host, action, role in calls if action == "rollout" and host != training_ops.trainer_head))

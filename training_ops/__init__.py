@@ -724,13 +724,77 @@ def _rollout_pull_environment(run_dir: str) -> dict[str, str]:
 
 
 def _rollout_pull_command(run_dir: str, action: str) -> str:
-    if action not in {"start", "stop", "status"}:
+    if action not in {"start", "stop", "status", "state", "pause", "resume"}:
         raise Refused(f"invalid rollout pull action: {action}")
     environment = " ".join(
         f"{name}={shlex.quote(value)}"
         for name, value in _rollout_pull_environment(run_dir).items()
     )
     return f"{environment} bash {shlex.quote(rollout_pull_script)} {action}"
+
+
+def _rollout_pull_state(run_dir: str) -> str:
+    """Read the exact current puller state without creating its lock file."""
+    if rollout_transfer_direction != "trainer_pull":
+        return "stopped"
+    code, output = _ssh(
+        trainer_head,
+        _rollout_pull_command(run_dir, "state"),
+        timeout=60,
+    )
+    state = output.strip()
+    if code or state not in {"running", "stopped"}:
+        raise Refused(
+            f"rollout puller state is unresolved on {trainer_head}: {output.strip()}"
+        )
+    return state
+
+
+def _pause_rollout_puller(run_dir: str) -> str | None:
+    """Pause one exact puller and return its run-scoped ownership token."""
+    if rollout_transfer_direction != "trainer_pull":
+        return None
+    token = uuid.uuid4().hex
+    try:
+        code, output = _ssh(
+            trainer_head,
+            f"{_rollout_pull_command(run_dir, 'pause')} {shlex.quote(token)}",
+            timeout=60,
+        )
+    except (OSError, RuntimeError) as error:
+        try:
+            _restore_rollout_puller(run_dir, token)
+        except (Refused, OSError, RuntimeError) as restore_error:
+            raise Refused(
+                f"rollout puller pause failed and token recovery is unresolved: {restore_error}"
+            ) from error
+        raise Refused(f"rollout puller pause failed: {error}") from error
+    result = output.strip()
+    if code == 0 and result == "already-stopped":
+        return None
+    if code == 0 and result == "paused":
+        return token
+    try:
+        _restore_rollout_puller(run_dir, token)
+    except (Refused, OSError, RuntimeError) as restore_error:
+        raise Refused(
+            f"rollout puller pause failed and token recovery is unresolved: {restore_error}"
+        )
+    raise Refused(f"rollout puller pause is unresolved on {trainer_head}: {result}")
+
+
+def _restore_rollout_puller(run_dir: str, token: str | None) -> None:
+    """Restore only the puller pause receipt owned by this exact token."""
+    if token is None:
+        return
+    code, output = _ssh(
+        trainer_head,
+        f"{_rollout_pull_command(run_dir, 'resume')} {shlex.quote(token)}",
+        timeout=60,
+    )
+    result = output.strip()
+    if code or result not in {"restored", "already-running", "already-stopped", "not-owned"}:
+        raise Refused(f"rollout puller restore is unresolved on {trainer_head}: {result}")
 
 
 def _direct_route_command(action: str) -> str:
@@ -5377,29 +5441,34 @@ def _repair_rollout_quarantine(arguments: list[str]) -> str:
     expected_adapter = f"{service_dir}/broadcasts/step_{step}/adapter_model.safetensors"
     if adapter != expected_adapter or not adapter.startswith("/"):
         raise Refused("rollout-quarantine adapter is not the exact run policy path")
-    origin = _resume_repair_state(trainer_head, "policy", service_dir, step, role="origin", adapter=adapter); digest = origin.get("sha256")  # noqa: E702
-    if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
-        raise Refused("stable resume adapter has no exact SHA-256 identity")
-    hosts_to_check = list(dict.fromkeys([*trainer_hosts, orchestrator_host]))
-    for host in trainer_hosts:
-        if host != trainer_head: _resume_repair_state(host, "policy", service_dir, step, role="cache")  # noqa: E701
-    _resume_repair_state(orchestrator_host, "policy", service_dir, step, role="orchestrator-cache")
-    blocked = {}
-    for host in hosts_to_check: code, output = _ssh(host, _rollout_quarantine_guard(service_dir, orchestrator=host == orchestrator_host), timeout=180); blocked.update({host: output.strip()} if code else {})  # noqa: E701,E702
-    if blocked:
-        raise Refused(f"rollout quarantine drain blocked: completed=[] blocked={blocked}")
-    receipts, blocked = {}, {}
-    for host in hosts_to_check:
-        try: receipts[host] = _resume_repair_state(host, "rollout", service_dir, step, "" if host == trainer_head else "", "origin" if host == trainer_head else ("orchestrator-cache" if host == orchestrator_host else "cache"), adapter if host == trainer_head else "")  # noqa: E701
-        except (Refused, RuntimeError, OSError) as error: blocked[host] = str(error)  # noqa: E701
-    if blocked:
-        raise Refused(f"partial rollout quarantine: completed={sorted(receipts)} blocked={blocked}; retry is required")
-    for host in trainer_hosts: _check_adapter_restart(host, service_dir, step, "origin" if host == trainer_head else "cache", adapter if host == trainer_head else "")  # noqa: E701
-    _check_adapter_restart(orchestrator_host, service_dir, step, "orchestrator-cache", "")
-    bytes_moved = sum(int(value.get("bytes", 0)) for value in receipts.values()); paths = [f"{host}:{','.join(value.get('quarantined', [])) or 'none'}" for host, value in receipts.items()]  # noqa: E702
-    result = f"quarantined future rollout caches: run={run} resume_step={step} next_batch={step + 1} hosts={','.join(hosts_to_check)} bytes={bytes_moved} paths={' ; '.join(paths)}"
-    print(result)
-    return result
+    puller_token = None
+    try:
+        puller_token = _pause_rollout_puller(service_dir)
+        origin = _resume_repair_state(trainer_head, "policy", service_dir, step, role="origin", adapter=adapter); digest = origin.get("sha256")  # noqa: E702
+        if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise Refused("stable resume adapter has no exact SHA-256 identity")
+        hosts_to_check = list(dict.fromkeys([*trainer_hosts, orchestrator_host]))
+        for host in trainer_hosts:
+            if host != trainer_head: _resume_repair_state(host, "policy", service_dir, step, role="cache")  # noqa: E701
+        _resume_repair_state(orchestrator_host, "policy", service_dir, step, role="orchestrator-cache")
+        blocked = {}
+        for host in hosts_to_check: code, output = _ssh(host, _rollout_quarantine_guard(service_dir, orchestrator=host == orchestrator_host), timeout=180); blocked.update({host: output.strip()} if code else {})  # noqa: E701,E702
+        if blocked:
+            raise Refused(f"rollout quarantine drain blocked: completed=[] blocked={blocked}")
+        receipts, blocked = {}, {}
+        for host in hosts_to_check:
+            try: receipts[host] = _resume_repair_state(host, "rollout", service_dir, step, "" if host == trainer_head else "", "origin" if host == trainer_head else ("orchestrator-cache" if host == orchestrator_host else "cache"), adapter if host == trainer_head else "")  # noqa: E701
+            except (Refused, RuntimeError, OSError) as error: blocked[host] = str(error)  # noqa: E701
+        if blocked:
+            raise Refused(f"partial rollout quarantine: completed={sorted(receipts)} blocked={blocked}; retry is required")
+        for host in trainer_hosts: _check_adapter_restart(host, service_dir, step, "origin" if host == trainer_head else "cache", adapter if host == trainer_head else "")  # noqa: E701
+        _check_adapter_restart(orchestrator_host, service_dir, step, "orchestrator-cache", "")
+        bytes_moved = sum(int(value.get("bytes", 0)) for value in receipts.values()); paths = [f"{host}:{','.join(value.get('quarantined', [])) or 'none'}" for host, value in receipts.items()]  # noqa: E702
+        result = f"quarantined future rollout caches: run={run} resume_step={step} next_batch={step + 1} hosts={','.join(hosts_to_check)} bytes={bytes_moved} paths={' ; '.join(paths)}"
+        print(result)
+        return result
+    finally:
+        _restore_rollout_puller(service_dir, puller_token)
 
 
 def _orchestrator_resume_step(run: str, *, latest: bool = False) -> int | None:
@@ -13114,42 +13183,47 @@ def _rollout_retention_action(arguments: list[str]):
                     raise Refused(f"rollout-retention apply freed bytes are forged on {host}")
         return parsed
 
-    preview = parse_phase(run_phase(False), "dry-run")
-    result: dict[str, object] = {
-        "run": run,
-        "dry_run": not bool(values["apply"]),
-        "nodes": preview,
-        "selected_steps": next(iter(preview.values()))["selected_steps"] if preview else [],
-        "selected_bytes": next(iter(preview.values()))["selected_bytes"] if preview else 0,
-        "selected_bytes_total": sum(
-            int(record["selected_bytes"]) for record in preview.values()
-        ),
-        "exact_bytes_total": sum(
-            int(record["selected_bytes"]) for record in preview.values()
-        ),
-    }
-    if values["apply"]:
-        if not preview or not next(iter(preview.values())).get("selected_steps"):
+    puller_token = None
+    try:
+        if values["apply"]:
+            puller_token = _pause_rollout_puller(run_dir)
+        preview = parse_phase(run_phase(False), "dry-run")
+        result: dict[str, object] = {
+            "run": run,
+            "dry_run": not bool(values["apply"]),
+            "nodes": preview,
+            "selected_steps": next(iter(preview.values()))["selected_steps"] if preview else [],
+            "selected_bytes": next(iter(preview.values()))["selected_bytes"] if preview else 0,
+            "selected_bytes_total": sum(
+                int(record["selected_bytes"]) for record in preview.values()
+            ),
+            "exact_bytes_total": sum(
+                int(record["selected_bytes"]) for record in preview.values()
+            ),
+        }
+        if values["apply"]:
+            if not preview or not next(iter(preview.values())).get("selected_steps"):
+                result["dry_run"] = False
+                result["no_op"] = True
+                result["freed_bytes"] = 0
+                result["freed_bytes_total"] = 0
+                result["exact_bytes_total"] = 0
+                result["removed_steps"] = []
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return result
+            applied = parse_phase(run_phase(True), "apply", preview)
             result["dry_run"] = False
-            result["no_op"] = True
-            result["freed_bytes"] = 0
-            result["freed_bytes_total"] = 0
-            result["exact_bytes_total"] = 0
-            result["removed_steps"] = []
-            print(json.dumps(result, indent=2, sort_keys=True))
-            return result
-        applied = parse_phase(run_phase(True), "apply", preview)
-        result["dry_run"] = False
-        result["nodes"] = applied
-        result["removed_steps"] = next(iter(applied.values()))["selected_steps"] if applied else []
-        result["freed_bytes"] = sum(
-            int(record.get("freed_bytes", 0)) for record in applied.values()
-        )
-        result["freed_bytes_total"] = result["freed_bytes"]
-        result["exact_bytes_total"] = result["freed_bytes"]
-    print(json.dumps(result, indent=2, sort_keys=True))
-    return result
-
+            result["nodes"] = applied
+            result["removed_steps"] = next(iter(applied.values()))["selected_steps"] if applied else []
+            result["freed_bytes"] = sum(
+                int(record.get("freed_bytes", 0)) for record in applied.values()
+            )
+            result["freed_bytes_total"] = result["freed_bytes"]
+            result["exact_bytes_total"] = result["freed_bytes"]
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return result
+    finally:
+        _restore_rollout_puller(run_dir, puller_token)
 
 def _stop_action(arguments: list[str]):
     if arguments:
