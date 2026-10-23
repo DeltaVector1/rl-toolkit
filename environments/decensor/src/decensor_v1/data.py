@@ -10,6 +10,7 @@ from decensor_v1.text import word_requirements
 
 
 decensor_dataset = "NewEden/RL-seed-Decensor"
+difficulty_decensor_dataset = "NewEden/RL-seed-Decensor-Difficulty"
 markdown_system_prompts_dataset = "Delta-Vector/Tauri-RL-Markdown-System-V2"
 plaintext_system_prompts_dataset = "Delta-Vector/Tauri-RL-Plaintext-System-V2"
 style_prompts_dataset = "Delta-Vector/Tauri-RL-Styles"
@@ -151,14 +152,88 @@ def iter_decensor_rows():
     yield from load_dataset(decensor_dataset, split="train", streaming=True)
 
 
+def iter_difficulty_decensor_rows(difficulty: str):
+    if difficulty not in {"easy", "medium", "hard"}:
+        raise ValueError("difficulty must be easy, medium, or hard")
+    columns = ["source_index", "prompt", "primary_harm_type_code", "bucket_ID"]
+    dataset = load_dataset(difficulty_decensor_dataset, split="train", streaming=True)
+    for row in dataset.select_columns(columns):
+        if row["bucket_ID"] == difficulty:
+            yield row
+
+
+def build_difficulty_decensor_pool(
+    target: int,
+    decay: float,
+    max_turns: int,
+    seed: int,
+    difficulty: str,
+) -> list[tuple[list[dict[str, str]], int, str, int]]:
+    if target <= 0:
+        return []
+    all_rows: list[dict[str, Any]] = []
+    rows_by_harm: dict[str, list[int]] = {}
+    for row in iter_difficulty_decensor_rows(difficulty):
+        prompt = row.get("prompt")
+        if (
+            not isinstance(prompt, list)
+            or len(prompt) != 1
+            or not isinstance(prompt[0], dict)
+            or prompt[0].get("role") != "user"
+            or not isinstance(prompt[0].get("content"), str)
+            or not prompt[0]["content"].strip()
+        ):
+            raise ValueError("each difficulty row must contain one user prompt")
+        harm_type = row.get("primary_harm_type_code")
+        if not isinstance(harm_type, str) or not harm_type:
+            raise ValueError("each difficulty row must contain a primary harm type")
+        source_index = row.get("source_index")
+        if not isinstance(source_index, int):
+            raise ValueError("each difficulty row must contain an integer source index")
+        row_index = len(all_rows)
+        all_rows.append(
+            {
+                "prompt": prompt[0]["content"].strip(),
+                "harm_type": harm_type,
+                "source_index": source_index,
+            }
+        )
+        rows_by_harm.setdefault(harm_type, []).append(row_index)
+
+    if not all_rows:
+        raise ValueError(f"the difficulty dataset has no {difficulty} rows")
+
+    selected = stratified_sample_by_key(rows_by_harm, target, seed + 7919)
+    turn_counts = sample_turn_counts(target, decay, max_turns, seed)
+    if len(selected) != target or len(turn_counts) != target:
+        raise ValueError("could not build the requested number of tasks")
+
+    pool = []
+    for row_index, turn_count in zip(selected, turn_counts, strict=True):
+        row = all_rows[int(row_index)]
+        pool.append(
+            (
+                [{"role": "user", "content": row["prompt"]}],
+                turn_count,
+                row["harm_type"],
+                row["source_index"],
+            )
+        )
+    random.Random(seed).shuffle(pool)
+    return pool
+
+
 def build_decensor_pool(
     target: int,
     decay: float,
     max_turns: int,
     seed: int,
+    difficulty: str | None = None,
 ) -> list[tuple[list[dict[str, str]], int, str, int]]:
     if target <= 0:
         return []
+    if difficulty is not None:
+        return build_difficulty_decensor_pool(target, decay, max_turns, seed, difficulty)
     all_rows: list[dict[str, Any]] = []
     rows_by_asst_turns: dict[int, dict[str, list[int]]] = {}
     for row in iter_decensor_rows():
@@ -224,9 +299,16 @@ def build_rows(
     markdown_probability: float,
     enable_length_prompts: bool,
     output_prompt: str | None,
+    difficulty: str | None = None,
 ) -> list[dict[str, Any]]:
     system_prompts = load_system_prompts()
-    pool = build_decensor_pool(num_examples, turn_decay_ratio, max_turns, seed + 2)
+    pool = build_decensor_pool(
+        num_examples,
+        turn_decay_ratio,
+        max_turns,
+        seed + 2,
+        difficulty=difficulty,
+    )
     response_formats = assign_response_formats(
         len(pool),
         markdown_probability,

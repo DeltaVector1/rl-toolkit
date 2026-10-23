@@ -532,6 +532,8 @@ class TrainSink:
         if failure.kind != "train":
             raise ValueError(f"TrainSink cannot process an {failure.kind} dispatch failure")
         group_id = failure.group_id
+        if group_id in self.abandoned_groups:
+            return None
         self.pending_group_started_at.setdefault(group_id, time.monotonic())
         self.pending_group_failures[group_id].append(failure)
         self.pending_group_episodes[group_id] += failure.count
@@ -544,6 +546,8 @@ class TrainSink:
         if cancellation.kind != "train":
             raise ValueError(f"TrainSink cannot process an {cancellation.kind} group cancellation")
         group_id = cancellation.group_id
+        if group_id in self.abandoned_groups:
+            return None
         self.pending_group_started_at.setdefault(group_id, time.monotonic())
         if group_id in self.pending_group_cancellations:
             raise ValueError(f"duplicate cancellation for group {group_id}")
@@ -637,13 +641,12 @@ class TrainSink:
             )
             if failures:
                 self.consecutive_errored_groups += 1
-            self._record_group(
-                group_id,
-                group,
-                "dispatch_failure_group",
-                rejected_rollouts=len(group) + sum(f.count for f in failures) + cancelled,
-            )
-            if failures:
+                self._record_group(
+                    group_id,
+                    group,
+                    "dispatch_failure_group",
+                    rejected_rollouts=len(group) + sum(f.count for f in failures) + cancelled,
+                )
                 if self.consecutive_errored_groups >= MAX_CONSECUTIVE_ERRORED_GROUPS:
                     raise RuntimeError(
                         f"{self.consecutive_errored_groups} consecutive rollout groups contained dispatch failures"

@@ -70,6 +70,7 @@ class DecensorTaskConfig(vf.TaskConfig):
 class DecensorTasksetConfig(vf.TasksetConfig):
     num_examples: int = 2000
     dataset_seed: int = 42
+    difficulty: str | None = None
     turn_decay_ratio: float = 0.5
     max_turns: int = 6
     style_probability: float = 0.25
@@ -445,6 +446,7 @@ class DecensorTaskset(vf.Taskset[DecensorTask, DecensorTasksetConfig]):
             markdown_probability=config.markdown_probability,
             enable_length_prompts=config.enable_length_prompts,
             output_prompt=config.reasoning_output_prompt,
+            difficulty=config.difficulty,
         )
         tasks: list[DecensorTask] = []
         for index, row in enumerate(rows):
