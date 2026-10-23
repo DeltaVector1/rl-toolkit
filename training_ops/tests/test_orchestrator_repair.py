@@ -1185,6 +1185,44 @@ class OrchestratorResumeStateTest(unittest.TestCase):
 
 
 class TrainerRunIdentityLaunchTest(unittest.TestCase):
+    def test_sparse_index_stats_helper_mount_is_in_trainer_launch(self):
+        source = (Path(__file__).resolve().parents[1] / "runtime/china/cluster.sh").read_text()
+        override = "has_trainer_env_override() {" + source.split("has_trainer_env_override() {", 1)[1].split("\n    }", 1)[0] + "\n}\n"
+        launch = "trainer_docker_args=(" + source.split("trainer_docker_args=(", 1)[1].split('    rm -f -- "$trainer_env_file"', 1)[0]
+        fixture = r'''
+set -euo pipefail
+common=()
+transformers_mount=()
+deployment=/fixture/deployment
+storage=/fixture/storage
+trainer_env_file=/fixture/config.env
+RUN=glm-perf-3
+trainer_container=exact-trainer
+image=fixture-image
+nnodes=8
+rank=0
+node=82
+master_node=82
+run_dir=/fixture/run_glm-perf-3
+trainer_config=/fixture/trainer.toml
+sudo() { printf '%s\0' "$@"; }
+trainer_env_keys=()
+'''
+        result = subprocess.run(["bash", "-c", fixture + override + launch], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = result.stdout.rstrip("\0").split("\0")
+        volumes = [arguments[index + 1] for index, argument in enumerate(arguments[:-1]) if argument == "-v"]
+        self.assertIn(
+            "/fixture/deployment/prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py:"
+            "/app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py:ro",
+            volumes,
+        )
+        self.assertIn(
+            "/fixture/deployment/prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_index_stats.py:"
+            "/app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_index_stats.py:ro",
+            volumes,
+        )
+
     def test_exact_launch_passes_run_and_keeps_config_environment_overrides(self):
         source = (Path(__file__).resolve().parents[1] / "runtime/china/cluster.sh").read_text()
         override = "has_trainer_env_override() {" + source.split("has_trainer_env_override() {", 1)[1].split("\n    }", 1)[0] + "\n}\n"
