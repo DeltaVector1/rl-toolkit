@@ -2411,6 +2411,139 @@ class DownloadSchedulerTest(unittest.TestCase):
         self.assertLessEqual(maximum_active, 2)
         self.assertLessEqual(maximum_pending, 2)
 
+    def test_bounded_scheduler_reuses_freed_lane(self):
+        filesystem = load_filesystem_module()
+        lock = threading.Lock()
+        started = {}
+        finished = {}
+        release_slow = threading.Event()
+
+        def worker(index, _item, lane):
+            with lock:
+                started[index] = (lane, time.monotonic())
+            if index == 0:
+                self.assertTrue(release_slow.wait(2))
+            elif index == 1:
+                time.sleep(0.03)
+            elif index == 2:
+                release_slow.set()
+            with lock:
+                finished[index] = time.monotonic()
+
+        filesystem._run_bounded_futures(
+            list(range(3)),
+            worker,
+            2,
+            time.monotonic() + 3,
+            threading.Event(),
+        )
+        self.assertEqual(started[0][0], 0)
+        self.assertEqual(started[1][0], 1)
+        self.assertEqual(started[2][0], 1)
+        self.assertLess(started[2][1], finished[0])
+
+    def test_bounded_scheduler_emits_heartbeat_without_network_progress(self):
+        filesystem = load_filesystem_module()
+        old_interval = filesystem._ADAPTER_STATUS_INTERVAL_S
+        filesystem._ADAPTER_STATUS_INTERVAL_S = 0.01
+        release = threading.Event()
+        heartbeats = []
+        bytes_done = 7
+
+        def worker(_index, _item, _lane):
+            self.assertTrue(release.wait(1))
+
+        def heartbeat(pending):
+            heartbeats.append((pending, bytes_done))
+
+        runner = threading.Thread(
+            target=filesystem._run_bounded_futures,
+            args=(
+                [object()],
+                worker,
+                1,
+                time.monotonic() + 1,
+                threading.Event(),
+            ),
+            kwargs={"heartbeat": heartbeat},
+        )
+        try:
+            runner.start()
+            deadline = time.monotonic() + 0.5
+            while not heartbeats and time.monotonic() < deadline:
+                time.sleep(0.005)
+            release.set()
+            runner.join(1)
+        finally:
+            release.set()
+            filesystem._ADAPTER_STATUS_INTERVAL_S = old_interval
+        self.assertFalse(runner.is_alive())
+        self.assertTrue(heartbeats)
+        self.assertTrue(all(pending == 1 for pending, _bytes in heartbeats))
+        self.assertTrue(all(value == bytes_done for _pending, value in heartbeats))
+
+    def test_future_wait_emits_reconstruction_heartbeat(self):
+        filesystem = load_filesystem_module()
+        old_interval = filesystem._ADAPTER_STATUS_INTERVAL_S
+        filesystem._ADAPTER_STATUS_INTERVAL_S = 0.01
+        release = threading.Event()
+        heartbeats = []
+        executor = filesystem.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(lambda: release.wait(1))
+        try:
+            waiter = threading.Thread(
+                target=filesystem._wait_for_futures,
+                args=(executor, [future], time.monotonic() + 1, threading.Event()),
+                kwargs={"heartbeat": heartbeats.append},
+            )
+            waiter.start()
+            deadline = time.monotonic() + 0.5
+            while not heartbeats and time.monotonic() < deadline:
+                time.sleep(0.005)
+            release.set()
+            waiter.join(1)
+        finally:
+            release.set()
+            filesystem._ADAPTER_STATUS_INTERVAL_S = old_interval
+        self.assertFalse(waiter.is_alive())
+        self.assertTrue(heartbeats)
+        self.assertEqual(heartbeats[0], 1)
+
+    def test_reconstruction_heartbeat_counts_unfinished_futures(self):
+        filesystem = load_filesystem_module()
+        old_interval = filesystem._ADAPTER_STATUS_INTERVAL_S
+        filesystem._ADAPTER_STATUS_INTERVAL_S = 0.01
+        release_first = threading.Event()
+        second = threading.Event()
+        heartbeats = []
+        executor = filesystem.ThreadPoolExecutor(max_workers=2)
+        first_future = executor.submit(lambda: release_first.wait(1))
+        second_future = executor.submit(lambda: second.set())
+        try:
+            waiter = threading.Thread(
+                target=filesystem._wait_for_futures,
+                args=(
+                    executor,
+                    [first_future, second_future],
+                    time.monotonic() + 1,
+                    threading.Event(),
+                ),
+                kwargs={"heartbeat": heartbeats.append},
+            )
+            waiter.start()
+            deadline = time.monotonic() + 0.5
+            while not heartbeats and time.monotonic() < deadline:
+                time.sleep(0.005)
+            release_first.set()
+            waiter.join(1)
+        finally:
+            release_first.set()
+            second.set()
+            filesystem._ADAPTER_STATUS_INTERVAL_S = old_interval
+        self.assertFalse(waiter.is_alive())
+        self.assertTrue(heartbeats)
+        self.assertEqual(heartbeats[0], 1)
+
     def test_bounded_full_scheduler_caps_configured_streams_to_lanes(self):
         filesystem = load_filesystem_module()
         lock = threading.Lock()

@@ -892,22 +892,48 @@ def _wait_for_futures(
     futures,
     deadline: float | None,
     cancel_event: threading.Event | None = None,
+    heartbeat=None,
 ) -> None:
     try:
-        for future in futures:
+        next_heartbeat = (
+            time.monotonic() + max(_ADAPTER_STATUS_INTERVAL_S, 0.001)
+            if heartbeat is not None
+            else None
+        )
+        for index, future in enumerate(futures):
             _check_cancelled(cancel_event)
-            if deadline is None:
-                future.result()
-                _check_cancelled(cancel_event)
-                continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("adapter delta staging exceeded its time limit")
-            try:
-                future.result(timeout=remaining)
-            except FutureTimeoutError as exc:
-                raise TimeoutError("adapter delta staging exceeded its time limit") from exc
+            while True:
+                if deadline is None:
+                    remaining = None
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("adapter delta staging exceeded its time limit")
+                timeout = remaining
+                if next_heartbeat is not None:
+                    heartbeat_wait = next_heartbeat - time.monotonic()
+                    timeout = heartbeat_wait if timeout is None else min(timeout, heartbeat_wait)
+                    timeout = max(timeout, 0.0)
+                try:
+                    future.result(timeout=timeout)
+                except FutureTimeoutError:
+                    if heartbeat is None:
+                        raise TimeoutError(
+                            "adapter delta staging exceeded its time limit"
+                        )
+                    heartbeat(sum(not pending.done() for pending in futures))
+                    next_heartbeat = time.monotonic() + max(
+                        _ADAPTER_STATUS_INTERVAL_S, 0.001
+                    )
+                    _check_deadline(deadline, cancel_event)
+                    continue
+                break
             _check_cancelled(cancel_event)
+            if next_heartbeat is not None and time.monotonic() >= next_heartbeat:
+                heartbeat(sum(not pending.done() for pending in futures))
+                next_heartbeat = time.monotonic() + max(
+                    _ADAPTER_STATUS_INTERVAL_S, 0.001
+                )
     except BaseException:
         if cancel_event is not None:
             cancel_event.set()
@@ -928,6 +954,7 @@ def _run_bounded_futures(
     width: int,
     deadline: float | None,
     cancel_event: threading.Event | None = None,
+    heartbeat=None,
 ) -> None:
     """Run bounded tasks and reuse each lane as its task completes."""
     if width < 1:
@@ -937,6 +964,11 @@ def _run_bounded_futures(
     executor = ThreadPoolExecutor(max_workers=min(width, len(items))) if items else None
     if executor is None:
         return
+    next_heartbeat = (
+        time.monotonic() + max(_ADAPTER_STATUS_INTERVAL_S, 0.001)
+        if heartbeat is not None
+        else None
+    )
     try:
         while len(pending) < width:
             try:
@@ -952,13 +984,24 @@ def _run_bounded_futures(
                 timeout = deadline - time.monotonic()
                 if timeout <= 0:
                     raise TimeoutError("adapter delta staging exceeded its time limit")
+            if next_heartbeat is not None:
+                heartbeat_wait = next_heartbeat - time.monotonic()
+                timeout = heartbeat_wait if timeout is None else min(timeout, heartbeat_wait)
+                timeout = max(timeout, 0.0)
             done, _ = wait(
                 pending,
                 timeout=timeout,
                 return_when=FIRST_COMPLETED,
             )
             if not done:
-                raise TimeoutError("adapter delta staging exceeded its time limit")
+                if heartbeat is None:
+                    raise TimeoutError("adapter delta staging exceeded its time limit")
+                heartbeat(len(pending))
+                next_heartbeat = time.monotonic() + max(
+                    _ADAPTER_STATUS_INTERVAL_S, 0.001
+                )
+                _check_deadline(deadline, cancel_event)
+                continue
             for future in done:
                 lane = pending.pop(future)
                 future.result()
@@ -968,6 +1011,11 @@ def _run_bounded_futures(
                 except StopIteration:
                     continue
                 pending[executor.submit(worker, index, item, lane)] = lane
+            if next_heartbeat is not None and time.monotonic() >= next_heartbeat:
+                heartbeat(len(pending))
+                next_heartbeat = time.monotonic() + max(
+                    _ADAPTER_STATUS_INTERVAL_S, 0.001
+                )
         _check_cancelled(cancel_event)
     except BaseException:
         if cancel_event is not None:
@@ -4988,6 +5036,7 @@ def _stage_chunked_linear_adapter(
     _ensure_directory(chunk_root, "adapter transport chunk directory")
     output_path = temporary / _ADAPTER_FILES[1]
     config_path = temporary / _ADAPTER_FILES[0]
+    config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
     total_wire_bytes = sum(int(item["wire_size"]) for item in chunks) + config_size
     progress_lock = threading.Lock()
     progress_bytes = 0
@@ -5002,6 +5051,12 @@ def _stage_chunked_linear_adapter(
         if _sha256(chunk_path, deadline, cancel_event) == str(item["wire_sha256"]):
             progress_bytes += int(item["wire_size"])
             credited_wire_names.add(str(item["file"]))
+    if _path_regular_size(config_incoming_path, "adapter configuration incoming file") == config_size:
+        try:
+            if _sha256(config_incoming_path, deadline, cancel_event) == config_sha256:
+                progress_bytes += config_size
+        except (FileNotFoundError, OSError):
+            pass
     reconstruct_lock = threading.Lock()
     reconstruct_worker_seconds = 0.0
     reconstruction_started = None
@@ -5011,47 +5066,133 @@ def _stage_chunked_linear_adapter(
     verification_started = None
     verification_finished = None
     last_status = 0.0
+    status_lock = threading.Lock()
+    status_write_lock = threading.Lock()
+    last_written_elapsed = 0.0
+    phase = "preparing"
+    last_network_progress_at = None
+    active_pending_downloads = 0
+    active_pending_reconstructions = 0
+    reconstruct_futures = []
+    reconstruct_futures_lock = threading.Lock()
 
-    def write_stage_status(value: dict[str, object]) -> None:
-        _write_stage_status(
-            destination.parent,
-            {
-                **value,
-                **_stage_timing_fields(
-                    started,
-                    transfer_started=transfer_started,
-                    transfer_finished=transfer_finished,
-                    reconstruction_started=reconstruction_started,
-                    reconstruction_finished=reconstruction_finished,
-                    reconstruction_worker_seconds=reconstruct_worker_seconds,
-                    verification_started=verification_started,
-                    verification_finished=verification_finished,
-                ),
-                **(status_metadata or {}),
-            },
-        )
+    def write_stage_status(value: dict[str, object], *, lock_held: bool = False) -> None:
+        nonlocal last_written_elapsed
 
-    def report(lane: int, amount: int) -> None:
-        nonlocal progress_bytes, last_status
-        _check_deadline(deadline, cancel_event)
-        with progress_lock:
-            progress_bytes += amount
-            now = time.monotonic()
-            if amount >= 0 and now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
-                return
-            last_status = now
+        def write() -> None:
+            nonlocal last_written_elapsed
+            last_written_elapsed = max(
+                last_written_elapsed,
+                round(time.monotonic() - started, 3),
+            )
+            _write_stage_status(
+                destination.parent,
+                {
+                    **value,
+                    "elapsed_seconds": last_written_elapsed,
+                    **_stage_timing_fields(
+                        started,
+                        transfer_started=transfer_started,
+                        transfer_finished=transfer_finished,
+                        reconstruction_started=reconstruction_started,
+                        reconstruction_finished=reconstruction_finished,
+                        reconstruction_worker_seconds=reconstruct_worker_seconds,
+                        verification_started=verification_started,
+                        verification_finished=verification_finished,
+                    ),
+                    **(status_metadata or {}),
+                },
+            )
+
+        if lock_held:
+            write()
+        else:
+            with status_write_lock:
+                write()
+
+    def set_phase(next_phase: str) -> None:
+        nonlocal phase
+        with status_lock:
+            phase = next_phase
+
+    def stage_heartbeat(
+        phase_name: str,
+        pending_downloads: int,
+        pending_reconstructions: int,
+    ) -> None:
+        nonlocal phase, active_pending_downloads, active_pending_reconstructions
+        with status_write_lock:
+            with progress_lock:
+                bytes_done = progress_bytes
+            with status_lock:
+                phase = phase_name
+                current_phase = phase
+                network_progress = last_network_progress_at
+                active_pending_downloads = max(0, pending_downloads)
+                active_pending_reconstructions = max(0, pending_reconstructions)
+                current_pending_downloads = active_pending_downloads
+                current_pending_reconstructions = active_pending_reconstructions
             write_stage_status(
                 {
                     "status": "staging",
                     "source_url": source_url,
                     "path": destination.as_posix(),
                     "transport": _ADAPTER_LINEAR_TRANSPORT,
-                    "bytes_done": progress_bytes,
+                    "bytes_done": bytes_done,
                     "bytes_total": total_wire_bytes,
+                    "phase": current_phase,
+                    "last_network_progress_at": network_progress,
+                    "pending_downloads": current_pending_downloads,
+                    "pending_reconstructions": current_pending_reconstructions,
+                    "updated_at": time.time(),
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                },
+                lock_held=True,
+            )
+
+    def report(lane: int, amount: int) -> None:
+        nonlocal progress_bytes, last_status, last_network_progress_at
+        _check_deadline(deadline, cancel_event)
+        with progress_lock:
+            progress_bytes += amount
+            now = time.monotonic()
+            bytes_done = progress_bytes
+            should_report = (
+                now - last_status >= _ADAPTER_STATUS_INTERVAL_S
+                or progress_bytes >= total_wire_bytes
+            )
+            if should_report:
+                last_status = now
+        with status_lock:
+            if amount > 0:
+                last_network_progress_at = time.time()
+        if not should_report:
+            return
+        with status_write_lock:
+            with progress_lock:
+                bytes_done = progress_bytes
+            with status_lock:
+                current_phase = phase
+                network_progress = last_network_progress_at
+                current_pending_downloads = active_pending_downloads
+                current_pending_reconstructions = active_pending_reconstructions
+            write_stage_status(
+                {
+                    "status": "staging",
+                    "source_url": source_url,
+                    "path": destination.as_posix(),
+                    "transport": _ADAPTER_LINEAR_TRANSPORT,
+                    "bytes_done": bytes_done,
+                    "bytes_total": total_wire_bytes,
+                    "phase": current_phase,
+                    "last_network_progress_at": network_progress,
+                    "pending_downloads": current_pending_downloads,
+                    "pending_reconstructions": current_pending_reconstructions,
                     "lane": lane,
                     "updated_at": time.time(),
                     "elapsed_seconds": round(now - started, 3),
                 },
+                lock_held=True,
             )
 
     write_stage_status(
@@ -5063,10 +5204,16 @@ def _stage_chunked_linear_adapter(
             "verified_files": source_manifest["files"],
             "bytes_done": progress_bytes,
             "bytes_total": total_wire_bytes,
+            "phase": phase,
+            "last_network_progress_at": last_network_progress_at,
+            "pending_downloads": 0,
+            "pending_reconstructions": 0,
             "updated_at": time.time(),
             "elapsed_seconds": 0.0,
         },
     )
+    set_phase("connecting")
+    stage_heartbeat("connecting", 0, 0)
     lane_urls, source_connection_count = _responsive_adapter_source_urls(
         source_url,
         deadline,
@@ -5077,7 +5224,6 @@ def _stage_chunked_linear_adapter(
         "source_connections": source_connection_count,
         "responsive_source_connections": len(lane_urls),
     }
-    config_incoming_path = config_path.with_name(f".{config_path.name}.incoming")
     _reject_symlink_path(output_path, "adapter output")
     _reject_symlink_path(config_path, "adapter configuration file")
     _reject_symlink_path(config_incoming_path, "adapter configuration incoming file")
@@ -5100,6 +5246,9 @@ def _stage_chunked_linear_adapter(
     )
     if _path_regular_size(output_path, "adapter output") != target_size:
         _preallocate(output_path, target_size)
+
+    set_phase("downloading")
+    stage_heartbeat("downloading", 0, 0)
 
     # Publish configuration atomically before the relay index. The peer must
     # never observe a relay index that points at an unfinished config file.
@@ -5416,9 +5565,6 @@ def _stage_chunked_linear_adapter(
         persistent_pool.close()
         os.close(chunk_root_fd)
         raise
-    reconstruct_futures = []
-    reconstruct_futures_lock = threading.Lock()
-
     def fetch_and_reconstruct(
         index: int,
         item: dict[str, object],
@@ -5429,6 +5575,17 @@ def _stage_chunked_linear_adapter(
         with reconstruct_futures_lock:
             reconstruct_futures.append(future)
 
+    def download_heartbeat(pending_downloads: int) -> None:
+        with reconstruct_futures_lock:
+            pending_reconstructions = sum(
+                not future.done() for future in reconstruct_futures
+            )
+        stage_heartbeat(
+            "downloading",
+            pending_downloads,
+            pending_reconstructions,
+        )
+
     try:
         try:
             _run_bounded_futures(
@@ -5437,21 +5594,31 @@ def _stage_chunked_linear_adapter(
                 download_width,
                 deadline,
                 cancel_event,
+                heartbeat=download_heartbeat,
             )
         except BaseException:
             reconstruct_executor.shutdown(wait=True, cancel_futures=True)
             raise
         with reconstruct_futures_lock:
             pending_reconstruction = list(reconstruct_futures)
+        set_phase("reconstructing")
+        stage_heartbeat("reconstructing", 0, len(pending_reconstruction))
         _wait_for_futures(
             reconstruct_executor,
             pending_reconstruction,
             deadline,
             cancel_event,
+            heartbeat=lambda pending: stage_heartbeat(
+                "reconstructing",
+                0,
+                pending,
+            ),
         )
     finally:
         persistent_pool.close()
         os.close(chunk_root_fd)
+    set_phase("verifying")
+    stage_heartbeat("verifying", 0, 0)
     output_fd = _open_nofollow(output_path, os.O_RDONLY)
     try:
         os.fsync(output_fd)
@@ -5529,6 +5696,10 @@ def _stage_chunked_linear_adapter(
             "verified_files": source_manifest["files"],
             "bytes_done": total_wire_bytes,
             "bytes_total": total_wire_bytes,
+            "phase": "ready",
+            "last_network_progress_at": last_network_progress_at,
+            "pending_downloads": 0,
+            "pending_reconstructions": 0,
             "updated_at": time.time(),
             "elapsed_seconds": round(time.monotonic() - started, 3),
         },
