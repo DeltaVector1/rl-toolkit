@@ -308,6 +308,59 @@ class RolloutPullTest(unittest.TestCase):
                 subprocess.run(["bash", "-c", cleanup], env=environment, capture_output=True, timeout=10)
                 training_ops.rollout_pull_script = old_script
 
+    def test_pause_attempt_receipt_write_failure_releases_exact_running_puller(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            tools = Path(directory) / "tools"
+            old_script = training_ops.rollout_pull_script
+            token = "1" * 32
+            receipt_path = run_dir / ".rollout-pull-paused"
+            move_count = Path(directory) / "receipt-move-count"
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                start = training_ops._rollout_pull_command(str(run_dir), "start")
+                pause = training_ops._rollout_pull_command(str(run_dir), "pause")
+                resume = training_ops._rollout_pull_command(str(run_dir), "resume")
+                state = training_ops._rollout_pull_command(str(run_dir), "state")
+                status = training_ops._rollout_pull_command(str(run_dir), "status")
+                result = subprocess.run(["bash", "-c", start], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                recorded_pid = (run_dir / ".rollout-pull.pid").read_text().strip()
+                (tools / "mv").write_text(
+                    "#!/usr/bin/env bash\nset -eu\n"
+                    "target=${!#}\n"
+                    "if [ \"$target\" = \"$RECEIPT_PATH\" ]; then\n"
+                    "  count=0; [ ! -f \"$RECEIPT_MOVE_COUNT\" ] || count=$(cat \"$RECEIPT_MOVE_COUNT\")\n"
+                    "  count=$((count + 1)); printf '%s' \"$count\" >\"$RECEIPT_MOVE_COUNT\"\n"
+                    "  [ \"$count\" -ne 1 ] || exit 73\n"
+                    "fi\n"
+                    "exec /usr/bin/mv \"$@\"\n"
+                )
+                (tools / "mv").chmod(0o755)
+                environment.update(
+                    RECEIPT_PATH=str(receipt_path),
+                    RECEIPT_MOVE_COUNT=str(move_count),
+                )
+                result = subprocess.run(["bash", "-c", f"{pause} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                receipt = receipt_path.read_text().splitlines()
+                self.assertEqual(receipt[0:5], [token, str(run_dir), "running", recorded_pid, "no"])
+                self.assertEqual(move_count.read_text(), "1")
+                self.assertEqual((run_dir / ".rollout-pull.pid").read_text().strip(), recorded_pid)
+                result = subprocess.run(["bash", "-c", state], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, "running"), result.stderr)
+                result = subprocess.run(["bash", "-c", f"{resume} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, "already-running"), result.stderr)
+                self.assertFalse(receipt_path.exists())
+                self.assertEqual((run_dir / ".rollout-pull.pid").read_text().strip(), recorded_pid)
+                self.assertEqual(subprocess.run(["bash", "-c", status], env=environment, capture_output=True, timeout=10).returncode, 0)
+            finally:
+                cleanup = training_ops._rollout_pull_command(str(run_dir), "stop")
+                subprocess.run(["bash", "-c", cleanup], env=environment, capture_output=True, timeout=10)
+                training_ops.rollout_pull_script = old_script
+
     def test_stop_is_idempotent_with_stale_lock_and_pid_state(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory) / "alpha/run_alpha"

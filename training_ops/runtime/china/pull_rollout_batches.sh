@@ -513,6 +513,13 @@ resume_action() {
   fi
   state_value=$(state) || return 1
   if [ "$state_value" = running ]; then
+    if [ "$was_running" = running ] && [ "${receipt[4]}" = no ] && \
+      [ "$(cat "$pid_file" 2>/dev/null || true)" = "$recorded_pid" ] && \
+      process_matches "$recorded_pid" && receipt_process_matches; then
+      remove_pause_receipt || return 1
+      echo already-running
+      return 0
+    fi
     echo "rollout puller is running during a paused namespace transaction; receipt retained" >&2
     return 1
   fi
