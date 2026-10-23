@@ -536,12 +536,15 @@ class LinearAdapterReceiverTest(unittest.TestCase):
         old_decode = filesystem._decode_linear_transport_chunk
         old_timeout = filesystem._delta_stage_timeout_s
         old_pool = filesystem._PersistentAdapterLanePool
+        old_status = filesystem._write_stage_status
+        old_interval = filesystem._ADAPTER_STATUS_INTERVAL_S
         relaying_seen_before_chunk = False
         wire_proof_seen_during_decode = False
         decode_calls = 0
         chunk_download_calls = 0
         base_calls = []
         pool_instances = []
+        statuses = []
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 os.environ["PRIME_LORA_CACHE_DIR"] = temporary
@@ -561,6 +564,14 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 def fake_download(_source, destination, **kwargs):
                     nonlocal relaying_seen_before_chunk, chunk_download_calls
                     destination.parent.mkdir(parents=True, exist_ok=True)
+                    if (
+                        "adapter_config.json" in destination.name
+                        and destination.is_file()
+                        and destination.stat().st_size == len(config)
+                        and hashlib.sha256(destination.read_bytes()).hexdigest()
+                        == digest(config)
+                    ):
+                        return
                     if "chunk-" in destination.name:
                         chunk_download_calls += 1
                         relaying_seen_before_chunk = (
@@ -571,6 +582,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                     )
                     if kwargs.get("progress"):
                         kwargs["progress"](0, destination.stat().st_size)
+                        time.sleep(0.02)
 
                 class FakePool:
                     def __init__(self, source_urls, width):
@@ -608,6 +620,14 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 filesystem._source_manifest = lambda *_args, **_kwargs: source_manifest
                 filesystem._delta_stage_timeout_s = lambda: 30.0
 
+                def record_status(cache_root, value, **kwargs):
+                    statuses.append(dict(value))
+                    time.sleep(0.001)
+                    return old_status(cache_root, value, **kwargs)
+
+                filesystem._write_stage_status = record_status
+                filesystem._ADAPTER_STATUS_INTERVAL_S = 0.005
+
                 def fake_decode(*_args, **_kwargs):
                     nonlocal decode_calls, wire_proof_seen_during_decode
                     decode_calls += 1
@@ -644,6 +664,8 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 self.assertTrue(
                     (partial / "transport-chunks" / "chunk-0.wire-ready").is_file()
                 )
+                (partial / ".adapter_config.json.incoming").write_bytes(config)
+                statuses.clear()
                 result = filesystem._stage_chunked_linear_adapter(
                     source_url,
                     transport,
@@ -660,6 +682,34 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 self.assertTrue(wire_proof_seen_during_decode)
                 self.assertEqual(chunk_download_calls, 1)
                 self.assertTrue(all(pool.closed for pool in pool_instances))
+                self.assertTrue(
+                    any(
+                        value["status"] == "staging"
+                        and value["phase"] == "downloading"
+                        and value["bytes_done"] == value["bytes_total"]
+                        for value in statuses
+                    )
+                )
+                segments = []
+                segment = []
+                for value in statuses:
+                    segment.append(value)
+                    if value.get("status") == "ready":
+                        segments.append(segment)
+                        segment = []
+                for segment in segments:
+                    progress = [
+                        value["bytes_done"]
+                        for value in segment
+                        if value.get("status") == "staging"
+                    ]
+                    self.assertEqual(progress, sorted(progress))
+                    elapsed = [
+                        value["elapsed_seconds"]
+                        for value in segment
+                        if value.get("status") == "staging"
+                    ]
+                    self.assertEqual(elapsed, sorted(elapsed))
                 self.assertFalse(
                     (result / "transport-chunks" / "chunk-0.wire-ready").exists()
                 )
@@ -684,11 +734,11 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 (partial / "adapter_model.safetensors").write_bytes(b"damaged!")
                 (partial / "transport-chunks" / "chunk-0.done").unlink()
                 statuses = []
-                old_status = filesystem._write_stage_status
+                old_resume_status = filesystem._write_stage_status
 
                 def record_status(cache_root, value, **kwargs):
                     statuses.append(dict(value))
-                    return old_status(cache_root, value, **kwargs)
+                    return old_resume_status(cache_root, value, **kwargs)
 
                 filesystem._write_stage_status = record_status
                 try:
@@ -704,7 +754,7 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                         },
                     )
                 finally:
-                    filesystem._write_stage_status = old_status
+                    filesystem._write_stage_status = old_resume_status
                 self.assertEqual(statuses[0]["bytes_done"], len(wire))
                 self.assertEqual(
                     max(value["bytes_done"] for value in statuses if value["status"] == "staging"),
@@ -727,6 +777,8 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             filesystem._decode_linear_transport_chunk = old_decode
             filesystem._delta_stage_timeout_s = old_timeout
             filesystem._PersistentAdapterLanePool = old_pool
+            filesystem._write_stage_status = old_status
+            filesystem._ADAPTER_STATUS_INTERVAL_S = old_interval
 
     def test_linear_receiver_caps_download_workers_to_responsive_lanes(self):
         filesystem = load_filesystem()
@@ -1762,6 +1814,79 @@ class LinearAdapterReceiverTest(unittest.TestCase):
                 os.environ.pop("PRIME_FULL_CHECKPOINT_CACHE_DIR", None)
             else:
                 os.environ["PRIME_FULL_CHECKPOINT_CACHE_DIR"] = old_cache
+
+    def test_verified_base_uses_published_identity_without_hashing_model(self):
+        filesystem = load_filesystem()
+        base_url = "http://source/step_1"
+        model = b"cached model"
+        config = b"{}\n"
+        model_sha256 = hashlib.sha256(model).hexdigest()
+        config_sha256 = hashlib.sha256(config).hexdigest()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_sha256_entry = filesystem._sha256_entry
+        hashed = []
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                base_dir = filesystem.adapter_cache_path(base_url)
+                base_dir.mkdir(parents=True)
+                (base_dir / "READY").write_bytes(b"ready\n")
+                (base_dir / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "source_url": base_url,
+                            "files": {
+                                "adapter_config.json": {
+                                    "size": len(config),
+                                    "sha256": config_sha256,
+                                },
+                                "adapter_model.safetensors": {
+                                    "size": len(model),
+                                    "sha256": model_sha256,
+                                },
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+                (base_dir / "adapter_config.json").write_bytes(config)
+                (base_dir / "adapter_model.safetensors").write_bytes(model)
+                (base_dir / "adapter_model.safetensors.sha256").write_text(
+                    f"{model_sha256}\n",
+                    encoding="ascii",
+                )
+
+                def hash_entry(parent_fd, name, label):
+                    hashed.append(name)
+                    if name == "adapter_model.safetensors":
+                        raise AssertionError("published model identity must not be rehashed")
+                    return old_sha256_entry(parent_fd, name, label)
+
+                filesystem._sha256_entry = hash_entry
+                result = filesystem._verified_adapter_base(
+                    base_url,
+                    model_sha256,
+                    expected_size=len(model),
+                    expected_config_sha256=config_sha256,
+                    expected_config_size=len(config),
+                )
+                self.assertEqual(
+                    result,
+                    (
+                        base_dir / "adapter_model.safetensors",
+                        base_dir / "adapter_config.json",
+                    ),
+                )
+                self.assertEqual(hashed, ["adapter_config.json"])
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._sha256_entry = old_sha256_entry
+
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import hashlib
 import http.client
 import http.server
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -16,6 +17,7 @@ import types
 import unittest
 from unittest import mock
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2410,6 +2412,201 @@ class DownloadSchedulerTest(unittest.TestCase):
         self.assertLessEqual(maximum_active, 2)
         self.assertLessEqual(maximum_pending, 2)
 
+    def test_bounded_scheduler_reuses_freed_lane(self):
+        filesystem = load_filesystem_module()
+        lock = threading.Lock()
+        started = {}
+        finished = {}
+        release_slow = threading.Event()
+
+        def worker(index, _item, lane):
+            with lock:
+                started[index] = (lane, time.monotonic())
+            if index == 0:
+                self.assertTrue(release_slow.wait(2))
+            elif index == 1:
+                time.sleep(0.03)
+            elif index == 2:
+                release_slow.set()
+            with lock:
+                finished[index] = time.monotonic()
+
+        filesystem._run_bounded_futures(
+            list(range(3)),
+            worker,
+            2,
+            time.monotonic() + 3,
+            threading.Event(),
+        )
+        self.assertEqual(started[0][0], 0)
+        self.assertEqual(started[1][0], 1)
+        self.assertEqual(started[2][0], 1)
+        self.assertLess(started[2][1], finished[0])
+
+    def test_bounded_scheduler_emits_heartbeat_without_network_progress(self):
+        filesystem = load_filesystem_module()
+        old_interval = filesystem._ADAPTER_STATUS_INTERVAL_S
+        filesystem._ADAPTER_STATUS_INTERVAL_S = 0.01
+        release = threading.Event()
+        heartbeats = []
+        bytes_done = 7
+
+        def worker(_index, _item, _lane):
+            self.assertTrue(release.wait(1))
+
+        def heartbeat(pending):
+            heartbeats.append((pending, bytes_done))
+
+        runner = threading.Thread(
+            target=filesystem._run_bounded_futures,
+            args=(
+                [object()],
+                worker,
+                1,
+                time.monotonic() + 1,
+                threading.Event(),
+            ),
+            kwargs={"heartbeat": heartbeat},
+        )
+        try:
+            runner.start()
+            deadline = time.monotonic() + 0.5
+            while not heartbeats and time.monotonic() < deadline:
+                time.sleep(0.005)
+            release.set()
+            runner.join(1)
+        finally:
+            release.set()
+            filesystem._ADAPTER_STATUS_INTERVAL_S = old_interval
+        self.assertFalse(runner.is_alive())
+        self.assertTrue(heartbeats)
+        self.assertTrue(all(pending == 1 for pending, _bytes in heartbeats))
+        self.assertTrue(all(value == bytes_done for _pending, value in heartbeats))
+
+    def test_future_wait_emits_reconstruction_heartbeat(self):
+        filesystem = load_filesystem_module()
+        old_interval = filesystem._ADAPTER_STATUS_INTERVAL_S
+        filesystem._ADAPTER_STATUS_INTERVAL_S = 0.01
+        release = threading.Event()
+        heartbeats = []
+        executor = filesystem.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(lambda: release.wait(1))
+        try:
+            waiter = threading.Thread(
+                target=filesystem._wait_for_futures,
+                args=(executor, [future], time.monotonic() + 1, threading.Event()),
+                kwargs={"heartbeat": heartbeats.append},
+            )
+            waiter.start()
+            deadline = time.monotonic() + 0.5
+            while not heartbeats and time.monotonic() < deadline:
+                time.sleep(0.005)
+            release.set()
+            waiter.join(1)
+        finally:
+            release.set()
+            filesystem._ADAPTER_STATUS_INTERVAL_S = old_interval
+        self.assertFalse(waiter.is_alive())
+        self.assertTrue(heartbeats)
+        self.assertEqual(heartbeats[0], 1)
+
+    def test_reconstruction_heartbeat_counts_unfinished_futures(self):
+        filesystem = load_filesystem_module()
+        old_interval = filesystem._ADAPTER_STATUS_INTERVAL_S
+        filesystem._ADAPTER_STATUS_INTERVAL_S = 0.01
+        release_first = threading.Event()
+        second = threading.Event()
+        heartbeats = []
+        executor = filesystem.ThreadPoolExecutor(max_workers=2)
+        first_future = executor.submit(lambda: release_first.wait(1))
+        second_future = executor.submit(lambda: second.set())
+        try:
+            waiter = threading.Thread(
+                target=filesystem._wait_for_futures,
+                args=(
+                    executor,
+                    [first_future, second_future],
+                    time.monotonic() + 1,
+                    threading.Event(),
+                ),
+                kwargs={"heartbeat": heartbeats.append},
+            )
+            waiter.start()
+            deadline = time.monotonic() + 0.5
+            while not heartbeats and time.monotonic() < deadline:
+                time.sleep(0.005)
+            release_first.set()
+            waiter.join(1)
+        finally:
+            release_first.set()
+            second.set()
+            filesystem._ADAPTER_STATUS_INTERVAL_S = old_interval
+        self.assertFalse(waiter.is_alive())
+        self.assertTrue(heartbeats)
+        self.assertEqual(heartbeats[0], 1)
+
+    def test_heartbeat_write_errors_do_not_mask_worker_failures(self):
+        filesystem = load_filesystem_module()
+        old_interval = filesystem._ADAPTER_STATUS_INTERVAL_S
+        filesystem._ADAPTER_STATUS_INTERVAL_S = 0.001
+        try:
+            for wait_mode in ("bounded", "futures"):
+                with self.subTest(wait_mode=wait_mode):
+                    started = threading.Event()
+                    fail = threading.Event()
+                    heartbeats = []
+
+                    def worker(*_args):
+                        started.set()
+                        if not fail.wait(1):
+                            raise TimeoutError("worker was not released")
+                        raise OSError("transport worker failed")
+
+                    def heartbeat(pending):
+                        heartbeats.append(pending)
+                        fail.set()
+                        raise RuntimeError("status file could not be written")
+
+                    if wait_mode == "bounded":
+                        call = lambda: filesystem._run_bounded_futures(
+                            [object()],
+                            lambda index, item, lane: worker(index, item, lane),
+                            1,
+                            time.monotonic() + 1,
+                            threading.Event(),
+                            heartbeat=heartbeat,
+                        )
+                    else:
+                        executor = filesystem.ThreadPoolExecutor(max_workers=1)
+                        future = executor.submit(worker)
+                        call = lambda: filesystem._wait_for_futures(
+                            executor,
+                            [future],
+                            time.monotonic() + 1,
+                            threading.Event(),
+                            heartbeat=heartbeat,
+                        )
+                    errors = []
+
+                    def run_call():
+                        try:
+                            call()
+                        except BaseException as exc:
+                            errors.append(exc)
+
+                    runner = threading.Thread(target=run_call)
+                    runner.start()
+                    self.assertTrue(started.wait(1))
+                    runner.join(1)
+                    self.assertFalse(runner.is_alive())
+                    self.assertEqual(len(errors), 1)
+                    self.assertIsInstance(errors[0], OSError)
+                    self.assertIn("transport worker failed", str(errors[0]))
+                    self.assertTrue(heartbeats)
+                    self.assertTrue(all(pending == 1 for pending in heartbeats))
+        finally:
+            filesystem._ADAPTER_STATUS_INTERVAL_S = old_interval
+
     def test_bounded_full_scheduler_caps_configured_streams_to_lanes(self):
         filesystem = load_filesystem_module()
         lock = threading.Lock()
@@ -2788,6 +2985,8 @@ class DownloadSchedulerTest(unittest.TestCase):
             OSError("generic metadata failure"),
             OSError("connection reset by peer"),
             filesystem.URLError("connection reset by peer"),
+            filesystem.URLError("adapter checksum mismatch"),
+            filesystem.HTTPError("http://lane/manifest", 500, "server error", None, None),
             OSError("adapter checksum mismatch"),
             OSError("adapter identity differs"),
             OSError("adapter protocol error"),
@@ -3420,6 +3619,865 @@ class DownloadSchedulerTest(unittest.TestCase):
             [18146, 18148],
         )
 
+    def test_persistent_chunks_reuse_one_connection(self):
+        filesystem = load_filesystem_module()
+        payload = b"persistent-range"
+        server, thread, handler = self._persistent_server(filesystem, payload)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                try:
+                    for name in ("one", "two"):
+                        pool.download(
+                            [f"http://127.0.0.1:{server.server_address[1]}/{name}"],
+                            0,
+                            chunks / name,
+                            parent_fd,
+                            expected_size=len(payload),
+                            expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            per_request_timeout_seconds=2,
+                        )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertEqual(handler.connections, 1)
+                self.assertEqual(handler.requests, 2)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_connection_reopens_after_idle_threshold(self):
+        filesystem = load_filesystem_module()
+        payload = b"idle-reopen"
+        server, thread, handler = self._persistent_server(filesystem, payload)
+        old_idle = filesystem.persistent_connection_idle_seconds
+        filesystem.persistent_connection_idle_seconds = 0.05
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                try:
+                    for name in ("one", "two"):
+                        pool.download(
+                            [f"http://127.0.0.1:{server.server_address[1]}/{name}"],
+                            0,
+                            chunks / name,
+                            parent_fd,
+                            expected_size=len(payload),
+                            expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            per_request_timeout_seconds=1,
+                        )
+                        if name == "one":
+                            time.sleep(0.08)
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertEqual(handler.connections, 2)
+        finally:
+            filesystem.persistent_connection_idle_seconds = old_idle
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_chunk_attempt_deadline_stops_trickle_and_rotates(self):
+        filesystem = load_filesystem_module()
+        payload = b"trickle-body"
+
+        def trickle_once(request, number):
+            if number != 1:
+                return False
+            start, end = map(
+                int,
+                request.headers["Range"].removeprefix("bytes=").split("-", 1),
+            )
+            body = payload[start : end + 1]
+            request.send_response(206)
+            request.send_header("Content-Length", str(len(body)))
+            request.send_header(
+                "Content-Range", f"bytes {start}-{end}/{len(payload)}"
+            )
+            request.end_headers()
+            for value in body:
+                try:
+                    request.wfile.write(bytes((value,)))
+                    request.wfile.flush()
+                except OSError:
+                    return True
+                time.sleep(0.05)
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, trickle_once
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        filesystem.lane_rotation_delay_seconds = 0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                started = time.monotonic()
+                try:
+                    pool.download(
+                        [
+                            f"http://127.0.0.1:{server.server_address[1]}/slow",
+                            f"http://127.0.0.1:{server.server_address[1]}/fast",
+                        ],
+                        0,
+                        chunks / "trickle",
+                        parent_fd,
+                        expected_size=len(payload),
+                        expected_sha256=hashlib.sha256(payload).hexdigest(),
+                        per_request_timeout_seconds=0.2,
+                    )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                elapsed = time.monotonic() - started
+                self.assertEqual((chunks / "trickle").read_bytes(), payload)
+                self.assertEqual(handler.requests, 2)
+                self.assertGreaterEqual(elapsed, 0.15)
+                self.assertLess(elapsed, 0.8)
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_chunk_retries_only_404_and_503(self):
+        filesystem = load_filesystem_module()
+        payload = b"status-retry"
+
+        def unavailable_once(request, number):
+            if number != 1:
+                return False
+            request.send_response(404)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, unavailable_once
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        filesystem.lane_rotation_delay_seconds = 0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                self._persistent_download(
+                    filesystem, server, Path(temporary), "status", payload
+                )
+                self.assertEqual(handler.requests, 2)
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_config_http500_is_terminal(self):
+        filesystem = load_filesystem_module()
+        payload = b"config-500"
+
+        def server_error(request, number):
+            if number != 1:
+                return False
+            request.send_response(500)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, server_error
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(OSError, "unexpected HTTP status"):
+                    filesystem._download_persistent_file(
+                        [f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json"],
+                        Path(temporary) / "adapter_config.json",
+                        expected_size=len(payload),
+                        expected_sha256=hashlib.sha256(payload).hexdigest(),
+                        per_request_timeout_seconds=1,
+                    )
+                self.assertEqual(handler.requests, 1)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_chunk_http500_is_terminal(self):
+        filesystem = load_filesystem_module()
+        payload = b"server-error"
+
+        def server_error(request, number):
+            if number != 1:
+                return False
+            request.send_response(500)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, server_error
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                try:
+                    with self.assertRaisesRegex(OSError, "unexpected HTTP status"):
+                        pool.download(
+                            [f"http://127.0.0.1:{server.server_address[1]}/error"],
+                            0,
+                            chunks / "error",
+                            parent_fd,
+                            expected_size=len(payload),
+                            expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            per_request_timeout_seconds=2,
+                        )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertEqual(handler.requests, 1)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_download_keeps_public_signature(self):
+        filesystem = load_filesystem_module()
+        signature = str(inspect.signature(filesystem.download)).replace("pathlib._local.Path", "pathlib.Path")
+        self.assertEqual(
+            signature,
+            "(source_url: str, destination: pathlib.Path, *, expected_size: int | None = None, expected_sha256: str | None = None, progress=None, source_urls: list[str] | None = None, parallel_ranges: bool = True, deadline: float | None = None, cancel_event: threading.Event | None = None, per_request_timeout_seconds: float | None = None, retry_http_statuses: set[int] | None = None) -> None",
+        )
+        self.assertFalse(hasattr(filesystem.download, "__wrapped__"))
+
+    def test_glm_stream_count_accepts_24_lanes(self):
+        filesystem = load_filesystem_module()
+        old_value = filesystem.os.environ.get(filesystem._DOWNLOAD_STREAMS_ENV)
+        filesystem.os.environ[filesystem._DOWNLOAD_STREAMS_ENV] = "24"
+        try:
+            self.assertEqual(filesystem._configured_download_streams(), 24)
+        finally:
+            if old_value is None:
+                filesystem.os.environ.pop(filesystem._DOWNLOAD_STREAMS_ENV, None)
+            else:
+                filesystem.os.environ[filesystem._DOWNLOAD_STREAMS_ENV] = old_value
+
+
+
+    def test_bundle_identity_is_explicit(self):
+        filesystem = load_filesystem_module()
+        with self.assertRaisesRegex(OSError, "not published"):
+            filesystem._bundle_identity(
+                "http://source/step_1",
+                {"source_manifest": {}, "chunks": []},
+            )
+
+    def test_bundle_identity_preserves_query(self):
+        filesystem = load_filesystem_module()
+        payload = b"bundle-wire"
+        item = {
+            "file": "adapter_model.safetensors.transport-delta-000000",
+            "wire_size": len(payload),
+        }
+        transport = {
+            "transport": filesystem._ADAPTER_DELTA_TRANSPORT,
+            "source_manifest": {
+                "bundle": {
+                    "path": ".adapter-transport-bundle",
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            },
+            "chunks": [item],
+        }
+        bundle = filesystem._bundle_identity(
+            "http://source/step_1?token=abc",
+            transport,
+        )
+        self.assertEqual(
+            bundle["url"],
+            "http://source/step_1/.adapter-transport-bundle?token=abc",
+        )
+
+    def test_bundle_identity_rejects_private_chunk_names(self):
+        filesystem = load_filesystem_module()
+        payload = b"bundle-wire"
+        transport = {
+            "transport": filesystem._ADAPTER_DELTA_TRANSPORT,
+            "source_manifest": {
+                "bundle": {
+                    "path": ".adapter-transport-bundle",
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            },
+            "chunks": [{"file": ".identity.json", "wire_size": len(payload)}],
+        }
+        with self.assertRaisesRegex(OSError, "chunk identity"):
+            filesystem._bundle_identity("http://source/step_1", transport)
+
+    def test_bundle_resume_identity_tracks_bundle_and_lane_plan(self):
+        filesystem = load_filesystem_module()
+        transport = {
+            "version": 1,
+            "mode": "delta",
+            "transport": filesystem._ADAPTER_DELTA_TRANSPORT,
+            "chunks": [
+                {
+                    "file": "chunk-0",
+                    "offset": 0,
+                    "raw_size": 4,
+                    "wire_size": 3,
+                    "wire_sha256": "a" * 64,
+                    "raw_sha256": "b" * 64,
+                }
+            ],
+        }
+        bundle = {
+            "path": ".adapter-transport-bundle",
+            "size": 3,
+            "sha256": "c" * 64,
+            "url": "http://source/step_1/.adapter-transport-bundle",
+        }
+        lane_plan = {"size": 3, "lanes": [{"start": 0, "end": 2}]}
+
+        identity = json.loads(
+            filesystem._adapter_bundle_resume_identity(
+                "http://source/step_1", transport, bundle, lane_plan
+            )
+        )
+        changed_bundle = {**bundle, "sha256": "d" * 64}
+        changed_identity = filesystem._adapter_bundle_resume_identity(
+            "http://source/step_1", transport, changed_bundle, lane_plan
+        )
+
+        self.assertEqual(identity["bundle"], bundle)
+        self.assertEqual(identity["bundle_lane_plan"], lane_plan)
+        self.assertNotEqual(json.dumps(identity, sort_keys=True), changed_identity)
+
+    def test_bundle_requires_exact_first_forward_pool(self):
+        filesystem = load_filesystem_module()
+        source_url = "http://127.0.0.1:18100/step_1?token=abc"
+        old_ports = os.environ.get("PRIME_LORA_SOURCE_PORTS")
+        old_probe = filesystem._responsive_adapter_source_urls
+        ports = list(range(18100, 18228, 2)) + list(range(18101, 18228, 2))
+        try:
+            os.environ.pop("PRIME_LORA_SOURCE_PORTS", None)
+            with self.assertRaisesRegex(OSError, "exactly 128"):
+                filesystem._bundle_responsive_source_urls(source_url, None, None)
+
+            os.environ["PRIME_LORA_SOURCE_PORTS"] = ",".join(str(port) for port in ports)
+            source_urls = filesystem._adapter_source_urls(source_url)
+            filesystem._responsive_adapter_source_urls = lambda *_args: (source_urls, 128)
+            self.assertEqual(
+                [urlsplit(url).port for url in filesystem._bundle_responsive_source_urls(source_url, None, None)],
+                ports[:64],
+            )
+            filesystem._responsive_adapter_source_urls = lambda *_args: (source_urls[:63], 128)
+            with self.assertRaisesRegex(OSError, "all 128"):
+                filesystem._bundle_responsive_source_urls(source_url, None, None)
+
+            bad_ports = list(ports)
+            bad_ports[65] = bad_ports[64]
+            os.environ["PRIME_LORA_SOURCE_PORTS"] = ",".join(str(port) for port in bad_ports)
+            with self.assertRaisesRegex(OSError, "port mapping"):
+                filesystem._bundle_responsive_source_urls(source_url, None, None)
+            bad_order = list(ports)
+            bad_order[0], bad_order[1] = bad_order[1], bad_order[0]
+            os.environ["PRIME_LORA_SOURCE_PORTS"] = ",".join(str(port) for port in bad_order)
+            with self.assertRaisesRegex(OSError, "port mapping"):
+                filesystem._bundle_responsive_source_urls(source_url, None, None)
+        finally:
+            filesystem._responsive_adapter_source_urls = old_probe
+            if old_ports is None:
+                os.environ.pop("PRIME_LORA_SOURCE_PORTS", None)
+            else:
+                os.environ["PRIME_LORA_SOURCE_PORTS"] = old_ports
+
+    def test_bundle_plan_is_private_and_ready_identity_stays_canonical(self):
+        filesystem = load_filesystem_module()
+        chunks = [
+            {
+                "file": f"adapter_model.safetensors.transport-delta-{index:06d}",
+                "wire_size": 1,
+            }
+            for index in range(64)
+        ]
+        bundle = filesystem._bundle_identity(
+            "http://127.0.0.1:18100/step_1?token=abc",
+            {
+                "source_manifest": {
+                    "bundle": {
+                        "path": ".adapter-transport-bundle",
+                        "size": 64,
+                        "sha256": hashlib.sha256(bytes(range(64))).hexdigest(),
+                    }
+                },
+                "transport": filesystem._ADAPTER_DELTA_TRANSPORT,
+                "chunks": chunks,
+            },
+        )
+        chunks = [
+            {
+                "file": f"chunk-{index}",
+                "offset": index,
+                "bundle_offset": index,
+                "wire_size": 1,
+            }
+            for index in range(64)
+        ]
+        sources = [f"http://127.0.0.1:{18100 + index}/step_1?token=abc" for index in range(64)]
+        before = json.dumps(bundle, sort_keys=True)
+        plan = filesystem._bundle_lane_plan(bundle, chunks, sources)
+        self.assertEqual(json.dumps(bundle, sort_keys=True), before)
+        self.assertNotIn("lane_plan", bundle)
+        recorded = {**bundle, "lane_plan": plan}
+        self.assertTrue(filesystem._bundle_identity_matches(recorded, bundle))
+
+    def test_bundle_lane_plan_uses_first_64_sources_and_exact_ranges(self):
+        filesystem = load_filesystem_module()
+        ports = list(range(18100, 18164, 2)) + list(range(18101, 18165, 2))
+        source_urls = [f"http://source:{port}/step_1?token=abc" for port in ports]
+        chunks = []
+        bundle_offset = 0
+        for index in range(1834):
+            wire_size = 100 + (index % 17)
+            chunks.append(
+                {
+                    "file": f"chunk-{index:04d}",
+                    "offset": index * 4096,
+                    "bundle_offset": bundle_offset,
+                    "wire_size": wire_size,
+                }
+            )
+            bundle_offset += wire_size
+        plan = filesystem._bundle_lane_plan(
+            {"size": bundle_offset},
+            chunks,
+            source_urls,
+        )
+        self.assertEqual(plan["lane_count"], 64)
+        self.assertEqual(len(plan["lanes"]), 64)
+        self.assertEqual(
+            [urlsplit(url).port for url in (lane["url"] for lane in plan["lanes"])],
+            ports[:64],
+        )
+        self.assertTrue(all("?token=abc" in lane["url"] for lane in plan["lanes"]))
+        planned_files = [name for lane in plan["lanes"] for name in lane["chunks"]]
+        self.assertEqual(planned_files, [item["file"] for item in chunks])
+        expected_start = 0
+        for lane in plan["lanes"]:
+            self.assertEqual(lane["start"], expected_start)
+            self.assertEqual(lane["end"] - lane["start"] + 1, lane["wire_bytes"])
+            expected_start = lane["end"] + 1
+        self.assertEqual(expected_start, bundle_offset)
+
+    def test_bundle_lane_reset_resumes_and_preserves_hashes(self):
+        filesystem = load_filesystem_module()
+        pieces = [b"wire-a", b"wire-bb", b"wire-ccc"]
+        payload = b"".join(pieces)
+        chunks = []
+        offset = 0
+        raw_offset = 0
+        for index, piece in enumerate(pieces):
+            chunks.append(
+                {
+                    "file": f"chunk-{index}",
+                    "offset": raw_offset,
+                    "bundle_offset": offset,
+                    "raw_size": len(piece),
+                    "wire_size": len(piece),
+                    "wire_sha256": hashlib.sha256(piece).hexdigest(),
+                    "raw_sha256": hashlib.sha256(piece).hexdigest(),
+                }
+            )
+            offset += len(piece)
+            raw_offset += len(piece)
+        bundle = {
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        lane = {
+            "url": "http://source:18100/.adapter-transport-bundle?token=abc",
+            "start": 0,
+            "end": len(payload) - 1,
+            "wire_bytes": len(payload),
+            "chunks": [item["file"] for item in chunks],
+        }
+        calls = []
+
+        class Response(io.BytesIO):
+            status = 206
+
+            def __init__(self, value, start, end, reset=False):
+                super().__init__(value)
+                self._reset = reset
+                self._returned = False
+                self.headers = {
+                    "Content-Length": str(end - start + 1),
+                    "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                    "ETag": f'"{hashlib.sha256(payload).hexdigest()}"',
+                }
+
+            def read(self, amount=-1):
+                if self._reset and not self._returned:
+                    self._returned = True
+                    return super().read(3)
+                if self._reset:
+                    raise filesystem.URLError("connection reset")
+                return super().read(amount)
+
+            def read1(self, amount=-1):
+                return self.read(amount)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            del timeout
+            start, end = (
+                int(part)
+                for part in request.headers["Range"].removeprefix("bytes=").split("-")
+            )
+            calls.append((request.full_url, start, end))
+            return Response(payload[start : end + 1], start, end, reset=len(calls) == 1)
+
+        def is_completed(_index, item, path):
+            return path.with_name(f"{path.name}.done").exists()
+
+        def process_chunk(_index, item):
+            path = root / item["file"]
+            encoded = path.read_bytes()
+            self.assertEqual(hashlib.sha256(encoded).hexdigest(), item["wire_sha256"])
+            path.with_name(f"{path.name}.done").write_text(
+                json.dumps({"output_sha256": hashlib.sha256(encoded).hexdigest()})
+            )
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_sleep = filesystem.time.sleep
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.sleep = lambda _seconds: None
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                filesystem._download_bundle_lane(
+                    bundle,
+                    lane,
+                    chunks,
+                    root,
+                    is_completed=is_completed,
+                    process_chunk=process_chunk,
+                )
+                self.assertEqual(
+                    b"".join((root / item["file"]).read_bytes() for item in chunks),
+                    payload,
+                )
+                filesystem._verify_bundle_chunks(bundle, chunks, root)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.sleep = old_sleep
+        self.assertEqual(calls[0][1:], (0, len(payload) - 1))
+        self.assertEqual(calls[1][1:], (3, len(payload) - 1))
+        self.assertEqual(calls[0][0], calls[1][0])
+
+    def test_bundle_lane_uses_incremental_reads_for_slow_stream(self):
+        filesystem = load_filesystem_module()
+        payload = b"abcdefgh"
+        digest = hashlib.sha256(payload).hexdigest()
+        item = {
+            "file": "chunk-0",
+            "offset": 0,
+            "bundle_offset": 0,
+            "raw_size": len(payload),
+            "wire_size": len(payload),
+            "wire_sha256": digest,
+            "raw_sha256": digest,
+        }
+        bundle = {"size": len(payload), "sha256": digest}
+        lane = {
+            "url": "http://source:18100/.adapter-transport-bundle",
+            "start": 0,
+            "end": len(payload) - 1,
+            "wire_bytes": len(payload),
+            "chunks": [item["file"]],
+        }
+        calls = []
+        clock = [0.0]
+
+        class Response:
+            status = 206
+
+            def __init__(self):
+                self.position = 0
+                self.headers = {
+                    "Content-Length": str(len(payload)),
+                    "Content-Range": f"bytes 0-{len(payload) - 1}/{len(payload)}",
+                    "ETag": f'"{digest}"',
+                }
+
+            def read1(self, _amount):
+                clock[0] += 6
+                value = payload[self.position : self.position + 1]
+                self.position += len(value)
+                return value
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, timeout))
+            return Response()
+
+        def is_completed(_index, _item, path):
+            return path.with_name(f"{path.name}.done").exists()
+
+        def process_chunk(_index, _item):
+            (root / "chunk-0.done").write_text("done\n", encoding="ascii")
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_monotonic = filesystem.time.monotonic
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.monotonic = lambda: clock[0]
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                filesystem._download_bundle_lane(
+                    bundle,
+                    lane,
+                    [item],
+                    root,
+                    is_completed=is_completed,
+                    process_chunk=process_chunk,
+                    deadline=120.0,
+                )
+                self.assertEqual((root / "chunk-0").read_bytes(), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.monotonic = old_monotonic
+        self.assertGreater(clock[0], filesystem._ADAPTER_LANE_TIMEOUT_S)
+        self.assertLessEqual(calls[0][1], filesystem._ADAPTER_LANE_TIMEOUT_S)
+
+    def test_bundle_lane_stalled_stream_hits_deadline(self):
+        filesystem = load_filesystem_module()
+        payload = b"stall"
+        digest = hashlib.sha256(payload).hexdigest()
+        item = {
+            "file": "chunk-0",
+            "offset": 0,
+            "bundle_offset": 0,
+            "raw_size": len(payload),
+            "wire_size": len(payload),
+            "wire_sha256": digest,
+            "raw_sha256": digest,
+        }
+        lane = {
+            "url": "http://source:18100/.adapter-transport-bundle",
+            "start": 0,
+            "end": len(payload) - 1,
+            "wire_bytes": len(payload),
+            "chunks": [item["file"]],
+        }
+        clock = [0.0]
+        calls = []
+
+        class Response:
+            status = 206
+            headers = {
+                "Content-Length": str(len(payload)),
+                "Content-Range": f"bytes 0-{len(payload) - 1}/{len(payload)}",
+                "ETag": f'"{digest}"',
+            }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read1(self, _amount):
+                clock[0] += 46
+                raise TimeoutError("stalled stream")
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, timeout))
+            return Response()
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        old_monotonic = filesystem.time.monotonic
+        filesystem.urllib.request.urlopen = fake_urlopen
+        filesystem.time.monotonic = lambda: clock[0]
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaises(TimeoutError):
+                    filesystem._download_bundle_lane(
+                        {"size": len(payload), "sha256": digest},
+                        lane,
+                        [item],
+                        Path(temporary),
+                        is_completed=lambda *_args: False,
+                        process_chunk=lambda *_args: None,
+                        deadline=45.0,
+                    )
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+            filesystem.time.monotonic = old_monotonic
+        self.assertEqual(len(calls), 1)
+
+    def test_bundle_lanes_open_one_distinct_range_each(self):
+        filesystem = load_filesystem_module()
+        payload = bytes(range(64))
+        source_urls = [f"http://source:{18100 + index}/step_1?token=abc" for index in range(64)]
+        chunks = [
+            {
+                "file": f"chunk-{index}",
+                "offset": index,
+                "bundle_offset": index,
+                "wire_size": 1,
+                "wire_sha256": hashlib.sha256(bytes([index])).hexdigest(),
+                "raw_sha256": hashlib.sha256(bytes([index])).hexdigest(),
+            }
+            for index in range(64)
+        ]
+        bundle = {"size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+        plan = filesystem._bundle_lane_plan(bundle, chunks, source_urls)
+        calls = []
+
+        class Response(io.BytesIO):
+            status = 206
+
+            def __init__(self, value, start, end):
+                super().__init__(value)
+                self.headers = {
+                    "Content-Length": str(end - start + 1),
+                    "Content-Range": f"bytes {start}-{end}/{len(payload)}",
+                    "ETag": f'"{hashlib.sha256(payload).hexdigest()}"',
+                }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        def fake_urlopen(request, timeout):
+            del timeout
+            start, end = (
+                int(part)
+                for part in request.headers["Range"].removeprefix("bytes=").split("-")
+            )
+            calls.append((request.full_url, start, end))
+            return Response(payload[start : end + 1], start, end)
+
+        def is_completed(_index, _item, path):
+            return path.with_name(f"{path.name}.done").exists()
+
+        def process_chunk(_index, item):
+            path = root / item["file"]
+            path.with_name(f"{path.name}.done").write_text(
+                json.dumps({"output_sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+            )
+
+        old_urlopen = filesystem.urllib.request.urlopen
+        filesystem.urllib.request.urlopen = fake_urlopen
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for lane_index, lane in enumerate(plan["lanes"]):
+                    filesystem._download_bundle_lane(
+                        bundle,
+                        lane,
+                        chunks,
+                        root,
+                        is_completed=is_completed,
+                        process_chunk=process_chunk,
+                        lane_index=lane_index,
+                    )
+                self.assertEqual([call[0] for call in calls], [lane["url"] for lane in plan["lanes"]])
+                self.assertEqual([(call[1], call[2]) for call in calls], [(lane["start"], lane["end"]) for lane in plan["lanes"]])
+                self.assertEqual(b"".join((root / item["file"]).read_bytes() for item in chunks), payload)
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+
+    def test_bundle_lane_rejects_non_range_response(self):
+        filesystem = load_filesystem_module()
+        piece = b"wire"
+        item = {
+            "file": "chunk",
+            "offset": 0,
+            "bundle_offset": 0,
+            "wire_size": len(piece),
+            "wire_sha256": hashlib.sha256(piece).hexdigest(),
+        }
+        lane = {
+            "url": "http://source:18100/.adapter-transport-bundle",
+            "start": 0,
+            "end": len(piece) - 1,
+            "wire_bytes": len(piece),
+            "chunks": ["chunk"],
+        }
+
+        class Response(io.BytesIO):
+            status = 200
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.close()
+
+        calls = []
+        old_urlopen = filesystem.urllib.request.urlopen
+        filesystem.urllib.request.urlopen = lambda request, timeout: (calls.append(request), Response())[-1]
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(OSError, "did not honor"):
+                    filesystem._download_bundle_lane(
+                        {"size": len(piece), "sha256": hashlib.sha256(piece).hexdigest()},
+                        lane,
+                        [item],
+                        Path(temporary),
+                        is_completed=lambda *_args: False,
+                        process_chunk=lambda *_args: None,
+                    )
+        finally:
+            filesystem.urllib.request.urlopen = old_urlopen
+        self.assertEqual(len(calls), 1)
 
 if __name__ == "__main__":
     unittest.main()

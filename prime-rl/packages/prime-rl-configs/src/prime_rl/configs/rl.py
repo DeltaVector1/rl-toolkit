@@ -152,6 +152,7 @@ class SharedFileSystemWeightBroadcastConfig(BaseConfig):
     type: Literal["filesystem"] = "filesystem"
     source_url: str | None = None
     source_dir: Path | None = None
+    require_bundle: bool = False
 
 
 SharedWeightBroadcastConfig: TypeAlias = Annotated[
@@ -416,6 +417,7 @@ class RLConfig(BaseConfig):
             self.orchestrator.weight_broadcast = OrchestratorFileSystemWeightBroadcastConfig(
                 source_url=self.weight_broadcast.source_url,
                 source_dir=self.weight_broadcast.source_dir,
+                require_bundle=self.weight_broadcast.require_bundle,
             )
         if self.inference is not None:
             self.inference.weight_broadcast = InferenceWeightBroadcastConfig(type=self.weight_broadcast.type)
