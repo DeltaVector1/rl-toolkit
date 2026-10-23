@@ -18,13 +18,14 @@
   so they are allowed to finish even if training advances. Train rollouts
   sampled from a frozen model never age — their sampler doesn't change
   with policy updates.
-  Cancellations surface as synthetic ``Cancelled`` markers so the sink's
+  Cancellations surface as explicit results so the sink's
   count-to-``group_size`` finalization still fires.
 """
 
 from __future__ import annotations
 
 import asyncio
+import traceback
 import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ from typing import Literal
 import verifiers.v1 as vf
 from aiolimiter import AsyncLimiter
 
+from prime_rl.orchestrator.dispatch_results import DispatchFailure, DispatchResult, GroupCancellation
 from prime_rl.orchestrator.envs import EvalEnvs, TrainEnvs
 from prime_rl.orchestrator.eval_source import EvalSource
 from prime_rl.orchestrator.train_source import TrainSource
@@ -79,8 +81,8 @@ class DispatcherMetrics:
     def record_cancellation(self, *, kind: Literal["train", "eval"], env_name: str, n: int = 1) -> None:
         self.cancelled_by_kind_env[(kind, env_name)] += n
 
-    def record_error(self, *, kind: Literal["train", "eval"], env_name: str) -> None:
-        self.errored_by_kind_env[(kind, env_name)] += 1
+    def record_error(self, *, kind: Literal["train", "eval"], env_name: str, n: int = 1) -> None:
+        self.errored_by_kind_env[(kind, env_name)] += n
 
     def drained(self, *, train_envs: set[str], eval_envs: set[str]) -> dict[str, float]:
         """Return per-tick counters and clear them. Emits the full pre-
@@ -161,7 +163,7 @@ class RolloutDispatcher:
 
         # Bounded so the dispatcher backpressures on a slow sink. One entry per
         # episode — the sinks count episodes, never loose traces.
-        self.out_q: asyncio.Queue[list[Rollout]] = asyncio.Queue(maxsize=max(8, self.max_inflight))
+        self.out_q: asyncio.Queue[DispatchResult] = asyncio.Queue(maxsize=max(8, self.max_inflight))
         self.queued_train_episodes = 0
 
         self.mode: DispatcherMode = DispatcherMode.PREFER_TRAIN
@@ -667,10 +669,10 @@ class RolloutDispatcher:
         """Emit every dispatched env-rollout exactly once to ``out_q``: a ``run``
         result as one episode, a legacy ``run_group`` result as ``rollout_count``
         single-trace episodes. Task exceptions synthesize ``rollout_count``
-        error-marker episodes so the sink's count-to-``group_size`` finalization
-        still triggers. Cancelled tasks (popped by ``drop_group``) raise
-        ``CancelledError`` and are discarded — ``drop_group`` already emitted
-        their markers.
+        explicit failure results so the sink's count-to-``group_size``
+        finalization still triggers. Cancelled tasks (popped by ``drop_group``)
+        raise ``CancelledError`` and are discarded — ``drop_group`` already
+        emitted its cancellation result.
         """
         meta = self.inflight.pop(task, None)
         if meta is None:
@@ -678,7 +680,6 @@ class RolloutDispatcher:
         self.release(meta.rollout_count)
         group = self.groups.get(meta.group_id)
 
-        is_synth_exception = False
         try:
             result = task.result()
             rollouts: list[Rollout] = result if isinstance(result, list) else [result]
@@ -688,14 +689,31 @@ class RolloutDispatcher:
             return
         except Exception as exc:
             get_logger().warning(f"Rollout task failed in group {meta.group_id} ({meta.env_name}): {exc!r}")
+            self.metrics.record_error(kind=meta.kind, env_name=meta.env_name, n=meta.rollout_count)
             task_idx = group.task_idx if group is not None else -1
-            rollouts = [
-                Rollout(task=vf.TraceTask(type="Task", data=vf.TaskData(idx=task_idx, prompt=None)))
-                for _ in range(meta.rollout_count)
-            ]
-            for r in rollouts:
-                r.capture_error(exc)
-            is_synth_exception = True
+            task_info = group.task if group is not None else None
+            error = vf.Error(
+                type=type(exc).__name__,
+                message=str(exc),
+                traceback="".join(traceback.format_exception(exc)),
+            )
+            self._complete_group(meta, group, meta.rollout_count)
+            await self.out_q.put(
+                DispatchFailure(
+                    kind=meta.kind,
+                    env_name=meta.env_name,
+                    group_id=meta.group_id,
+                    step=meta.eval_step or 0,
+                    policy_version=meta.policy_version,
+                    task_idx=task_idx,
+                    task_type=type(task_info).__name__ if task_info is not None else "legacy",
+                    task_key=getattr(task_info, "key", "") if task_info is not None else "",
+                    task_hash=getattr(task_info, "hash", "") if task_info is not None else "",
+                    count=meta.rollout_count,
+                    error=error,
+                )
+            )
+            return
 
         transient_policy_failure = (
             len(rollouts) == 1 and self._is_transient_policy_failure(rollouts[0])
@@ -764,7 +782,7 @@ class RolloutDispatcher:
                 )
             if r.has_error:
                 self.metrics.record_error(kind=meta.kind, env_name=meta.env_name)
-                if not is_synth_exception and r.error is not None:
+                if r.error is not None:
                     get_logger().warning(
                         f"Rollout failed in group {meta.group_id} ({meta.env_name}) — {r.error.type}: {r.error.message}"
                     )
@@ -847,10 +865,7 @@ class RolloutDispatcher:
         if group is not None:
             eval_step = group.eval_step
             policy_version = group.policy_version_at_start
-            group.emitted += 1
-            if group.emitted >= group.target_rollouts:
-                self.groups.pop(meta.group_id, None)
-                self.transient_retries.pop(meta.group_id, None)
+        self._complete_group(meta, group, 1)
 
         for rollout in rollouts:
             rollout.kind = meta.kind
@@ -865,15 +880,20 @@ class RolloutDispatcher:
             self.queued_train_episodes += 1
         await self.out_q.put(rollouts)
 
+    def _complete_group(
+        self, meta: InflightRollout, group: GroupState | None, count: int
+    ) -> None:
+        if group is None:
+            return
+        group.emitted += count
+        if group.emitted >= group.target_rollouts:
+            self.groups.pop(meta.group_id, None)
+            self.transient_retries.pop(meta.group_id, None)
+
     async def drop_group(self, group_id: uuid.UUID) -> int:
-        """Cancel remaining in-flight tasks for this group and emit a
-        ``Cancelled`` marker for every rollout it still owes the sink
-        (both in-flight and not-yet-scheduled). Returns the count for
-        off-policy metrics."""
+        """Cancel remaining tasks and emit one result for owed group members."""
         group = self.groups.pop(group_id, None)
         self.transient_retries.pop(group_id, None)
-        task_idx = group.task_idx if group is not None else -1
-
         # Sync claim phase: pop matching tasks from ``self.inflight`` and
         # release their permits in one non-yielding sweep. After this loop
         # the dropped tasks are no longer reachable from ``self.inflight``,
@@ -890,43 +910,13 @@ class RolloutDispatcher:
         tasks_to_cancel = [task for task, _ in claimed]
         inflight_cancelled = sum(meta.rollout_count for _, meta in claimed)
         last_meta: InflightRollout | None = claimed[-1][1] if claimed else None
-        for _, meta in claimed:
-            for _ in range(meta.rollout_count):
-                trace = Rollout(
-                    task=vf.TraceTask(type="Task", data=vf.TaskData(idx=task_idx, prompt=None)),
-                    ok=False,
-                    errors=[vf.Error(type="Cancelled", message="Off-policy cancel")],
-                    stop_condition="error",
-                )
-                await self.emit_episode(meta, group, [trace])
-
         # For non-group-scoring envs, the group may have rollouts that
         # were never dispatched (``rollouts_to_schedule > 0``). Emit
         # markers for those too so the sink hits ``target_rollouts``
         #
-        # ``last_meta`` can be ``None`` if the only inflight task for this
-        # group completed naturally between ``on_version_pending``'s snapshot
-        # and us reaching it — synthesize a stand-in from the group state
         unscheduled_cancelled = 0
         if group is not None and group.rollouts_to_schedule > 0:
-            fallback_meta = last_meta or InflightRollout(
-                kind=group.kind,
-                env_name=group.env_name,
-                group_id=group_id,
-                policy_version=group.policy_version_at_start,
-                rollout_count=1,
-                eval_step=group.eval_step,
-            )
             unscheduled_cancelled = group.rollouts_to_schedule
-            for _ in range(unscheduled_cancelled):
-                trace = Rollout(
-                    task=vf.TraceTask(type="Task", data=vf.TaskData(idx=task_idx, prompt=None)),
-                    ok=False,
-                    errors=[vf.Error(type="Cancelled", message="Off-policy cancel")],
-                    stop_condition="error",
-                )
-                await self.emit_episode(fallback_meta, group, [trace])
-
         cancelled = inflight_cancelled + unscheduled_cancelled
         if cancelled > 0:
             meta_for_log = last_meta or (
@@ -942,10 +932,21 @@ class RolloutDispatcher:
                 else None
             )
             if meta_for_log is not None:
+                self._complete_group(meta_for_log, group, cancelled)
                 self.metrics.record_cancellation(kind=meta_for_log.kind, env_name=meta_for_log.env_name, n=cancelled)
                 get_logger().debug(
                     f"drain {meta_for_log.kind} | group={str(group_id)[:8]} env={meta_for_log.env_name} | "
                     f"cancelled={cancelled} (inflight={inflight_cancelled} unscheduled={unscheduled_cancelled})"
+                )
+                await self.out_q.put(
+                    GroupCancellation(
+                        kind=meta_for_log.kind,
+                        env_name=meta_for_log.env_name,
+                        group_id=group_id,
+                        step=meta_for_log.eval_step or 0,
+                        count=cancelled,
+                        reason="superseded",
+                    )
                 )
 
         if tasks_to_cancel:

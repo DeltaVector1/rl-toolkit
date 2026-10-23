@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.envs import TrainEnvs
+from prime_rl.orchestrator.dispatch_results import DispatchFailure, GroupCancellation
 from prime_rl.orchestrator.filters import RolloutFilter, apply_filters
 from prime_rl.orchestrator.metrics import TrainRollouts
 from prime_rl.orchestrator.trajectories import trace_to_samples
@@ -45,6 +46,7 @@ MAX_CONSECUTIVE_ERRORED_GROUPS = 8
 _PRE_BATCH_REJECTION_REASONS = (
     "stale_policy",
     "errored_group",
+    "dispatch_failure_group",
     "trainer_seq_len_group",
     "untrainable_group",
     "zero_advantage_group",
@@ -109,10 +111,15 @@ class PreBatchProgress:
         *,
         rejection_reason: str | None = None,
         policy_invalid_rollouts: int = 0,
+        rejected_rollouts: int | None = None,
     ) -> PreBatchGroupRecord:
         record = PreBatchGroupRecord(
             clean=rejection_reason is None,
-            rejected_rollouts=0 if rejection_reason is None else len(group),
+            rejected_rollouts=(
+                0
+                if rejection_reason is None
+                else len(group) if rejected_rollouts is None else max(0, int(rejected_rollouts))
+            ),
             rejection_reason=rejection_reason,
             policy_invalid_rollouts=policy_invalid_rollouts,
         )
@@ -242,6 +249,8 @@ class TrainSink:
         # Monotonic first-arrival times make the oldest partial-group age
         # authoritative without scanning trace files or retaining content.
         self.pending_group_started_at: dict[uuid.UUID, float] = {}
+        self.pending_group_failures: dict[uuid.UUID, list[DispatchFailure]] = defaultdict(list)
+        self.pending_group_cancellations: dict[uuid.UUID, GroupCancellation] = {}
         self.abandoned_groups: set[uuid.UUID] = set()
         self.pending_batch: list[Rollout] = []
         # Running payload-token total of ``pending_batch`` (token-batched
@@ -343,11 +352,23 @@ class TrainSink:
     def buffered_count(self) -> int:
         """Episodes that have arrived but sit in not-yet-complete groups
         (non-group-scoring envs) — buffered in the sink ahead of the batch."""
-        return sum(
-            self.pending_group_episodes.get(group_id, 0)
-            for group_id, rollouts in self.pending_groups.items()
-            if rollouts and not self.train_envs.get(rollouts[0].env_name).requires_group_scoring
+        count = 0
+        group_ids = (
+            set(self.pending_groups)
+            | set(self.pending_group_failures)
+            | set(self.pending_group_cancellations)
         )
+        for group_id in group_ids:
+            rollouts = self.pending_groups.get(group_id, [])
+            if rollouts:
+                env_name = rollouts[0].env_name
+            elif self.pending_group_failures.get(group_id):
+                env_name = self.pending_group_failures[group_id][0].env_name
+            else:
+                env_name = self.pending_group_cancellations[group_id].env_name
+            if not self.train_envs.get(env_name).requires_group_scoring:
+                count += self.pending_group_episodes.get(group_id, 0)
+        return count
 
     def pending_batch_by_env(self) -> dict[str, int]:
         """Per-env breakdown of ``batch_progress()`` (``pending_batch`` only);
@@ -358,12 +379,17 @@ class TrainSink:
         return dict(counts)
 
     def _partial_progress(self) -> tuple[int, int, float | None]:
-        partial_groups = sum(bool(rollouts) for rollouts in self.pending_groups.values())
-        partial_rollouts = sum(len(rollouts) for rollouts in self.pending_groups.values())
+        group_ids = (
+            set(self.pending_groups)
+            | set(self.pending_group_failures)
+            | set(self.pending_group_cancellations)
+        )
+        partial_groups = sum(self.pending_group_episodes.get(group_id, 0) > 0 for group_id in group_ids)
+        partial_rollouts = sum(self.pending_group_episodes.get(group_id, 0) for group_id in group_ids)
         started = [
             self.pending_group_started_at[group_id]
-            for group_id, rollouts in self.pending_groups.items()
-            if rollouts and group_id in self.pending_group_started_at
+            for group_id in group_ids
+            if self.pending_group_episodes.get(group_id, 0) and group_id in self.pending_group_started_at
         ]
         oldest_age = max(0.0, time.monotonic() - min(started)) if started else None
         return partial_groups, partial_rollouts, oldest_age
@@ -422,12 +448,15 @@ class TrainSink:
         group_id: uuid.UUID,
         group: list[Rollout],
         rejection_reason: str | None = None,
+        *,
+        rejected_rollouts: int | None = None,
     ) -> None:
         policy_invalid_rollouts = self._policy_invalid_rollouts(group)
         record = self.pre_batch_progress.record_group(
             group,
             rejection_reason=rejection_reason,
             policy_invalid_rollouts=policy_invalid_rollouts,
+            rejected_rollouts=rejected_rollouts,
         )
         self.pending_group_progress[group_id] = record
         self._pre_batch_log()
@@ -465,6 +494,40 @@ class TrainSink:
             return self.process_batch()
         return None
 
+    async def fail(self, failure: DispatchFailure) -> TrainBatch | None:
+        """Count an attempt that returned no rollout without making a fake trace."""
+        if failure.kind != "train":
+            raise ValueError(f"TrainSink cannot process an {failure.kind} dispatch failure")
+        group_id = failure.group_id
+        self.pending_group_started_at.setdefault(group_id, time.monotonic())
+        self.pending_group_failures[group_id].append(failure)
+        self.pending_group_episodes[group_id] += failure.count
+        if self.pending_group_episodes[group_id] >= self.group_size_for(failure.env_name):
+            await self.process_group(group_id)
+        return self._ready_batch()
+
+    async def cancel(self, cancellation: GroupCancellation) -> TrainBatch | None:
+        """Count cancelled group members without making fake error traces."""
+        if cancellation.kind != "train":
+            raise ValueError(f"TrainSink cannot process an {cancellation.kind} group cancellation")
+        group_id = cancellation.group_id
+        self.pending_group_started_at.setdefault(group_id, time.monotonic())
+        if group_id in self.pending_group_cancellations:
+            raise ValueError(f"duplicate cancellation for group {group_id}")
+        self.pending_group_cancellations[group_id] = cancellation
+        self.pending_group_episodes[group_id] += cancellation.count
+        if self.pending_group_episodes[group_id] >= self.group_size_for(cancellation.env_name):
+            await self.process_group(group_id)
+        return self._ready_batch()
+
+    def _ready_batch(self) -> TrainBatch | None:
+        ready = (
+            len(self.pending_batch) >= self.batch_size
+            if self.batch_size is not None
+            else self.pending_tokens >= (self.token_batch_size or 0)
+        )
+        return self.process_batch() if ready else None
+
     def abandon_groups(self, group_ids: set[uuid.UUID]) -> int:
         """Discard partial groups that will restart under a new policy.
 
@@ -477,6 +540,8 @@ class TrainSink:
             discarded += self.pending_group_episodes.pop(group_id, 0)
             self.pending_groups.pop(group_id, None)
             self.pending_group_started_at.pop(group_id, None)
+            self.pending_group_failures.pop(group_id, None)
+            self.pending_group_cancellations.pop(group_id, None)
         return discarded
 
     async def process_rollout(self, rollout: Rollout) -> None:
@@ -503,9 +568,12 @@ class TrainSink:
         any member failed, is oversized, or is untrainable; assign advantages;
         run pre-batch filters; append clean survivors to ``pending_batch``."""
         group = self.pending_groups.pop(group_id, [])
+        failures = self.pending_group_failures.pop(group_id, [])
+        cancellation = self.pending_group_cancellations.pop(group_id, None)
+        cancelled = cancellation.count if cancellation is not None else 0
         self.pending_group_episodes.pop(group_id, None)
         self.pending_group_started_at.pop(group_id, None)
-        if not group:
+        if not group and not failures and not cancelled:
             return
         # Window membership follows group finalization, not arrival: a rollout
         # only becomes observable (metrics / persistence) once its whole group
@@ -513,8 +581,41 @@ class TrainSink:
         # that ships later. Dropped groups still land here — they were observed.
         for r in group:
             self.pending_rollouts.append(r)
-        env_name = group[0].env_name
-        task_idx = group[0].task.data.idx
+        if group:
+            env_name = group[0].env_name
+            task_idx = group[0].task.data.idx
+        elif failures:
+            env_name = failures[0].env_name
+            task_idx = failures[0].task_idx
+        else:
+            env_name = cancellation.env_name
+            task_idx = -1
+        if failures or cancelled:
+            for r in group:
+                r.samples = []
+                r.is_filtered = True
+                r.filter_results = {"dispatch_failure_group": True}
+            detail = ", ".join(f"{f.error.type}={f.count}" for f in failures)
+            if cancelled:
+                detail = f"{detail}, cancelled={cancelled}" if detail else f"cancelled={cancelled}"
+            get_logger().warning(
+                f"Finished group | env={env_name} task_idx={task_idx} | "
+                f"dispatch result: {detail}; dropped complete group"
+            )
+            if failures:
+                self.consecutive_errored_groups += 1
+            self._record_group(
+                group_id,
+                group,
+                "dispatch_failure_group",
+                rejected_rollouts=len(group) + sum(f.count for f in failures) + cancelled,
+            )
+            if failures:
+                if self.consecutive_errored_groups >= MAX_CONSECUTIVE_ERRORED_GROUPS:
+                    raise RuntimeError(
+                        f"{self.consecutive_errored_groups} consecutive rollout groups contained dispatch failures"
+                    )
+            return
         if any(self._is_stale(r) for r in group):
             self._mark_off_policy(group)
             self._record_group(group_id, group, "stale_policy")
