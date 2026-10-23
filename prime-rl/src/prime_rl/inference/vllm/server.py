@@ -834,9 +834,10 @@ async def _stage_lora_adapter_once(raw_request: Request, *, accepted_at: float |
             "require_delta": require_delta,
             "require_bundle": require_bundle,
             "policy_step": policy_step,
-            "stage_timeout_seconds": remaining,
             "stage_id": stage_id,
         }
+        if not require_bundle:
+            request["stage_timeout_seconds"] = remaining
         communication = asyncio.create_task(
             process.communicate(json.dumps(request, separators=(",", ":")).encode("utf-8"))
         )

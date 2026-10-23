@@ -410,7 +410,13 @@ def load_relay_module():
     return module
 
 
-def load_server_stage_method(stage_worker, publish_lock=None, initial_stage_state=None):
+def load_server_stage_method(
+    stage_worker,
+    publish_lock=None,
+    initial_stage_state=None,
+    *,
+    run_worker_inline=False,
+):
     path = ROOT / "src/prime_rl/inference/vllm/server.py"
     source = path.read_text(encoding="utf-8")
     functions = [
@@ -491,7 +497,11 @@ def load_server_stage_method(stage_worker, publish_lock=None, initial_stage_stat
                 return json.dumps(result, separators=(",", ":")).encode("utf-8")
 
             try:
-                stdout = await asyncio.to_thread(run_stage)
+                stdout = (
+                    run_stage()
+                    if run_worker_inline
+                    else await asyncio.to_thread(run_stage)
+                )
             finally:
                 self.returncode = 0
                 self.finished.set()
@@ -1596,7 +1606,9 @@ class AdapterTransportStateTest(unittest.TestCase):
                 )
                 return Path(temporary)
 
-            stage_method, response_type = load_server_stage_method(stage_worker)
+            stage_method, response_type = load_server_stage_method(
+                stage_worker, run_worker_inline=True
+            )
 
             class Request:
                 async def json(self):
