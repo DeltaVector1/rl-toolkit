@@ -126,6 +126,8 @@ def bwd(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
     skip_sentinel_stores=False,
+    direct_dkv_store=False,
+    dkv_partitions=1,
 ):
     assert is_causal is True, "non-casual is not supported now"
     assert topk % block_size == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -133,6 +135,9 @@ def bwd(
     assert accum_dtype == T.float32
     assert indices_dtype == T.int32
     assert isinstance(skip_sentinel_stores, bool)
+    assert isinstance(direct_dkv_store, bool)
+    if type(dkv_partitions) is not int or dkv_partitions not in (1, 2, 4):
+        raise ValueError("dkv_partitions must be one of 1, 2, or 4")
 
     if sm_scale is None:
         sm_scale = (D + D_tail) ** (-0.5)
@@ -145,6 +150,7 @@ def bwd(
     H_kv = H // kv_group
     q_shape = [B, S, H, D + D_tail]
     k_shape = [B, S_kv, kv_group, D + D_tail]
+    dkv_shape = [B * dkv_partitions, S_kv, kv_group, D + D_tail]
     o_shape = [B, S, H, D]
     indices_shape = [B, S, kv_group, topk]
     delta_shape = [B, S, H]
@@ -169,9 +175,10 @@ def bwd(
         Lse: T.Tensor(lse_shape, accum_dtype),
         Delta: T.Tensor(delta_shape, accum_dtype),
         dQ: T.Tensor(q_shape, dtype),
-        dKV: T.Tensor(k_shape, accum_dtype),
+        dKV: T.Tensor(dkv_shape, accum_dtype),
     ):
         with T.Kernel(S, B, kv_group * NH, threads=threads) as (s_i, by, bz):
+            dkv_batch = by if dkv_partitions == 1 else by + (s_i % dkv_partitions) * B
             Q_shared = T.alloc_shared([block_H, D], dtype)
             Q_tail_shared = T.alloc_shared([block_H, D_tail], dtype)
             KV_shared = T.alloc_shared([BS, D], dtype)
@@ -190,8 +197,9 @@ def bwd(
             acc_dq_tail = T.alloc_fragment([block_H, D_tail], accum_dtype)
             acc_dkv = T.alloc_fragment([BS, D], accum_dtype)
             acc_dkv_tail = T.alloc_fragment([BS, D_tail], accum_dtype)
-            acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
-            acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
+            if vectorized_atomic or not direct_dkv_store:
+                acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
+                acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
 
             # See sparse_mla_fwd: sentinel is at index S_kv - 1 (zero KV), valid indices
             # live in [0, S_kv - 1). Using this single bound makes the kernel work for
@@ -254,63 +262,82 @@ def bwd(
                 T.clear(acc_dkv_tail)
                 T.gemm(dP_shared_cast, Q_tail_shared, acc_dkv_tail, transpose_A=True, policy=T.GemmWarpPolicy.FullCol)
 
-                for s in range(split_store):
+                if direct_dkv_store:
                     for bi_i, d_i in T.Parallel(BS, D):
-                        if bi_i < BS // split_store:
-                            acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
-
+                        if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i] <= max_kv_i:
+                            T.atomic_add(
+                                dKV[dkv_batch, Indices[by, s_i, bz // NH, i_i * BS + bi_i], bz // NH, d_i],
+                                acc_dkv[bi_i, d_i],
+                            )
                     for bi_i, d_i in T.Parallel(BS, D_tail):
-                        if bi_i < BS // split_store:
-                            acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
+                        if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i] <= max_kv_i:
+                            T.atomic_add(
+                                dKV[
+                                    dkv_batch,
+                                    Indices[by, s_i, bz // NH, i_i * BS + bi_i],
+                                    bz // NH,
+                                    D + d_i,
+                                ],
+                                acc_dkv_tail[bi_i, d_i],
+                            )
+                else:
+                    for s in range(split_store):
+                        for bi_i, d_i in T.Parallel(BS, D):
+                            if bi_i < BS // split_store:
+                                acc_dkv_shared[bi_i, d_i] = acc_dkv[bi_i + s * (BS // split_store), d_i]
 
-                    if vectorized_atomic:
-                        for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
-                            if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
-                                T.atomic_addx4(
-                                    dKV[
-                                        by,
-                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                        bz // NH,
-                                        d_i * 4,
-                                    ],
-                                    acc_dkv_shared[bi_i, d_i * 4],
-                                )
+                        for bi_i, d_i in T.Parallel(BS, D_tail):
+                            if bi_i < BS // split_store:
+                                acc_dkv_tail_shared[bi_i, d_i] = acc_dkv_tail[bi_i + s * (BS // split_store), d_i]
 
-                        for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
-                            if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
-                                T.atomic_addx4(
-                                    dKV[
-                                        by,
-                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                        bz // NH,
-                                        D + d_i * 4,
-                                    ],
-                                    acc_dkv_tail_shared[bi_i, d_i * 4],
-                                )
-                    else:
-                        for bi_i, d_i in T.Parallel(BS // split_store, D):
-                            if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
-                                T.atomic_add(
-                                    dKV[
-                                        by,
-                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                        bz // NH,
-                                        d_i,
-                                    ],
-                                    acc_dkv_shared[bi_i, d_i],
-                                )
+                        if vectorized_atomic:
+                            for bi_i, d_i in T.Parallel(BS // split_store, D // 4):
+                                if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
+                                    T.atomic_addx4(
+                                        dKV[
+                                            dkv_batch,
+                                            Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                            bz // NH,
+                                            d_i * 4,
+                                        ],
+                                        acc_dkv_shared[bi_i, d_i * 4],
+                                    )
 
-                        for bi_i, d_i in T.Parallel(BS // split_store, D_tail):
-                            if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
-                                T.atomic_add(
-                                    dKV[
-                                        by,
-                                        Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
-                                        bz // NH,
-                                        D + d_i,
-                                    ],
-                                    acc_dkv_tail_shared[bi_i, d_i],
-                                )
+                            for bi_i, d_i in T.Parallel(BS // split_store, D_tail // 4):
+                                if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
+                                    T.atomic_addx4(
+                                        dKV[
+                                            dkv_batch,
+                                            Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                            bz // NH,
+                                            D + d_i * 4,
+                                        ],
+                                        acc_dkv_tail_shared[bi_i, d_i * 4],
+                                    )
+                        else:
+                            for bi_i, d_i in T.Parallel(BS // split_store, D):
+                                if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
+                                    T.atomic_add(
+                                        dKV[
+                                            dkv_batch,
+                                            Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                            bz // NH,
+                                            d_i,
+                                        ],
+                                        acc_dkv_shared[bi_i, d_i],
+                                    )
+
+                            for bi_i, d_i in T.Parallel(BS // split_store, D_tail):
+                                if not skip_sentinel_stores or Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)] <= max_kv_i:
+                                    T.atomic_add(
+                                        dKV[
+                                            dkv_batch,
+                                            Indices[by, s_i, bz // NH, i_i * BS + bi_i + s * (BS // split_store)],
+                                            bz // NH,
+                                            D + d_i,
+                                        ],
+                                        acc_dkv_tail_shared[bi_i, d_i],
+                                    )
 
             T.copy(acc_dq, dQ_shared)
             T.copy(acc_dq_tail, dQ_tail_shared)
@@ -321,7 +348,26 @@ def bwd(
     return sparse_mla_bwd_kernel
 
 
-def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
+def _sparse_bwd_options(dkv_partitions: int | None = None) -> tuple[bool, bool, int]:
+    direct_value = os.environ.get("prime_sparse_bwd_direct_dkv", "0")
+    if direct_value not in {"0", "1"}:
+        raise ValueError("prime_sparse_bwd_direct_dkv must be 0 or 1")
+    skip_sentinel_value = os.environ.get("prime_sparse_bwd_skip_sentinel", "0")
+    if skip_sentinel_value not in {"0", "1"}:
+        raise ValueError("prime_sparse_bwd_skip_sentinel must be 0 or 1")
+
+    if dkv_partitions is None:
+        value = os.environ.get("prime_sparse_bwd_dkv_partitions", "1")
+        try:
+            dkv_partitions = int(value)
+        except ValueError as exc:
+            raise ValueError("prime_sparse_bwd_dkv_partitions must be 1, 2, or 4") from exc
+    if type(dkv_partitions) is not int or dkv_partitions not in (1, 2, 4):
+        raise ValueError("dkv_partitions must be one of 1, 2, or 4")
+    return direct_value == "1", skip_sentinel_value == "1", dkv_partitions
+
+
+def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None, dkv_partitions: int | None = None):
     assert q.is_contiguous()
     assert kv.is_contiguous()
     assert indices.is_contiguous()
@@ -336,14 +382,18 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
     assert indices.shape == (B, S, kv_group, topk)
     assert lse.shape == (B, S, H)
 
+    direct_dkv_store, skip_sentinel_stores, dkv_partitions = _sparse_bwd_options(dkv_partitions)
+    capability = torch.cuda.get_device_capability(q.device)
+    if direct_dkv_store and capability != (8, 9):
+        raise ValueError("prime_sparse_bwd_direct_dkv requires an SM89 CUDA device")
+
     preprocess_kernel = preprocess(H, D)
-    if torch.cuda.get_device_capability(q.device)[0] < 9:
+    if capability[0] < 9:
         block_size = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_SIZE", "16"))
         block_heads = int(os.environ.get("PRIME_SPARSE_BWD_BLOCK_HEADS", "16"))
         threads = int(os.environ.get("PRIME_SPARSE_BWD_THREADS", "64"))
-        skip_sentinel_value = os.environ.get("prime_sparse_bwd_skip_sentinel", "0")
-        if skip_sentinel_value not in {"0", "1"}:
-            raise ValueError("prime_sparse_bwd_skip_sentinel must be 0 or 1")
+        if direct_dkv_store and (block_size != 16 or threads not in {64, 128}):
+            raise ValueError("prime_sparse_bwd_direct_dkv requires SM89 block=16 threads=64 or 128")
         bwd_kernel = bwd(
             H,
             D,
@@ -356,15 +406,36 @@ def sparse_mla_bwd(q, kv, o, do, indices, lse, sm_scale=None):
             block_H=block_heads,
             threads=threads,
             vectorized_atomic=False,
-            skip_sentinel_stores=skip_sentinel_value == "1",
+            skip_sentinel_stores=skip_sentinel_stores,
+            direct_dkv_store=direct_dkv_store,
+            dkv_partitions=dkv_partitions,
         )
     else:
-        bwd_kernel = bwd(H, D, D_tail, topk, kv_group, sm_scale, True)
+        bwd_kernel = bwd(
+            H,
+            D,
+            D_tail,
+            topk,
+            kv_group,
+            sm_scale,
+            True,
+            skip_sentinel_stores=skip_sentinel_stores,
+            dkv_partitions=dkv_partitions,
+        )
     postprocess_kernel = postprocess(D, D_tail, kv_group)
 
     delta = preprocess_kernel(o, do)
-    dkv = torch.zeros_like(kv, dtype=torch.float32)
+    if dkv_partitions == 1:
+        dkv = torch.zeros_like(kv, dtype=torch.float32)
+    else:
+        dkv = torch.zeros(
+            (dkv_partitions * B, S_kv, kv_group, dim_plus_tail_dim),
+            device=kv.device,
+            dtype=torch.float32,
+        )
     dq = bwd_kernel(q, kv, do, indices, lse, delta, dkv)
+    if dkv_partitions > 1:
+        dkv = dkv.view(dkv_partitions, B, S_kv, kv_group, dim_plus_tail_dim).sum(dim=0)
     dkv = postprocess_kernel(dkv)
 
     return dq, dkv

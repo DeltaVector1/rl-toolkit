@@ -23,6 +23,7 @@ COPY --chmod=644 prime-rl/src/prime_rl/trainer/distributed/pipeline_parallel.py 
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/distributed/pp_runner.py /app/src/prime_rl/trainer/distributed/pp_runner.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py /app/src/prime_rl/trainer/models/glm_moe_dsa/modeling_glm_moe_dsa.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py /app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_mla_attention.py
+COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/glm_moe_dsa/sparse_index_stats.py /app/src/prime_rl/trainer/models/glm_moe_dsa/sparse_index_stats.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py /app/src/prime_rl/trainer/models/afmoe/modeling_afmoe.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py /app/src/prime_rl/trainer/models/kernels/sparse_mla_fwd.py
 COPY --chmod=644 prime-rl/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py /app/src/prime_rl/trainer/models/kernels/sparse_mla_bwd.py

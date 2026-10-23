@@ -184,6 +184,20 @@ def _normalize_compressed_tensors_ignore(model_config, qconfig):
     return normalized
 
 
+def _shared_expert_prefetch_enabled() -> bool:
+    value = os.environ.get("prime_shared_expert_prefetch", "0")
+    if value not in {"0", "1"}:
+        raise ValueError("prime_shared_expert_prefetch must be 0 or 1")
+    return value == "1"
+
+
+def _append_shared_expert_prefetch(prefetch_modules, shared_expert, enabled: bool) -> None:
+    if enabled and isinstance(shared_expert, FSDPModule) and all(
+        module is not shared_expert for module in prefetch_modules
+    ):
+        prefetch_modules.append(shared_expert)
+
+
 def _virtual_stage_blocks(language_model: nn.Module) -> list[list[nn.Module]]:
     ranges = getattr(language_model, "pp_layer_ranges", None)
     if ranges is None:
@@ -1273,6 +1287,7 @@ def _glm_router_fsdp_policy(model: nn.Module, config: ModelConfig) -> MixedPreci
 
 
 def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDims):
+    shared_expert_prefetch = _shared_expert_prefetch_enabled()
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=DTYPE_MAP[config.reduce_dtype])
     offload_policy: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if config.fsdp_cpu_offload else OffloadPolicy()
     cold_offload_policy: OffloadPolicy = (
@@ -1437,6 +1452,11 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 and (not native_fp8 or config.native_fp8_expert_prefetch)
             ):
                 prefetch_modules.append(next_mlp.experts)
+            _append_shared_expert_prefetch(
+                prefetch_modules,
+                getattr(next_mlp, "shared_expert", None),
+                shared_expert_prefetch,
+            )
             transformer_block.set_modules_to_forward_prefetch(prefetch_modules)
         else:
             transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
@@ -1463,6 +1483,11 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 prefetch_modules.append(prev_mlp.experts)
             if isinstance(prev_mlp.router, FSDPModule):
                 prefetch_modules.append(prev_mlp.router)
+            _append_shared_expert_prefetch(
+                prefetch_modules,
+                getattr(prev_mlp, "shared_expert", None),
+                shared_expert_prefetch,
+            )
             transformer_block.set_modules_to_backward_prefetch(prefetch_modules)
         else:
             transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
