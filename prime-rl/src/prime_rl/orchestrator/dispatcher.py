@@ -126,9 +126,10 @@ class DispatcherMetrics:
 class RolloutDispatcher:
     """``await dispatcher.start()`` runs the dispatch loop until ``stop()``.
     Pulls examples from ``TrainSource`` / ``EvalSource``, schedules
-    rollouts under shared capacity, and emits ``Rollout``\\ s to
-    ``out_q``. The watcher drives ``on_version_pending`` for off-policy
-    cancellation; the orchestrator triggers eval epochs."""
+    rollouts under shared capacity, and emits ``DispatchResult`` values
+    (episodes, dispatch failures, or explicit group cancellations) to ``out_q``.
+    The watcher drives ``on_version_pending`` for policy restarts; the
+    orchestrator triggers eval epochs."""
 
     def __init__(
         self,
