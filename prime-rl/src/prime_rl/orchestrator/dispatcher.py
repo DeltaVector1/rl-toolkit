@@ -28,6 +28,7 @@ import asyncio
 import traceback
 import uuid
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from time import monotonic
@@ -141,6 +142,7 @@ class RolloutDispatcher:
         max_inflight_rollouts: int,
         tasks_per_minute: float | None,
         max_off_policy_steps: int,
+        train_step: Callable[[], int] | None = None,
     ) -> None:
         self.policy = policy
         self.train_envs = train_envs
@@ -151,6 +153,7 @@ class RolloutDispatcher:
         self.train_source = train_source
         self.eval_source = eval_source
         self.max_off_policy_steps = max_off_policy_steps
+        self.train_step = train_step
 
         self.max_inflight = max_inflight_rollouts
         self.inflight_permits = 0
@@ -527,7 +530,13 @@ class RolloutDispatcher:
         available_permits = self.available_permits
         if kind == "train":
             available_permits = min(available_permits, self.fresh_train_rollout_budget)
-        example = source.next_example(available_permits)
+        if kind == "train":
+            # Stage weights apply when a fresh group opens. Existing groups keep
+            # their env, so a batch may span a stage boundary.
+            step = self.train_step() if self.train_step is not None else None
+            example = source.next_example(available_permits, step=step)
+        else:
+            example = source.next_example(available_permits)
         if example is None:
             return None
 

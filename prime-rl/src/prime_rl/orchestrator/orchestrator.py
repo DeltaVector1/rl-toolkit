@@ -1321,7 +1321,9 @@ class Orchestrator:
                 self.policy.version = sync_version
                 await self.policy_inference.wait_for_ready(self.policy.model_name)
 
-        self.train_source = TrainSource(self.train_envs, seed=42)
+        self.train_source = TrainSource(
+            self.train_envs, seed=42, ratio_stages=config.train.ratio_stages
+        )
         self.eval_source: EvalSource | None = (
             EvalSource(
                 self.eval_envs,
@@ -1345,6 +1347,7 @@ class Orchestrator:
             max_inflight_rollouts=config.max_inflight_rollouts,
             tasks_per_minute=config.tasks_per_minute,
             max_off_policy_steps=config.max_off_policy_steps,
+            train_step=lambda: self.progress.step,
         )
         self.train_sink = TrainSink(
             config,
@@ -1693,6 +1696,7 @@ class Orchestrator:
             )
             for name, count in self.train_sink.pre_filter_dropped_by_name.items():
                 metrics[f"pre_filters/all/{name}/rate"] = count / self.train_sink.pre_filter_seen
+        metrics["groups/all_refusal/skipped"] = self.train_sink.all_refusal_groups_skipped
         self.monitor.log(metrics, step=step)
         self.wait_for_policy_time = 0.0
         self.monitor.log_samples(effective.rollouts, step=step)

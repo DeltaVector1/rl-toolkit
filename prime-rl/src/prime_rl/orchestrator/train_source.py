@@ -1,7 +1,9 @@
 """TrainSource: weighted round-robin across train envs, infinite pull.
 
 Weights are each env's configured ``ratio`` (default 1, i.e. equal weight
-per env). A v1 env serves the tasks the orchestrator loaded client-side: a
+per env). Optional train-level ``ratio_stages`` entries replace those weights
+by training step.
+A v1 env serves the tasks the orchestrator loaded client-side: a
 finite one as a shuffled table (reshuffled on cursor exhaustion), an
 infinite one (``num_tasks is None``) straight off its generator — every
 pull is a fresh task and there are no epochs to shuffle. A legacy env's
@@ -15,6 +17,7 @@ from collections.abc import Iterator
 import verifiers.v1 as vf
 
 from prime_rl.orchestrator.envs import TrainEnvs
+from prime_rl.utils.logger import get_logger
 
 
 class TrainSource:
@@ -24,7 +27,7 @@ class TrainSource:
     Returned dicts carry ``env_name`` + ``task_idx`` (+ ``task`` for v1 envs,
     whose data is shipped to the env server at dispatch)."""
 
-    def __init__(self, train_envs: TrainEnvs, *, seed: int | None) -> None:
+    def __init__(self, train_envs: TrainEnvs, *, seed: int | None, ratio_stages=None) -> None:
         self.rng = random.Random(seed)
         self.envs = list(train_envs)
         if not self.envs:
@@ -55,9 +58,60 @@ class TrainSource:
 
         self.env_names = [e.name for e in self.envs]
         self.weights: list[float] = [float(e.config.ratio) for e in self.envs]
+        self._last_logged_stage: int | None = None
+        self.ratio_stages: dict[str, tuple[tuple[int, float], ...]] | None = None
+        if ratio_stages is not None:
+            if not ratio_stages:
+                raise ValueError("ratio_stages must not be empty")
+            self.ratio_stages = {}
+            starts = [stage.start_step for stage in ratio_stages]
+            if starts[0] != 1:
+                raise ValueError("ratio_stages must start at step 1")
+            if starts != sorted(starts) or len(starts) != len(set(starts)):
+                raise ValueError("ratio_stages must use strictly increasing start_step values")
+            env_names = set(self.env_names)
+            for stage in ratio_stages:
+                stage_names = set(stage.ratios)
+                if stage_names != env_names:
+                    missing = sorted(env_names - stage_names)
+                    extra = sorted(stage_names - env_names)
+                    raise ValueError(
+                        "ratio_stages ratios must exactly match training environment names; "
+                        f"missing: {missing}, extra: {extra}"
+                    )
+                if any(ratio <= 0 for ratio in stage.ratios.values()):
+                    raise ValueError("ratio_stages ratios must be greater than zero")
+            for env_name in self.env_names:
+                self.ratio_stages[env_name] = tuple(
+                    (int(stage.start_step), float(stage.ratios[env_name])) for stage in ratio_stages
+                )
 
-    def next_example(self, available_permits: int) -> dict | None:
-        env_name = self.rng.choices(self.env_names, weights=self.weights, k=1)[0]
+    def weights_for_step(self, step: int | None) -> list[float]:
+        """Return the configured weights for the active training step."""
+        if self.ratio_stages is None:
+            return self.weights
+        if not isinstance(step, int) or isinstance(step, bool) or step < 1:
+            raise ValueError("step must be a positive integer when ratio_stages are configured")
+        weights: list[float] = []
+        for env_name in self.env_names:
+            active_ratio = None
+            for start_step, ratio in self.ratio_stages[env_name]:
+                if start_step > step:
+                    break
+                active_ratio = ratio
+            assert active_ratio is not None
+            weights.append(active_ratio)
+        stage_start = max(start for start, _ in self.ratio_stages[self.env_names[0]] if start <= step)
+        if stage_start != self._last_logged_stage:
+            get_logger().info(
+                f"Train ratio stage at step {step}: "
+                f"{dict(zip(self.env_names, weights, strict=True))}"
+            )
+            self._last_logged_stage = stage_start
+        return weights
+
+    def next_example(self, available_permits: int, *, step: int | None = None) -> dict | None:
+        env_name = self.rng.choices(self.env_names, weights=self.weights_for_step(step), k=1)[0]
         if self.env_costs[env_name] > available_permits:
             return None
         rows = self.examples[env_name]
