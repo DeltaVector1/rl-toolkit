@@ -10,16 +10,19 @@ import os
 import re
 import socketserver
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+import tomllib
 import types
 import unittest
 import uuid
 from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +37,16 @@ SERVER_SPEC = importlib.util.spec_from_file_location("adapter_server", SERVER_PA
 assert SERVER_SPEC is not None and SERVER_SPEC.loader is not None
 adapter_server = importlib.util.module_from_spec(SERVER_SPEC)
 SERVER_SPEC.loader.exec_module(adapter_server)
+
+
+def function_arguments(path: Path, name: str) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    )
+    return [argument.arg for argument in function.args.args]
 
 
 
@@ -3079,6 +3092,229 @@ else:
             filesystem._PersistentAdapterLanePool.close = old_pool_close
             filesystem._cleanup_delta_stage_artifacts = old_cleanup
             base_directory.cleanup()
+
+    def test_default_chunk_sizes_keep_v1_and_v2_transport_contracts(self):
+        target_size = 30_767_549_784
+        self.assertEqual(
+            len(adapter_delta._chunk_ranges(target_size, adapter_delta.default_chunk_size)),
+            1834,
+        )
+        self.assertEqual(
+            len(adapter_delta._chunk_ranges(target_size, adapter_delta.predictive_chunk_size)),
+            1834,
+        )
+
+    def test_bootstrap_does_not_duplicate_the_full_adapter(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "step_0"
+            target.mkdir()
+            (target / "adapter_config.json").write_text("{}", encoding="utf-8")
+            (target / "adapter_model.safetensors").write_bytes(bytes(range(251)) * 33)
+            manifest = adapter_delta.publish_adapter_manifest(target, target_step=0)
+            self.assertEqual(manifest["mode"], "full")
+            self.assertEqual(manifest["transport"], "chunked-full-zstd")
+            self.assertEqual(manifest["chunk_count"], 1)
+            self.assertEqual(len(list(target.glob("*.transport-*"))), 1)
+
+    def test_full_stage_corrupt_exact_size_progress_stays_bounded(self):
+        filesystem = load_filesystem_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "step_0"
+            source.mkdir()
+            config = b"{}\n"
+            model = (b"\x01\x02" * ((adapter_delta.default_chunk_size + 18) // 2))[
+                : adapter_delta.default_chunk_size + 17
+            ]
+            (source / "adapter_config.json").write_bytes(config)
+            (source / "adapter_model.safetensors").write_bytes(model)
+            manifest = adapter_delta.publish_adapter_manifest(source, target_step=0, max_workers=2)
+            (source / "adapter_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            handler = functools.partial(QuietDirectoryHandler, directory=str(root))
+            with socketserver.ThreadingTCPServer(("127.0.0.1", 0), handler) as server:
+                server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                server_thread.start()
+                source_url = f"http://127.0.0.1:{server.server_address[1]}/step_0"
+                old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+                old_streams = os.environ.get("PRIME_LORA_DOWNLOAD_STREAMS")
+                os.environ["PRIME_LORA_CACHE_DIR"] = str(root / "cache")
+                os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = "24"
+                try:
+                    destination = filesystem.stage_lora_adapter_files(source_url)
+                    partial = destination.with_name(f"{destination.name}.partial")
+                    destination.rename(partial)
+                    (partial / "READY").unlink()
+                    chunk = partial / "transport-chunks" / manifest["chunks"][0]["file"]
+                    chunk.write_bytes(b"x" * chunk.stat().st_size)
+                    statuses = []
+                    old_status = filesystem._write_stage_status
+
+                    def record_status(cache_root, value, **kwargs):
+                        statuses.append(dict(value))
+                        return old_status(cache_root, value, **kwargs)
+
+                    filesystem._write_stage_status = record_status
+                    try:
+                        resumed = filesystem.stage_lora_adapter_files(source_url)
+                    finally:
+                        filesystem._write_stage_status = old_status
+                finally:
+                    if old_cache is None:
+                        os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+                    else:
+                        os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+                    if old_streams is None:
+                        os.environ.pop("PRIME_LORA_DOWNLOAD_STREAMS", None)
+                    else:
+                        os.environ["PRIME_LORA_DOWNLOAD_STREAMS"] = old_streams
+                    server.shutdown()
+                    server_thread.join()
+            self.assertEqual(resumed, destination)
+            for status in statuses:
+                self.assertGreaterEqual(status["bytes_done"], 0)
+                self.assertLessEqual(status["bytes_done"], status["bytes_total"])
+            self.assertEqual((resumed / "adapter_model.safetensors").read_bytes(), model)
+
+    def test_protocol_has_one_strict_delta_flag(self):
+        worker = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
+        client = ROOT / "src/prime_rl/utils/client.py"
+        server = ROOT / "src/prime_rl/inference/vllm/server.py"
+        watcher = ROOT / "src/prime_rl/orchestrator/watcher.py"
+        self.assertEqual(
+            function_arguments(worker, "stage_lora_adapter_files"),
+            ["source_url", "require_delta"],
+        )
+        self.assertEqual(
+            function_arguments(worker, "stage_lora_adapter"),
+            ["self", "source_url", "require_delta", "policy_step"],
+        )
+        for path in (client, server, watcher):
+            self.assertIn("require_delta", path.read_text(encoding="utf-8"))
+        worker_source = worker.read_text(encoding="utf-8")
+        self.assertIn("delta adapter transport is required", worker_source)
+        self.assertIn('chunk_urls = [f"{lane_url.rstrip(\'/\')}/{name}" for lane_url in lane_urls]', worker_source)
+        self.assertIn("chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]", worker_source)
+        self.assertIn("persistent_pool.download(\n                    chunk_urls", worker_source)
+        self.assertIn("executor.shutdown(wait=True, cancel_futures=True)", worker_source)
+        self.assertIn("_cleanup_delta_stage_artifacts(", worker_source)
+        self.assertIn("preserve_partial=_has_matching_adapter_resume_identity(", worker_source)
+        self.assertIn("deadline=operation_deadline", worker_source)
+        self.assertIn("asyncio.wait_for(", server.read_text(encoding="utf-8"))
+        watcher_source = watcher.read_text(encoding="utf-8")
+        self.assertIn('manifest.get("version") != 1', watcher_source)
+        self.assertIn("require_delta=True", watcher_source)
+        self.assertIn("delta_deadline", watcher_source)
+        self.assertIn("adapter_stage_limit_seconds", watcher_source)
+
+    def test_request_disconnect_stops_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            ready = Path(temporary) / "READY"
+            started = threading.Event()
+            stopped = threading.Event()
+
+            def stage_worker(
+                _source_url,
+                *,
+                require_delta,
+                stage_timeout_seconds,
+                policy_step,
+                cancel_event,
+                committed_event,
+            ):
+                self.assertFalse(require_delta)
+                self.assertIsNone(policy_step)
+                self.assertIsNone(stage_timeout_seconds)
+                self.assertFalse(committed_event.is_set())
+                started.set()
+                time.sleep(0.04)
+                if cancel_event.is_set():
+                    stopped.set()
+                    raise TimeoutError("cancelled")
+                ready.write_text("ready\n", encoding="utf-8")
+                return Path(temporary)
+
+            stage_method, response_type = load_server_stage_method(stage_worker)
+
+            class Request:
+                async def json(self):
+                    return {
+                        "lora_path": "http://source/step_1",
+                        "require_delta": False,
+                    }
+
+                async def is_disconnected(self):
+                    return True
+
+            response = asyncio.run(stage_method(Request()))
+            self.assertIsInstance(response, response_type)
+            self.assertEqual(response.status_code, 499)
+            self.assertTrue(started.is_set())
+            self.assertTrue(stopped.is_set())
+            self.assertFalse(ready.exists())
+
+    def test_inventory_defines_bounded_transfer(self):
+        nodes = REPOSITORY / "configs/nodes.toml"
+        with nodes.open("rb") as stream:
+            config = tomllib.load(stream)
+        ports = config["ports"]
+        self.assertEqual(ports["lora_source_first"], 18100)
+        self.assertEqual(ports["lora_source_last"], 18227)
+        self.assertEqual(ports["adapter_relay"], 18228)
+        self.assertEqual(ports["refusal_classifier"], 18250)
+        self.assertEqual(ports["lora_source_last"] - ports["lora_source_first"] + 1, 128)
+        source_ports = set(range(ports["lora_source_first"], ports["lora_source_last"] + 1))
+        self.assertNotIn(ports["adapter_relay"], source_ports)
+        self.assertNotIn(ports["refusal_classifier"], source_ports)
+        self.assertNotEqual(ports["adapter_relay"], ports["refusal_classifier"])
+        reserved_ports = [
+            value
+            for name, value in ports.items()
+            if name not in {"lora_source_first", "lora_source_last"}
+        ]
+        self.assertEqual(len(reserved_ports), len(set(reserved_ports)))
+        config_path = REPOSITORY / "configs/general-agent/orchestrator.toml"
+        with config_path.open("rb") as stream:
+            edge_config = tomllib.load(stream)
+        source_url = edge_config["weight_broadcast"]["source_url"]
+        self.assertEqual(urlsplit(source_url).port, ports["lora_source_first"])
+        runtime = REPOSITORY / "training_ops/runtime/h200"
+        glm_source = (runtime / "start_inference.sh").read_text(encoding="utf-8")
+        self.assertIn('download_streams=$(python3 - "$deployment/configs/nodes.toml"', glm_source)
+        self.assertIn('-e PRIME_LORA_DOWNLOAD_STREAMS="$download_streams"', glm_source)
+        self.assertIn('PRIME_LORA_SOURCE_PORTS="$lora_source_port_list"', glm_source)
+        source_generator = glm_source.split(
+            'runtime_output=$(python3 - "$deployment/configs/nodes.toml" "$engine_host" "$inference_config" <<\'PY\'\n',
+            1,
+        )[1].split("\nPY\n", 1)[0]
+        source_result = subprocess.run(
+            [sys.executable, "-", str(nodes), "h200b", str(REPOSITORY / "configs/current/inference.toml")],
+            input=source_generator,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        generated_ports = [
+            int(value) for value in source_result.stdout.splitlines()[0].split(",")
+        ]
+        self.assertEqual(
+            generated_ports,
+            [
+                port
+                for offset in range(2)
+                for port in range(18100 + offset, 18228, 2)
+            ],
+        )
+        orchestrator_source = (
+            REPOSITORY / "training_ops/runtime/h200/start_orchestrator.sh"
+        ).read_text(encoding="utf-8")
+        for legacy_port in ("18101", "18111", "18112", "18113", "18114"):
+            self.assertNotIn(legacy_port, orchestrator_source)
+        self.assertIn("parsed.port != source_first", orchestrator_source)
+        worker_source = (REPOSITORY / "prime-rl/src/prime_rl/inference/vllm/worker/filesystem.py").read_text(encoding="utf-8")
+        self.assertIn("full_download_streams = 48", worker_source)
+        self.assertIn("download_streams = _configured_download_streams()", worker_source)
+        self.assertNotIn("_PARALLEL_DOWNLOAD_STREAMS", worker_source)
+
 
 
 if __name__ == "__main__":

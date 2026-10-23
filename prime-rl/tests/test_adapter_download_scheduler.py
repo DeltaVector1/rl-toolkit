@@ -3,6 +3,7 @@ import hashlib
 import http.client
 import http.server
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -3419,6 +3420,279 @@ class DownloadSchedulerTest(unittest.TestCase):
             [int(url.split(":")[2].split("/", 1)[0]) for url in calls],
             [18146, 18148],
         )
+
+    def test_persistent_chunks_reuse_one_connection(self):
+        filesystem = load_filesystem_module()
+        payload = b"persistent-range"
+        server, thread, handler = self._persistent_server(filesystem, payload)
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                try:
+                    for name in ("one", "two"):
+                        pool.download(
+                            [f"http://127.0.0.1:{server.server_address[1]}/{name}"],
+                            0,
+                            chunks / name,
+                            parent_fd,
+                            expected_size=len(payload),
+                            expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            per_request_timeout_seconds=2,
+                        )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertEqual(handler.connections, 1)
+                self.assertEqual(handler.requests, 2)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_connection_reopens_after_idle_threshold(self):
+        filesystem = load_filesystem_module()
+        payload = b"idle-reopen"
+        server, thread, handler = self._persistent_server(filesystem, payload)
+        old_idle = filesystem.persistent_connection_idle_seconds
+        filesystem.persistent_connection_idle_seconds = 0.05
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                try:
+                    for name in ("one", "two"):
+                        pool.download(
+                            [f"http://127.0.0.1:{server.server_address[1]}/{name}"],
+                            0,
+                            chunks / name,
+                            parent_fd,
+                            expected_size=len(payload),
+                            expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            per_request_timeout_seconds=1,
+                        )
+                        if name == "one":
+                            time.sleep(0.08)
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertEqual(handler.connections, 2)
+        finally:
+            filesystem.persistent_connection_idle_seconds = old_idle
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_chunk_attempt_deadline_stops_trickle_and_rotates(self):
+        filesystem = load_filesystem_module()
+        payload = b"trickle-body"
+
+        def trickle_once(request, number):
+            if number != 1:
+                return False
+            start, end = map(
+                int,
+                request.headers["Range"].removeprefix("bytes=").split("-", 1),
+            )
+            body = payload[start : end + 1]
+            request.send_response(206)
+            request.send_header("Content-Length", str(len(body)))
+            request.send_header(
+                "Content-Range", f"bytes {start}-{end}/{len(payload)}"
+            )
+            request.end_headers()
+            for value in body:
+                try:
+                    request.wfile.write(bytes((value,)))
+                    request.wfile.flush()
+                except OSError:
+                    return True
+                time.sleep(0.05)
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, trickle_once
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        filesystem.lane_rotation_delay_seconds = 0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                started = time.monotonic()
+                try:
+                    pool.download(
+                        [
+                            f"http://127.0.0.1:{server.server_address[1]}/slow",
+                            f"http://127.0.0.1:{server.server_address[1]}/fast",
+                        ],
+                        0,
+                        chunks / "trickle",
+                        parent_fd,
+                        expected_size=len(payload),
+                        expected_sha256=hashlib.sha256(payload).hexdigest(),
+                        per_request_timeout_seconds=0.2,
+                    )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                elapsed = time.monotonic() - started
+                self.assertEqual((chunks / "trickle").read_bytes(), payload)
+                self.assertEqual(handler.requests, 2)
+                self.assertGreaterEqual(elapsed, 0.15)
+                self.assertLess(elapsed, 0.8)
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_chunk_retries_only_404_and_503(self):
+        filesystem = load_filesystem_module()
+        payload = b"status-retry"
+
+        def unavailable_once(request, number):
+            if number != 1:
+                return False
+            request.send_response(404)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, unavailable_once
+        )
+        old_delay = filesystem.lane_rotation_delay_seconds
+        filesystem.lane_rotation_delay_seconds = 0
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                self._persistent_download(
+                    filesystem, server, Path(temporary), "status", payload
+                )
+                self.assertEqual(handler.requests, 2)
+        finally:
+            filesystem.lane_rotation_delay_seconds = old_delay
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_config_http500_is_terminal(self):
+        filesystem = load_filesystem_module()
+        payload = b"config-500"
+
+        def server_error(request, number):
+            if number != 1:
+                return False
+            request.send_response(500)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, server_error
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(OSError, "unexpected HTTP status"):
+                    filesystem._download_persistent_file(
+                        [f"http://127.0.0.1:{server.server_address[1]}/adapter_config.json"],
+                        Path(temporary) / "adapter_config.json",
+                        expected_size=len(payload),
+                        expected_sha256=hashlib.sha256(payload).hexdigest(),
+                        per_request_timeout_seconds=1,
+                    )
+                self.assertEqual(handler.requests, 1)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_persistent_chunk_http500_is_terminal(self):
+        filesystem = load_filesystem_module()
+        payload = b"server-error"
+
+        def server_error(request, number):
+            if number != 1:
+                return False
+            request.send_response(500)
+            request.send_header("Content-Length", "0")
+            request.send_header("Connection", "close")
+            request.end_headers()
+            request.close_connection = True
+            return True
+
+        server, thread, handler = self._persistent_server(
+            filesystem, payload, server_error
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                chunks = root / "chunks"
+                chunks.mkdir()
+                parent_fd = filesystem._open_directory_nofollow(
+                    chunks, create=False, label="test chunks"
+                )
+                pool = filesystem._PersistentAdapterLanePool(1)
+                try:
+                    with self.assertRaisesRegex(OSError, "unexpected HTTP status"):
+                        pool.download(
+                            [f"http://127.0.0.1:{server.server_address[1]}/error"],
+                            0,
+                            chunks / "error",
+                            parent_fd,
+                            expected_size=len(payload),
+                            expected_sha256=hashlib.sha256(payload).hexdigest(),
+                            per_request_timeout_seconds=2,
+                        )
+                finally:
+                    pool.close()
+                    os.close(parent_fd)
+                self.assertEqual(handler.requests, 1)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_download_keeps_public_signature(self):
+        filesystem = load_filesystem_module()
+        signature = str(inspect.signature(filesystem.download)).replace("pathlib._local.Path", "pathlib.Path")
+        self.assertEqual(
+            signature,
+            "(source_url: str, destination: pathlib.Path, *, expected_size: int | None = None, expected_sha256: str | None = None, progress=None, source_urls: list[str] | None = None, parallel_ranges: bool = True, deadline: float | None = None, cancel_event: threading.Event | None = None, per_request_timeout_seconds: float | None = None, retry_http_statuses: set[int] | None = None) -> None",
+        )
+        self.assertFalse(hasattr(filesystem.download, "__wrapped__"))
+
+    def test_glm_stream_count_accepts_24_lanes(self):
+        filesystem = load_filesystem_module()
+        old_value = filesystem.os.environ.get(filesystem._DOWNLOAD_STREAMS_ENV)
+        filesystem.os.environ[filesystem._DOWNLOAD_STREAMS_ENV] = "24"
+        try:
+            self.assertEqual(filesystem._configured_download_streams(), 24)
+        finally:
+            if old_value is None:
+                filesystem.os.environ.pop(filesystem._DOWNLOAD_STREAMS_ENV, None)
+            else:
+                filesystem.os.environ[filesystem._DOWNLOAD_STREAMS_ENV] = old_value
+
 
 
 if __name__ == "__main__":

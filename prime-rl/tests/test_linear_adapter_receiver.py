@@ -1763,6 +1763,79 @@ class LinearAdapterReceiverTest(unittest.TestCase):
             else:
                 os.environ["PRIME_FULL_CHECKPOINT_CACHE_DIR"] = old_cache
 
+    def test_verified_base_uses_published_identity_without_hashing_model(self):
+        filesystem = load_filesystem()
+        base_url = "http://source/step_1"
+        model = b"cached model"
+        config = b"{}\n"
+        model_sha256 = hashlib.sha256(model).hexdigest()
+        config_sha256 = hashlib.sha256(config).hexdigest()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_sha256_entry = filesystem._sha256_entry
+        hashed = []
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                base_dir = filesystem.adapter_cache_path(base_url)
+                base_dir.mkdir(parents=True)
+                (base_dir / "READY").write_bytes(b"ready\n")
+                (base_dir / "manifest.json").write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "source_url": base_url,
+                            "files": {
+                                "adapter_config.json": {
+                                    "size": len(config),
+                                    "sha256": config_sha256,
+                                },
+                                "adapter_model.safetensors": {
+                                    "size": len(model),
+                                    "sha256": model_sha256,
+                                },
+                            },
+                        },
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+                (base_dir / "adapter_config.json").write_bytes(config)
+                (base_dir / "adapter_model.safetensors").write_bytes(model)
+                (base_dir / "adapter_model.safetensors.sha256").write_text(
+                    f"{model_sha256}\n",
+                    encoding="ascii",
+                )
+
+                def hash_entry(parent_fd, name, label):
+                    hashed.append(name)
+                    if name == "adapter_model.safetensors":
+                        raise AssertionError("published model identity must not be rehashed")
+                    return old_sha256_entry(parent_fd, name, label)
+
+                filesystem._sha256_entry = hash_entry
+                result = filesystem._verified_adapter_base(
+                    base_url,
+                    model_sha256,
+                    expected_size=len(model),
+                    expected_config_sha256=config_sha256,
+                    expected_config_size=len(config),
+                )
+                self.assertEqual(
+                    result,
+                    (
+                        base_dir / "adapter_model.safetensors",
+                        base_dir / "adapter_config.json",
+                    ),
+                )
+                self.assertEqual(hashed, ["adapter_config.json"])
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._sha256_entry = old_sha256_entry
+
+
 
 if __name__ == "__main__":
     unittest.main()
