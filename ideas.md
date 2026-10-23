@@ -229,6 +229,61 @@ no fixed prefill, TailRL, staged ratios, group filters, or held-out split wiring
   a proven saturation exit. Preserve the existing watchdog and status
   semantics until a concurrent PID/identity trace captures a real mismatch.
 
+## Fail-closed consumed rollout retention
+
+- **Measured production risk (2026-09-28).** All eight configured trainer
+  nodes retain consumed rollout step directories. The measured total is
+  8,344,539,136 bytes at trainer step 14 on a 22,840,700,928-byte free-space
+  budget on n76. Each later step adds about 0.4-0.8 GB, so a 50-step run can
+  exhaust n76 before completion. The configured trainer set is n76, n77, n78,
+  n80, n82, n83, n84, and n85; n79 is blocked.
+- **Bounded experiment.** Add an explicit `training-ops rollout-retention`
+  action that accepts one exact active run and authoritative per-node
+  evidence. Dry-run is the default. It selects only old, consumed
+  `rollouts/step_N` directories with an exact delivered batch identity, keeps
+  the current and latest two steps plus every batch required by resume state,
+  and applies only when every configured trainer node agrees. Apply quarantines
+  each candidate with an atomic rename, fsyncs the parent where possible, then
+  deletes only the quarantined tree. Report exact bytes and step numbers.
+- **Fail-closed gates.** Refuse canonical-path or ownership changes, symlinks,
+  open descriptors, locks, writer or partial markers, unknown files, changed
+  identities, missing or partial delivery evidence, and cross-node
+  disagreement. Recheck every identity immediately before quarantine and
+  delete. Use existing training-ops host APIs for the configured trainers
+  only; never include n79. No live deletion is part of this experiment.
+- **Tests.** Disposable fixtures must cover dry-run and apply, races and
+  changed identity, symlinks, open files, unknown files, latest protection,
+  partial or delivered evidence, cross-node failure, and exact byte totals.
+- **Review hardening.** The apply phase must compare the exact dry-run
+  candidate records, complete step inventory, current step, paths, identities,
+  and byte totals on every trainer. After atomic quarantine, hold directory and
+  file descriptors through a final content, lock, and open-descriptor check;
+  remove entries by descriptor-relative operations and verify actual freed
+  bytes. Reusing unchanged evidence after removal fails before mutation;
+  refreshed evidence with no candidates is a verified no-op.
+- **Deletion race experiment.** Before final content verification, acquire a
+  Linux `F_SETLEASE` write lease on every quarantined regular file and hold the
+  leases through descriptor-relative `unlinkat`. A lease conflict, unsupported
+  filesystem, or lease break fails closed and preserves the quarantine. Test
+  this with a bounded competing subprocess and an unsupported-lease fixture;
+  do not accept advisory flock as the race boundary.
+- **Rejected exact-inode removal experiment.** `renameat2(RENAME_EXCHANGE)` can
+  move a checked entry to a private sentinel atomically, but Linux has no
+  compare-and-unlink or unlink-by-file-descriptor operation. After the
+  displaced inode is removed, deleting the sentinel still names a mutable
+  directory entry; a same-UID `rename` can replace it between verification and
+  `unlinkat`. Write leases protect inode contents, not directory names. Keep
+  the action fail-closed until writer quiescence or a kernel primitive that
+  binds removal to the held inode is available.
+- **Quiescent cleanup experiment.** Require the active trainer writer to stop
+  and acquire its existing `.microbatch-sync.lock` namespace lock before the
+  final inventory, inode/size/mtime recheck, quarantine, and unlink. Require
+  verified process identity and an explicit restart responsibility record;
+  refuse an alive writer, missing or busy lock, changed lock identity, unknown
+  files, symlinks, nonregular entries, or any concurrent rename. Release the
+  lock only after the cleanup result and directory fsync are recorded. This is
+  the bounded fallback because leases alone do not protect directory names.
+
 ## Measured long-haul evidence
 
 Snapshot: 2026-09-14 22:56 UTC, run `glm-decensor-difficulty-9`.
