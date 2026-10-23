@@ -12,7 +12,9 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +87,317 @@ class AdapterServerTest(unittest.TestCase):
         adapter_server._identity_cache.clear()
         adapter_server._identity_validation_runs.clear()
         adapter_server._manifest_cache.clear()
+        adapter_server._transport_digest_cache.clear()
+
+    def test_transport_digest_cache_keeps_a_complete_predictive_manifest(self):
+        self.assertGreaterEqual(
+            adapter_server._MAX_TRANSPORT_DIGEST_CACHE_ENTRIES,
+            adapter_server.max_transport_chunks,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            chunks = []
+            payload = b"verified transport chunk"
+            digest = hashlib.sha256(payload).hexdigest()
+            for index in range(1834):
+                name = f"{adapter_server.adapter_weights_name}.transport-predictive-{index:05d}.bin"
+                (root / name).write_bytes(payload)
+                chunks.append({"file": name, "wire_size": len(payload), "wire_sha256": digest})
+            with mock.patch.object(
+                adapter_server, "_transport_digest_cache", adapter_server.OrderedDict()
+            ), mock.patch.object(
+                adapter_server, "_sha256_fd", wraps=adapter_server._sha256_fd
+            ) as hash_file:
+                adapter_server._validate_predictive_chunks(root, chunks)
+                self.assertEqual(hash_file.call_count, len(chunks))
+                for _ in range(2):
+                    for item in chunks:
+                        fd = os.open(root / item["file"], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                        try:
+                            adapter_server._verify_transport_fd(fd, item["wire_size"], item["wire_sha256"])
+                        finally:
+                            os.close(fd)
+                self.assertEqual(hash_file.call_count, len(chunks))
+                self.assertEqual(len(adapter_server._transport_digest_cache), len(chunks))
+
+    def test_transport_digest_cache_remains_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            adapter_server, "_transport_digest_cache", adapter_server.OrderedDict()
+        ), mock.patch.object(adapter_server, "_MAX_TRANSPORT_DIGEST_CACHE_ENTRIES", 3):
+            root = Path(temporary)
+            for index in range(4):
+                path = root / str(index)
+                path.write_bytes(b"chunk")
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    adapter_server._verify_transport_fd(fd, 5, hashlib.sha256(b"chunk").hexdigest())
+                finally:
+                    os.close(fd)
+                self.assertLessEqual(len(adapter_server._transport_digest_cache), 3)
+            self.assertEqual(len(adapter_server._transport_digest_cache), 3)
+
+    def test_transport_digest_cache_rejects_changed_file_or_manifest_digest(self):
+        for mutation in ("rewrite", "replacement", "size", "digest"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+                adapter_server, "_transport_digest_cache", adapter_server.OrderedDict()
+            ):
+                path = Path(temporary) / "chunk"
+                path.write_bytes(b"chunk")
+                digest = hashlib.sha256(b"chunk").hexdigest()
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    adapter_server._verify_transport_fd(fd, 5, digest)
+                finally:
+                    os.close(fd)
+                before = path.stat()
+                # Let filesystems with a coarse update clock advance ctime.
+                time.sleep(0.01)
+                if mutation == "rewrite":
+                    path.write_bytes(b"wrong")
+                    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    self.assertNotEqual(path.stat().st_ctime_ns, before.st_ctime_ns)
+                elif mutation == "replacement":
+                    incoming = path.with_name("incoming")
+                    incoming.write_bytes(b"wrong")
+                    os.utime(incoming, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    os.replace(incoming, path)
+                    self.assertNotEqual(path.stat().st_ino, before.st_ino)
+                elif mutation == "size":
+                    path.write_bytes(b"shorter?")
+                else:
+                    digest = hashlib.sha256(b"wrong").hexdigest()
+                fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    with self.assertRaises(adapter_server.UpgradeError):
+                        adapter_server._verify_transport_fd(fd, 5, digest)
+                finally:
+                    os.close(fd)
+
+    def test_transport_digest_cache_does_not_keep_a_hash_raced_by_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
+            adapter_server, "_transport_digest_cache", adapter_server.OrderedDict()
+        ):
+            path = Path(temporary) / "chunk"
+            path.write_bytes(b"chunk")
+            original_hash = adapter_server._sha256_fd
+
+            def hash_then_mutate(fd, name):
+                result = original_hash(fd, name)
+                time.sleep(0.01)
+                path.write_bytes(b"wrong")
+                return result
+
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                with mock.patch.object(adapter_server, "_sha256_fd", hash_then_mutate):
+                    with self.assertRaisesRegex(adapter_server.UpgradeError, "changed during validation"):
+                        adapter_server._verify_transport_fd(fd, 5, hashlib.sha256(b"chunk").hexdigest())
+            finally:
+                os.close(fd)
+            self.assertFalse(adapter_server._transport_digest_cache)
+
+    @contextmanager
+    def _predictive_http_server(self, root):
+        self._clear_identity_state()
+        handler = functools.partial(
+            QuietAdapterHandler,
+            directory=str(root),
+            upgrade_path=("active",),
+            source_base_url="http://127.0.0.1:8100/active",
+        )
+        server = adapter_server.AdapterServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}/active/step_2"
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+            self._clear_identity_state()
+
+    def test_published_v2_http_requests_skip_upgrade_and_reparse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "active"
+            active.mkdir()
+            _step, manifest = self._write_predictive_step(active, 2)
+            name = manifest["chunks"][0]["file"]
+            with self._predictive_http_server(root) as base_url, mock.patch.object(
+                adapter_server, "_json_object", wraps=adapter_server._json_object
+            ) as read_json, mock.patch.object(
+                adapter_server, "_upgrade_v1_step", side_effect=AssertionError("unexpected upgrade")
+            ), mock.patch.object(
+                adapter_server.fcntl, "flock", side_effect=AssertionError("unexpected lock")
+            ):
+                for _ in range(3):
+                    for method, headers, status, body in (
+                        ("GET", {}, 200, b"chunk"),
+                        ("HEAD", {}, 200, b""),
+                        ("GET", {"Range": "bytes=1-3"}, 206, b"hun"),
+                    ):
+                        request = urllib.request.Request(f"{base_url}/{name}", method=method, headers=headers)
+                        with urllib.request.urlopen(request, timeout=5) as response:
+                            self.assertEqual(response.status, status)
+                            self.assertEqual(response.read(), body)
+                manifest_reads = [call for call in read_json.call_args_list
+                                  if call.args[0].name == adapter_server.adapter_manifest_name]
+                self.assertEqual(len(manifest_reads), 1)
+                self.assertFalse((active / adapter_server.lock_name).exists())
+
+    def test_published_v2_fast_path_keeps_file_and_marker_checks(self):
+        for mutation, expected_status in (("chunk", 500), ("marker", 500), ("manifest", 500), ("legacy", 404)):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                active = root / "active"
+                active.mkdir()
+                step, manifest = self._write_predictive_step(active, 2)
+                name = manifest["chunks"][0]["file"]
+                with self._predictive_http_server(root) as base_url:
+                    with urllib.request.urlopen(f"{base_url}/{name}", timeout=5) as response:
+                        self.assertEqual(response.read(), b"chunk")
+                    if mutation == "chunk":
+                        (step / name).write_bytes(b"wrong")
+                    elif mutation == "marker":
+                        (step / adapter_server.stable_name).unlink()
+                    elif mutation == "manifest":
+                        manifest["mode"] = "full"
+                        (step / adapter_server.adapter_manifest_name).write_text(json.dumps(manifest), encoding="utf-8")
+                    else:
+                        name = f"{adapter_server.adapter_weights_name}.transport-delta-old.bin"
+                        (step / name).write_bytes(b"old")
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(f"{base_url}/{name}", timeout=5)
+                    self.assertEqual(raised.exception.code, expected_status)
+
+    def test_published_v2_http_cache_tracks_manifest_and_directory_replacement(self):
+        for replacement in ("manifest", "directory"):
+            with self.subTest(replacement=replacement), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                active = root / "active"
+                active.mkdir()
+                step, manifest = self._write_predictive_step(active, 2)
+                name = manifest["chunks"][0]["file"]
+                with self._predictive_http_server(root) as base_url:
+                    with urllib.request.urlopen(f"{base_url}/{name}", timeout=5) as response:
+                        self.assertEqual(response.read(), b"chunk")
+                    if replacement == "directory":
+                        step.rename(active / "previous-step")
+                        self._write_predictive_step(active, 2, chunk=b"newer")
+                    else:
+                        (step / name).write_bytes(b"newer")
+                        manifest["chunks"][0]["wire_sha256"] = hashlib.sha256(b"newer").hexdigest()
+                        incoming = step / ".manifest-incoming"
+                        incoming.write_text(json.dumps(manifest), encoding="utf-8")
+                        os.replace(incoming, step / adapter_server.adapter_manifest_name)
+                    with urllib.request.urlopen(f"{base_url}/{name}", timeout=5) as response:
+                        self.assertEqual(response.read(), b"newer")
+
+    def test_published_v2_rechecks_manifest_after_fast_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "active"
+            active.mkdir()
+            step, manifest = self._write_predictive_step(active, 2)
+            name = manifest["chunks"][0]["file"]
+            original_upgrade = adapter_server.RangeHandler._maybe_upgrade
+
+            def replace_after_check(handler):
+                path = original_upgrade(handler)
+                manifest["chunks"][0]["wire_sha256"] = hashlib.sha256(b"wrong").hexdigest()
+                incoming = step / ".manifest-incoming"
+                incoming.write_text(json.dumps(manifest), encoding="utf-8")
+                os.replace(incoming, step / adapter_server.adapter_manifest_name)
+                return path
+
+            with self._predictive_http_server(root) as base_url, mock.patch.object(
+                adapter_server.RangeHandler, "_maybe_upgrade", replace_after_check
+            ):
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(f"{base_url}/{name}", timeout=5)
+                self.assertEqual(raised.exception.code, 500)
+
+    def test_changed_fast_path_identity_falls_back_to_locked_upgrade(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "active"
+            active.mkdir()
+            _step, manifest = self._write_predictive_step(active, 2)
+            name = manifest["chunks"][0]["file"]
+            original_entry = adapter_server._manifest_cache_entry
+            first_check = True
+
+            def changed_entry(*args):
+                nonlocal first_check
+                if first_check:
+                    first_check = False
+                    raise adapter_server.UpgradeError("manifest changed during validation")
+                return original_entry(*args)
+
+            with self._predictive_http_server(root) as base_url, mock.patch.object(
+                adapter_server, "_manifest_cache_entry", changed_entry
+            ), mock.patch.object(
+                adapter_server, "_upgrade_v1_step", wraps=adapter_server._upgrade_v1_step
+            ) as upgrade:
+                with urllib.request.urlopen(f"{base_url}/{name}", timeout=5) as response:
+                    self.assertEqual(response.read(), b"chunk")
+                upgrade.assert_called_once()
+
+    def test_concurrent_v1_http_requests_publish_once_then_use_fast_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / "active"
+            active.mkdir()
+            step, predictive = self._write_predictive_step(active, 2)
+            original = dict(predictive, version=1)
+            manifest_path = step / adapter_server.adapter_manifest_name
+            manifest_path.write_text(json.dumps(original), encoding="utf-8")
+            worker_started = threading.Event()
+            release_worker = threading.Event()
+            build_calls = []
+
+            def build_once(_active, target, _step, _url, _pending, build, *_args, **kwargs):
+                if kwargs.get("cleanup_only"):
+                    adapter_server._scavenge_upgrade_leftovers(_active)
+                    return
+                build_calls.append(build)
+                worker_started.set()
+                if not release_worker.wait(5):
+                    raise AssertionError("upgrade worker was not released")
+                build.mkdir()
+                (build / adapter_server.adapter_manifest_name).write_text(json.dumps(predictive), encoding="utf-8")
+                return {name: list(adapter_server._stat_identity(target / name)) for name in (
+                    adapter_server.adapter_config_name, adapter_server.adapter_weights_name,
+                    adapter_server.adapter_manifest_name, adapter_server.stable_name)}
+
+            errors = []
+            bodies = []
+            with self._predictive_http_server(root) as base_url, mock.patch.object(
+                adapter_server, "_run_upgrade_worker", build_once
+            ):
+                def request():
+                    try:
+                        with urllib.request.urlopen(f"{base_url}/adapter_config.json", timeout=5) as response:
+                            bodies.append(response.read())
+                    except Exception as exc:
+                        errors.append(exc)
+
+                requests = [threading.Thread(target=request) for _ in range(8)]
+                try:
+                    for thread in requests:
+                        thread.start()
+                    self.assertTrue(worker_started.wait(5))
+                finally:
+                    release_worker.set()
+                    for thread in requests:
+                        thread.join(timeout=5)
+                self.assertFalse(errors)
+                self.assertEqual(bodies, [b"{}\n"] * 8)
+                self.assertEqual(len(build_calls), 1)
+                self.assertEqual(json.loads(manifest_path.read_text())["version"], 2)
+                with mock.patch.object(adapter_server, "_upgrade_v1_step", side_effect=AssertionError("unexpected upgrade")):
+                    request()
+                self.assertFalse(errors)
 
     def test_manifest_replacement_uses_new_cache_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
