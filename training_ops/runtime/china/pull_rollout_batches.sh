@@ -187,7 +187,7 @@ receipt_valid() {
   [ "${#receipt[@]}" -eq 12 ] && \
     [ "${receipt[0]}" = "$1" ] && [ "${receipt[1]}" = "$dest_dir" ] && \
     [[ "${receipt[2]}" == running || "${receipt[2]}" == stopped ]] && \
-    [[ "${receipt[4]}" == yes || "${receipt[4]}" == no ]] || return 1
+    [[ "${receipt[4]}" == yes || "${receipt[4]}" == no || "${receipt[4]}" == attempting ]] || return 1
   current=$(puller_identity 0) || return 1
   read -r -a current_fields <<<"$current"
   [ "${#current_fields[@]}" -eq 7 ] || return 1
@@ -435,6 +435,10 @@ pause_action() {
     mapfile -t receipt <"$pause_file"
     receipt_valid "$token" || return 1
     identity_fields=("${receipt[@]:5:7}")
+    if [ "${receipt[4]}" = attempting ]; then
+      echo "rollout puller pause ownership is unresolved; receipt retained" >&2
+      return 1
+    fi
     current_state=$(state) || return 1
     if [ "$current_state" = stopped ]; then
       echo paused
@@ -466,6 +470,8 @@ pause_action() {
       return 0
     fi
   fi
+  receipt[4]=attempting
+  write_pause_receipt yes "${receipt[@]}" || return 1
   stop_target_pid=$recorded_pid
   if stop_impl; then
     stop_status=0
@@ -477,10 +483,10 @@ pause_action() {
   for pid in "${stop_signalled_pids[@]}"; do
     [ "$pid" = "$recorded_pid" ] && owns_restore=yes
   done
+  receipt[4]=$owns_restore
+  write_pause_receipt yes "${receipt[@]}" || return 1
   if [ "$owns_restore" = yes ]; then
     [ "${#identity_fields[@]}" -eq 7 ] || return 1
-    receipt[4]=yes
-    write_pause_receipt yes "${receipt[@]}" || return 1
   fi
   if [ "$stop_status" != 0 ]; then
     echo "rollout puller pause did not finish; receipt retained" >&2
@@ -501,27 +507,25 @@ resume_action() {
   receipt_valid "$token" || return 1
   was_running=${receipt[2]}
   recorded_pid=${receipt[3]}
+  if [ "${receipt[4]}" = attempting ]; then
+    echo "rollout puller pause ownership is unresolved; receipt retained" >&2
+    return 1
+  fi
+  state_value=$(state) || return 1
+  if [ "$state_value" = running ]; then
+    echo "rollout puller is running during a paused namespace transaction; receipt retained" >&2
+    return 1
+  fi
   if [ "$was_running" = stopped ] || [ "${receipt[4]}" = no ]; then
     remove_pause_receipt || return 1
     echo already-stopped
     return 0
   fi
-  state_value=$(state) || return 1
-  if [ "$state_value" = stopped ]; then
-    start_impl >/dev/null || return 1
-    status || return 1
-    remove_pause_receipt || return 1
-    echo restored
-    return 0
-  fi
-  if [ "$(cat "$pid_file" 2>/dev/null || true)" != "$recorded_pid" ] || \
-    ! process_matches "$recorded_pid" || ! receipt_process_matches; then
-    remove_pause_receipt || return 1
-    echo already-running
-    return 0
-  fi
+  [ "$state_value" = stopped ] || return 1
+  start_impl >/dev/null || return 1
+  status || return 1
   remove_pause_receipt || return 1
-  echo already-running
+  echo restored
 }
 
 case "$action" in
