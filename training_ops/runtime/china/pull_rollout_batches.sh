@@ -33,6 +33,8 @@ b2_download_threshold=${B2_DOWNLOAD_THRESHOLD_BYTES:-67108864}
 [[ "$b2_download_threshold" =~ ^[1-9][0-9]{0,12}$ ]] && [ "$b2_download_threshold" -le 1099511627776 ] || { echo "invalid B2 download threshold" >&2; exit 2; }
 pid_file="$dest_dir/.rollout-pull.pid"
 lock_file="$dest_dir/.rollout-pull.lock"
+control_file="$dest_dir/.rollout-pull-control.lock"
+pause_file="$dest_dir/.rollout-pull-paused"
 log_file=${LOG_FILE:-"${dest_dir%/*}/rollout-pull.log"}
 source_target="$source_user@$source_host"
 ssh_opts=(
@@ -49,6 +51,9 @@ rsync_ssh_wrapper=
 pid_owned=0
 health_lease_pid=
 health_probe_pids=()
+stop_signalled=0
+stop_signalled_pids=()
+stop_target_pid=
 
 pull_rsync() {
   timeout --signal=TERM --kill-after=10s "$pull_part_timeout" rsync "$@"
@@ -125,6 +130,113 @@ status() {
   [ "$count" -eq 1 ]
 }
 
+state() {
+  local -a pids=()
+  local pid
+  local_path_safe "$dest_dir" || return 1
+  if status; then
+    echo running
+    return 0
+  fi
+  mapfile -t pids < <(matching_pids)
+  [ "${#pids[@]}" -eq 0 ] || return 1
+  [ ! -e "$pid_file" ] && [ ! -L "$pid_file" ] || return 1
+  if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
+    [ -f "$lock_file" ] && [ ! -L "$lock_file" ] || return 1
+    flock -n "$lock_file" -c true || return 1
+  fi
+  echo stopped
+}
+
+puller_identity() {
+  python3 - "$dest_dir" "${1:-0}" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+pid = sys.argv[2]
+info = os.stat(directory, follow_symlinks=False)
+if not stat.S_ISDIR(info.st_mode):
+    raise SystemExit(1)
+fields = [str(info.st_dev), str(info.st_ino), str(info.st_uid), str(info.st_gid)]
+if pid == "0":
+    fields.extend(("0", "0", "0"))
+else:
+    if not pid.isdigit() or int(pid) <= 1:
+        raise SystemExit(1)
+    process = Path("/proc") / pid
+    stat_fields = (process / "stat").read_bytes().rsplit(b") ", 1)[1].split()
+    if len(stat_fields) <= 19 or not stat_fields[19].isdigit():
+        raise SystemExit(1)
+    command = (process / "cmdline").read_bytes()
+    environment = (process / "environ").read_bytes()
+    fields.extend((
+        stat_fields[19].decode("ascii"),
+        hashlib.sha256(command).hexdigest(),
+        hashlib.sha256(environment).hexdigest(),
+    ))
+print(" ".join(fields))
+PY
+}
+
+receipt_valid() {
+  local current mode_owner
+  [ "${#receipt[@]}" -eq 12 ] && \
+    [ "${receipt[0]}" = "$1" ] && [ "${receipt[1]}" = "$dest_dir" ] && \
+    [[ "${receipt[2]}" == running || "${receipt[2]}" == stopped ]] && \
+    [[ "${receipt[4]}" == yes || "${receipt[4]}" == no || "${receipt[4]}" == attempting ]] || return 1
+  current=$(puller_identity 0) || return 1
+  read -r -a current_fields <<<"$current"
+  [ "${#current_fields[@]}" -eq 7 ] || return 1
+  for index in 0 1 2 3; do
+    [ "${receipt[index + 5]}" = "${current_fields[index]}" ] || return 1
+  done
+  mode_owner=$(stat -c '%u:%g:%a' -- "$pause_file") || return 1
+  [ "$mode_owner" = "${receipt[7]}:${receipt[8]}:600" ] || return 1
+  if [ "${receipt[2]}" = stopped ]; then
+    [ "${receipt[3]}" = 0 ] && [ "${receipt[4]}" = no ] && \
+      [ "${receipt[9]}" = 0 ] && [ "${receipt[10]}" = 0 ] && \
+      [ "${receipt[11]}" = 0 ] || return 1
+  else
+    [[ "${receipt[3]}" =~ ^[0-9]+$ ]] && [[ "${receipt[8]}" =~ ^[0-9]+$ ]] && \
+      [[ "${receipt[9]}" =~ ^[0-9]+$ ]] && \
+      [[ "${receipt[10]}" =~ ^[a-f0-9]{64}$ ]] && \
+      [[ "${receipt[11]}" =~ ^[a-f0-9]{64}$ ]] || return 1
+  fi
+}
+
+receipt_process_matches() {
+  local current
+  current=$(puller_identity "${receipt[3]}") || return 1
+  read -r -a current_fields <<<"$current"
+  [ "${#current_fields[@]}" -eq 7 ] || return 1
+  for index in 0 1 2 3 4 5 6; do
+    [ "${receipt[index + 5]}" = "${current_fields[index]}" ] || return 1
+  done
+}
+
+write_pause_receipt() {
+  local replace=$1 temporary
+  shift
+  if [ "$replace" = no ]; then
+    (
+      umask 077
+      set -o noclobber
+      printf '%s\n' "$@" >"$pause_file"
+    )
+    return
+  fi
+  temporary=$(mktemp -- "$dest_dir/.rollout-pull-pause.XXXXXX") || return 1
+  chmod 600 -- "$temporary" || { rm -f -- "$temporary"; return 1; }
+  if ! printf '%s\n' "$@" >"$temporary" || ! mv -fT -- "$temporary" "$pause_file"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
 matching_pids() {
   local proc candidate
   for proc in /proc/[0-9]*; do
@@ -185,14 +297,23 @@ cleanup_pid() {
   lock_owner_safe
 }
 
-stop() {
+stop_impl() {
   local pid any_live
   local -a pids=()
+  stop_signalled=0
+  stop_signalled_pids=()
   local_path_safe "$dest_dir" || return 1
   mapfile -t pids < <(matching_pids)
   for pid in "${pids[@]}"; do
+    [ -z "$stop_target_pid" ] || [ "$pid" = "$stop_target_pid" ] || continue
     process_matches "$pid" || continue
-    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    if [ -n "$stop_target_pid" ]; then receipt_process_matches || return 1; fi
+    if kill -- "-$pid" 2>/dev/null; then
+      stop_signalled=1
+      stop_signalled_pids+=("$pid")
+    elif group_live "$pid"; then
+      return 1
+    fi
   done
   for _ in $(seq 1 50); do
     any_live=0
@@ -201,8 +322,16 @@ stop() {
     sleep 0.1
   done
   for pid in "${pids[@]}"; do
+    [ -z "$stop_target_pid" ] || [ "$pid" = "$stop_target_pid" ] || continue
     group_live "$pid" || continue
-    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    process_matches "$pid" || return 1
+    if [ -n "$stop_target_pid" ]; then receipt_process_matches || return 1; fi
+    if kill -KILL -- "-$pid" 2>/dev/null; then
+      stop_signalled=1
+      stop_signalled_pids+=("$pid")
+    else
+      return 1
+    fi
   done
   for _ in $(seq 1 50); do
     any_live=0
@@ -219,14 +348,14 @@ stop() {
   cleanup_pid
 }
 
-start() {
+start_impl() {
   local_path_safe "$dest_dir" || return 1
   mkdir -p "$dest_dir"
   if status; then
     echo "rollout puller already running"
     return
   fi
-  stop
+  stop_impl
   nohup setsid env \
     ROLLOUT_TRANSFER_DIRECTION=trainer_pull \
     ROLLOUT_TRANSFER_BACKEND="$rollout_backend" \
@@ -236,7 +365,7 @@ start() {
     SOURCE_HOST="$source_host" SOURCE_PORT="$source_port" SOURCE_USER="$source_user" \
     SOURCE_IDENTITY_FILE="$source_identity" SOURCE_KNOWN_HOSTS_FILE="$source_known_hosts" \
     LOG_FILE="$log_file" \
-    bash "$script" run >>"$log_file" 2>&1 </dev/null &
+    bash "$script" run 7>&- >>"$log_file" 2>&1 </dev/null &
   local pid=$!
   local deadline=$((SECONDS + 30))
   local failure="timeout"
@@ -249,7 +378,7 @@ start() {
     [ "$SECONDS" -lt "$deadline" ] || break
     sleep 0.1
   done
-  if ! stop || [ -n "$(matching_pids)" ] || [ -e "$pid_file" ] || ! flock -n "$lock_file" -c true; then
+  if ! stop_impl || [ -n "$(matching_pids)" ] || [ -e "$pid_file" ] || ! flock -n "$lock_file" -c true; then
     echo "rollout puller failed to start ($failure); cleanup failed" >&2
     return 1
   fi
@@ -257,12 +386,176 @@ start() {
   return 1
 }
 
+management_lock() {
+  local old_umask
+  local_path_safe "$dest_dir" || return 1
+  mkdir -p "$dest_dir"
+  [ ! -L "$control_file" ] || return 1
+  if [ -e "$control_file" ] && [ ! -f "$control_file" ]; then return 1; fi
+  old_umask=$(umask)
+  umask 077
+  exec 7>>"$control_file"
+  umask "$old_umask"
+  flock -x 7 || return 1
+  python3 - "$control_file" "$BASHPID" <<'PY'
+import os
+import stat
+import sys
+
+path, pid = sys.argv[1:]
+try:
+    named = os.lstat(path)
+    opened = os.stat(f"/proc/{pid}/fd/7")
+except OSError:
+    raise SystemExit(1)
+if stat.S_ISLNK(named.st_mode) or not stat.S_ISREG(named.st_mode):
+    raise SystemExit(1)
+if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+    raise SystemExit(1)
+PY
+}
+
+remove_pause_receipt() {
+  local identity current
+  [ -e "$pause_file" ] || [ -L "$pause_file" ] || return 0
+  [ -f "$pause_file" ] && [ ! -L "$pause_file" ] || return 1
+  identity=$(stat -c '%d:%i' -- "$pause_file") || return 1
+  current=$(stat -c '%d:%i' -- "$pause_file") || return 1
+  [ "$identity" = "$current" ] || return 1
+  rm -- "$pause_file"
+}
+
+pause_action() {
+  local token=$1 current_state was_running recorded_pid identity pid
+  local stop_status=0 owns_restore
+  local -a identity_fields=()
+  [[ "$token" =~ ^[a-f0-9]{32}$ ]] || return 2
+  if [ -e "$pause_file" ] || [ -L "$pause_file" ]; then
+    [ -f "$pause_file" ] && [ ! -L "$pause_file" ] || return 1
+    mapfile -t receipt <"$pause_file"
+    receipt_valid "$token" || return 1
+    identity_fields=("${receipt[@]:5:7}")
+    if [ "${receipt[4]}" = attempting ]; then
+      echo "rollout puller pause ownership is unresolved; receipt retained" >&2
+      return 1
+    fi
+    current_state=$(state) || return 1
+    if [ "$current_state" = stopped ]; then
+      echo paused
+      return 0
+    fi
+    [ "${receipt[2]}" = running ] || return 1
+    recorded_pid=${receipt[3]}
+    [ "$(cat "$pid_file" 2>/dev/null || true)" = "$recorded_pid" ] && \
+      process_matches "$recorded_pid" && receipt_process_matches || return 1
+  else
+    current_state=$(state) || return 1
+    was_running=stopped
+    recorded_pid=0
+    if [ "$current_state" = stopped ]; then
+      identity=$(puller_identity 0) || return 1
+    else
+      was_running=running
+      recorded_pid=$(cat "$pid_file") || return 1
+      [[ "$recorded_pid" =~ ^[0-9]+$ ]] || return 1
+      process_matches "$recorded_pid" || return 1
+      identity=$(puller_identity "$recorded_pid") || return 1
+    fi
+    read -r -a identity_fields <<<"$identity"
+    [ "${#identity_fields[@]}" -eq 7 ] || return 1
+    receipt=("$token" "$dest_dir" "$was_running" "$recorded_pid" no "${identity_fields[@]}")
+    write_pause_receipt no "${receipt[@]}" || return 1
+    if [ "$was_running" = stopped ]; then
+      echo paused
+      return 0
+    fi
+  fi
+  receipt[4]=attempting
+  write_pause_receipt yes "${receipt[@]}" || return 1
+  stop_target_pid=$recorded_pid
+  if stop_impl; then
+    stop_status=0
+  else
+    stop_status=$?
+  fi
+  stop_target_pid=
+  owns_restore=no
+  for pid in "${stop_signalled_pids[@]}"; do
+    [ "$pid" = "$recorded_pid" ] && owns_restore=yes
+  done
+  receipt[4]=$owns_restore
+  write_pause_receipt yes "${receipt[@]}" || return 1
+  if [ "$owns_restore" = yes ]; then
+    [ "${#identity_fields[@]}" -eq 7 ] || return 1
+  fi
+  if [ "$stop_status" != 0 ]; then
+    echo "rollout puller pause did not finish; receipt retained" >&2
+    return 1
+  fi
+  echo paused
+}
+
+resume_action() {
+  local token=$1 state_value was_running recorded_pid
+  [[ "$token" =~ ^[a-f0-9]{32}$ ]] || return 2
+  if [ ! -e "$pause_file" ] && [ ! -L "$pause_file" ]; then
+    echo not-owned
+    return 0
+  fi
+  [ -f "$pause_file" ] && [ ! -L "$pause_file" ] || return 1
+  mapfile -t receipt <"$pause_file"
+  receipt_valid "$token" || return 1
+  was_running=${receipt[2]}
+  recorded_pid=${receipt[3]}
+  if [ "${receipt[4]}" = attempting ]; then
+    echo "rollout puller pause ownership is unresolved; receipt retained" >&2
+    return 1
+  fi
+  state_value=$(state) || return 1
+  if [ "$state_value" = running ]; then
+    if [ "$was_running" = running ] && [ "${receipt[4]}" = no ] && \
+      [ "$(cat "$pid_file" 2>/dev/null || true)" = "$recorded_pid" ] && \
+      process_matches "$recorded_pid" && receipt_process_matches; then
+      remove_pause_receipt || return 1
+      echo already-running
+      return 0
+    fi
+    echo "rollout puller is running during a paused namespace transaction; receipt retained" >&2
+    return 1
+  fi
+  if [ "$was_running" = stopped ] || [ "${receipt[4]}" = no ]; then
+    remove_pause_receipt || return 1
+    echo already-stopped
+    return 0
+  fi
+  [ "$state_value" = stopped ] || return 1
+  start_impl >/dev/null || return 1
+  status || return 1
+  remove_pause_receipt || return 1
+  echo restored
+}
+
 case "$action" in
-  start) start; exit ;;
-  stop) stop; exit ;;
+  state) state; exit ;;
   status) status; exit ;;
+  start|stop|pause|resume)
+    management_lock || { echo "rollout puller control lock is unsafe" >&2; exit 1; }
+    case "$action" in
+      start)
+        if [ -e "$pause_file" ] || [ -L "$pause_file" ]; then echo "rollout puller is paused by a namespace transaction" >&2; exit 1; fi
+        start_impl
+        ;;
+      stop)
+        if [ -e "$pause_file" ] || [ -L "$pause_file" ]; then echo "rollout puller is paused by a namespace transaction" >&2; exit 1; fi
+        stop_impl
+        ;;
+      pause) pause_action "${2:-}" ;;
+      resume) resume_action "${2:-}" ;;
+    esac
+    exit
+    ;;
   run) ;;
-  *) echo "usage: $0 {run|start|stop|status}" >&2; exit 2 ;;
+  *) echo "usage: $0 {run|start|stop|pause|resume|status|state}" >&2; exit 2 ;;
 esac
 
 local_path_safe "$dest_dir"
@@ -270,7 +563,7 @@ remote_path_safe "$source_dir"
 
 cleanup() {
   if [ -n "$health_lease_pid" ]; then
-    kill -- "-$health_lease_pid" 2>/dev/null || kill "$health_lease_pid" 2>/dev/null || true
+    kill -- "-$health_lease_pid" 2>/dev/null || true
     wait "$health_lease_pid" 2>/dev/null || true
     health_lease_pid=
   fi
@@ -295,6 +588,8 @@ chmod 700 "$rsync_ssh_wrapper"
 rsync_ssh="$rsync_ssh_wrapper"
 
 mkdir -p "$dest_dir"
+exec 8<"$dest_dir"
+flock -s 8
 exec 9>"$lock_file"
 flock -n 9 || exit 0
 echo "$$" >"$pid_file"

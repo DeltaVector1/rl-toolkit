@@ -76,6 +76,7 @@ from training_ops.runtime.adapter_cache_cleanup import (
     validate_status as _validate_adapter_cache_status,
 )
 from training_ops.runtime.broadcast_retention import cleanup as _broadcast_retention_cleanup
+from training_ops.runtime import rollout_retention as _rollout_retention
 
 repo_root = Path(__file__).resolve().parents[1]
 nodes_path = repo_root / "configs" / "nodes.toml"
@@ -724,13 +725,77 @@ def _rollout_pull_environment(run_dir: str) -> dict[str, str]:
 
 
 def _rollout_pull_command(run_dir: str, action: str) -> str:
-    if action not in {"start", "stop", "status"}:
+    if action not in {"start", "stop", "status", "state", "pause", "resume"}:
         raise Refused(f"invalid rollout pull action: {action}")
     environment = " ".join(
         f"{name}={shlex.quote(value)}"
         for name, value in _rollout_pull_environment(run_dir).items()
     )
     return f"{environment} bash {shlex.quote(rollout_pull_script)} {action}"
+
+
+def _rollout_pull_state(run_dir: str) -> str:
+    """Read the exact current puller state without creating its lock file."""
+    if rollout_transfer_direction != "trainer_pull":
+        return "stopped"
+    code, output = _ssh(
+        trainer_head,
+        _rollout_pull_command(run_dir, "state"),
+        timeout=60,
+    )
+    state = output.strip()
+    if code or state not in {"running", "stopped"}:
+        raise Refused(
+            f"rollout puller state is unresolved on {trainer_head}: {output.strip()}"
+        )
+    return state
+
+
+def _pause_rollout_puller(run_dir: str) -> str | None:
+    """Pause one exact puller and return its run-scoped ownership token."""
+    if rollout_transfer_direction != "trainer_pull":
+        return None
+    token = uuid.uuid4().hex
+    try:
+        code, output = _ssh(
+            trainer_head,
+            f"{_rollout_pull_command(run_dir, 'pause')} {shlex.quote(token)}",
+            timeout=60,
+        )
+    except (OSError, RuntimeError) as error:
+        try:
+            _restore_rollout_puller(run_dir, token)
+        except (Refused, OSError, RuntimeError) as restore_error:
+            raise Refused(
+                f"rollout puller pause failed and token recovery is unresolved: {restore_error}"
+            ) from error
+        raise Refused(f"rollout puller pause failed: {error}") from error
+    result = output.strip()
+    if code == 0 and result == "already-stopped":
+        return None
+    if code == 0 and result == "paused":
+        return token
+    try:
+        _restore_rollout_puller(run_dir, token)
+    except (Refused, OSError, RuntimeError) as restore_error:
+        raise Refused(
+            f"rollout puller pause failed and token recovery is unresolved: {restore_error}"
+        )
+    raise Refused(f"rollout puller pause is unresolved on {trainer_head}: {result}")
+
+
+def _restore_rollout_puller(run_dir: str, token: str | None) -> None:
+    """Restore only the puller pause receipt owned by this exact token."""
+    if token is None:
+        return
+    code, output = _ssh(
+        trainer_head,
+        f"{_rollout_pull_command(run_dir, 'resume')} {shlex.quote(token)}",
+        timeout=60,
+    )
+    result = output.strip()
+    if code or result not in {"restored", "already-running", "already-stopped", "not-owned"}:
+        raise Refused(f"rollout puller restore is unresolved on {trainer_head}: {result}")
 
 
 def _direct_route_command(action: str) -> str:
@@ -5337,16 +5402,19 @@ esac
 """
 
 
-def _resume_repair_state(host: str, action: str, service_dir: str, step: int, digest: str = "") -> dict:
+def _resume_repair_state(host: str, action: str, service_dir: str, step: int, digest: str = "", role: str = "", adapter: str = "") -> dict:
     source = (repo_root / "training_ops/runtime/china/resume_state.py").read_text()
-    arguments = " ".join(shlex.quote(str(item)) for item in (action, service_dir, step, digest))
+    values = (action, service_dir, step, role, adapter, digest) if role else (action, service_dir, step, digest)
+    arguments = " ".join(shlex.quote(str(item)) for item in values)
     prefix = ""
     if action == "quarantine":
         prefix = (
             "set -euo pipefail\nstate=$(\n" + _orchestrator_state_script(orchestrator_container)
             + '\n)\n[[ "$state" = stopped || "$state" = absent ]] || exit 62\n'
         )
-    interpreter = "sudo python3" if action in {"partial", "quarantine"} else "python3"
+    elif action == "rollout":
+        prefix = _rollout_quarantine_guard(service_dir, orchestrator=host == orchestrator_host)
+    interpreter = "sudo python3" if action in {"partial", "quarantine", "rollout"} or role else "python3"
     code, output = _ssh(host, prefix + f"{interpreter} - {arguments} <<'PY'\n{source}\nPY", timeout=600)
     if code:
         raise Refused(f"orchestrator repair {action} check failed on {host}: {output.strip()}")
@@ -5357,6 +5425,58 @@ def _resume_repair_state(host: str, action: str, service_dir: str, step: int, di
         return value
     except (TypeError, ValueError) as error:
         raise Refused(f"invalid orchestrator repair {action} evidence") from error
+
+
+def _rollout_quarantine_guard(service_dir: str, *, orchestrator: bool = False) -> str:
+    """Drain only this run's exact publishers before the cache transaction."""
+    container = orchestrator_container if orchestrator else trainer_container
+    drain = f"{runtime_root}/h200/drain_rollout_publisher.py"; micro = f"{runtime_root}/china/sync_microbatches.sh"; batch = f"{runtime_root}/h200/sync_rollout_batches.sh"  # noqa: E702
+    return f"""set -euo pipefail
+container={shlex.quote(container)}
+state=$(sudo docker inspect --format '{{{{.Name}}}} {{{{.State.Running}}}}' "$container" 2>/dev/null || true)
+if [ -z "$state" ]; then listed=$(sudo docker ps -a --filter "name=^$container$" --format '{{{{.Names}}}}' 2>/dev/null) || exit 62; [ -z "$listed" ] || exit 62; else [ "$state" = "/$container false" ] || exit 62; fi
+sudo python3 {shlex.quote(drain)} {shlex.quote(service_dir)} {shlex.quote(micro)} --microbatch >/dev/null
+sudo python3 {shlex.quote(drain)} {shlex.quote(service_dir)} {shlex.quote(batch)} >/dev/null
+"""
+
+
+def _repair_rollout_quarantine(arguments: list[str]) -> str:
+    if len(arguments) != 3: raise Refused("rollout-quarantine requires RUN STEP ADAPTER")  # noqa: E701
+    run, step_text, adapter = arguments
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run) or not re.fullmatch(r"0|[1-9][0-9]*", step_text):
+        raise Refused("rollout-quarantine run or step is invalid")
+    step = int(step_text); _config_for_run(run); _, _, service_dir = _cold_run_paths(run)  # noqa: E702
+    expected_adapter = f"{service_dir}/broadcasts/step_{step}/adapter_model.safetensors"
+    if adapter != expected_adapter or not adapter.startswith("/"):
+        raise Refused("rollout-quarantine adapter is not the exact run policy path")
+    puller_token = None
+    try:
+        puller_token = _pause_rollout_puller(service_dir)
+        origin = _resume_repair_state(trainer_head, "policy", service_dir, step, role="origin", adapter=adapter); digest = origin.get("sha256")  # noqa: E702
+        if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+            raise Refused("stable resume adapter has no exact SHA-256 identity")
+        hosts_to_check = list(dict.fromkeys([*trainer_hosts, orchestrator_host]))
+        for host in trainer_hosts:
+            if host != trainer_head: _resume_repair_state(host, "policy", service_dir, step, role="cache")  # noqa: E701
+        _resume_repair_state(orchestrator_host, "policy", service_dir, step, role="orchestrator-cache")
+        blocked = {}
+        for host in hosts_to_check: code, output = _ssh(host, _rollout_quarantine_guard(service_dir, orchestrator=host == orchestrator_host), timeout=180); blocked.update({host: output.strip()} if code else {})  # noqa: E701,E702
+        if blocked:
+            raise Refused(f"rollout quarantine drain blocked: completed=[] blocked={blocked}")
+        receipts, blocked = {}, {}
+        for host in hosts_to_check:
+            try: receipts[host] = _resume_repair_state(host, "rollout", service_dir, step, "" if host == trainer_head else "", "origin" if host == trainer_head else ("orchestrator-cache" if host == orchestrator_host else "cache"), adapter if host == trainer_head else "")  # noqa: E701
+            except (Refused, RuntimeError, OSError) as error: blocked[host] = str(error)  # noqa: E701
+        if blocked:
+            raise Refused(f"partial rollout quarantine: completed={sorted(receipts)} blocked={blocked}; retry is required")
+        for host in trainer_hosts: _check_adapter_restart(host, service_dir, step, "origin" if host == trainer_head else "cache", adapter if host == trainer_head else "")  # noqa: E701
+        _check_adapter_restart(orchestrator_host, service_dir, step, "orchestrator-cache", "")
+        bytes_moved = sum(int(value.get("bytes", 0)) for value in receipts.values()); paths = [f"{host}:{','.join(value.get('quarantined', [])) or 'none'}" for host, value in receipts.items()]  # noqa: E702
+        result = f"quarantined future rollout caches: run={run} resume_step={step} next_batch={step + 1} hosts={','.join(hosts_to_check)} bytes={bytes_moved} paths={' ; '.join(paths)}"
+        print(result)
+        return result
+    finally:
+        _restore_rollout_puller(service_dir, puller_token)
 
 
 def _orchestrator_resume_step(run: str, *, latest: bool = False) -> int | None:
@@ -5527,8 +5647,10 @@ echo "recreated exact orchestrator container $container"
 """
 
 
-def repair(what: str) -> str:
+def repair(what: str, *arguments: str) -> str:
     """Apply a named repair to the configured hosts."""
+    if what == "rollout-quarantine":
+        return _repair_rollout_quarantine(list(arguments))
     if what.startswith("engine-watchdog:"):
         return _repair_engine_watchdog(what.split(":", 1)[1])
     if what.startswith("engine:"):
@@ -5568,7 +5690,7 @@ def repair(what: str) -> str:
             raise Refused("adapter-tunnels-reset requires a run config directory")
         return _repair_adapter_tunnels(config_dir, reset=True)
     raise Refused(
-        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>[:config-dir], supervisors, rollout-puller, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, adapter-tunnels[:config-dir], or adapter-tunnels-reset[:config-dir]."
+        f"unknown repair {what!r}. Use rollout-quarantine RUN STEP ADAPTER, engine-watchdog:<host>, engine:<host>[:config-dir], supervisors, rollout-puller, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, adapter-tunnels[:config-dir], or adapter-tunnels-reset[:config-dir]."
     )
 
 
@@ -12913,6 +13035,204 @@ def _broadcast_retention_action(arguments: list[str]):
     return result
 
 
+def _rollout_retention_action(arguments: list[str]):
+    """Preflight and, explicitly, apply consumed rollout retention on trainers."""
+    values: dict[str, object] = {"evidence": None, "apply": False}
+    positional: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--apply":
+            values["apply"] = True
+        elif argument == "--evidence":
+            index += 1
+            if index >= len(arguments):
+                raise Refused("--evidence requires a value")
+            if values["evidence"] is not None:
+                raise Refused("rollout-retention evidence was provided twice")
+            values["evidence"] = arguments[index]
+        elif argument.startswith("--"):
+            raise Refused(f"unknown rollout-retention option {argument}")
+        else:
+            positional.append(argument)
+        index += 1
+    if len(positional) != 1 or values["evidence"] is None:
+        raise Refused("rollout-retention requires RUN and --evidence EVIDENCE")
+    run = positional[0]
+    try:
+        _runs_path, _run_parent, run_dir = _cold_run_paths(run)
+        active_nodes = [host for host in trainer_hosts if host not in blocked_hosts]
+        evidence = _rollout_retention.validate_evidence(
+            values["evidence"], nodes=active_nodes
+        )
+        if evidence["run_name"] != run:
+            raise _rollout_retention.RetentionError("retention evidence run differs from requested run")
+        for host, record in evidence["nodes"].items():
+            if record["run_dir"] != run_dir:
+                raise _rollout_retention.RetentionError(
+                    f"retention evidence path differs from configured run on {host}"
+                )
+    except (_rollout_retention.RetentionError, Refused) as error:
+        raise Refused(str(error)) from error
+    encoded = base64.b64encode(
+        json.dumps(evidence, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).decode("ascii")
+
+    def command(host: str, apply: bool = False) -> str:
+        option = " --apply" if apply else ""
+        return (
+            "set -euo pipefail; "
+            f"sudo -n python3 {shlex.quote(remote_repo + '/training_ops/runtime/rollout_retention.py')} "
+            f"{shlex.quote(run_dir)} --node {shlex.quote(host)} "
+            f"--evidence-b64 {shlex.quote(encoded)}{option}"
+        )
+
+    def run_phase(apply: bool) -> dict[str, tuple[int, str]]:
+        return _fan(
+            active_nodes,
+            lambda host: _ssh(host, command(host, apply), timeout=900),
+        )
+
+    def parse_phase(
+        results: dict[str, tuple[int, str]],
+        phase: str,
+        expected_preview: dict[str, dict[str, object]] | None = None,
+    ) -> dict[str, dict[str, object]]:
+        parsed: dict[str, dict[str, object]] = {}
+        failures: dict[str, str] = {}
+        for host, (code, output) in results.items():
+            if code:
+                failures[host] = output.strip() or f"exit {code}"
+                continue
+            records = []
+            try:
+                candidate = json.loads(output)
+                if isinstance(candidate, dict) and candidate.get("node") == host:
+                    records.append(candidate)
+            except (TypeError, ValueError):
+                for line in reversed(output.splitlines()):
+                    try:
+                        candidate = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(candidate, dict) and candidate.get("node") == host:
+                        records.append(candidate)
+                        break
+            if not records:
+                failures[host] = "no rollout-retention JSON result"
+            else:
+                parsed[host] = records[0]
+        if failures:
+            raise Refused(f"rollout-retention {phase} failed: {failures}")
+        expected_steps = None
+        expected_bytes = None
+        expected_all_steps = None
+        expected_active_step = None
+
+        def candidate_identity(value: object, label: str) -> tuple:
+            if not isinstance(value, list):
+                raise Refused(f"rollout-retention {phase} {label} candidates are invalid")
+            fields = (
+                "step", "bytes", "sha256", "path", "size", "device", "inode",
+                "mtime_ns", "dir_device", "dir_inode", "dir_mtime_ns", "dir_uid", "dir_gid",
+            )
+            result = []
+            for item in value:
+                if not isinstance(item, dict) or any(name not in item for name in fields):
+                    raise Refused(f"rollout-retention {phase} {label} candidate identity is incomplete")
+                if not all(type(item[name]) is int for name in fields if name != "sha256" and name != "path"):
+                    raise Refused(f"rollout-retention {phase} {label} candidate identity is invalid")
+                if not isinstance(item["path"], str) or not isinstance(item["sha256"], str):
+                    raise Refused(f"rollout-retention {phase} {label} candidate identity is invalid")
+                result.append(tuple(item[name] for name in fields))
+            return tuple(result)
+
+        for host, record in parsed.items():
+            steps = record.get("selected_steps")
+            bytes_used = record.get("selected_bytes")
+            all_steps = record.get("all_steps")
+            active_step = record.get("active_step")
+            if record.get("run_name") != run or record.get("run_dir") != run_dir:
+                raise Refused(f"rollout-retention {phase} result path or run identity differs on {host}")
+            selected_identity = candidate_identity(record.get("selected"), "selected")
+            if (
+                not isinstance(steps, list)
+                or not all(type(item) is int for item in steps)
+                or type(bytes_used) is not int
+                or bytes_used < 0
+                or not isinstance(all_steps, list)
+                or not all(type(item) is int for item in all_steps)
+                or all_steps != sorted(set(all_steps))
+                or type(active_step) is not int
+            ):
+                raise Refused(f"rollout-retention {phase} result is invalid on {host}")
+            if [item[0] for item in selected_identity] != steps or sum(item[1] for item in selected_identity) != bytes_used:
+                raise Refused(f"rollout-retention {phase} result bytes or steps are forged on {host}")
+            if expected_steps is None:
+                expected_steps, expected_bytes = steps, bytes_used
+                expected_all_steps, expected_active_step = all_steps, active_step
+            elif (
+                steps != expected_steps
+                or bytes_used != expected_bytes
+                or all_steps != expected_all_steps
+                or active_step != expected_active_step
+            ):
+                raise Refused(f"rollout-retention {phase} nodes disagree on current, complete, or selected steps")
+            if expected_preview is not None:
+                preview_identity = candidate_identity(expected_preview[host].get("selected"), "preview")
+                if selected_identity != preview_identity or all_steps != expected_preview[host].get("all_steps") or active_step != expected_preview[host].get("active_step"):
+                    raise Refused(f"rollout-retention apply differs from dry-run preview on {host}")
+            if phase == "apply":
+                removed_identity = candidate_identity(record.get("removed"), "removed")
+                if removed_identity != selected_identity:
+                    raise Refused(f"rollout-retention apply removed candidates differ on {host}")
+                freed = record.get("freed_bytes")
+                if type(freed) is not int or freed != sum(item[1] for item in removed_identity):
+                    raise Refused(f"rollout-retention apply freed bytes are forged on {host}")
+        return parsed
+
+    puller_token = None
+    try:
+        if values["apply"]:
+            puller_token = _pause_rollout_puller(run_dir)
+        preview = parse_phase(run_phase(False), "dry-run")
+        result: dict[str, object] = {
+            "run": run,
+            "dry_run": not bool(values["apply"]),
+            "nodes": preview,
+            "selected_steps": next(iter(preview.values()))["selected_steps"] if preview else [],
+            "selected_bytes": next(iter(preview.values()))["selected_bytes"] if preview else 0,
+            "selected_bytes_total": sum(
+                int(record["selected_bytes"]) for record in preview.values()
+            ),
+            "exact_bytes_total": sum(
+                int(record["selected_bytes"]) for record in preview.values()
+            ),
+        }
+        if values["apply"]:
+            if not preview or not next(iter(preview.values())).get("selected_steps"):
+                result["dry_run"] = False
+                result["no_op"] = True
+                result["freed_bytes"] = 0
+                result["freed_bytes_total"] = 0
+                result["exact_bytes_total"] = 0
+                result["removed_steps"] = []
+                print(json.dumps(result, indent=2, sort_keys=True))
+                return result
+            applied = parse_phase(run_phase(True), "apply", preview)
+            result["dry_run"] = False
+            result["nodes"] = applied
+            result["removed_steps"] = next(iter(applied.values()))["selected_steps"] if applied else []
+            result["freed_bytes"] = sum(
+                int(record.get("freed_bytes", 0)) for record in applied.values()
+            )
+            result["freed_bytes_total"] = result["freed_bytes"]
+            result["exact_bytes_total"] = result["freed_bytes"]
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return result
+    finally:
+        _restore_rollout_puller(run_dir, puller_token)
+
 def _stop_action(arguments: list[str]):
     if arguments:
         raise Refused("stop does not accept arguments")
@@ -12958,6 +13278,7 @@ actions = {
     "archive": _archive_action,
     "remove-adapter-cache": _remove_adapter_cache_action,
     "retention": _broadcast_retention_action,
+    "rollout-retention": _rollout_retention_action,
     "qualify": _qualify_action,
     "load-policy0": _load_policy0_action,
     "load-qualified-adapter": _qualified_adapter_load_action,
@@ -12990,6 +13311,7 @@ usage = f"""training-ops <action> [args]
   watch [hours] [seconds]       monitor in the foreground
   watch-rollouts                 stream H200 rollout progress in the foreground
   repair <name>                 repair an engine, adapter server, orchestrator, supervisors, rollout-puller, or microbatch sync
+  repair rollout-quarantine RUN STEP ADAPTER  quarantine future rollout cache
   deploy <path>                 copy one repository file
   start <run> [cold|fresh|restart] [config-dir]  start one run config directory
   archive <run> [step ...]      upload stable old LoRA adapters
@@ -13000,6 +13322,9 @@ usage = f"""training-ops <action> [args]
                                 remove one exact unloaded adapter cache entry
   retention RUN_DIR --evidence EVIDENCE [--apply]
                                 inventory or apply guarded broadcast retention;
+                                dry-run is the default
+  rollout-retention RUN --evidence EVIDENCE [--apply]
+                                preflight and apply consumed rollout retention;
                                 dry-run is the default
   qualify <name> [mode] [config-dir]  start a trainer-only config directory
   load-policy0 [config-dir] [plan|apply] \

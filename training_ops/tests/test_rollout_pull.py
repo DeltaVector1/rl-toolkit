@@ -91,21 +91,274 @@ class RolloutPullTest(unittest.TestCase):
             commands = []
             try:
                 training_ops.rollout_pull_script = str(puller)
-                commands = [training_ops._rollout_pull_command(str(run_dir), action) for action in ("start", "status", "stop")]
-                self.assertNotIn("china-trainer", "\n".join(commands))
-                for command in commands[:2]:
-                    result = subprocess.run(["bash", "-c", command], env=environment, capture_output=True, text=True, timeout=10)
+                commands = {
+                    action: training_ops._rollout_pull_command(str(run_dir), action)
+                    for action in ("start", "status", "state", "stop", "pause", "resume")
+                }
+                self.assertNotIn("china-trainer", "\n".join(commands.values()))
+                for action in ("start", "status", "state"):
+                    result = subprocess.run(["bash", "-c", commands[action]], env=environment, capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stderr)
+                    if action == "state":
+                        self.assertEqual(result.stdout.strip(), "running")
                 pid_file = run_dir / ".rollout-pull.pid"
                 self.assertTrue(pid_file.is_file())
-                pid_file.unlink()
-                result = subprocess.run(["bash", "-c", commands[2]], env=environment, capture_output=True, text=True, timeout=10)
+                token = "a" * 32
+                result = subprocess.run(["bash", "-c", f"{commands['pause']} {token}"], env=environment, capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertNotEqual(subprocess.run(["bash", "-c", commands[1]], env=environment).returncode, 0)
+                self.assertEqual(result.stdout.strip(), "paused")
+                self.assertFalse(pid_file.exists())
+                self.assertEqual((run_dir / ".rollout-pull-paused").read_text().splitlines()[:2], [token, str(run_dir)])
+                blocked = subprocess.run(["bash", "-c", commands["start"]], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(blocked.returncode, 0)
+                wrong_token = subprocess.run(["bash", "-c", f"{commands['resume']} {'b' * 32}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(wrong_token.returncode, 0)
+                self.assertTrue((run_dir / ".rollout-pull-paused").exists())
+                result = subprocess.run(["bash", "-c", f"{commands['resume']} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "restored")
+                self.assertTrue(pid_file.is_file())
+                result = subprocess.run(["bash", "-c", commands["stop"]], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotEqual(subprocess.run(["bash", "-c", commands["status"]], env=environment).returncode, 0)
+                result = subprocess.run(["bash", "-c", commands["state"]], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "stopped")
                 self.assertEqual(subprocess.run(["flock", "-n", str(run_dir / ".rollout-pull.lock"), "-c", "true"]).returncode, 0)
             finally:
                 if commands:
-                    subprocess.run(["bash", "-c", commands[2]], env=environment, capture_output=True, timeout=10)
+                    subprocess.run(["bash", "-c", commands["stop"]], env=environment, capture_output=True, timeout=10)
+                training_ops.rollout_pull_script = old_script
+
+    def test_state_reports_stopped_without_creating_a_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            old_script = training_ops.rollout_pull_script
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                command = training_ops._rollout_pull_command(str(run_dir), "state")
+                result = subprocess.run(["bash", "-c", command], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "stopped")
+                self.assertFalse((run_dir / ".rollout-pull.lock").exists())
+                self.assertFalse((run_dir / ".rollout-pull.pid").exists())
+                self.assertFalse((run_dir / ".rollout-pull-control.lock").exists())
+            finally:
+                training_ops.rollout_pull_script = old_script
+
+    def test_pause_of_stopped_puller_holds_barrier_and_does_not_start_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            old_script = training_ops.rollout_pull_script
+            token = "c" * 32
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                pause = training_ops._rollout_pull_command(str(run_dir), "pause")
+                start = training_ops._rollout_pull_command(str(run_dir), "start")
+                resume = training_ops._rollout_pull_command(str(run_dir), "resume")
+                result = subprocess.run(["bash", "-c", f"{pause} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, "paused"), result.stderr)
+                self.assertEqual((run_dir / ".rollout-pull-paused").read_text().splitlines()[2:5], ["stopped", "0", "no"])
+                blocked = subprocess.run(["bash", "-c", start], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(blocked.returncode, 0)
+                result = subprocess.run(["bash", "-c", f"{resume} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, "already-stopped"), result.stderr)
+                self.assertFalse((run_dir / ".rollout-pull-paused").exists())
+                self.assertFalse((run_dir / ".rollout-pull.pid").exists())
+            finally:
+                training_ops.rollout_pull_script = old_script
+
+    def test_partial_pause_failure_keeps_owned_receipt_for_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            old_script = training_ops.rollout_pull_script
+            token = "d" * 32
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                start = training_ops._rollout_pull_command(str(run_dir), "start")
+                pause = training_ops._rollout_pull_command(str(run_dir), "pause")
+                resume = training_ops._rollout_pull_command(str(run_dir), "resume")
+                result = subprocess.run(["bash", "-c", start], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lock = run_dir / ".rollout-pull.lock"
+                saved_lock = run_dir / ".saved-rollout-pull.lock"
+                lock.rename(saved_lock)
+                lock.symlink_to(saved_lock.name)
+                result = subprocess.run(["bash", "-c", f"{pause} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                receipt = (run_dir / ".rollout-pull-paused").read_text().splitlines()
+                self.assertEqual(receipt[0:4], [token, str(run_dir), "running", receipt[3]])
+                self.assertEqual(receipt[4], "yes")
+                self.assertFalse((run_dir / ".rollout-pull.pid").exists())
+                lock.unlink()
+                saved_lock.rename(lock)
+                result = subprocess.run(["bash", "-c", f"{resume} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, "restored"), result.stderr)
+                self.assertTrue((run_dir / ".rollout-pull.pid").is_file())
+            finally:
+                cleanup = training_ops._rollout_pull_command(str(run_dir), "stop")
+                subprocess.run(["bash", "-c", cleanup], env=environment, capture_output=True, timeout=10)
+                training_ops.rollout_pull_script = old_script
+
+    def test_pause_does_not_restore_a_puller_stopped_by_another_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            old_script = training_ops.rollout_pull_script
+            token = "e" * 32
+            race_marker = Path(directory) / "other-stop-won"
+            hook = Path(directory) / "bash_env"
+            hook.write_text(
+                "kill() {\n"
+                "  if [ \"${RACE_KILL_GROUP:-}\" -gt 1 ] && [ \"$#\" -eq 2 ] &&\n"
+                "    [ \"$1\" = -- ] && [ \"$2\" = \"-$RACE_KILL_GROUP\" ] &&\n"
+                "    (set -C; : >\"$RACE_MARKER\") 2>/dev/null; then\n"
+                "    /bin/kill -TERM -- \"-$RACE_KILL_GROUP\" 2>/dev/null || true\n"
+                "    for _ in $(seq 1 50); do\n"
+                "      ps -eo pgid=,stat= | awk -v group=\"$RACE_KILL_GROUP\" '$1 == group && $2 !~ /^Z/ {found=1} END {exit !found}' || break\n"
+                "      sleep 0.1\n"
+                "    done\n"
+                "  fi\n"
+                "  builtin kill \"$@\"\n"
+                "}\n"
+            )
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                start = training_ops._rollout_pull_command(str(run_dir), "start")
+                pause = training_ops._rollout_pull_command(str(run_dir), "pause")
+                resume = training_ops._rollout_pull_command(str(run_dir), "resume")
+                result = subprocess.run(["bash", "-c", start], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                recorded_pid = (run_dir / ".rollout-pull.pid").read_text().strip()
+                environment.update(
+                    BASH_ENV=str(hook),
+                    RACE_KILL_GROUP=recorded_pid,
+                    RACE_MARKER=str(race_marker),
+                )
+                result = subprocess.run(["bash", "-c", f"{pause} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, "paused"), result.stderr)
+                self.assertTrue(race_marker.is_file())
+                receipt = (run_dir / ".rollout-pull-paused").read_text().splitlines()
+                self.assertEqual(receipt[2:5], ["running", recorded_pid, "no"])
+                self.assertFalse((run_dir / ".rollout-pull.pid").exists())
+                result = subprocess.run(["bash", "-c", f"{resume} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, "already-stopped"), result.stderr)
+                self.assertFalse((run_dir / ".rollout-pull-paused").exists())
+                self.assertFalse((run_dir / ".rollout-pull.pid").exists())
+            finally:
+                cleanup = training_ops._rollout_pull_command(str(run_dir), "stop")
+                subprocess.run(["bash", "-c", cleanup], env=environment, capture_output=True, timeout=10)
+                training_ops.rollout_pull_script = old_script
+
+    def test_pause_signal_receipt_write_failure_keeps_ownership_unresolved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            tools = Path(directory) / "tools"
+            old_script = training_ops.rollout_pull_script
+            token = "f" * 32
+            receipt_path = run_dir / ".rollout-pull-paused"
+            move_count = Path(directory) / "receipt-move-count"
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                start = training_ops._rollout_pull_command(str(run_dir), "start")
+                pause = training_ops._rollout_pull_command(str(run_dir), "pause")
+                resume = training_ops._rollout_pull_command(str(run_dir), "resume")
+                result = subprocess.run(["bash", "-c", start], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                (tools / "mv").write_text(
+                    "#!/usr/bin/env bash\nset -eu\n"
+                    "target=${!#}\n"
+                    "if [ \"$target\" = \"$RECEIPT_PATH\" ]; then\n"
+                    "  count=0; [ ! -f \"$RECEIPT_MOVE_COUNT\" ] || count=$(cat \"$RECEIPT_MOVE_COUNT\")\n"
+                    "  count=$((count + 1)); printf '%s' \"$count\" >\"$RECEIPT_MOVE_COUNT\"\n"
+                    "  [ \"$count\" -ne 2 ] || exit 73\n"
+                    "fi\n"
+                    "exec /usr/bin/mv \"$@\"\n"
+                )
+                (tools / "mv").chmod(0o755)
+                environment.update(
+                    RECEIPT_PATH=str(receipt_path),
+                    RECEIPT_MOVE_COUNT=str(move_count),
+                )
+                result = subprocess.run(["bash", "-c", f"{pause} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                receipt = receipt_path.read_text().splitlines()
+                self.assertEqual(receipt[0:5], [token, str(run_dir), "running", receipt[3], "attempting"])
+                self.assertFalse((run_dir / ".rollout-pull.pid").exists())
+                self.assertEqual(move_count.read_text(), "2")
+                for command in (f"{resume} {token}", f"{pause} {token}"):
+                    unresolved = subprocess.run(["bash", "-c", command], env=environment, capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(unresolved.returncode, 0)
+                    self.assertIn("ownership is unresolved", unresolved.stderr)
+                    self.assertEqual(receipt_path.read_text().splitlines()[4], "attempting")
+                blocked = subprocess.run(["bash", "-c", start], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(blocked.returncode, 0)
+                self.assertTrue(receipt_path.is_file())
+            finally:
+                cleanup = training_ops._rollout_pull_command(str(run_dir), "stop")
+                subprocess.run(["bash", "-c", cleanup], env=environment, capture_output=True, timeout=10)
+                training_ops.rollout_pull_script = old_script
+
+    def test_pause_attempt_receipt_write_failure_releases_exact_running_puller(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "alpha/run_alpha"
+            run_dir.mkdir(parents=True)
+            environment = self.environment(run_dir, run_dir, self.tools(directory))
+            tools = Path(directory) / "tools"
+            old_script = training_ops.rollout_pull_script
+            token = "1" * 32
+            receipt_path = run_dir / ".rollout-pull-paused"
+            move_count = Path(directory) / "receipt-move-count"
+            try:
+                training_ops.rollout_pull_script = str(puller)
+                start = training_ops._rollout_pull_command(str(run_dir), "start")
+                pause = training_ops._rollout_pull_command(str(run_dir), "pause")
+                resume = training_ops._rollout_pull_command(str(run_dir), "resume")
+                state = training_ops._rollout_pull_command(str(run_dir), "state")
+                status = training_ops._rollout_pull_command(str(run_dir), "status")
+                result = subprocess.run(["bash", "-c", start], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                recorded_pid = (run_dir / ".rollout-pull.pid").read_text().strip()
+                (tools / "mv").write_text(
+                    "#!/usr/bin/env bash\nset -eu\n"
+                    "target=${!#}\n"
+                    "if [ \"$target\" = \"$RECEIPT_PATH\" ]; then\n"
+                    "  count=0; [ ! -f \"$RECEIPT_MOVE_COUNT\" ] || count=$(cat \"$RECEIPT_MOVE_COUNT\")\n"
+                    "  count=$((count + 1)); printf '%s' \"$count\" >\"$RECEIPT_MOVE_COUNT\"\n"
+                    "  [ \"$count\" -ne 1 ] || exit 73\n"
+                    "fi\n"
+                    "exec /usr/bin/mv \"$@\"\n"
+                )
+                (tools / "mv").chmod(0o755)
+                environment.update(
+                    RECEIPT_PATH=str(receipt_path),
+                    RECEIPT_MOVE_COUNT=str(move_count),
+                )
+                result = subprocess.run(["bash", "-c", f"{pause} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                receipt = receipt_path.read_text().splitlines()
+                self.assertEqual(receipt[0:5], [token, str(run_dir), "running", recorded_pid, "no"])
+                self.assertEqual(move_count.read_text(), "1")
+                self.assertEqual((run_dir / ".rollout-pull.pid").read_text().strip(), recorded_pid)
+                result = subprocess.run(["bash", "-c", state], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, "running"), result.stderr)
+                result = subprocess.run(["bash", "-c", f"{resume} {token}"], env=environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, "already-running"), result.stderr)
+                self.assertFalse(receipt_path.exists())
+                self.assertEqual((run_dir / ".rollout-pull.pid").read_text().strip(), recorded_pid)
+                self.assertEqual(subprocess.run(["bash", "-c", status], env=environment, capture_output=True, timeout=10).returncode, 0)
+            finally:
+                cleanup = training_ops._rollout_pull_command(str(run_dir), "stop")
+                subprocess.run(["bash", "-c", cleanup], env=environment, capture_output=True, timeout=10)
                 training_ops.rollout_pull_script = old_script
 
     def test_stop_is_idempotent_with_stale_lock_and_pid_state(self):
@@ -144,6 +397,7 @@ class RolloutPullTest(unittest.TestCase):
             (run_dir / ".rollout-pull.pid").write_text("unresolvable-owner\n")
             (tools / "flock").write_text(
                 "#!/usr/bin/env bash\n"
+                "if [ \"$#\" -eq 2 ] && [ \"$1\" = -x ] && [ \"$2\" = 7 ]; then exec /usr/bin/flock \"$@\"; fi\n"
                 "exit \"${FAKE_FLOCK_STATUS:-0}\"\n"
             )
             (tools / "lslocks").write_text(
@@ -184,6 +438,7 @@ class RolloutPullTest(unittest.TestCase):
             pid_file.write_text("other-run-owner\n")
             (tools / "flock").write_text(
                 "#!/usr/bin/env bash\n"
+                "if [ \"$#\" -eq 2 ] && [ \"$1\" = -x ] && [ \"$2\" = 7 ]; then exec /usr/bin/flock \"$@\"; fi\n"
                 "exit 75\n"
             )
             (tools / "lslocks").write_text(
@@ -224,7 +479,11 @@ class RolloutPullTest(unittest.TestCase):
             lock_file.touch()
             pid_file = run_dir / ".rollout-pull.pid"
             pid_file.write_text("dead-owner\n")
-            (tools / "flock").write_text("#!/usr/bin/env bash\nexit 75\n")
+            (tools / "flock").write_text(
+                "#!/usr/bin/env bash\n"
+                "if [ \"$#\" -eq 2 ] && [ \"$1\" = -x ] && [ \"$2\" = 7 ]; then exec /usr/bin/flock \"$@\"; fi\n"
+                "exit 75\n"
+            )
             (tools / "lslocks").write_text(
                 "#!/usr/bin/env bash\n"
                 "printf '%s\\n' \"999999999 $FAKE_LOCK_PATH\"\n"
@@ -261,6 +520,7 @@ class RolloutPullTest(unittest.TestCase):
             (tools / "flock").write_text(
                 "#!/usr/bin/env bash\n"
                 "set -eu\n"
+                "if [ \"$#\" -eq 2 ] && [ \"$1\" = -x ] && [ \"$2\" = 7 ]; then exec /usr/bin/flock \"$@\"; fi\n"
                 "printf '%s\\n' \"$*\" >>\"$FAKE_FLOCK_LOG\"\n"
                 "if [ \"${FAKE_RACE:-0}\" = 1 ] && [ ! -e \"$FAKE_RACE_MARKER\" ]; then\n"
                 "  : >\"$FAKE_RACE_MARKER\"\n"

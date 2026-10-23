@@ -306,6 +306,104 @@ class OrchestratorRepairTest(unittest.TestCase):
             self.assertEqual(training_ops.repair("adapter-tunnels-reset:configs/current"), "ok")
             repair_tunnels.assert_called_once_with("configs/current", reset=True)
 
+    def test_rollout_quarantine_dispatch_requires_explicit_arguments(self):
+        with mock.patch.object(training_ops, "_repair_rollout_quarantine", return_value="ok") as quarantine:
+            self.assertEqual(training_ops.repair("rollout-quarantine", "run", "6", "/runs/run/run_run/broadcasts/step_6/adapter_model.safetensors"), "ok")
+            quarantine.assert_called_once()
+        with self.assertRaisesRegex(training_ops.Refused, "requires RUN STEP ADAPTER"):
+            training_ops.repair("rollout-quarantine", "run", "6")
+
+    def test_rollout_puller_pause_and_restore_are_exact_and_owned(self):
+        responses = iter(((0, "paused"), (0, "restored")))
+        with mock.patch.object(training_ops, "rollout_transfer_direction", "trainer_pull"), \
+            mock.patch.object(training_ops, "_ssh", side_effect=lambda *_args, **_kwargs: next(responses)) as remote:
+            token = training_ops._pause_rollout_puller("/tmp/run_demo")
+            self.assertRegex(token, r"^[a-f0-9]{32}$")
+            training_ops._restore_rollout_puller("/tmp/run_demo", token)
+        self.assertEqual(
+            [call.args[1].split(" bash ", 1)[-1].split()[-2] for call in remote.call_args_list],
+            ["pause", "resume"],
+        )
+        self.assertEqual(remote.call_args_list[0].args[1].rsplit(" ", 1)[-1], token)
+        self.assertEqual(remote.call_args_list[1].args[1].rsplit(" ", 1)[-1], token)
+        self.assertTrue(all(call.args[0] == training_ops.trainer_head for call in remote.call_args_list))
+
+    def test_rollout_puller_restore_does_not_start_when_not_owned(self):
+        with mock.patch.object(training_ops, "_ssh") as remote:
+            training_ops._restore_rollout_puller("/tmp/run_demo", None)
+        remote.assert_not_called()
+
+    def test_rollout_puller_pause_error_attempts_token_recovery(self):
+        responses = iter(((1, "pause stopped with an error"), (0, "restored")))
+        with mock.patch.object(training_ops, "rollout_transfer_direction", "trainer_pull"), \
+            mock.patch.object(training_ops, "_ssh", side_effect=lambda *_args, **_kwargs: next(responses)) as remote:
+            with self.assertRaisesRegex(training_ops.Refused, "pause is unresolved"):
+                training_ops._pause_rollout_puller("/tmp/run_demo")
+        commands = [call.args[1] for call in remote.call_args_list]
+        self.assertIn(" pause ", commands[0])
+        self.assertIn(" resume ", commands[1])
+        self.assertEqual(commands[0].rsplit(" ", 1)[-1], commands[1].rsplit(" ", 1)[-1])
+
+    def test_rollout_quarantine_guard_has_service_publisher_and_lock_guards(self):
+        script = training_ops._rollout_quarantine_guard("/data/glm52-rl/runs/run/run_run")
+        for token in ("docker inspect", "drain_rollout_publisher.py", "sync_microbatches.sh", "sync_rollout_batches.sh", "--microbatch"):
+            with self.subTest(token=token):
+                self.assertIn(token, script)
+        self.assertNotIn("for proc in /proc/[0-9]*", script)
+        self.assertEqual(script.count("drain_rollout_publisher.py"), 2)
+
+    def test_rollout_guard_drain_stdout_cannot_pollute_json_evidence(self):
+        service_dir = "/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3"
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, '{"policy_step":3,"next_batch":4}\n')) as ssh:
+            self.assertEqual(
+                training_ops._resume_repair_state("n82", "rollout", service_dir, 3, role="cache"),
+                {"policy_step": 3, "next_batch": 4},
+            )
+        script = ssh.call_args.args[1]
+        guard = script.split("sudo python3 -", 1)[0]
+        self.assertIn("sync_microbatches.sh --microbatch >/dev/null", guard)
+        self.assertIn("sync_rollout_batches.sh >/dev/null", guard)
+
+    def test_rollout_quarantine_reports_partial_hosts_without_parallel_mutation(self):
+        run = "glm-perf-3"
+        service_dir = f"{training_ops.run_root}/{run}/run_{run}"
+        calls = []
+
+        def state(host, action, *_args, **kwargs):
+            calls.append((host, action, kwargs.get("role") or (_args[3] if len(_args) > 3 else "")))
+            if action == "policy" and kwargs.get("role") == "origin":
+                return {"sha256": "a" * 64}
+            if action == "rollout" and host == training_ops.trainer_hosts[-1]:
+                raise training_ops.Refused("host cache changed")
+            return {"bytes": 2, "quarantined": [f"/q/{host}"]}
+
+        with mock.patch.object(training_ops, "_config_for_run", return_value={}), mock.patch.object(
+            training_ops, "_cold_run_paths", return_value=("", "", service_dir)
+        ), mock.patch.object(training_ops, "_resume_repair_state", side_effect=state), mock.patch.object(
+            training_ops, "_ssh", return_value=(0, "publisher drained\n")
+        ), mock.patch.object(training_ops, "_pause_rollout_puller", return_value="a" * 32), mock.patch.object(
+            training_ops, "_restore_rollout_puller"
+        ) as restore, mock.patch.object(training_ops, "_check_adapter_restart"), mock.patch.object(
+            training_ops, "_fan", side_effect=AssertionError("quarantine must be deterministic")
+        ):
+            with self.assertRaisesRegex(training_ops.Refused, "completed=.*blocked=.*host cache changed"):
+                training_ops._repair_rollout_quarantine(
+                    [run, "3", f"{service_dir}/broadcasts/step_3/adapter_model.safetensors"]
+                )
+        restore.assert_called_once_with(service_dir, "a" * 32)
+        self.assertEqual([action for _, action, _ in calls].count("rollout"), len(training_ops.trainer_hosts) + 1)
+        self.assertIn((training_ops.trainer_head, "rollout", "origin"), calls)
+        self.assertTrue(all(role == ("orchestrator-cache" if host == training_ops.orchestrator_host else "cache") for host, action, role in calls if action == "rollout" and host != training_ops.trainer_head))
+
+    def test_rollout_mutation_rechecks_service_after_drain(self):
+        service_dir = "/data/glm52-rl/runs/glm-perf-3/run_glm-perf-3"
+        adapter = f"{service_dir}/broadcasts/step_3/adapter_model.safetensors"
+        with mock.patch.object(training_ops, "_ssh", return_value=(0, '{"policy_step":3,"next_batch":4}')) as ssh:
+            training_ops._resume_repair_state("n82", "rollout", service_dir, 3, "a" * 64, role="trainer", adapter=adapter)
+        script = ssh.call_args.args[1]
+        self.assertLess(script.index("docker inspect"), script.index("sudo python3 -"))
+        self.assertIn("drain_rollout_publisher.py", script)
+
     def test_adapter_tunnels_does_not_fall_back_from_trainer_only_run(self):
         with mock.patch.object(
             training_ops,

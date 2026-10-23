@@ -6,6 +6,8 @@ nodes=${nodes:?set nodes}
 interval=${interval:-1}
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
 mkdir -p "$run_dir"
+exec 8<"$run_dir"
+flock -s 8
 exec 9>"$run_dir/.microbatch-sync.lock"
 flock -n 9 || exit 0
 echo "$$" >"$run_dir/.microbatch-sync.pid"
