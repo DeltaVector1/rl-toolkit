@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before transitive imports
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.ckpt import setup_ckpt_manager
+from prime_rl.orchestrator.dispatch_results import DispatchFailure, GroupCancellation
 from prime_rl.orchestrator.dispatcher import DispatcherMetrics, DispatcherMode, RolloutDispatcher
 from prime_rl.orchestrator.envs import EvalEnvs, TrainEnvs
 from prime_rl.orchestrator.eval_sink import EvalSink
@@ -1320,7 +1321,9 @@ class Orchestrator:
                 self.policy.version = sync_version
                 await self.policy_inference.wait_for_ready(self.policy.model_name)
 
-        self.train_source = TrainSource(self.train_envs, seed=42)
+        self.train_source = TrainSource(
+            self.train_envs, seed=42, ratio_stages=config.train.ratio_stages
+        )
         self.eval_source: EvalSource | None = (
             EvalSource(
                 self.eval_envs,
@@ -1344,6 +1347,7 @@ class Orchestrator:
             max_inflight_rollouts=config.max_inflight_rollouts,
             tasks_per_minute=config.tasks_per_minute,
             max_off_policy_steps=config.max_off_policy_steps,
+            train_step=lambda: self.progress.step,
         )
         self.train_sink = TrainSink(
             config,
@@ -1479,9 +1483,14 @@ class Orchestrator:
                 break
 
             try:
-                episode: list[Rollout] = await asyncio.wait_for(self.dispatcher.out_q.get(), timeout=0.5)
+                result = await asyncio.wait_for(self.dispatcher.out_q.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
+
+            if isinstance(result, (DispatchFailure, GroupCancellation)):
+                await self.handle_dispatch_result(result)
+                continue
+            episode: list[Rollout] = result
 
             # Every completed rollout — errored, filtered, or never batched — lands in the
             # ``all`` trace file the moment it arrives, so it survives crashes and drains.
@@ -1529,6 +1538,32 @@ class Orchestrator:
                 self.dispatcher.set_fresh_train_rollout_budget(0)
                 await self.finalize_train_batch(train_batch)
                 self.update_rollout_budget()
+
+    async def handle_dispatch_result(self, result: DispatchFailure | GroupCancellation) -> None:
+        """Route a failed or cancelled attempt without manufacturing a trace."""
+        if result.kind == "eval":
+            if self.eval_sink is None:
+                raise RuntimeError("received an eval dispatch result without an eval sink")
+            batch = (
+                self.eval_sink.fail(result)
+                if isinstance(result, DispatchFailure)
+                else self.eval_sink.cancel(result)
+            )
+            if batch is not None:
+                await self.finalize_eval_batch(batch)
+            return
+
+        batch = (
+            await self.train_sink.fail(result)
+            if isinstance(result, DispatchFailure)
+            else await self.train_sink.cancel(result)
+        )
+        if batch is None:
+            self.update_rollout_budget()
+        elif not self.draining and not self.stopped.is_set():
+            self.dispatcher.set_fresh_train_rollout_budget(0)
+            await self.finalize_train_batch(batch)
+            self.update_rollout_budget()
 
     async def finalize_train_batch(self, batch: TrainBatch) -> None:
         """Ship one ``TrainBatch`` out to the trainer and handle the I/O
@@ -1661,6 +1696,7 @@ class Orchestrator:
             )
             for name, count in self.train_sink.pre_filter_dropped_by_name.items():
                 metrics[f"pre_filters/all/{name}/rate"] = count / self.train_sink.pre_filter_seen
+        metrics["groups/all_refusal/skipped"] = self.train_sink.all_refusal_groups_skipped
         self.monitor.log(metrics, step=step)
         self.wait_for_policy_time = 0.0
         self.monitor.log_samples(effective.rollouts, step=step)
