@@ -1643,6 +1643,155 @@ def _send_range_error(handler: SimpleHTTPRequestHandler, size: int, message: str
         handler.wfile.write(body)
 
 
+class _VirtualBundle:
+    """Read existing encoded chunks as one range-readable stream."""
+
+    def __init__(self, chunks: list[tuple[Path, int, str]], start: int):
+        self._chunks = chunks
+        self._source = None
+        self._chunk_index = 0
+        self._chunk_offset = 0
+        self._remaining = sum(size for _path, size, _digest in chunks) - start
+        for index, (_path, size, _digest) in enumerate(chunks):
+            if start < size:
+                self._chunk_index = index
+                self._chunk_offset = start
+                break
+            start -= size
+        else:
+            self._chunk_index = len(chunks)
+
+    def read(self, limit: int) -> bytes:
+        if limit <= 0 or self._remaining <= 0:
+            return b""
+        output = bytearray()
+        while len(output) < limit and self._remaining:
+            if self._source is None:
+                path, size, expected_digest = self._chunks[self._chunk_index]
+                fd = None
+                try:
+                    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                    _verify_transport_fd(fd, size, expected_digest)
+                    self._source = os.fdopen(fd, "rb")
+                    fd = None
+                    self._source.seek(self._chunk_offset)
+                except OSError as exc:
+                    raise UpgradeError(f"cannot read bundle chunk {path.name}") from exc
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+            count = min(limit - len(output), self._remaining)
+            chunk = self._source.read(count)
+            if not chunk:
+                self.close()
+                raise UpgradeError("bundle chunk ended before its declared size")
+            output.extend(chunk)
+            self._remaining -= len(chunk)
+            self._chunk_offset += len(chunk)
+            if self._chunk_offset == self._chunks[self._chunk_index][1]:
+                self._source.close()
+                self._source = None
+                self._chunk_index += 1
+                self._chunk_offset = 0
+        return bytes(output)
+
+    def close(self) -> None:
+        if self._source is not None:
+            self._source.close()
+            self._source = None
+
+
+def _virtual_bundle(path: Path, pieces: tuple[str, ...]) -> tuple[_VirtualBundle, int, str] | None:
+    if not pieces or pieces[-1] != ".adapter-transport-bundle":
+        return None
+    directory = path.parent
+    stable_path = directory / stable_name
+    if stable_path.is_symlink() or not stable_path.is_file():
+        raise UpgradeError("adapter bundle step is not stable")
+    manifest_path = directory / adapter_manifest_name
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise UpgradeError("adapter bundle manifest is missing")
+    try:
+        manifest = _json_object(manifest_path, "adapter bundle manifest")
+    except UpgradeError:
+        raise
+    bundle = manifest.get("bundle") if isinstance(manifest, dict) else None
+    if not isinstance(bundle, dict):
+        raise UpgradeError("adapter bundle is not published")
+    size = bundle.get("size")
+    digest = bundle.get("sha256")
+    if (
+        bundle.get("path") != pieces[-1]
+        or type(size) is not int
+        or size <= 0
+        or not isinstance(digest, str)
+        or digest_pattern.fullmatch(digest) is None
+    ):
+        raise UpgradeError("adapter bundle identity is invalid")
+    step_match = step_pattern.fullmatch(directory.name)
+    if step_match is None:
+        raise UpgradeError("adapter bundle path has an invalid step")
+    published_identity = _identity_from_published_directory(
+        directory, int(step_match.group(1)), cache=False
+    )
+    raw_chunks = manifest.get("chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks:
+        raise UpgradeError("adapter bundle has no chunks")
+    source_transport = manifest.get("transport")
+    if source_transport == "chunked-shuffled-xor-zstd":
+        chunk_mode = "delta"
+    elif source_transport == "chunked-full-zstd":
+        chunk_mode = "full-zstd"
+    else:
+        raise UpgradeError("adapter bundle transport is unsupported")
+    raw_chunks = sorted(
+        raw_chunks,
+        key=lambda item: item.get("offset")
+        if isinstance(item, dict) and type(item.get("offset")) is int
+        else -1,
+    )
+    chunks: list[tuple[Path, int, str]] = []
+    raw_offset = 0
+    bundle_size = 0
+    for index, item in enumerate(raw_chunks):
+        if not isinstance(item, dict):
+            raise UpgradeError("adapter bundle chunk identity is invalid")
+        name = item.get("file")
+        expected_name = f"{adapter_weights_name}.transport-{chunk_mode}-{index:06d}"
+        offset = item.get("offset")
+        raw_size = item.get("raw_size")
+        wire_size = item.get("wire_size")
+        if (
+            not isinstance(name, str)
+            or name != expected_name
+            or Path(name).name != name
+            or name in {adapter_config_name, adapter_weights_name, adapter_manifest_name}
+            or type(offset) is not int
+            or offset != raw_offset
+            or type(raw_size) is not int
+            or raw_size <= 0
+            or type(wire_size) is not int
+            or wire_size <= 0
+            or not isinstance(item.get("wire_sha256"), str)
+            or digest_pattern.fullmatch(item["wire_sha256"]) is None
+        ):
+            raise UpgradeError("adapter bundle chunk identity is invalid")
+        chunk_path = directory / name
+        try:
+            entry = os.stat(chunk_path, follow_symlinks=False)
+        except OSError as exc:
+            raise UpgradeError(f"adapter bundle chunk is missing: {name}") from exc
+        if not stat.S_ISREG(entry.st_mode) or entry.st_size != wire_size:
+            raise UpgradeError(f"adapter bundle chunk size differs: {name}")
+        chunks.append((chunk_path, wire_size, item["wire_sha256"]))
+        raw_offset += raw_size
+        bundle_size += wire_size
+    if raw_offset != published_identity["weights_size"] or bundle_size != size:
+        raise UpgradeError("adapter bundle size or target coverage differs from its chunks")
+    return _VirtualBundle(chunks, 0), size, digest
+
+
+
 class RangeHandler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1719,6 +1868,33 @@ class RangeHandler(SimpleHTTPRequestHandler):
         try:
             _request_path, pieces = _safe_request_path(self)
             path = self._maybe_upgrade()
+            virtual = _virtual_bundle(path, pieces)
+            if virtual is not None:
+                _bundle_source, size, digest = virtual
+                try:
+                    status, start, end = _byte_range(self.headers.get("Range"), size)
+                except ValueError as exc:
+                    _bundle_source.close()
+                    _send_range_error(self, size, str(exc))
+                    return None
+                if status == 206:
+                    self.send_response(status)
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                else:
+                    self.send_response(status)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("ETag", f'"{digest}"')
+                self.end_headers()
+                if self.command == "HEAD":
+                    _bundle_source.close()
+                    return None
+                if start:
+                    _bundle_source.close()
+                    _bundle_source = _VirtualBundle(virtual[0]._chunks, start)
+                self.remaining = end - start + 1
+                return _bundle_source
             prefix = self.upgrade_path
             step_path = None
             step = None

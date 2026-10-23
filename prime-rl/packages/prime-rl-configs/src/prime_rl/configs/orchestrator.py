@@ -397,6 +397,9 @@ class FileSystemWeightBroadcastConfig(BaseConfig):
     source_dir: Path | None = None
     """Local directory exposed at ``source_url``."""
 
+    require_bundle: bool = False
+    """Require the explicit virtual adapter bundle transport for remote LoRA staging."""
+
 
 class InMemoryWeightBroadcastConfig(BaseConfig):
     host: str = "localhost"

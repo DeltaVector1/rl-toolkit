@@ -60,6 +60,8 @@ _ADAPTER_LOADED_RECEIPTS = ".adapter-loaded-receipts.json"
 _ADAPTER_DELTA_TRANSPORT = "chunked-shuffled-xor-zstd"
 _ADAPTER_FULL_TRANSPORT = "chunked-full-zstd"
 _ADAPTER_LINEAR_TRANSPORT = "chunked-bf16-linear-zigzag-sparse-zstd"
+_ADAPTER_BUNDLE_PATH = ".adapter-transport-bundle"
+_ADAPTER_BUNDLE_MAX_LANES = 64
 _ADAPTER_KNOWN_TRANSPORTS = {_ADAPTER_DELTA_TRANSPORT, _ADAPTER_LINEAR_TRANSPORT}
 _ADAPTER_KNOWN_CHUNK_CODECS = {"zstd"}
 _ADAPTER_MAX_CHUNKS = 65536
@@ -102,6 +104,19 @@ def _adapter_step_from_source_url(source_url: str) -> int:
     if step < 0:
         raise OSError("adapter source URL does not identify a non-negative policy step")
     return step
+
+
+def _adapter_url_entry(source_url: str, name: str) -> str:
+    parsed = urlsplit(source_url)
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            f"{parsed.path.rstrip('/')}/{name}",
+            parsed.query,
+            "",
+        )
+    )
 
 
 def _reject_symlink_path(path: Path, label: str = "adapter path") -> None:
@@ -887,6 +902,16 @@ def _chunk_request_timeout(
     return min(timeout, remaining)
 
 
+def _notify_stage_heartbeat(heartbeat, pending: int) -> None:
+    """Keep status reporting errors from replacing a transport or worker error."""
+    if heartbeat is None:
+        return
+    try:
+        heartbeat(pending)
+    except Exception:
+        pass
+
+
 def _wait_for_futures(
     executor: ThreadPoolExecutor,
     futures,
@@ -921,7 +946,10 @@ def _wait_for_futures(
                         raise TimeoutError(
                             "adapter delta staging exceeded its time limit"
                         )
-                    heartbeat(sum(not pending.done() for pending in futures))
+                    _notify_stage_heartbeat(
+                        heartbeat,
+                        sum(not pending.done() for pending in futures),
+                    )
                     next_heartbeat = time.monotonic() + max(
                         _ADAPTER_STATUS_INTERVAL_S, 0.001
                     )
@@ -930,7 +958,10 @@ def _wait_for_futures(
                 break
             _check_cancelled(cancel_event)
             if next_heartbeat is not None and time.monotonic() >= next_heartbeat:
-                heartbeat(sum(not pending.done() for pending in futures))
+                _notify_stage_heartbeat(
+                    heartbeat,
+                    sum(not pending.done() for pending in futures),
+                )
                 next_heartbeat = time.monotonic() + max(
                     _ADAPTER_STATUS_INTERVAL_S, 0.001
                 )
@@ -996,7 +1027,7 @@ def _run_bounded_futures(
             if not done:
                 if heartbeat is None:
                     raise TimeoutError("adapter delta staging exceeded its time limit")
-                heartbeat(len(pending))
+                _notify_stage_heartbeat(heartbeat, len(pending))
                 next_heartbeat = time.monotonic() + max(
                     _ADAPTER_STATUS_INTERVAL_S, 0.001
                 )
@@ -1012,7 +1043,7 @@ def _run_bounded_futures(
                     continue
                 pending[executor.submit(worker, index, item, lane)] = lane
             if next_heartbeat is not None and time.monotonic() >= next_heartbeat:
-                heartbeat(len(pending))
+                _notify_stage_heartbeat(heartbeat, len(pending))
                 next_heartbeat = time.monotonic() + max(
                     _ADAPTER_STATUS_INTERVAL_S, 0.001
                 )
@@ -1333,11 +1364,10 @@ def _source_manifest(
     Older broadcasts have only the model checksum sidecar. Keep that fallback,
     but always return a local manifest with a size and digest for every file.
     """
-    source_root = source_url.rstrip("/")
     _check_deadline(deadline, cancel_event)
     value = published_manifest
     if value is None:
-        manifest_url = f"{source_root}/{_ADAPTER_MANIFEST}"
+        manifest_url = _adapter_url_entry(source_url, _ADAPTER_MANIFEST)
         try:
             value = json.loads(
                 _read_source_text(
@@ -1379,10 +1409,10 @@ def _source_manifest(
             raise OSError("adapter source manifest is missing an adapter file")
         return {"version": 1, "source_url": source_url, "files": files}
 
-    model_url = f"{source_root}/{_ADAPTER_FILES[1]}"
-    config_url = f"{source_root}/{_ADAPTER_FILES[0]}"
+    model_url = _adapter_url_entry(source_url, _ADAPTER_FILES[1])
+    config_url = _adapter_url_entry(source_url, _ADAPTER_FILES[0])
     digest_text = _read_source_text(
-        f"{source_root}/{_ADAPTER_DIGEST}",
+        _adapter_url_entry(source_url, _ADAPTER_DIGEST),
         deadline=deadline,
         cancel_event=cancel_event,
         max_bytes=_ADAPTER_MARKER_MAX_BYTES,
@@ -1482,7 +1512,7 @@ def _is_retryable_metadata_error(exception: BaseException) -> bool:
         reason = exception.reason
         if isinstance(reason, BaseException):
             return _is_retryable_metadata_error(reason)
-        return False
+        return True
     return False
 
 
@@ -1497,7 +1527,7 @@ def _responsive_adapter_source_urls(
         return source_urls, 1
 
     def probe(candidate: str) -> bool:
-        config_url = f"{candidate.rstrip('/')}/{_ADAPTER_FILES[0]}"
+        config_url = _adapter_url_entry(candidate, _ADAPTER_FILES[0])
         try:
             with _adapter_http_open(
                 urllib.request.Request(config_url, method="HEAD"),
@@ -1614,12 +1644,11 @@ def _read_chunked_v1_manifest(
     cancel_event: threading.Event | None = None,
 ) -> dict[str, object] | None:
     """Read the exact version-one adapter transport manifest."""
-    source_root = source_url.rstrip("/")
     _check_deadline(deadline, cancel_event)
     try:
         value = json.loads(
             _read_source_text(
-                f"{source_root}/{_ADAPTER_MANIFEST}",
+                _adapter_url_entry(source_url, _ADAPTER_MANIFEST),
                 deadline=deadline,
                 cancel_event=cancel_event,
                 max_bytes=_ADAPTER_METADATA_MAX_BYTES,
@@ -1767,11 +1796,10 @@ def _read_chunked_linear_manifest(
     cancel_event: threading.Event | None = None,
 ) -> dict[str, object]:
     """Read and validate the version-two two-predecessor transport manifest."""
-    source_root = source_url.rstrip("/")
     try:
         value = json.loads(
             _read_source_text(
-                f"{source_root}/{_ADAPTER_MANIFEST}",
+                _adapter_url_entry(source_url, _ADAPTER_MANIFEST),
                 deadline=deadline,
                 cancel_event=cancel_event,
                 max_bytes=_ADAPTER_METADATA_MAX_BYTES,
@@ -1997,12 +2025,11 @@ def _read_chunked_xor_manifest(
     cancel_event: threading.Event | None = None,
 ) -> dict[str, object]:
     """Read a known exact adapter transport manifest."""
-    source_root = source_url.rstrip("/")
     _check_deadline(deadline, cancel_event)
     try:
         raw = json.loads(
             _read_source_text(
-                f"{source_root}/{_ADAPTER_MANIFEST}",
+                _adapter_url_entry(source_url, _ADAPTER_MANIFEST),
                 deadline=deadline,
                 cancel_event=cancel_event,
                 max_bytes=_ADAPTER_METADATA_MAX_BYTES,
@@ -2021,6 +2048,105 @@ def _read_chunked_xor_manifest(
     if raw.get("version") == 1:
         return _read_chunked_v1_manifest(source_url, deadline, cancel_event)
     raise OSError("adapter manifest version is unsupported")
+
+
+def _bundle_identity(
+    source_url: str,
+    transport: dict[str, object],
+) -> dict[str, object]:
+    """Validate the explicit virtual bundle identity in one source manifest."""
+    source_manifest = transport.get("source_manifest")
+    bundle = source_manifest.get("bundle") if isinstance(source_manifest, dict) else None
+    if not isinstance(bundle, dict):
+        raise OSError("adapter bundle transport is not published")
+    path = bundle.get("path")
+    size = bundle.get("size")
+    digest = bundle.get("sha256")
+    if (
+        path != _ADAPTER_BUNDLE_PATH
+        or type(size) is not int
+        or size <= 0
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+    ):
+        raise OSError("adapter bundle identity is invalid")
+    chunks = transport.get("chunks")
+    if not isinstance(chunks, list):
+        raise OSError("adapter bundle size differs from its chunks")
+    chunk_transport = transport.get("transport")
+    if chunk_transport == _ADAPTER_DELTA_TRANSPORT:
+        chunk_mode = "delta"
+    elif chunk_transport == _ADAPTER_FULL_TRANSPORT:
+        chunk_mode = "full-zstd"
+    else:
+        raise OSError("adapter bundle transport is unsupported")
+    offset = 0
+    for index, item in enumerate(chunks):
+        expected_name = f"adapter_model.safetensors.transport-{chunk_mode}-{index:06d}"
+        if (
+            not isinstance(item, dict)
+            or item.get("file") != expected_name
+            or type(item.get("wire_size")) is not int
+        ):
+            raise OSError("adapter bundle chunk identity is invalid")
+        item["bundle_offset"] = offset
+        offset += int(item["wire_size"])
+    if offset != size:
+        raise OSError("adapter bundle size differs from its chunks")
+    parsed = urlsplit(source_url)
+    bundle_url = urlunsplit(
+        (parsed.scheme, parsed.netloc, f"{parsed.path.rstrip('/')}/{path}", parsed.query, "")
+    )
+    return {"path": path, "size": size, "sha256": digest, "url": bundle_url}
+
+
+def _bundle_identity_matches(recorded: object, expected: dict[str, object]) -> bool:
+    """Compare canonical bundle identity without runtime lane state."""
+    if not isinstance(recorded, dict):
+        return False
+    return {key: value for key, value in recorded.items() if key != "lane_plan"} == expected
+
+
+def _bundle_responsive_source_urls(
+    source_url: str,
+    deadline: float | None,
+    cancel_event: threading.Event | None,
+) -> list[str]:
+    """Return exactly one responsive first forward from each SSH pair."""
+    source_urls = _adapter_source_urls(source_url)
+    if len(source_urls) != 128:
+        raise OSError("adapter bundle requires exactly 128 mapped source URLs")
+    try:
+        ports = [urlsplit(url).port for url in source_urls]
+    except ValueError as exc:
+        raise OSError("adapter bundle source port mapping is invalid") from exc
+    if any(port is None for port in ports):
+        raise OSError("adapter bundle source port mapping is invalid")
+    first = ports[:64]
+    second = ports[64:]
+    if (
+        len(set(ports)) != 128
+        or any(port != first[0] + index * 2 for index, port in enumerate(first))
+        or second != [port + 1 for port in first]
+    ):
+        raise OSError("adapter bundle source port mapping is invalid")
+    responsive, configured_count = _responsive_adapter_source_urls(
+        source_url,
+        deadline,
+        cancel_event,
+    )
+    try:
+        responsive_ports = [urlsplit(url).port for url in responsive]
+    except (TypeError, ValueError) as exc:
+        raise OSError("adapter bundle responsive port mapping is invalid") from exc
+    if (
+        configured_count != 128
+        or len(responsive) != 128
+        or responsive != source_urls
+        or responsive_ports != ports
+    ):
+        raise OSError("adapter bundle requires all 128 mapped URLs to respond")
+    return responsive[:64]
 
 
 def _read_delta_manifest_with_visibility_wait(
@@ -2205,13 +2331,18 @@ def _publish_relay_manifest(
             raise OSError("adapter relay transport is unsupported")
         if mode == "full" and transport_name not in {None, _ADAPTER_FULL_TRANSPORT}:
             raise OSError("adapter relay full transport is unsupported")
+        bundle_value = source_manifest.get("bundle")
+        has_bundle = (
+            isinstance(bundle_value, dict)
+            and bundle_value.get("path") == _ADAPTER_BUNDLE_PATH
+        )
 
         adapter_manifest_path = directory / _ADAPTER_MANIFEST
         relay_source_manifest = source_manifest
         if mode == "full" and transport_name == _ADAPTER_FULL_TRANSPORT:
             relay_source_manifest = dict(source_manifest)
-            for key in ("transport", "chunks", "chunk_count", "encoded_size"):
-                relay_source_manifest.pop(key, None)
+            if not has_bundle:
+                relay_source_manifest.pop("chunks", None)
         _write_json(adapter_manifest_path, relay_source_manifest, parent_fd=directory_fd)
         _check_deadline(deadline, cancel_event)
         manifest_stat = _stat_regular_entry(
@@ -2259,7 +2390,7 @@ def _publish_relay_manifest(
                 "sha256": digest,
             }
 
-        if mode == "delta":
+        if mode == "delta" or (mode == "full" and has_bundle):
             chunks = transport.get("chunks")
             if not isinstance(chunks, list) or not chunks:
                 raise OSError("adapter relay delta has no chunks")
@@ -2407,19 +2538,50 @@ def _relay_manifest_matches(
     config_sha256 = transport.get("config_sha256")
     target_size = transport.get("target_size")
     target_sha256 = transport.get("target_sha256")
+    source_manifest = transport.get("source_manifest")
+    bundle_manifest = None
     if mode == "delta":
         adapter_specs = {
             _ADAPTER_FILES[0]: (config_size, config_sha256),
             _ADAPTER_FILES[1]: (target_size, target_sha256),
         }
     elif mode == "full":
-        source_manifest = transport.get("source_manifest")
         source_files = source_manifest.get("files") if isinstance(source_manifest, dict) else None
         adapter_specs = {}
         if isinstance(source_files, list):
             for item in source_files:
                 if isinstance(item, dict) and isinstance(item.get("name"), str):
                     adapter_specs[item["name"]] = (item.get("size"), item.get("sha256"))
+        bundle_manifest = source_manifest.get("bundle") if isinstance(source_manifest, dict) else None
+        if bundle_manifest is not None:
+            if (
+                not isinstance(bundle_manifest, dict)
+                or bundle_manifest.get("path") != _ADAPTER_BUNDLE_PATH
+                or type(bundle_manifest.get("size")) is not int
+                or bundle_manifest["size"] <= 0
+                or not isinstance(bundle_manifest.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", bundle_manifest["sha256"]) is None
+            ):
+                return False
+            try:
+                local_manifest = json.loads(
+                    _read_text_nofollow(
+                        _ADAPTER_MANIFEST,
+                        encoding="utf-8",
+                        dir_fd=directory_fd,
+                        max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                    )
+                )
+            except (FileNotFoundError, OSError, ValueError):
+                return False
+            local_bundle = local_manifest.get("bundle") if isinstance(local_manifest, dict) else None
+            if (
+                not isinstance(local_manifest, dict)
+                or local_manifest.get("transport") != _ADAPTER_FULL_TRANSPORT
+                or not isinstance(local_bundle, dict)
+                or any(local_bundle.get(key) != bundle_manifest.get(key) for key in ("path", "size", "sha256"))
+            ):
+                return False
     else:
         return False
     for filename, (size, digest) in adapter_specs.items():
@@ -2429,10 +2591,11 @@ def _relay_manifest_matches(
     if set(expected) != set(_ADAPTER_FILES) | {_ADAPTER_MANIFEST}:
         return False
 
-    chunks = transport.get("chunks") if mode == "delta" else None
-    if mode == "delta":
+    chunks = transport.get("chunks") if mode == "delta" or bundle_manifest is not None else None
+    if chunks is not None:
         if not isinstance(chunks, list) or not chunks:
             return False
+        total_wire_size = 0
         for item in chunks:
             if not isinstance(item, dict):
                 return False
@@ -2452,6 +2615,27 @@ def _relay_manifest_matches(
             ):
                 return False
             expected[filename] = (f"transport-chunks/{filename}", size, digest)
+            total_wire_size += size
+        if bundle_manifest is not None:
+            if total_wire_size != bundle_manifest["size"]:
+                return False
+            local_chunks = local_manifest.get("chunks")
+            if not isinstance(local_chunks, list) or len(local_chunks) != len(chunks):
+                return False
+            if not all(isinstance(item, dict) for item in local_chunks):
+                return False
+            fields = ("file", "offset", "raw_size", "wire_size", "wire_sha256", "raw_sha256")
+            try:
+                local_chunks = sorted(local_chunks, key=lambda item: int(item.get("offset", -1)))
+            except (TypeError, ValueError):
+                return False
+            for remote_item, local_item in zip(
+                chunks,
+                local_chunks,
+                strict=True,
+            ):
+                if any(local_item.get(field) != remote_item.get(field) for field in fields):
+                    return False
     if set(files) != set(expected):
         return False
     for filename, (relative, size, digest) in expected.items():
@@ -4954,6 +5138,277 @@ def _transport_raw_sha256(delta: bytes, *, codec: str = _ADAPTER_DELTA_TRANSPORT
     return hashlib.sha256(shuffle_bf16_bytes(delta)).hexdigest()
 
 
+class _BundleNetworkError(OSError):
+    """A bundle response failed before its requested bytes arrived."""
+
+
+def _bundle_lane_plan(
+    bundle: dict[str, object],
+    chunks: list[dict[str, object]],
+    source_urls: list[str],
+) -> dict[str, object]:
+    """Partition sorted virtual-bundle chunks into balanced contiguous lanes."""
+    if (
+        len(source_urls) != _ADAPTER_BUNDLE_MAX_LANES
+        or len(chunks) < _ADAPTER_BUNDLE_MAX_LANES
+        or any(not isinstance(url, str) for url in source_urls)
+    ):
+        raise OSError("adapter bundle requires exactly 64 source lanes and chunks")
+    ordered = sorted(chunks, key=lambda item: int(item.get("offset", -1)))
+    lane_count = _ADAPTER_BUNDLE_MAX_LANES
+    if len(set(source_urls[:lane_count])) != lane_count:
+        raise OSError("adapter bundle source lanes are not independent")
+    prefix = [0]
+    expected_start = 0
+    for item in ordered:
+        wire_size = item.get("wire_size")
+        start = item.get("bundle_offset")
+        if (
+            not isinstance(item.get("file"), str)
+            or type(wire_size) is not int
+            or wire_size <= 0
+            or type(start) is not int
+            or start < 0
+        ):
+            raise OSError("adapter bundle lane identity is invalid")
+        if start != expected_start:
+            raise OSError("adapter bundle chunks are not contiguous")
+        expected_start += wire_size
+        prefix.append(prefix[-1] + wire_size)
+    bundle_size = bundle.get("size")
+    if type(bundle_size) is not int or prefix[-1] != bundle_size:
+        raise OSError("adapter bundle lane size differs from its chunks")
+
+    lanes: list[dict[str, object]] = []
+    begin = 0
+    total = prefix[-1]
+    for lane_index in range(lane_count):
+        lanes_left = lane_count - lane_index
+        if lane_index == lane_count - 1:
+            end = len(ordered)
+        else:
+            max_end = len(ordered) - (lanes_left - 1)
+            target = total * (lane_index + 1) / lane_count
+            end = begin + 1
+            while end < max_end and prefix[end] < target:
+                end += 1
+            if end > begin + 1 and abs(prefix[end - 1] - target) <= abs(prefix[end] - target):
+                end -= 1
+        lane_chunks = ordered[begin:end]
+        lane_start = int(lane_chunks[0]["bundle_offset"])
+        lane_end = lane_start + sum(int(item["wire_size"]) for item in lane_chunks) - 1
+        lanes.append(
+            {
+                "url": _adapter_url_entry(source_urls[lane_index], _ADAPTER_BUNDLE_PATH),
+                "start": lane_start,
+                "end": lane_end,
+                "wire_bytes": lane_end - lane_start + 1,
+                "chunks": [str(item["file"]) for item in lane_chunks],
+            }
+        )
+        begin = end
+    if begin != len(ordered):
+        raise OSError("adapter bundle lane plan does not cover every chunk")
+    return {"version": 1, "lane_count": lane_count, "lanes": lanes}
+
+
+def _download_bundle_lane(
+    bundle: dict[str, object],
+    lane: dict[str, object],
+    chunks: list[dict[str, object]],
+    chunk_root: Path,
+    *,
+    is_completed,
+    process_chunk,
+    progress=None,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+    lane_index: int = 0,
+) -> None:
+    """Stream one contiguous lane into its existing chunk files."""
+    url, start, end, names = (lane.get(key) for key in ("url", "start", "end", "chunks"))
+    size, digest = bundle.get("size"), bundle.get("sha256")
+    if not isinstance(url, str) or type(start) is not int or type(end) is not int:
+        raise OSError("adapter bundle lane identity is invalid")
+    if start < 0 or end < start or type(size) is not int or end >= size:
+        raise OSError("adapter bundle lane identity is invalid")
+    if not isinstance(digest, str) or not isinstance(names, list) or not names:
+        raise OSError("adapter bundle lane identity is invalid")
+    if any(not isinstance(item, dict) for item in chunks):
+        raise OSError("adapter bundle chunk identity is invalid")
+    by_name = {item.get("file"): (index, item) for index, item in enumerate(chunks)}
+    if len(by_name) != len(chunks) or any(not isinstance(name, str) for name in by_name):
+        raise OSError("adapter bundle chunk identity is invalid")
+    lane_items = []
+    expected = start
+    for name in names:
+        if name not in by_name:
+            raise OSError("adapter bundle lane chunk is not in the manifest")
+        index, item = by_name[name]
+        offset, wire_size = item.get("bundle_offset"), item.get("wire_size")
+        if type(offset) is not int or type(wire_size) is not int or wire_size <= 0 or offset != expected:
+            raise OSError("adapter bundle lane chunks are not contiguous")
+        path = chunk_root / Path(name).name
+        if path.name != name:
+            raise OSError("adapter bundle chunk path is invalid")
+        _reject_symlink_path(path, "adapter transport chunk")
+        lane_items.append((index, item, path))
+        expected += wire_size
+    if expected != end + 1:
+        raise OSError("adapter bundle lane range differs from its chunks")
+
+    def read_exact(response, amount: int, output=None) -> None:
+        read_available = getattr(response, "read1", None)
+        if read_available is None:
+            read_available = response.read
+        while amount:
+            _check_deadline(deadline, cancel_event)
+            try:
+                data = read_available(min(256 * 1024, amount))
+            except (OSError, TimeoutError, URLError) as exc:
+                raise _BundleNetworkError("adapter bundle lane response ended") from exc
+            if not data:
+                raise _BundleNetworkError("adapter bundle lane response ended early")
+            if len(data) > amount:
+                raise OSError("adapter bundle lane response exceeded its range")
+            if output is not None:
+                output.write(data)
+            amount -= len(data)
+            if progress is not None:
+                progress(lane_index, len(data))
+
+    for attempt in range(max(_ADAPTER_LANE_RETRIES, 64)):
+        _check_deadline(deadline, cancel_event)
+        states, first_position = {}, None
+        for position, (index, item, path) in enumerate(lane_items):
+            if is_completed(index, item, path):
+                continue
+            wire_size = int(item["wire_size"])
+            present = _path_regular_size(path, "adapter transport chunk") or 0
+            if present > wire_size:
+                _unlink_path(path, "adapter transport chunk")
+                present = 0
+            if present == wire_size:
+                if _sha256(path, deadline, cancel_event) == item.get("wire_sha256"):
+                    process_chunk(index, item)
+                    if not is_completed(index, item, path):
+                        raise OSError("adapter bundle chunk was not completed")
+                    continue
+                _unlink_path(path, "invalid adapter bundle chunk")
+                present = 0
+            states[index] = present
+            if first_position is None:
+                first_position = position
+        if first_position is None:
+            return
+        _, first_item, _ = lane_items[first_position]
+        request_start = int(first_item["bundle_offset"]) + states[lane_items[first_position][0]]
+        if request_start > end:
+            raise OSError("adapter bundle resume offset is outside its lane")
+        request = urllib.request.Request(url, headers={"Range": f"bytes={request_start}-{end}"})
+        try:
+            timeout = _request_timeout(
+                deadline,
+                cancel_event,
+                maximum=_ADAPTER_LANE_TIMEOUT_S,
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                if response.status != 206:
+                    raise OSError("adapter bundle server did not honor byte range")
+                length = end - request_start + 1
+                if response.headers.get("Content-Length") != str(length):
+                    raise OSError("adapter bundle response Content-Length differs")
+                if response.headers.get("Content-Range") != f"bytes {request_start}-{end}/{size}":
+                    raise OSError("adapter bundle response Content-Range differs")
+                etag = response.headers.get("ETag")
+                if etag is not None and etag.strip() != f'"{digest}"':
+                    raise OSError("adapter bundle response ETag differs")
+                for position, (index, item, path) in enumerate(lane_items):
+                    if position < first_position:
+                        continue
+                    wire_size = int(item["wire_size"])
+                    if is_completed(index, item, path):
+                        read_exact(response, wire_size)
+                        continue
+                    present = states.get(index, 0)
+                    _reject_symlink_path(path, "adapter transport chunk")
+                    with os.fdopen(
+                        _open_nofollow(
+                            path,
+                            os.O_WRONLY | os.O_CREAT | (os.O_APPEND if present else os.O_TRUNC),
+                            label="adapter transport chunk",
+                        ),
+                        "ab" if present else "wb",
+                    ) as output:
+                        if present and position != first_position:
+                            read_exact(response, present)
+                        read_exact(response, wire_size - present, output)
+                    if _path_regular_size(path, "adapter transport chunk") != wire_size:
+                        raise _BundleNetworkError("incomplete adapter bundle chunk")
+                    process_chunk(index, item)
+        except HTTPError as exc:
+            if exc.code not in {404, 503}:
+                raise
+        except _BundleNetworkError:
+            pass
+        except URLError as exc:
+            if not _is_retryable_metadata_error(exc):
+                raise
+        except (TimeoutError, socket.timeout, ConnectionError):
+            pass
+        else:
+            if all(is_completed(index, item, path) for index, item, path in lane_items):
+                return
+            raise OSError("adapter bundle lane did not complete its chunks")
+        if attempt + 1 == max(_ADAPTER_LANE_RETRIES, 64):
+            raise OSError("adapter bundle lane retries exhausted")
+        _check_deadline(deadline, cancel_event)
+        _check_cancelled(cancel_event)
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise TimeoutError("adapter delta staging exceeded its time limit")
+        sleep_for = 1.0 if remaining is None else min(1.0, remaining)
+        (time.sleep(sleep_for) if cancel_event is None else cancel_event.wait(sleep_for))
+    raise OSError("adapter bundle lane retries exhausted")
+
+
+def _verify_bundle_chunks(
+    bundle: dict[str, object],
+    chunks: list[dict[str, object]],
+    chunk_root: Path,
+    *,
+    deadline: float | None = None,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Verify the virtual wire stream without creating a local bundle copy."""
+    expected = bundle.get("sha256")
+    if not isinstance(expected, str):
+        raise OSError("adapter bundle checksum is unavailable")
+    digest = hashlib.sha256()
+    for item in chunks:
+        _check_deadline(deadline, cancel_event)
+        name = item.get("file")
+        if not isinstance(name, str):
+            raise OSError("adapter bundle chunk identity is invalid")
+        path = chunk_root / name
+        wire_size = item.get("wire_size")
+        expected_wire = item.get("wire_sha256")
+        if type(wire_size) is not int or wire_size <= 0 or not isinstance(expected_wire, str):
+            raise OSError("adapter bundle chunk identity is invalid")
+        if _path_regular_size(path, "adapter bundle chunk") != wire_size:
+            raise OSError("adapter bundle chunk size differs")
+        wire_digest = hashlib.sha256()
+        with os.fdopen(_open_nofollow(path, os.O_RDONLY, label="adapter bundle chunk"), "rb") as source:
+            while chunk := source.read(16 * 1024 * 1024):
+                _check_deadline(deadline, cancel_event)
+                digest.update(chunk)
+                wire_digest.update(chunk)
+        if wire_digest.hexdigest() != expected_wire:
+            raise OSError("adapter bundle chunk checksum mismatch")
+    if digest.hexdigest() != expected:
+        raise OSError("adapter bundle checksum mismatch")
+
+
 def _stage_chunked_linear_adapter(
     source_url: str,
     transport: dict[str, object],
@@ -5735,6 +6190,21 @@ def _adapter_resume_identity(source_url: str, transport: dict[str, object]) -> s
     return json.dumps(identity, sort_keys=True, separators=(",", ":"))
 
 
+def _adapter_bundle_resume_identity(
+    source_url: str,
+    transport: dict[str, object],
+    bundle: dict[str, object],
+    lane_plan: dict[str, object],
+) -> str:
+    """Bind partial bundle ranges to both their wire digest and lane routing."""
+    identity = json.loads(_adapter_resume_identity(source_url, transport))
+    identity["bundle"] = {
+        key: bundle.get(key) for key in ("path", "size", "sha256", "url")
+    }
+    identity["bundle_lane_plan"] = lane_plan
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+
 def _legacy_adapter_resume_identity(value: str | None, source_url: str) -> str | None:
     """Read the old private format without trusting any of its chunk data."""
     try:
@@ -5866,6 +6336,7 @@ def _stage_chunked_xor_adapter(
     cancel_event: threading.Event | None = None,
     committed_event: threading.Event | None = None,
     status_metadata: dict[str, object] | None = None,
+    bundle: dict[str, object] | None = None,
 ) -> Path:
     full_zstd = transport.get("transport") == _ADAPTER_FULL_TRANSPORT
     cancel_event = cancel_event or threading.Event()
@@ -5902,7 +6373,24 @@ def _stage_chunked_xor_adapter(
     chunks = transport["chunks"]
     assert isinstance(chunks, list)
     chunks = sorted(chunks, key=lambda item: int(item["offset"]))
-    transport_identity = _adapter_resume_identity(source_url, transport)
+    bundle_lane_plan = None
+    if bundle is not None:
+        bundle_lane_urls = _bundle_responsive_source_urls(
+            source_url,
+            deadline,
+            cancel_event,
+        )
+        bundle_lane_plan = _bundle_lane_plan(bundle, chunks, bundle_lane_urls)
+    if bundle_lane_plan is not None:
+        assert bundle is not None
+        transport_identity = _adapter_bundle_resume_identity(
+            source_url,
+            transport,
+            bundle,
+            bundle_lane_plan,
+        )
+    else:
+        transport_identity = _adapter_resume_identity(source_url, transport)
     identity_path = temporary / "transport-manifest.json"
     _reset_staging_directory_identity(
         temporary,
@@ -5930,6 +6418,10 @@ def _stage_chunked_xor_adapter(
     verification_started = None
     verification_finished = None
     last_status = 0.0
+    status_state_lock = threading.Lock()
+    phase = "preparing"
+    pending_downloads = 0
+    last_network_progress_at = None
 
     def write_stage_status(value: dict[str, object]) -> None:
         _write_stage_status(
@@ -5950,8 +6442,34 @@ def _stage_chunked_xor_adapter(
             },
         )
 
+    def stage_heartbeat(next_phase: str, pending: int) -> None:
+        nonlocal phase, pending_downloads
+        with status_state_lock:
+            phase = next_phase
+            pending_downloads = max(0, pending)
+            current_phase = phase
+            current_pending = pending_downloads
+            network_progress = last_network_progress_at
+        with progress_lock:
+            bytes_done = progress_bytes
+        write_stage_status(
+            {
+                "status": "staging",
+                "source_url": source_url,
+                "path": destination.as_posix(),
+                "transport": _ADAPTER_FULL_TRANSPORT if full_zstd else _ADAPTER_DELTA_TRANSPORT,
+                "bytes_done": bytes_done,
+                "bytes_total": total_wire_bytes,
+                "phase": current_phase,
+                "pending_downloads": current_pending,
+                "last_network_progress_at": network_progress,
+                "updated_at": time.time(),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            },
+        )
+
     def report(lane: int, amount: int) -> None:
-        nonlocal progress_bytes, last_status
+        nonlocal progress_bytes, last_status, last_network_progress_at
         _check_deadline(deadline, cancel_event)
         with progress_lock:
             progress_bytes += amount
@@ -5959,14 +6477,25 @@ def _stage_chunked_xor_adapter(
             if amount >= 0 and now - last_status < _ADAPTER_STATUS_INTERVAL_S and progress_bytes < total_wire_bytes:
                 return
             last_status = now
+            bytes_done = progress_bytes
+        if amount > 0:
+            with status_state_lock:
+                last_network_progress_at = time.time()
+        with status_state_lock:
+            current_phase = phase
+            current_pending = pending_downloads
+            network_progress = last_network_progress_at
             write_stage_status(
                 {
                     "status": "staging",
                     "source_url": source_url,
                     "path": destination.as_posix(),
                     "transport": _ADAPTER_FULL_TRANSPORT if full_zstd else _ADAPTER_DELTA_TRANSPORT,
-                    "bytes_done": progress_bytes,
+                    "bytes_done": bytes_done,
                     "bytes_total": total_wire_bytes,
+                    "phase": current_phase,
+                    "pending_downloads": current_pending,
+                    "last_network_progress_at": network_progress,
                     "lane": lane,
                     "updated_at": time.time(),
                     "elapsed_seconds": round(now - started, 3),
@@ -5982,16 +6511,31 @@ def _stage_chunked_xor_adapter(
             "verified_files": source_manifest["files"],
             "bytes_done": progress_bytes,
             "bytes_total": total_wire_bytes,
+            "phase": phase,
+            "pending_downloads": pending_downloads,
+            "last_network_progress_at": last_network_progress_at,
             "updated_at": time.time(),
             "elapsed_seconds": 0.0,
         },
     )
 
-    lane_urls, source_connection_count = _responsive_adapter_source_urls(
-        source_url,
-        deadline,
-        cancel_event,
-    )
+    stage_heartbeat("connecting", 0)
+    if bundle is None:
+        lane_urls, source_connection_count = _responsive_adapter_source_urls(
+            source_url,
+            deadline,
+            cancel_event,
+        )
+    else:
+        lane_plan = bundle_lane_plan
+        if (
+            not isinstance(lane_plan, dict)
+            or not isinstance(lane_plan.get("lanes"), list)
+            or not lane_plan["lanes"]
+        ):
+            raise OSError("adapter bundle lane plan is unavailable")
+        lane_urls = [lane["url"] for lane in lane_plan["lanes"]]
+        source_connection_count = len(lane_urls)
     status_metadata = {
         **(status_metadata or {}),
         "source_connections": source_connection_count,
@@ -6000,12 +6544,15 @@ def _stage_chunked_xor_adapter(
     }
     download_streams = _configured_download_streams()
     persistent_width = min(download_streams, len(lane_urls))
-    status_metadata["active_persistent_connections"] = persistent_width
+    status_metadata["active_persistent_connections"] = (
+        0 if bundle is not None else persistent_width
+    )
     output_path = temporary / _ADAPTER_FILES[1]
     config_path = temporary / _ADAPTER_FILES[0]
-    persistent_pool = _PersistentAdapterLanePool(
-        lane_urls,
-        width=persistent_width,
+    persistent_pool = (
+        None
+        if bundle is not None
+        else _PersistentAdapterLanePool(lane_urls, width=persistent_width)
     )
     _reject_symlink_path(output_path, "adapter output")
     _reject_symlink_path(config_path, "adapter configuration file")
@@ -6028,8 +6575,8 @@ def _stage_chunked_xor_adapter(
             if transfer_started is None or config_transfer_started < transfer_started:
                 transfer_started = config_transfer_started
         config_urls = [
-            f"{lane_url.rstrip('/')}/{_ADAPTER_FILES[0]}"
-            for lane_url in lane_urls
+            _adapter_url_entry(lane_url, _ADAPTER_FILES[0])
+            for lane_url in _adapter_source_urls(source_url)
         ]
         _download_persistent_file(
             config_urls,
@@ -6069,10 +6616,59 @@ def _stage_chunked_xor_adapter(
         )
         _write_marker(temporary / _RELAYING_MARKER, "relaying\n")
 
+    def chunk_completed(index: int, item: dict[str, object], chunk_path: Path) -> bool:
+        name = str(item["file"])
+        offset = int(item["offset"])
+        raw_size = int(item["raw_size"])
+        wire_size = int(item["wire_size"])
+        wire_sha256 = str(item["wire_sha256"])
+        raw_sha256 = str(item["raw_sha256"])
+        completed_path = chunk_path.with_name(f"{chunk_path.name}.done")
+        _reject_symlink_path(completed_path, "adapter completed proof")
+        if _path_regular_size(completed_path, "adapter completed proof") is None:
+            return False
+        try:
+            proof = json.loads(
+                _read_text_nofollow(
+                    completed_path,
+                    encoding="utf-8",
+                    max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                )
+            )
+        except (OSError, ValueError):
+            _unlink_path(completed_path, "adapter completed proof")
+            return False
+        matches = (
+            isinstance(proof, dict)
+            and proof.get("file") == name
+            and proof.get("offset") == offset
+            and proof.get("raw_size") == raw_size
+            and proof.get("wire_size") == wire_size
+            and proof.get("wire_sha256") == wire_sha256
+            and proof.get("raw_sha256") == raw_sha256
+            and isinstance(proof.get("output_sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", proof["output_sha256"]) is not None
+        )
+        if matches:
+            try:
+                matches = (
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                    and _output_proof_matches(output_path, item, proof, deadline, cancel_event)
+                )
+            except (FileNotFoundError, OSError):
+                matches = False
+        if matches:
+            return True
+        _unlink_path(completed_path, "adapter completed proof")
+        return False
+
     def fetch(
         index: int,
         item: dict[str, object],
         assigned_lane: int | None = None,
+        *,
+        wire_ready: bool = False,
     ) -> None:
         nonlocal transfer_started, transfer_finished
         nonlocal reconstruction_started, reconstruction_finished
@@ -6090,7 +6686,9 @@ def _stage_chunked_xor_adapter(
         wire_sha256 = str(item["wire_sha256"])
         raw_sha256 = str(item["raw_sha256"])
         completed_path = chunk_path.with_name(f"{chunk_path.name}.done")
-        _reject_symlink_path(completed_path, "adapter completed proof")
+        if chunk_completed(index, item, chunk_path):
+            # The final file checksum validates all resumed regions together.
+            return
 
         if assigned_lane is not None:
             chunk_lane = assigned_lane
@@ -6100,62 +6698,36 @@ def _stage_chunked_xor_adapter(
             chunk_lane = index % len(lane_urls)
 
         wire_reusable = False
-        if _path_regular_size(completed_path, "adapter completed proof") is not None:
-            try:
-                proof = json.loads(
-                    _read_text_nofollow(
-                        completed_path,
-                        encoding="utf-8",
-                        max_bytes=_ADAPTER_METADATA_MAX_BYTES,
-                    )
-                )
-                proof_matches = (
-                    isinstance(proof, dict)
-                    and proof.get("file") == name
-                    and proof.get("offset") == offset
-                    and proof.get("raw_size") == raw_size
-                    and proof.get("wire_size") == wire_size
-                    and proof.get("wire_sha256") == wire_sha256
-                    and proof.get("raw_sha256") == raw_sha256
-                    and isinstance(proof.get("output_sha256"), str)
-                    and re.fullmatch(r"[0-9a-f]{64}", proof["output_sha256"]) is not None
-                )
-            except (OSError, ValueError):
-                proof_matches = False
-            if proof_matches:
-                try:
-                    proof_matches = (
-                        _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
-                        and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
-                        and _output_proof_matches(
-                            output_path, item, proof, deadline, cancel_event
-                        )
-                    )
-                except (FileNotFoundError, OSError):
-                    proof_matches = False
-                if proof_matches:
-                    # The final file checksum validates all resumed regions together.
-                    report(chunk_lane, wire_size)
-                    return
-            _unlink_path(completed_path, "adapter completed proof")
-
-        try:
+        if wire_ready:
             wire_reusable = (
                 _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
                 and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
             )
-        except (FileNotFoundError, OSError):
-            wire_reusable = False
+            if not wire_reusable:
+                _unlink_path(chunk_path, "invalid adapter bundle chunk")
+                raise OSError("adapter bundle chunk checksum mismatch")
+        else:
+            try:
+                wire_reusable = (
+                    _path_regular_size(chunk_path, "adapter transport chunk") == wire_size
+                    and _sha256(chunk_path, deadline, cancel_event) == wire_sha256
+                )
+            except (FileNotFoundError, OSError):
+                wire_reusable = False
 
         def lane_report(_lane: int, amount: int) -> None:
             report(chunk_lane, amount)
 
-        if not wire_reusable and persistent_pool is not None:
-            chunk_urls = persistent_pool.urls_for_lane(chunk_lane, name)
-        elif not wire_reusable:
-            chunk_urls = [f"{lane_url.rstrip('/')}/{name}" for lane_url in lane_urls]
-            chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
+        if bundle is not None and not wire_ready and not wire_reusable:
+            raise OSError("bundle chunks must be streamed by their lane")
         if not wire_reusable:
+            chunk_urls = (
+                persistent_pool.urls_for_lane(chunk_lane, name)
+                if persistent_pool is not None
+                else [_adapter_url_entry(lane_url, name) for lane_url in lane_urls]
+            )
+            if persistent_pool is None:
+                chunk_urls = chunk_urls[chunk_lane:] + chunk_urls[:chunk_lane]
             transfer_started_at = time.monotonic()
             with timing_lock:
                 if transfer_started is None or transfer_started_at < transfer_started:
@@ -6166,7 +6738,7 @@ def _stage_chunked_xor_adapter(
                     chunk_lane,
                     chunk_path,
                     chunk_root_fd,
-                    expected_size=int(item["wire_size"]),
+                    expected_size=wire_size,
                     expected_sha256=wire_sha256,
                     progress=lane_report,
                     deadline=deadline,
@@ -6177,7 +6749,7 @@ def _stage_chunked_xor_adapter(
                 _download_persistent_file(
                     chunk_urls,
                     chunk_path,
-                    expected_size=int(item["wire_size"]),
+                    expected_size=wire_size,
                     expected_sha256=wire_sha256,
                     progress=lane_report,
                     deadline=deadline,
@@ -6189,10 +6761,13 @@ def _stage_chunked_xor_adapter(
                 if transfer_finished is None or transfer_finished_at > transfer_finished:
                     transfer_finished = transfer_finished_at
         else:
-            report(chunk_lane, wire_size)
+            if _path_regular_size(chunk_path, "adapter transport chunk") != wire_size:
+                raise OSError("adapter bundle chunk size changed before processing")
+            if _sha256(chunk_path, deadline, cancel_event) != wire_sha256:
+                raise OSError("adapter bundle chunk checksum mismatch")
 
         _check_deadline(deadline, cancel_event)
-        encoded = _read_bytes_nofollow(chunk_path)
+        encoded = _read_bytes_nofollow(chunk_path, max_bytes=wire_size)
         if len(encoded) != wire_size:
             raise OSError("adapter transport chunk size changed")
         _check_deadline(deadline, cancel_event)
@@ -6261,13 +6836,51 @@ def _stage_chunked_xor_adapter(
         label="adapter transport chunk directory",
     )
     try:
-        _run_bounded_futures(
-            chunks,
-            fetch,
-            persistent_width,
-            deadline,
-            cancel_event,
-        )
+        if bundle is None:
+            _run_bounded_futures(
+                chunks,
+                fetch,
+                persistent_width,
+                deadline,
+                cancel_event,
+                heartbeat=lambda pending: stage_heartbeat("downloading", pending),
+            )
+        else:
+            if not isinstance(bundle_lane_plan, dict) or not isinstance(bundle_lane_plan.get("lanes"), list):
+                raise OSError("adapter bundle lane plan is unavailable")
+            lanes = bundle_lane_plan["lanes"]
+
+            def process_lane_chunk(index: int, item: dict[str, object]) -> None:
+                fetch(index, item, wire_ready=True)
+
+            executor = ThreadPoolExecutor(max_workers=len(lanes))
+            futures = [
+                executor.submit(
+                    _download_bundle_lane,
+                    bundle,
+                    lane,
+                    chunks,
+                    chunk_root,
+                    is_completed=chunk_completed,
+                    process_chunk=process_lane_chunk,
+                    progress=report,
+                    deadline=deadline,
+                    cancel_event=cancel_event,
+                    lane_index=lane_index,
+                )
+                for lane_index, lane in enumerate(lanes)
+            ]
+            _wait_for_futures(
+                executor,
+                futures,
+                deadline,
+                cancel_event,
+                heartbeat=lambda pending: stage_heartbeat("downloading", pending),
+            )
+            with timing_lock:
+                transfer_finished = time.monotonic()
+            stage_heartbeat("verifying", 0)
+            _verify_bundle_chunks(bundle, chunks, chunk_root, deadline=deadline, cancel_event=cancel_event)
     finally:
         if persistent_pool is not None:
             persistent_pool.close()
@@ -6280,6 +6893,7 @@ def _stage_chunked_xor_adapter(
     finally:
         os.close(output_fd)
     verification_started = time.monotonic()
+    stage_heartbeat("verifying", 0)
     if _sha256(output_path, deadline, cancel_event) != target_sha256:
         raise OSError("reconstructed adapter checksum mismatch")
     if _path_regular_size(output_path, "adapter output") != target_size:
@@ -6294,8 +6908,8 @@ def _stage_chunked_xor_adapter(
             if transfer_started is None or config_transfer_started < transfer_started:
                 transfer_started = config_transfer_started
         config_urls = [
-            f"{lane_url.rstrip('/')}/{_ADAPTER_FILES[0]}"
-            for lane_url in lane_urls
+            _adapter_url_entry(lane_url, _ADAPTER_FILES[0])
+            for lane_url in _adapter_source_urls(source_url)
         ]
         _download_persistent_file(
             config_urls,
@@ -6336,6 +6950,7 @@ def _stage_chunked_xor_adapter(
             "transport": _ADAPTER_FULL_TRANSPORT if full_zstd else _ADAPTER_DELTA_TRANSPORT,
             "source_url": source_url,
             "target_sha256": target_sha256,
+            **({"bundle": bundle} if bundle is not None else {}),
             **({} if full_zstd else {"base_url": base_url, "base_sha256": base_sha256}),
         },
     )
@@ -6904,6 +7519,7 @@ def stage_lora_adapter_files(
     source_url: str,
     require_delta: bool = False,
     *,
+    require_bundle: bool = False,
     stage_timeout_seconds: float | None = None,
     policy_step: int | None = None,
     cancel_event: threading.Event | None = None,
@@ -6916,6 +7532,10 @@ def stage_lora_adapter_files(
     the prefetch already wrote ``READY``.
     """
     _check_cancelled(cancel_event)
+    if type(require_delta) is not bool or type(require_bundle) is not bool:
+        raise OSError("adapter transport requirements must be boolean")
+    if require_delta and require_bundle:
+        raise OSError("adapter delta and bundle requirements are mutually exclusive")
     started = time.monotonic()
     destination = adapter_cache_path(source_url)
     configured_delta_timeout = _delta_stage_timeout_s() if require_delta else None
@@ -7000,8 +7620,9 @@ def stage_lora_adapter_files(
     ) as host_lock:
         _acquire_stage_lock(host_lock, operation_deadline, cancel_event)
         transport: dict[str, object] | None = None
+        bundle: dict[str, object] | None = None
         try:
-            if not require_delta:
+            if not require_delta and not require_bundle:
                 local_cache = _verified_local_full_adapter_cache(
                     source_url,
                     destination,
@@ -7077,6 +7698,13 @@ def stage_lora_adapter_files(
 
             if require_delta and (transport is None or transport.get("mode") != "delta"):
                 raise OSError("delta adapter transport is required; full adapter fallback is disabled")
+            if require_bundle:
+                if not isinstance(transport, dict) or transport.get("mode") not in {"delta", "full"}:
+                    raise OSError("adapter bundle transport is required")
+                if transport.get("transport") not in {_ADAPTER_DELTA_TRANSPORT, _ADAPTER_FULL_TRANSPORT}:
+                    raise OSError("adapter bundle transport is unsupported")
+                bundle = _bundle_identity(source_url, transport)
+                transport["bundle"] = bundle
 
             if transport is not None and transport.get("mode") == "delta":
                 target_spec = files.get(_ADAPTER_FILES[1])
@@ -7119,6 +7747,7 @@ def stage_lora_adapter_files(
                             )
                         )
                         and proof.get("source_url") == source_url
+                        and (not require_bundle or _bundle_identity_matches(proof.get("bundle"), bundle))
                         and proof.get("target_sha256") == transport["target_sha256"]
                         and (
                             transport.get("transport") == _ADAPTER_DELTA_TRANSPORT
@@ -7203,6 +7832,7 @@ def stage_lora_adapter_files(
                         cancel_event=cancel_event,
                         committed_event=committed_event,
                         status_metadata=status_metadata,
+                        bundle=bundle,
                     )
                 raise OSError("adapter delta transport is unsupported")
             _reject_symlink_path(destination / "READY", "adapter ready marker")
@@ -7218,9 +7848,29 @@ def stage_lora_adapter_files(
                     )
                 except (FileNotFoundError, OSError, ValueError):
                     local_manifest = None
+                bundle_proof = None
+                if bundle is not None:
+                    try:
+                        _reject_symlink_path(destination / "transport.json", "adapter transport record")
+                        bundle_proof = json.loads(
+                            _read_text_nofollow(
+                                destination / "transport.json",
+                                encoding="utf-8",
+                                max_bytes=_ADAPTER_METADATA_MAX_BYTES,
+                            )
+                        )
+                    except (FileNotFoundError, OSError, ValueError):
+                        bundle_proof = None
                 if (
                     local_manifest == manifest
                     and isinstance(transport, dict)
+                    and (
+                        bundle is None
+                        or (
+                            isinstance(bundle_proof, dict)
+                            and _bundle_identity_matches(bundle_proof.get("bundle"), bundle)
+                        )
+                    )
                     and _relay_manifest_matches(destination, source_url, transport)
                     and _full_cache_matches_manifest(destination, files)
                 ):
@@ -7247,6 +7897,22 @@ def stage_lora_adapter_files(
                         with _adapter_stage_publish_lock:
                             committed_event.set()
                     return destination
+
+            if (
+                isinstance(transport, dict)
+                and transport.get("mode") == "full"
+                and transport.get("transport") == _ADAPTER_FULL_TRANSPORT
+            ):
+                return _stage_chunked_xor_adapter(
+                    source_url,
+                    transport,
+                    manifest,
+                    deadline=operation_deadline,
+                    cancel_event=cancel_event,
+                    committed_event=committed_event,
+                    status_metadata=status_metadata,
+                    bundle=bundle,
+                )
 
             if (
                 isinstance(transport, dict)
@@ -7466,7 +8132,7 @@ def stage_lora_adapter_files(
             )
             return destination
         except BaseException as exc:
-            if require_delta or (
+            if require_delta or require_bundle or (
                 isinstance(transport, dict) and transport.get("mode") in {"delta", "full"}
             ):
                 cleanup_failure: BaseException | None = None
@@ -7953,11 +8619,13 @@ class FileSystemWeightUpdateWorker(Worker):
         self,
         source_url: str,
         require_delta: bool = False,
+        require_bundle: bool = False,
         policy_step: int | None = None,
     ) -> None:
         stage_lora_adapter_files(
             source_url,
             require_delta=require_delta,
+            require_bundle=require_bundle,
             policy_step=policy_step,
         )
 

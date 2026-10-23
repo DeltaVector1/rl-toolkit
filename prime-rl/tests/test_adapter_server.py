@@ -37,7 +37,190 @@ class QuietAdapterHandler(adapter_server.RangeHandler):
         return
 
 
+class VirtualBundleFileTest(unittest.TestCase):
+    def test_virtual_bundle_reads_compressed_full_and_delta_chunks(self):
+        for mode, transport, chunk_mode in (
+            ("delta", "chunked-shuffled-xor-zstd", "delta"),
+            ("full", "chunked-full-zstd", "full-zstd"),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                step = root / "step_1"
+                step.mkdir()
+                (step / adapter_server.stable_name).write_text("stable\n", encoding="ascii")
+                config = b"{}\n"
+                chunks = [b"first-wire", b"second-wire"]
+                weights = b"adapter-weights-for-file-identity"
+                (step / adapter_server.adapter_config_name).write_bytes(config)
+                (step / adapter_server.adapter_weights_name).write_bytes(weights)
+                (step / adapter_server.adapter_digest_name).write_text(
+                    f"{hashlib.sha256(weights).hexdigest()}\n", encoding="ascii"
+                )
+                chunk_records = []
+                raw_sizes = [16, len(weights) - 16]
+                raw_offset = 0
+                for index, payload in enumerate(chunks):
+                    name = f"adapter_model.safetensors.transport-{chunk_mode}-{index:06d}"
+                    (step / name).write_bytes(payload)
+                    chunk_records.append(
+                        {
+                            "file": name,
+                            "offset": raw_offset,
+                            "raw_size": raw_sizes[index],
+                            "wire_size": len(payload),
+                            "wire_sha256": hashlib.sha256(payload).hexdigest(),
+                            "raw_sha256": hashlib.sha256(payload).hexdigest(),
+                        }
+                    )
+                    raw_offset += raw_sizes[index]
+                bundle = b"".join(chunks)
+                manifest = {
+                    "version": 1,
+                    "kind": "lora-adapter",
+                    "mode": mode,
+                    "target_step": 1,
+                    "target_size": len(weights),
+                    "transport": transport,
+                    "files": [
+                        {
+                            "name": adapter_server.adapter_config_name,
+                            "size": len(config),
+                            "sha256": hashlib.sha256(config).hexdigest(),
+                        },
+                        {
+                            "name": adapter_server.adapter_weights_name,
+                            "size": len(weights),
+                            "sha256": hashlib.sha256(weights).hexdigest(),
+                        },
+                    ],
+                    "bundle": {
+                        "path": ".adapter-transport-bundle",
+                        "size": len(bundle),
+                        "sha256": hashlib.sha256(bundle).hexdigest(),
+                    },
+                    "chunks": chunk_records,
+                }
+                (step / adapter_server.adapter_manifest_name).write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+
+                reader, size, digest = adapter_server._virtual_bundle(
+                    step / ".adapter-transport-bundle",
+                    ("step_1", ".adapter-transport-bundle"),
+                )
+                try:
+                    chunks_read = []
+                    while data := reader.read(7):
+                        chunks_read.append(data)
+                finally:
+                    reader.close()
+                self.assertEqual(size, len(bundle))
+                self.assertEqual(digest, hashlib.sha256(bundle).hexdigest())
+                self.assertEqual(b"".join(chunks_read), bundle)
+
+                ranged = adapter_server._VirtualBundle(reader._chunks, 3)
+                try:
+                    self.assertEqual(ranged.read(len(bundle)), bundle[3:])
+                finally:
+                    ranged.close()
+
+                manifest["chunks"][0]["file"] = ".identity.json"
+                (step / ".identity.json").write_text("private\n", encoding="ascii")
+                (step / adapter_server.adapter_manifest_name).write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+                with self.assertRaises(adapter_server.UpgradeError):
+                    adapter_server._virtual_bundle(
+                        step / ".adapter-transport-bundle",
+                        ("step_1", ".adapter-transport-bundle"),
+                    )
+
+
 class AdapterServerTest(unittest.TestCase):
+    def test_virtual_bundle_reads_existing_chunks_with_ranges(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            step = root / "step_1"
+            step.mkdir()
+            (step / "STABLE").write_text("stable\n", encoding="ascii")
+            chunks = [b"first-wire", b"second-wire"]
+            config = b"{}\n"
+            weights = b"".join(chunks)
+            (step / adapter_server.adapter_config_name).write_bytes(config)
+            (step / adapter_server.adapter_weights_name).write_bytes(weights)
+            (step / adapter_server.adapter_digest_name).write_text(
+                f"{hashlib.sha256(weights).hexdigest()}\n", encoding="ascii"
+            )
+            chunk_records = []
+            raw_sizes = [16, 5]
+            raw_offset = 0
+            for index, payload in enumerate(chunks):
+                name = f"adapter_model.safetensors.transport-delta-{index:06d}"
+                (step / name).write_bytes(payload)
+                chunk_records.append(
+                    {
+                        "file": name,
+                        "offset": raw_offset,
+                        "raw_size": raw_sizes[index],
+                        "wire_size": len(payload),
+                        "wire_sha256": hashlib.sha256(payload).hexdigest(),
+                        "raw_sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                )
+                raw_offset += raw_sizes[index]
+            bundle = b"".join(chunks)
+            manifest = {
+                "version": 1,
+                "kind": "lora-adapter",
+                "mode": "delta",
+                "target_step": 1,
+                "transport": "chunked-shuffled-xor-zstd",
+                "files": [
+                    {
+                        "name": adapter_server.adapter_config_name,
+                        "size": len(config),
+                        "sha256": hashlib.sha256(config).hexdigest(),
+                    },
+                    {
+                        "name": adapter_server.adapter_weights_name,
+                        "size": len(weights),
+                        "sha256": hashlib.sha256(weights).hexdigest(),
+                    },
+                ],
+                "bundle": {
+                    "path": ".adapter-transport-bundle",
+                    "size": len(bundle),
+                    "sha256": hashlib.sha256(bundle).hexdigest(),
+                },
+                "chunks": chunk_records,
+            }
+            (step / "adapter_manifest.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                functools.partial(QuietAdapterHandler, directory=str(root)),
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            url = (
+                f"http://127.0.0.1:{server.server_port}/step_1/"
+                ".adapter-transport-bundle"
+            )
+            try:
+                request = urllib.request.Request(url, headers={"Range": "bytes=3-14"})
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 206)
+                    self.assertEqual(response.headers["Content-Range"], "bytes 3-14/21")
+                    self.assertEqual(response.headers["ETag"], f'"{hashlib.sha256(bundle).hexdigest()}"')
+                    self.assertEqual(response.read(), bundle[3:15])
+                with urllib.request.urlopen(url, timeout=5) as response:
+                    self.assertEqual(response.read(), bundle)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+
     def _write_predictive_step(self, root, step_number=0, chunk=b"chunk"):
         step = root / f"step_{step_number}"
         step.mkdir()

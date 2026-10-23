@@ -12,7 +12,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 from modelexpress import p2p_pb2
@@ -42,6 +42,19 @@ v1_adapter_transport = "chunked-shuffled-xor-zstd"
 v2_adapter_transport = "chunked-bf16-linear-zigzag-sparse-zstd"
 adapter_manifest_max_bytes = 2 * 1024 * 1024
 adapter_deadline_header = "X-Adapter-Deadline-Seconds"
+
+
+def _adapter_manifest_url(source_url: str) -> str:
+    parsed = urlsplit(source_url)
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            f"{parsed.path.rstrip('/')}/adapter_manifest.json",
+            parsed.query,
+            "",
+        )
+    )
 
 
 def _receiver_id(client) -> str:
@@ -461,9 +474,16 @@ def inference_weight_path(config: OrchestratorConfig, weights_path, lora_name: s
         return weights_path
     if broadcast.source_dir is None:
         raise ValueError("weight_broadcast.source_dir is required with source_url")
-    return (
-        f"{broadcast.source_url.rstrip('/')}/"
-        f"{quote(weights_path.relative_to(broadcast.source_dir).as_posix())}"
+    parsed = urlsplit(broadcast.source_url)
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            f"{parsed.path.rstrip('/')}/"
+            f"{quote(weights_path.relative_to(broadcast.source_dir).as_posix())}",
+            parsed.query,
+            "",
+        )
     )
 
 
@@ -507,7 +527,7 @@ async def _read_remote_adapter_manifest(
     remaining = min(deadline - time.monotonic(), 600.0)
     if not math.isfinite(remaining) or remaining <= 0:
         raise TimeoutError("published adapter manifest deadline expired")
-    location = f"{source_url.rstrip('/')}/adapter_manifest.json"
+    location = _adapter_manifest_url(source_url)
     headers = {adapter_deadline_header: f"{remaining:.6f}"}
     try:
         async with asyncio.timeout(remaining):
@@ -575,6 +595,7 @@ class WeightWatcher:
         self.poll_interval = poll_interval
         self.reconcile_interval = reconcile_interval
         self.model_express = model_express
+        self.require_bundle = bool(getattr(config.weight_broadcast, "require_bundle", False))
 
         self.last_update_weights_time: float = 0.0
         self.last_stage_weights_time: float = 0.0
@@ -662,6 +683,7 @@ class WeightWatcher:
                 self.inference.admin_clients,
                 source_path,
                 require_delta=False,
+                require_bundle=self.require_bundle,
                 origin_base_urls=self.inference.adapter_origin_base_urls,
             )
             transfer_seconds = result.get("transfer_wall_seconds")
@@ -911,7 +933,12 @@ class WeightWatcher:
                             get_logger().info(
                                 f"Built lossless checkpoint delta for policy v{next_step}: {delta_path}"
                             )
-                elif self.lora_name is not None and next_step > 0 and isinstance(weights_path, str):
+                elif (
+                    self.lora_name is not None
+                    and next_step > 0
+                    and isinstance(weights_path, str)
+                    and not self.require_bundle
+                ):
                     if local_weights_path is None:
                         raise RuntimeError("adapter delta target path is not local")
                     delta_deadline = time.monotonic() + adapter_stage_limit_seconds(next_step)
@@ -962,7 +989,10 @@ class WeightWatcher:
                         )
                     else:
                         stage_result = await stage_lora_adapter(
-                            self.inference.admin_clients, weights_path,
+                            self.inference.admin_clients,
+                            weights_path,
+                            require_delta=False,
+                            require_bundle=self.require_bundle,
                             origin_base_urls=self.inference.adapter_origin_base_urls,
                         )
                     self.last_adapter_policy_step = int(stage_result.get("policy_step", next_step))
@@ -1049,6 +1079,7 @@ class WeightWatcher:
                 lora_name=lora_name,
                 step=next_step,
                 require_delta=require_delta,
+                require_bundle=self.require_bundle,
                 prefetched=True,
                 expected_adapter_identity=adapter_identity,
                 timings=timings,
@@ -1132,7 +1163,7 @@ class WeightWatcher:
             if weights_path is None:
                 return
 
-            require_delta = self.ckpt_step > 0
+            require_delta = self.ckpt_step > 0 and not self.require_bundle
             if require_delta and self.verified_adapter_step != self.ckpt_step:
                 raise RuntimeError(
                     f"cannot reconcile policy v{self.ckpt_step}: exact loaded policy is not verified"
@@ -1182,6 +1213,7 @@ class WeightWatcher:
                 missing,
                 weights_path,
                 require_delta=require_delta,
+                require_bundle=self.require_bundle,
                 policy_step=self.ckpt_step if require_delta else None,
             )
             if require_delta:
@@ -1192,6 +1224,7 @@ class WeightWatcher:
                 self.policy.model_name,
                 weights_path,
                 require_delta=require_delta,
+                require_bundle=self.require_bundle,
                 prefetched=True,
                 expected_identity=stage_result["adapter_identity"],
             )

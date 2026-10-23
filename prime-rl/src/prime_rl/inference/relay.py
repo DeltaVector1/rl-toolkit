@@ -21,6 +21,7 @@ from urllib.parse import unquote, urlsplit
 
 
 relay_manifest_name = "relay_manifest.json"
+transport_bundle_name = ".adapter-transport-bundle"
 ready_marker_name = "READY"
 relaying_marker_name = "RELAYING"
 relay_transport = "chunked-shuffled-xor-zstd"
@@ -52,6 +53,13 @@ class RelayFile:
 
 
 @dataclass(frozen=True)
+class RelayBundle:
+    parts: tuple[tuple[str, int, str], ...]
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
 class RelayIndex:
     transport: str
     files: dict[str, dict[str, object]]
@@ -63,6 +71,7 @@ _MAX_RELAY_INDEX_CACHE_ENTRIES = 8
 _relay_digest_cache_lock = threading.Lock()
 _relay_digest_cache: OrderedDict[tuple[str, tuple[int, int, int, int, int]], None] = OrderedDict()
 _MAX_RELAY_DIGEST_CACHE_ENTRIES = 128
+_MAX_SOURCE_MANIFEST_BYTES = 32 * 1024 * 1024
 relay_socket_idle_timeout_seconds = 30.0
 relay_reader_lock_timeout_seconds = 5.0
 
@@ -295,6 +304,30 @@ def _open_regular_file(path: Path) -> tuple[BinaryIO, tuple[int, int, int, int, 
     return source, identity
 
 
+def _read_source_manifest(path: Path) -> dict[str, object]:
+    """Read a published source manifest without following links or unbounded reads."""
+    source, identity = _open_regular_file(path)
+    try:
+        if identity[2] > _MAX_SOURCE_MANIFEST_BYTES:
+            raise RelayRequestError(500, "relay source manifest exceeds its size limit")
+        payload = source.read(_MAX_SOURCE_MANIFEST_BYTES + 1)
+        if len(payload) > _MAX_SOURCE_MANIFEST_BYTES or _file_identity(source) != identity:
+            raise RelayRequestError(503, "relay source manifest changed during validation")
+    except RelayRequestError:
+        raise
+    except OSError as exc:
+        raise RelayRequestError(503, "relay source manifest cannot be read") from exc
+    finally:
+        source.close()
+    try:
+        manifest = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise RelayRequestError(500, "relay source manifest is invalid") from exc
+    if not isinstance(manifest, dict):
+        raise RelayRequestError(500, "relay source manifest is invalid")
+    return manifest
+
+
 def _sha256_source(source: BinaryIO) -> str:
     digest = hashlib.sha256()
     try:
@@ -404,7 +437,7 @@ def _build_relay_index(
         if not isinstance(raw_spec, dict):
             raise RelayRequestError(500, "relay manifest file entry is invalid")
         relative = _safe_relative_path(raw_spec.get("path"))
-        if transport in {relay_transport, predictive_transport} and name not in required_names:
+        if transport in {relay_transport, predictive_transport, full_transport} and name not in required_names:
             if relative != Path("transport-chunks") / name:
                 raise RelayRequestError(500, "relay manifest has an invalid chunk path")
         size = raw_spec.get("size")
@@ -414,7 +447,10 @@ def _build_relay_index(
     if not required_names.issubset(files):
         raise RelayRequestError(500, "relay manifest is missing an adapter file")
     if transport == full_transport and set(files) != required_names:
-        raise RelayRequestError(500, "full relay manifest contains transport chunks")
+        source_manifest = _read_source_manifest(published_path / "adapter_manifest.json")
+        bundle = source_manifest.get("bundle")
+        if not isinstance(bundle, dict) or bundle.get("path") != transport_bundle_name:
+            raise RelayRequestError(500, "full relay manifest contains transport chunks")
     return RelayIndex(transport=transport, files=files)
 
 
@@ -446,7 +482,105 @@ def _cached_relay_index(
     return index
 
 
-def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayFile:
+def _load_bundle(
+    published_path: Path,
+    index: RelayIndex,
+) -> RelayBundle:
+    if index.transport not in {relay_transport, full_transport}:
+        raise RelayRequestError(404, "adapter bundle is not published")
+    source_manifest = _read_source_manifest(published_path / "adapter_manifest.json")
+    bundle = source_manifest.get("bundle")
+    if (
+        not isinstance(bundle, dict)
+        or bundle.get("path") != transport_bundle_name
+        or type(bundle.get("size")) is not int
+        or bundle["size"] <= 0
+        or not isinstance(bundle.get("sha256"), str)
+        or not digest_pattern.fullmatch(bundle["sha256"])
+    ):
+        raise RelayRequestError(404, "adapter bundle is not published")
+    raw_chunks = source_manifest.get("chunks")
+    if not isinstance(raw_chunks, list) or not raw_chunks:
+        raise RelayRequestError(500, "relay source manifest has no bundle chunks")
+    source_transport = source_manifest.get("transport")
+    if source_transport == relay_transport:
+        chunk_mode = "delta"
+    elif source_transport == "chunked-full-zstd":
+        chunk_mode = "full-zstd"
+    else:
+        raise RelayRequestError(500, "relay source manifest has an unsupported bundle transport")
+    target_size = source_manifest.get("target_size")
+    if type(target_size) is not int or target_size <= 0:
+        raise RelayRequestError(500, "relay source manifest has an invalid target size")
+    parts: list[tuple[str, int, str]] = []
+    seen: set[str] = set()
+    raw_offset = 0
+    bundle_size = 0
+    raw_chunks = sorted(
+        raw_chunks,
+        key=lambda item: item.get("offset")
+        if isinstance(item, dict) and type(item.get("offset")) is int
+        else -1,
+    )
+    for chunk_index, item in enumerate(raw_chunks):
+        if not isinstance(item, dict) or not isinstance(item.get("file"), str):
+            raise RelayRequestError(500, "relay source manifest bundle chunk is invalid")
+        name = item["file"]
+        expected_name = f"adapter_model.safetensors.transport-{chunk_mode}-{chunk_index:06d}"
+        if name in seen or name != expected_name or Path(name).name != name:
+            raise RelayRequestError(500, "relay source manifest bundle chunk is invalid")
+        seen.add(name)
+        offset = item.get("offset")
+        raw_size = item.get("raw_size")
+        if type(offset) is not int or offset != raw_offset or type(raw_size) is not int or raw_size <= 0:
+            raise RelayRequestError(500, "relay source manifest bundle chunk offsets are invalid")
+        spec = index.files.get(name)
+        if not isinstance(spec, dict):
+            raise RelayRequestError(503, "relay bundle chunk is not published")
+        wire_size = item.get("wire_size")
+        wire_sha256 = item.get("wire_sha256")
+        if (
+            type(wire_size) is not int
+            or wire_size <= 0
+            or not isinstance(wire_sha256, str)
+            or not digest_pattern.fullmatch(wire_sha256)
+            or spec.get("size") != wire_size
+            or spec.get("sha256") != wire_sha256
+        ):
+            raise RelayRequestError(500, "relay bundle chunk identity differs")
+        relative = _safe_relative_path(spec.get("path"))
+        raw_candidate = published_path / relative
+        if raw_candidate.is_symlink():
+            raise RelayRequestError(500, "relay manifest points to a symbolic link")
+        cursor = published_path
+        for path_part in relative.parts[:-1]:
+            cursor /= path_part
+            if cursor.is_symlink():
+                raise RelayRequestError(500, "relay manifest traverses a symbolic link")
+        candidate = raw_candidate.resolve()
+        try:
+            candidate.relative_to(published_path.resolve())
+        except ValueError as exc:
+            raise RelayRequestError(500, "relay manifest escapes the adapter cache") from exc
+        try:
+            entry = candidate.lstat()
+        except OSError as exc:
+            raise RelayRequestError(503, "relay bundle chunk is unavailable") from exc
+        if not stat.S_ISREG(entry.st_mode) or entry.st_size != wire_size:
+            raise RelayRequestError(503, "relay bundle chunk is incomplete")
+        parts.append((name, wire_size, wire_sha256))
+        raw_offset += raw_size
+        bundle_size += wire_size
+    if (
+        raw_offset != target_size
+        or bundle_size != bundle["size"]
+        or len(parts) != len(index.files) - 3
+    ):
+        raise RelayRequestError(500, "relay bundle size differs from its chunks")
+    return RelayBundle(tuple(parts), bundle["size"], bundle["sha256"])
+
+
+def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayFile | RelayBundle:
     ready = cache_path / ready_marker_name
     relaying_path = cache_path.with_name(f"{cache_path.name}.partial")
     ready_file = ready.is_file()
@@ -477,6 +611,8 @@ def _load_file(cache_path: Path, source_url: str, requested_name: str) -> RelayF
     )
     transport = index.transport
     files = index.files
+    if requested_name == transport_bundle_name:
+        return _load_bundle(published_path, index)
     streaming_transports = {relay_transport, predictive_transport}
     if (
         relaying
@@ -586,6 +722,26 @@ def _byte_range(value: str | None, size: int) -> tuple[int, int, int]:
     return 206, start, end
 
 
+def _bundle_range_parts(
+    bundle: RelayBundle,
+    start: int,
+    end: int,
+) -> tuple[tuple[str, int, str, int, int], ...]:
+    """Return only the chunks that overlap an inclusive bundle byte range."""
+    selected: list[tuple[str, int, str, int, int]] = []
+    offset = 0
+    for name, size, digest in bundle.parts:
+        part_end = offset + size
+        overlap_start = max(start, offset)
+        overlap_end = min(end + 1, part_end)
+        if overlap_start < overlap_end:
+            selected.append(
+                (name, size, digest, overlap_start - offset, overlap_end - overlap_start)
+            )
+        offset = part_end
+    return tuple(selected)
+
+
 class RelayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -621,14 +777,6 @@ class RelayHandler(BaseHTTPRequestHandler):
         cache_path = config.cache_path(source_url)
         with reader_lock(cache_path):
             selected = _load_file(cache_path, source_url, filename)
-            source = selected.source
-            if source is None:
-                source, identity = _open_regular_file(selected.path)
-                try:
-                    _verify_relay_file(source, selected.sha256, selected.size, identity)
-                except RelayRequestError:
-                    source.close()
-                    raise
             try:
                 status, start, end = _byte_range(self.headers.get("Range"), selected.size)
                 length = end - start + 1 if selected.size else 0
@@ -636,34 +784,83 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", mimetypes.guess_type(filename)[0] or "application/octet-stream")
                 self.send_header("Content-Length", str(length))
                 self.send_header("Accept-Ranges", "bytes")
+                if isinstance(selected, RelayBundle):
+                    self.send_header("ETag", f'"{selected.sha256}"')
                 if status == 206:
                     self.send_header("Content-Range", f"bytes {start}-{end}/{selected.size}")
                 self.end_headers()
                 if self.command != "GET" or length == 0:
                     return
-                try:
-                    source.seek(start)
-                except OSError:
-                    self.close_connection = True
-                    return
-                remaining = length
-                while remaining:
+                if not isinstance(selected, RelayBundle):
+                    source = selected.source
+                    if source is None:
+                        source, identity = _open_regular_file(selected.path)
+                        _verify_relay_file(source, selected.sha256, selected.size, identity)
                     try:
-                        chunk = source.read(min(1024 * 1024, remaining))
+                        source.seek(start)
                     except OSError:
                         self.close_connection = True
                         return
-                    if not chunk:
-                        self.close_connection = True
-                        return
+                    remaining = length
+                    while remaining:
+                        try:
+                            chunk = source.read(min(1024 * 1024, remaining))
+                        except OSError:
+                            self.close_connection = True
+                            return
+                        if not chunk:
+                            self.close_connection = True
+                            return
+                        try:
+                            self.wfile.write(chunk)
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            self.close_connection = True
+                            return
+                        remaining -= len(chunk)
+                    return
+                remaining = length
+                for name, part_size, _digest, local_start, amount in _bundle_range_parts(
+                    selected, start, end
+                ):
+                    part = _load_file(cache_path, source_url, name)
+                    if not isinstance(part, RelayFile):
+                        raise RelayRequestError(500, "relay bundle chunk identity is invalid")
+                    source = part.source
+                    if source is None:
+                        source, identity = _open_regular_file(part.path)
+                        try:
+                            _verify_relay_file(source, part.sha256, part.size, identity)
+                        except BaseException:
+                            source.close()
+                            raise
                     try:
-                        self.wfile.write(chunk)
-                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        source.seek(local_start)
+                        while amount:
+                            try:
+                                chunk = source.read(min(1024 * 1024, amount))
+                            except OSError:
+                                self.close_connection = True
+                                return
+                            if not chunk:
+                                self.close_connection = True
+                                return
+                            try:
+                                self.wfile.write(chunk)
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                self.close_connection = True
+                                return
+                            amount -= len(chunk)
+                            remaining -= len(chunk)
+                    except OSError:
                         self.close_connection = True
                         return
-                    remaining -= len(chunk)
+                    finally:
+                        source.close()
+                if remaining:
+                    self.close_connection = True
             finally:
-                source.close()
+                if isinstance(selected, RelayFile) and selected.source is not None:
+                    selected.source.close()
 
     def do_GET(self) -> None:
         try:

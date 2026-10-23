@@ -200,6 +200,7 @@ class InferencePool(Protocol):
         lora_name: str | None = None,
         step: int = 0,
         require_delta: bool = False,
+        require_bundle: bool = False,
         prefetched: bool = False,
         expected_adapter_identity: Mapping[str, object] | None = None,
         timings: dict[str, float] | None = None,
@@ -328,6 +329,7 @@ class StaticInferencePool:
         lora_name: str | None = None,
         step: int = 0,
         require_delta: bool = False,
+        require_bundle: bool = False,
         prefetched: bool = False,
         expected_adapter_identity: Mapping[str, object] | None = None,
         timings: dict[str, float] | None = None,
@@ -338,6 +340,7 @@ class StaticInferencePool:
             lora_name=lora_name,
             step=step,
             require_delta=require_delta,
+            require_bundle=require_bundle,
             prefetched=prefetched,
             expected_adapter_identity=expected_adapter_identity,
             timings=timings,
@@ -866,6 +869,7 @@ async def stage_lora_adapter(
     lora_path: Path | str,
     *,
     require_delta: bool = False,
+    require_bundle: bool = False,
     policy_step: int | None = None,
     delta_deadline: float | None = None,
     origin_base_urls: list[str] | None = None,
@@ -877,6 +881,12 @@ async def stage_lora_adapter(
     requirement explicitly and returns measured staging time for each host.
     """
     lora_path_posix = str(lora_path)
+    if type(require_delta) is not bool or type(require_bundle) is not bool:
+        raise RuntimeError("adapter transport requirements must be boolean")
+    if require_delta and require_bundle:
+        raise RuntimeError("adapter delta and bundle requirements are mutually exclusive")
+    if require_bundle and (policy_step is not None or delta_deadline is not None):
+        raise RuntimeError("policy_step and delta_deadline are invalid for bundle staging")
     if policy_step is not None and (
         type(policy_step) is not int or policy_step <= 0
     ):
@@ -885,6 +895,8 @@ async def stage_lora_adapter(
         raise RuntimeError("adapter policy step is required for delta staging")
     if delta_deadline is not None and not require_delta:
         raise RuntimeError("adapter delta deadline requires delta staging")
+    if require_bundle and not lora_path_posix.startswith(("http://", "https://")):
+        raise RuntimeError("adapter bundle staging requires a remote HTTP URL")
     if not lora_path_posix.startswith(("http://", "https://")):
         return {
             "wire_stage_seconds": 0.0,
@@ -963,6 +975,7 @@ async def stage_lora_adapter(
         payload = {
             "lora_path": lora_path_posix,
             "require_delta": require_delta,
+            "require_bundle": require_bundle,
         }
         if policy_step is not None:
             payload["policy_step"] = policy_step
@@ -1236,6 +1249,7 @@ async def update_weights(
     lora_name: str | None = None,
     step: int = 0,
     require_delta: bool = False,
+    require_bundle: bool = False,
     prefetched: bool = False,
     expected_adapter_identity: Mapping[str, object] | None = None,
     timings: dict[str, float] | None = None,
@@ -1275,6 +1289,7 @@ async def update_weights(
                     lora_name,
                     weight_dir,
                     require_delta=require_delta,
+                    require_bundle=require_bundle,
                     prefetched=prefetched,
                     expected_identity=expected_adapter_identity,
                     deadline=load_deadline,
@@ -1397,6 +1412,7 @@ async def load_lora_adapter(
     lora_path: Path | str,
     *,
     require_delta: bool = False,
+    require_bundle: bool = False,
     prefetched: bool = False,
     expected_identity: Mapping[str, object] | None = None,
     deadline: float | None = None,
@@ -1412,7 +1428,13 @@ async def load_lora_adapter(
     """
     logger = get_logger()
     lora_path_posix = str(lora_path)
+    if type(require_delta) is not bool or type(require_bundle) is not bool:
+        raise RuntimeError("adapter transport requirements must be boolean")
+    if require_delta and require_bundle:
+        raise RuntimeError("adapter delta and bundle requirements are mutually exclusive")
     remote_adapter = lora_path_posix.startswith(("http://", "https://"))
+    if require_bundle and not remote_adapter:
+        raise RuntimeError("adapter bundle loading requires a remote HTTP URL")
     if remote_adapter and not admin_clients:
         raise RuntimeError("cannot load a remote adapter without an inference endpoint")
     effective_expected_identity = expected_identity
@@ -1468,6 +1490,7 @@ async def load_lora_adapter(
                             "lora_name": lora_name,
                             "lora_path": lora_path_posix,
                             "require_delta": require_delta,
+                            "require_bundle": require_bundle,
                             "prefetched": prefetched,
                         },
                         timeout=httpx.Timeout(

@@ -630,6 +630,54 @@ class StageLoraAdapterTest(unittest.TestCase):
         self.assertEqual(calls, clients)
         self.assertEqual(result["host_count"], 2)
 
+    def test_bundle_requirement_is_explicit_in_stage_request(self):
+        stage_lora_adapter, namespace = _load_stage_function()
+        calls = []
+
+        class Response:
+            def json(self):
+                return {"status": "ok", "stage_seconds": 0.0, "adapter_identity": _adapter_identity()}
+
+        async def fake_admin_post_response(_client, _path, **kwargs):
+            calls.append(kwargs)
+            return Response()
+
+        namespace["_admin_post_response"] = fake_admin_post_response
+        client = httpx.AsyncClient(base_url="http://127.0.0.1:8000")
+        result = asyncio.run(
+            stage_lora_adapter([client], "http://adapter/step_1", require_bundle=True)
+        )
+
+        self.assertEqual(result["host_count"], 1)
+        self.assertEqual(calls[0]["json"], {
+            "lora_path": "http://adapter/step_1",
+            "require_delta": False,
+            "require_bundle": True,
+        })
+
+    def test_bundle_requirement_rejects_delta_options(self):
+        stage_lora_adapter, _namespace = _load_stage_function()
+        with self.assertRaisesRegex(RuntimeError, "mutually exclusive"):
+            asyncio.run(
+                stage_lora_adapter(
+                    [],
+                    "http://adapter/step_1",
+                    require_delta=True,
+                    require_bundle=True,
+                )
+            )
+
+    def test_bundle_requirement_rejects_local_stage_without_silent_success(self):
+        stage_lora_adapter, _namespace = _load_stage_function()
+        with self.assertRaisesRegex(RuntimeError, "remote HTTP URL"):
+            asyncio.run(
+                stage_lora_adapter(
+                    [],
+                    "/tmp/prefetched-adapter",
+                    require_bundle=True,
+                )
+            )
+
     def test_exact_duplicate_origins_stage_once(self):
         stage_lora_adapter, namespace = _load_stage_function()
         calls = []

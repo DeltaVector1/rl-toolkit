@@ -22,6 +22,7 @@ adapter_weights_name = "adapter_model.safetensors"
 adapter_transport_name = "chunked-shuffled-xor"
 full_transport_name = "chunked-full-zstd"
 predictive_transport_name = "chunked-bf16-linear-zigzag-sparse-zstd"
+transport_bundle_name = ".adapter-transport-bundle"
 default_chunk_size = 16 * 1024 * 1024
 predictive_chunk_size = 16 * 1024 * 1024
 max_transport_chunk_size = 16 * 1024 * 1024
@@ -863,6 +864,19 @@ def _file_record(path: Path) -> dict[str, Any]:
     return {"name": path.name, "size": size, "sha256": digest}
 
 
+def _bundle_record(directory: Path, chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Describe a virtual concatenation of the existing encoded chunks."""
+    digest = hashlib.sha256()
+    size = 0
+    for item in sorted(chunks, key=lambda value: int(value["offset"])):
+        path = directory / str(item["file"])
+        with path.open("rb") as source:
+            while chunk := source.read(16 * 1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+    return {"path": transport_bundle_name, "size": size, "sha256": digest.hexdigest()}
+
+
 def publish_adapter_manifest(
     target_dir: Path,
     base_dir: Path | None = None,
@@ -1085,6 +1099,8 @@ def publish_adapter_manifest(
                 ],
             }
         )
+    if weight_chunks:
+        manifest["bundle"] = _bundle_record(target_dir, weight_chunks)
     if base_dir is not None:
         manifest["base_size"] = (base_dir / adapter_weights_name).stat().st_size
         manifest["base_sha256"] = base_weights_sha256
