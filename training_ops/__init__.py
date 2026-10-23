@@ -5330,16 +5330,19 @@ esac
 """
 
 
-def _resume_repair_state(host: str, action: str, service_dir: str, step: int, digest: str = "") -> dict:
+def _resume_repair_state(host: str, action: str, service_dir: str, step: int, digest: str = "", role: str = "", adapter: str = "") -> dict:
     source = (repo_root / "training_ops/runtime/china/resume_state.py").read_text()
-    arguments = " ".join(shlex.quote(str(item)) for item in (action, service_dir, step, digest))
+    values = (action, service_dir, step, role, adapter, digest) if role else (action, service_dir, step, digest)
+    arguments = " ".join(shlex.quote(str(item)) for item in values)
     prefix = ""
     if action == "quarantine":
         prefix = (
             "set -euo pipefail\nstate=$(\n" + _orchestrator_state_script(orchestrator_container)
             + '\n)\n[[ "$state" = stopped || "$state" = absent ]] || exit 62\n'
         )
-    interpreter = "sudo python3" if action in {"partial", "quarantine"} else "python3"
+    elif action == "rollout":
+        prefix = _rollout_quarantine_guard(service_dir, orchestrator=host == orchestrator_host)
+    interpreter = "sudo python3" if action in {"partial", "quarantine", "rollout"} or role else "python3"
     code, output = _ssh(host, prefix + f"{interpreter} - {arguments} <<'PY'\n{source}\nPY", timeout=600)
     if code:
         raise Refused(f"orchestrator repair {action} check failed on {host}: {output.strip()}")
@@ -5350,6 +5353,53 @@ def _resume_repair_state(host: str, action: str, service_dir: str, step: int, di
         return value
     except (TypeError, ValueError) as error:
         raise Refused(f"invalid orchestrator repair {action} evidence") from error
+
+
+def _rollout_quarantine_guard(service_dir: str, *, orchestrator: bool = False) -> str:
+    """Drain only this run's exact publishers before the cache transaction."""
+    container = orchestrator_container if orchestrator else trainer_container
+    drain = f"{runtime_root}/h200/drain_rollout_publisher.py"; micro = f"{runtime_root}/china/sync_microbatches.sh"; batch = f"{runtime_root}/h200/sync_rollout_batches.sh"  # noqa: E702
+    return f"""set -euo pipefail
+container={shlex.quote(container)}
+state=$(sudo docker inspect --format '{{{{.Name}}}} {{{{.State.Running}}}}' "$container" 2>/dev/null || true)
+if [ -z "$state" ]; then listed=$(sudo docker ps -a --filter "name=^$container$" --format '{{{{.Names}}}}' 2>/dev/null) || exit 62; [ -z "$listed" ] || exit 62; else [ "$state" = "/$container false" ] || exit 62; fi
+sudo python3 {shlex.quote(drain)} {shlex.quote(service_dir)} {shlex.quote(micro)} --microbatch >/dev/null
+sudo python3 {shlex.quote(drain)} {shlex.quote(service_dir)} {shlex.quote(batch)} >/dev/null
+"""
+
+
+def _repair_rollout_quarantine(arguments: list[str]) -> str:
+    if len(arguments) != 3: raise Refused("rollout-quarantine requires RUN STEP ADAPTER")  # noqa: E701
+    run, step_text, adapter = arguments
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run) or not re.fullmatch(r"0|[1-9][0-9]*", step_text):
+        raise Refused("rollout-quarantine run or step is invalid")
+    step = int(step_text); _config_for_run(run); _, _, service_dir = _cold_run_paths(run)  # noqa: E702
+    expected_adapter = f"{service_dir}/broadcasts/step_{step}/adapter_model.safetensors"
+    if adapter != expected_adapter or not adapter.startswith("/"):
+        raise Refused("rollout-quarantine adapter is not the exact run policy path")
+    origin = _resume_repair_state(trainer_head, "policy", service_dir, step, role="origin", adapter=adapter); digest = origin.get("sha256")  # noqa: E702
+    if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise Refused("stable resume adapter has no exact SHA-256 identity")
+    hosts_to_check = list(dict.fromkeys([*trainer_hosts, orchestrator_host]))
+    for host in trainer_hosts:
+        if host != trainer_head: _resume_repair_state(host, "policy", service_dir, step, role="cache")  # noqa: E701
+    _resume_repair_state(orchestrator_host, "policy", service_dir, step, role="orchestrator-cache")
+    blocked = {}
+    for host in hosts_to_check: code, output = _ssh(host, _rollout_quarantine_guard(service_dir, orchestrator=host == orchestrator_host), timeout=180); blocked.update({host: output.strip()} if code else {})  # noqa: E701,E702
+    if blocked:
+        raise Refused(f"rollout quarantine drain blocked: completed=[] blocked={blocked}")
+    receipts, blocked = {}, {}
+    for host in hosts_to_check:
+        try: receipts[host] = _resume_repair_state(host, "rollout", service_dir, step, "" if host == trainer_head else "", "origin" if host == trainer_head else ("orchestrator-cache" if host == orchestrator_host else "cache"), adapter if host == trainer_head else "")  # noqa: E701
+        except (Refused, RuntimeError, OSError) as error: blocked[host] = str(error)  # noqa: E701
+    if blocked:
+        raise Refused(f"partial rollout quarantine: completed={sorted(receipts)} blocked={blocked}; retry is required")
+    for host in trainer_hosts: _check_adapter_restart(host, service_dir, step, "origin" if host == trainer_head else "cache", adapter if host == trainer_head else "")  # noqa: E701
+    _check_adapter_restart(orchestrator_host, service_dir, step, "orchestrator-cache", "")
+    bytes_moved = sum(int(value.get("bytes", 0)) for value in receipts.values()); paths = [f"{host}:{','.join(value.get('quarantined', [])) or 'none'}" for host, value in receipts.items()]  # noqa: E702
+    result = f"quarantined future rollout caches: run={run} resume_step={step} next_batch={step + 1} hosts={','.join(hosts_to_check)} bytes={bytes_moved} paths={' ; '.join(paths)}"
+    print(result)
+    return result
 
 
 def _orchestrator_resume_step(run: str, *, latest: bool = False) -> int | None:
@@ -5520,8 +5570,10 @@ echo "recreated exact orchestrator container $container"
 """
 
 
-def repair(what: str) -> str:
+def repair(what: str, *arguments: str) -> str:
     """Apply a named repair to the configured hosts."""
+    if what == "rollout-quarantine":
+        return _repair_rollout_quarantine(list(arguments))
     if what.startswith("engine-watchdog:"):
         return _repair_engine_watchdog(what.split(":", 1)[1])
     if what.startswith("engine:"):
@@ -5561,7 +5613,7 @@ def repair(what: str) -> str:
             raise Refused("adapter-tunnels-reset requires a run config directory")
         return _repair_adapter_tunnels(config_dir, reset=True)
     raise Refused(
-        f"unknown repair {what!r}. Use engine-watchdog:<host>, engine:<host>[:config-dir], supervisors, rollout-puller, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, adapter-tunnels[:config-dir], or adapter-tunnels-reset[:config-dir]."
+        f"unknown repair {what!r}. Use rollout-quarantine RUN STEP ADAPTER, engine-watchdog:<host>, engine:<host>[:config-dir], supervisors, rollout-puller, microbatch-sync, adapter-update, adapter-server[:reload], orchestrator, adapter-tunnels[:config-dir], or adapter-tunnels-reset[:config-dir]."
     )
 
 
@@ -13177,6 +13229,7 @@ usage = f"""training-ops <action> [args]
   watch [hours] [seconds]       monitor in the foreground
   watch-rollouts                 stream H200 rollout progress in the foreground
   repair <name>                 repair an engine, adapter server, orchestrator, supervisors, rollout-puller, or microbatch sync
+  repair rollout-quarantine RUN STEP ADAPTER  quarantine future rollout cache
   deploy <path>                 copy one repository file
   start <run> [cold|fresh|restart] [config-dir]  start one run config directory
   archive <run> [step ...]      upload stable old LoRA adapters
