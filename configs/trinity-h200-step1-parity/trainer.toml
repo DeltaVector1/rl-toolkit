@@ -1,0 +1,79 @@
+# Trainer-only Trinity step-1 parity qualification.
+# The adapter and eight references are staged after the verified H200 load.
+
+output_dir = "/data/glm52-rl/qualifications/trinity-h200-step1-parity"
+max_steps = 1
+dist_timeout_seconds = 5400
+enable_router_replay = true
+
+[data.fake]
+batch_size = 8
+generate_samples = false
+reference_path = "/data/glm52-rl/qualifications/trinity-h200-step1-parity/reference.json"
+
+[parity_guard]
+max_unmasked_mismatch_kl = 0.1
+max_masked_mismatch_kl = 0.5
+max_masked_fraction = 0.06
+
+[file_monitor]
+filename = "trainer-metrics.jsonl"
+
+[log]
+level = "info"
+ranks_filter = [0]
+
+[model]
+name = "/data/trinity-thinking-fp8"
+impl = "custom"
+seq_len = 8192
+attn = "flash_attention_2"
+cp = 8
+cp_style = "ulysses"
+pp = 8
+pp_schedule = "1f1b"
+pp_boundary_plan = "balanced"
+reshard_after_forward = true
+ep = 8
+global_ep = false
+ep_comm_backend = "torch"
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+moe_router_dtype = "float32"
+moe_use_grouped_mm = true
+fused_lm_head_token_chunk_size = 1024
+
+[model.quantization]
+type = "fp8"
+dequantize_checkpoint = false
+expert_activation_transport = "bf16"
+
+[model.lora]
+initial_adapter_path = "/data/glm52-rl/qualifications/trinity-h200-step1-parity/policy-1/adapter_model.safetensors"
+rank = 32
+alpha = 64
+dropout = 0.0
+target_modules = [
+    "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj",
+    "down_proj", "shared_expert", "experts",
+]
+
+[model.ac]
+mode = "reentrant_attention_all_experts"
+freq = 1
+
+[optim]
+type = "muon"
+lr = 0.0
+weight_decay = 0.0
+max_norm = 1.0
+
+[scheduler]
+type = "constant"
+
+[weight_broadcast]
+type = "filesystem"
+save_format = "safetensors"
+
+[rollout_transport]
+type = "filesystem"

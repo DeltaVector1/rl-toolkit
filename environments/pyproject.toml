@@ -1,0 +1,11 @@
+[tool.uv.workspace]
+members = [
+    "nemotron_guard_v1",
+    "nemotron_instruction_following_v1",
+    "nemotron_knowledge_v1",
+    "nemotron_reasoning_v1",
+    "nemotron_tool_calling_v1",
+]
+
+[tool.uv]
+package = false

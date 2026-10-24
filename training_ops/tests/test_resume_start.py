@@ -1,0 +1,351 @@
+import contextlib
+import tempfile
+import tomllib
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import training_ops
+import training_ops.tests  # Install the local-only test guard before any test runs.
+
+
+class ResumeStartTest(unittest.TestCase):
+    def test_trinity_parity_config_is_new_and_fail_closed(self):
+        config_dir = (
+            Path(__file__).resolve().parents[2]
+            / "configs/trinity-decensor-experimental-parity"
+        )
+        with (config_dir / "trainer.toml").open("rb") as stream:
+            trainer = tomllib.load(stream)
+        with (config_dir / "orchestrator.toml").open("rb") as stream:
+            orchestrator = tomllib.load(stream)
+        with (config_dir / "inference.toml").open("rb") as stream:
+            inference = tomllib.load(stream)
+
+        self.assertEqual(trainer["max_steps"], 244)
+        self.assertEqual(
+            trainer["parity_guard"],
+            {
+                "max_unmasked_mismatch_kl": 0.1,
+                "max_masked_mismatch_kl": 0.5,
+                "max_masked_fraction": 0.06,
+            },
+        )
+        self.assertTrue(trainer["enable_router_replay"])
+        self.assertTrue(inference["enable_return_routed_experts"])
+        self.assertEqual(orchestrator["max_steps"], 244)
+        self.assertEqual(orchestrator["renderer"]["reasoning_parser"], "think")
+        self.assertEqual(
+            trainer["output_dir"],
+            "/data/glm52-rl/runs/trinity-decensor-experimental-parity",
+        )
+        self.assertTrue(
+            orchestrator["weight_broadcast"]["source_url"].endswith("-parity")
+        )
+        self.assertTrue(
+            orchestrator["weight_broadcast"]["source_dir"].endswith("-parity")
+        )
+
+        launcher = (
+            Path(__file__).resolve().parents[1]
+            / "runtime/h200/start_inference.sh"
+        )
+        source = launcher.read_text()
+        self.assertIn(
+            '"kv_cache_dtype": "bfloat16" if kind == "trinity" else "fp8"',
+            source,
+        )
+
+    def test_start_inventory_deploys_shared_drain_to_trainer_head(self):
+        selected = {
+            "trainer": "configs/general-agent/trainer.toml",
+            "orchestrator": "configs/general-agent/orchestrator.toml",
+            "inference": "configs/general-agent/inference.toml",
+        }
+        with mock.patch.object(training_ops, "mounted_files", return_value=[]):
+            inventory = dict(training_ops._start_dependency_inventory(selected, training_ops.trainer_hosts))
+        self.assertEqual(
+            set(inventory["training_ops/runtime/h200/drain_rollout_publisher.py"]),
+            {training_ops.trainer_head, *training_ops.inference_hosts},
+        )
+
+    def test_start_inventory_includes_experimental_environment_source(self):
+        selected = {
+            "trainer": "configs/trinity-decensor-experimental/trainer.toml",
+            "orchestrator": "configs/trinity-decensor-experimental/orchestrator.toml",
+            "inference": "configs/trinity-decensor-experimental/inference.toml",
+        }
+        with mock.patch.object(training_ops, "mounted_files", return_value=[]):
+            inventory = dict(
+                training_ops._start_dependency_inventory(
+                    selected, training_ops.trainer_hosts
+                )
+            )
+        self.assertIn(
+            "environments/decensor-experimental/src/decensor_experimental_v1/scoring.py",
+            inventory,
+        )
+
+    def test_production_inventory_deploys_exact_cache_cleanup_helper(self):
+        selected = {
+            "trainer": "configs/trinity-decensor-experimental-fixed/trainer.toml",
+            "orchestrator": "configs/trinity-decensor-experimental-fixed/orchestrator.toml",
+            "inference": "configs/trinity-decensor-experimental-fixed/inference.toml",
+        }
+        with mock.patch.object(training_ops, "mounted_files", return_value=[]):
+            inventory = dict(
+                training_ops._start_dependency_inventory(
+                    selected, training_ops.trainer_hosts
+                )
+            )
+        self.assertEqual(
+            set(inventory["training_ops/runtime/adapter_cache_cleanup.py"]),
+            set(training_ops.inference_hosts),
+        )
+        self.assertEqual(
+            set(inventory["training_ops/runtime/h200/start_inference.sh"]),
+            set(training_ops.inference_hosts),
+        )
+
+    def test_orchestrator_launcher_includes_experimental_pythonpath(self):
+        launcher = (
+            Path(__file__).resolve().parents[1]
+            / "runtime/h200/start_orchestrator.sh"
+        )
+        source = launcher.read_text()
+        self.assertIn(
+            '-e PYTHONPATH="$deployment/environments/decensor/src:'
+            '$deployment/environments/decensor-experimental/src:'
+            '$deployment/environments/general-agent:/app/src"',
+            source,
+        )
+
+    def run_start(self, *, mode="restart", resume=True, failure=None, control_files=None, nodes=None, state_failure=None, changed_origin=False):
+        calls = []
+        origin_checks = 0
+        if control_files is None:
+            control_files = {training_ops.trainer_head: "saved control"}
+
+        def ssh(host, command, timeout=60):
+            calls.append((host, command))
+            if failure is not None and failure(host, command):
+                return 1, "test failure"
+            if command.startswith("test -f ") and "control/orch.toml" in command:
+                self.assertIn(" && test -s ", command)
+                return (0, "") if control_files.get(host) else (1, "")
+            return 0, "ready"
+
+        def check_state(host, directory, step, role, adapter, digest=""):
+            nonlocal origin_checks
+            calls.append((host, f"check restart {role} step={step}"))
+            if role == state_failure:
+                raise training_ops.Refused(f"test {role} state failure")
+            if role == "origin":
+                origin_checks += 1
+            return {"policy_step": step, "next_batch": step + 1, "sha256": "a" * 64, "config_sha256": "b" * 64 if changed_origin and origin_checks > 1 else "c" * 64}
+
+        def remote_ok(host, command, _label, **kwargs):
+            code, output = ssh(host, command)
+            if code:
+                raise RuntimeError(output)
+
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
+            root = Path(temporary)
+            edge = root / "orch.toml"
+            edge.write_text(
+                f'output_dir = "{training_ops.run_root}/alpha/run_alpha"\n'
+                '[weight_broadcast]\nsource_url = "http://localhost:8100/alpha"\n'
+            )
+            patches = {
+                "repo_root": root,
+                "_config_dir": mock.Mock(return_value={"trainer": "trainer.toml", "orchestrator": "orch.toml"}),
+                "_start_dependency_inventory": mock.Mock(return_value=[]),
+                "_deploy_dependencies": mock.Mock(side_effect=lambda _files: calls.append(("deployment", "deploy dependencies"))),
+                "_orchestrator_image_preflight": mock.Mock(
+                    side_effect=lambda: calls.append(
+                        ("preflight", "check orchestrator image")
+                    )
+                    or "sha256:"
+                    + "d" * 64
+                ),
+                "_ssh": ssh,
+                "_check_adapter_restart": check_state,
+                "_ssh_address": mock.Mock(return_value="127.0.0.1"),
+                "_fan": lambda nodes, function: {host: function(host) for host in nodes},
+                "_remote_ok": remote_ok,
+                "_initial_adapter_cache_identity": mock.Mock(return_value=None),
+                "_cold_start_cleanup": mock.Mock(),
+                "_cold_adapter_cache_cleanup": mock.Mock(),
+                "_repair_supervisors": mock.Mock(),
+            }
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(training_ops, name, value))
+            stack.enter_context(mock.patch.object(training_ops.time, "sleep"))
+            stack.enter_context(mock.patch("builtins.print"))
+            try:
+                training_ops.start(
+                    "alpha", mode=mode, nodes=nodes or ["n82", "n76"], supervisors=False,
+                    resume_adapter=f"{training_ops.run_root}/alpha/saved.safetensors" if resume else None,
+                    resume_step=1 if resume else None,
+                )
+            except Exception as error:
+                return calls, error
+        return calls, None
+
+    def test_resume_starts_trainer_before_orchestrator_without_broadcast_wait(self):
+        calls, error = self.run_start()
+        self.assertIsNone(error)
+        commands = [command for _, command in calls]
+        control = [i for i, command in enumerate(commands) if command.startswith("test -f ") and "control/orch.toml" in command]
+        trainer = [i for i, command in enumerate(commands) if command.endswith(" trainer")]
+        orch = next(i for i, command in enumerate(commands) if command.endswith(training_ops.orchestrator_launcher))
+        self.assertEqual(len(control), 1)
+        self.assertEqual(calls[control[0]][0], training_ops.trainer_head)
+        self.assertLess(control[0], commands.index("deploy dependencies"))
+        image_preflight = commands.index("check orchestrator image")
+        self.assertLess(commands.index("deploy dependencies"), image_preflight)
+        self.assertLess(image_preflight, min(trainer))
+        self.assertLess(max(control), min(trainer))
+        self.assertLess(max(trainer), orch)
+        self.assertIn("adapter_resume_step=1 ", commands[orch])
+        checks = [i for i, command in enumerate(commands) if command.startswith("check restart trainer")]
+        self.assertEqual(len(checks), 2)
+        self.assertLess(max(checks), min(trainer))
+        drain = next(i for i, command in enumerate(commands) if "drain_rollout_publisher.py" in command)
+        final_origin = max(i for i, command in enumerate(commands) if command.startswith("check restart origin"))
+        self.assertLess(drain, final_origin)
+        microbatch = [i for i, command in enumerate(commands) if command.endswith("sync_microbatches.sh --microbatch")]
+        self.assertEqual(len(microbatch), 1)
+        self.assertEqual(calls[microbatch[0]][0], training_ops.trainer_head)
+        self.assertLess(drain, microbatch[0])
+        self.assertLess(microbatch[0], final_origin)
+        self.assertFalse(any("stop_sync_processes()" in command for command in commands))
+        self.assertLess(final_origin, min(checks))
+        self.assertFalse(any("pkill -f '[s]ync_rollout_batches.sh'" in command for command in commands))
+        self.assertFalse(any("fresh adapter" in command or ".trainer-restart-started" in command for command in commands))
+
+    def test_head_only_saved_control_accepts_missing_peer_control(self):
+        calls, error = self.run_start(
+            control_files={training_ops.trainer_head: "saved control"},
+            nodes=training_ops.trainer_hosts,
+        )
+        self.assertIsNone(error)
+        control_hosts = [host for host, command in calls if command.startswith("test -f ") and "control/orch.toml" in command]
+        self.assertEqual(control_hosts, [training_ops.trainer_head])
+        self.assertEqual(
+            {host for host, command in calls if command.endswith(" trainer")},
+            set(training_ops.trainer_hosts),
+        )
+
+    def test_missing_or_empty_head_control_refuses_before_any_write(self):
+        for control_files in ({"n76": "peer control"}, {"n82": "", "n76": "peer control"}):
+            with self.subTest(control_files=control_files):
+                calls, error = self.run_start(control_files=control_files)
+                self.assertIsInstance(error, training_ops.Refused)
+                self.assertIn("non-empty control file", str(error))
+                self.assertIn(f"on {training_ops.trainer_head}", str(error))
+                self.assertEqual(len(calls), 1)
+                host, command = calls[0]
+                self.assertEqual(host, training_ops.trainer_head)
+                self.assertTrue(command.startswith("test -f ") and "test -s " in command)
+
+    def test_adapter_restart_without_head_refuses_before_host_actions(self):
+        calls, error = self.run_start(nodes=["n76"])
+        self.assertIsInstance(error, training_ops.Refused)
+        self.assertIn(f"trainer head {training_ops.trainer_head} in nodes", str(error))
+        self.assertEqual(calls, [])
+
+    def test_trainer_failure_cleans_selected_services_and_does_not_launch_orchestrator(self):
+        calls, error = self.run_start(failure=lambda host, command: host == "n76" and command.endswith(" trainer"))
+        self.assertIn("trainer start failed", str(error))
+        self.assertFalse(any(command.endswith(training_ops.orchestrator_launcher) for _, command in calls))
+        self.assertEqual(
+            {host for host, command in calls if command == f"sudo docker rm -f {training_ops.trainer_container}"},
+            {"n82", "n76"},
+        )
+        self.assertIn(("n82", f"sudo docker rm -f {training_ops.adapter_container}"), calls)
+
+    def test_orchestrator_failure_cleans_trainer_and_preserves_original_error(self):
+        calls, error = self.run_start(failure=lambda _host, command: command.endswith(training_ops.orchestrator_launcher) or command == f"sudo docker rm -f {training_ops.trainer_container}")
+        self.assertIn("edge orchestrator start failed", str(error))
+        self.assertEqual(len(error.__notes__), 2)
+        self.assertIn(("n82", f"sudo docker rm -f {training_ops.adapter_container}"), calls)
+
+    def test_adapter_failure_does_not_launch_trainer_or_orchestrator(self):
+        calls, error = self.run_start(failure=lambda _host, command: command.endswith(" adapter-http"))
+        self.assertIn("adapter server start failed", str(error))
+        self.assertFalse(any(command.endswith(" trainer") or command.endswith(training_ops.orchestrator_launcher) for _, command in calls))
+        self.assertIn(("n82", f"sudo docker rm -f {training_ops.adapter_container}"), calls)
+
+    def test_cold_order_stays_orchestrator_control_trainer(self):
+        calls, error = self.run_start(mode="cold", resume=False, control_files={})
+        self.assertIsNone(error)
+        commands = [command for _, command in calls]
+        self.assertFalse(any(command.startswith("test -f ") and "control/orch.toml" in command for command in commands))
+        orch = next(i for i, command in enumerate(commands) if command.endswith(training_ops.orchestrator_launcher))
+        control = next(i for i, command in enumerate(commands) if "orchestrator control file did not arrive" in command)
+        trainer = next(i for i, command in enumerate(commands) if command.endswith(" trainer"))
+        self.assertIn("TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH=1", commands[orch])
+        self.assertLess(orch, control)
+        self.assertLess(control, trainer)
+
+    def test_restart_without_adapter_keeps_fresh_broadcast_wait(self):
+        calls, error = self.run_start(resume=False, control_files={})
+        self.assertIsNone(error)
+        commands = [command for _, command in calls]
+        self.assertFalse(any(command.startswith("test -f ") and "control/orch.toml" in command for command in commands))
+        trainer = next(i for i, command in enumerate(commands) if command.endswith(" trainer"))
+        broadcast = next(i for i, command in enumerate(commands) if "fresh adapter ready" in command)
+        orch = next(i for i, command in enumerate(commands) if command.endswith(training_ops.orchestrator_launcher))
+        self.assertIn("TRAINER_WATCHDOG_WAIT_FOR_INITIAL_HEALTH=0", commands[orch])
+        self.assertLess(trainer, broadcast)
+        self.assertLess(broadcast, orch)
+
+    def test_cold_and_restart_do_not_pass_fresh_no_replace_flag(self):
+        for mode in ("cold", "restart"):
+            with self.subTest(mode=mode):
+                calls, error = self.run_start(
+                    mode=mode,
+                    resume=False,
+                    control_files={},
+                )
+                self.assertIsNone(error)
+                self.assertFalse(
+                    any("FRESH_START_NO_REPLACE" in command for _, command in calls)
+                )
+
+    def test_unstable_origin_refuses_before_deployment_or_start(self):
+        calls, error = self.run_start(state_failure="origin")
+        self.assertIsInstance(error, training_ops.Refused)
+        self.assertFalse(any(command == "deploy dependencies" or command.endswith(" trainer") for _, command in calls))
+
+    def test_cached_trainer_batch_refuses_before_any_start(self):
+        calls, error = self.run_start(state_failure="trainer")
+        self.assertIsInstance(error, training_ops.Refused)
+        self.assertFalse(any(command.endswith(" trainer") or command.endswith(training_ops.orchestrator_launcher) for _, command in calls))
+
+    def test_orchestrator_state_is_checked_before_deployment(self):
+        calls, error = self.run_start(state_failure="orchestrator")
+        self.assertIsInstance(error, training_ops.Refused)
+        self.assertFalse(any(command == "deploy dependencies" for _, command in calls))
+
+    def test_publisher_drain_failure_never_scans_final_state_or_starts(self):
+        calls, error = self.run_start(failure=lambda _host, command: "drain_rollout_publisher.py" in command)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertFalse(any(command.startswith("check restart trainer") or command.endswith(" trainer") for _, command in calls))
+
+    def test_origin_mutation_after_first_check_refuses_start(self):
+        calls, error = self.run_start(changed_origin=True)
+        self.assertIsInstance(error, training_ops.Refused)
+        self.assertIn("identity changed", str(error))
+        self.assertFalse(any(command.endswith(" trainer") or command.endswith(training_ops.orchestrator_launcher) for _, command in calls))
+
+    def test_microbatch_drain_failure_never_scans_final_state_or_starts(self):
+        calls, error = self.run_start(failure=lambda _host, command: command.endswith("sync_microbatches.sh --microbatch"))
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(sum(command.startswith("check restart origin") for _, command in calls), 1)
+        self.assertFalse(any(command.startswith("check restart trainer") or command.endswith(" trainer") for _, command in calls))
+
+
+if __name__ == "__main__":
+    unittest.main()

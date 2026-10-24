@@ -1,0 +1,491 @@
+import os
+import warnings
+from typing import Optional, Union
+
+import torch
+import torch.distributed as dist
+from torch import Tensor, nn
+from transformers.cache_utils import Cache
+from transformers.generation import GenerationMixin
+from transformers.modeling_layers import GradientCheckpointingLayer
+from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, auto_docstring
+from transformers.utils.deprecation import deprecate_kwarg
+
+from prime_rl.trainer.models.base import PreTrainedModelPrimeRL
+from prime_rl.trainer.models.glm_moe_dsa.configuration_glm_moe_dsa import GlmMoeDsaConfig, _index_cache_skip_topk
+from prime_rl.trainer.models.glm_moe_dsa.converting_glm_moe_dsa import (
+    conversion_chain,
+    convert_tt_layer_to_vllm_kernel,
+)
+from prime_rl.trainer.models.glm_moe_dsa.sparse_mla_attention import GlmMoeDsaAttention, SparseMlaAttentionArgs
+from prime_rl.trainer.models.layers.lm_head import PrimeLmOutput
+from prime_rl.trainer.models.layers.mlp import MLP, MLPConfig
+from prime_rl.trainer.models.layers.moe import MoE, MoEArgs
+from prime_rl.trainer.models.layers.norms import RMSNorm, RMSNormConfig
+from prime_rl.trainer.models.layers.rotary_emb import RotaryEmbedding, RotaryEmbeddingConfig
+
+
+_LAYER_PROFILE = os.environ.get("PRIME_EP_PROFILE", "") == "1"
+_LAYER_PROFILE_EVERY = int(os.environ.get("PRIME_LAYER_PROFILE_EVERY", "180"))
+_LAYER_PROFILE_EVENTS: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]]] = {}
+_LAYER_PROFILE_CALLS = 0
+
+
+def _report_layer_profile(phase: str, events) -> None:
+    """Record attention and MLP CUDA time without timing pipeline waits."""
+    global _LAYER_PROFILE_CALLS
+    if not _LAYER_PROFILE:
+        return
+    _LAYER_PROFILE_EVENTS.setdefault(phase, []).append(events)
+    _LAYER_PROFILE_CALLS += 1
+    if _LAYER_PROFILE_CALLS % _LAYER_PROFILE_EVERY:
+        return
+    events[-1].synchronize()
+    parts = []
+    for name, samples in sorted(_LAYER_PROFILE_EVENTS.items()):
+        attention_ms = sum(start.elapsed_time(middle) for start, middle, _ in samples)
+        mlp_ms = sum(middle.elapsed_time(end) for _, middle, end in samples)
+        parts.append(
+            f"{name}:calls={len(samples)} attn={attention_ms / 1000:.2f}s "
+            f"mlp={mlp_ms / 1000:.2f}s"
+        )
+    _LAYER_PROFILE_EVENTS.clear()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if local_rank == 0:
+        print(
+            f"[glm-layer-prof] rank={os.environ.get('RANK', '0')} "
+            + " | ".join(parts),
+            flush=True,
+        )
+
+
+def _sparse_mla_attention_args(config: GlmMoeDsaConfig, layer_idx: int) -> SparseMlaAttentionArgs:
+    if config.q_lora_rank is None:
+        raise ValueError("Sparse MLA attention requires q_lora_rank to be set")
+    return SparseMlaAttentionArgs(
+        hidden_size=config.hidden_size,
+        num_attention_heads=config.num_attention_heads,
+        kv_lora_rank=config.kv_lora_rank,
+        q_lora_rank=config.q_lora_rank,
+        qk_rope_head_dim=config.qk_rope_head_dim,
+        qk_nope_head_dim=config.qk_nope_head_dim,
+        qk_head_dim=config.qk_head_dim,
+        v_head_dim=config.v_head_dim,
+        attention_bias=config.attention_bias,
+        rms_norm_eps=config.rms_norm_eps,
+        index_n_heads=config.index_n_heads,
+        index_head_dim=config.index_head_dim,
+        index_topk=config.index_topk,
+        use_index_cache=getattr(config, "use_index_cache", False),
+        skip_topk=_index_cache_skip_topk(config, layer_idx),
+    )
+
+
+class GlmMoeDsaDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: GlmMoeDsaConfig, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.self_attn = GlmMoeDsaAttention(_sparse_mla_attention_args(config, layer_idx))
+
+        moe_args = MoEArgs(
+            num_experts=config.n_routed_experts,
+            num_shared_experts=config.n_shared_experts,
+            score_func="sigmoid",
+            route_norm=config.norm_topk_prob,
+            route_scale=config.routed_scaling_factor,
+            score_before_experts=False,
+            top_k=config.num_experts_per_tok,
+            load_balance_coeff=1e-3,
+            use_grouped_mm=config.use_grouped_mm,
+            fp8=getattr(config, "fp8", False),
+            fp8_checkpoint=getattr(
+                config,
+                "fp8_checkpoint_moe",
+                getattr(config, "fp8_checkpoint", False),
+            ),
+            fp8_checkpoint_routed=getattr(
+                config,
+                "fp8_checkpoint_routed_moe",
+                getattr(config, "fp8_checkpoint", False),
+            ),
+            fp8_checkpoint_shared=getattr(
+                config,
+                "fp8_checkpoint_shared_moe",
+                getattr(config, "fp8_checkpoint", False),
+            ),
+        )
+        mlp_config = MLPConfig(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            gate_act=config.hidden_act,
+            bias=False,
+        )
+
+        if layer_idx >= config.first_k_dense_replace:
+            self.mlp = MoE(moe_args, dim=config.hidden_size, hidden_dim=config.moe_intermediate_size)
+        else:
+            self.mlp = MLP(mlp_config)
+
+        self.input_layernorm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.rms_norm_eps))
+        self.post_attention_layernorm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.rms_norm_eps))
+
+    def set_context_parallel_attributes(self, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> None:
+        self._cp_group = cp_group
+        self._cp_rank = cp_rank
+        self._cp_world_size = cp_world_size
+        self.self_attn.set_context_parallel_attributes(cp_group, cp_rank, cp_world_size)
+
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        ks: Optional[torch.Tensor] = None,
+        ke: Optional[torch.Tensor] = None,
+        cached_indices: Optional[torch.Tensor] = None,
+        routed_experts: Optional[torch.LongTensor] = None,
+        block_mask=None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # Backstop for the float8 residual stream. Under
+        # `quantization.dequantize_checkpoint = false` FSDP applies a bare
+        # MixedPrecisionPolicy() to these blocks (model.py:813) and nothing
+        # normalizes activation dtypes, so an fp8 tensor produced anywhere in
+        # attention or the MoE reaches these adds and torch raises "Promotion
+        # for Float8 Types is not supported". Patching interior sites one by one
+        # is whack-a-mole; the residual stream is where every path converges, so
+        # clamp here. Widening fp8 -> bf16 is exact and this is a no-op when
+        # nothing is fp8.
+        _REAL = (torch.float32, torch.float16, torch.bfloat16)
+
+        def _real(t):
+            return t if t.dtype in _REAL else t.to(torch.bfloat16)
+
+        hidden_states = _real(hidden_states)
+        if _LAYER_PROFILE:
+            profile_start = torch.cuda.Event(enable_timing=True)
+            profile_middle = torch.cuda.Event(enable_timing=True)
+            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_start.record()
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, cached_indices = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            ks=ks,
+            ke=ke,
+            cached_indices=cached_indices,
+            block_mask=block_mask,
+        )
+        hidden_states = residual + _real(hidden_states)
+        if _LAYER_PROFILE:
+            profile_middle.record()
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states, routed_experts=routed_experts)
+        hidden_states = residual + _real(hidden_states)
+        if _LAYER_PROFILE:
+            profile_end.record()
+            phase = (
+                "recompute"
+                if torch._C._current_graph_task_id() != -1
+                else "forward"
+            )
+            _report_layer_profile(
+                phase,
+                (profile_start, profile_middle, profile_end),
+            )
+        return hidden_states, cached_indices
+
+
+@auto_docstring
+class GlmMoeDsaPreTrainedModel(PreTrainedModelPrimeRL):
+    config: GlmMoeDsaConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["GlmMoeDsaDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn = True
+    _supports_sdpa = False
+    _supports_flex_attn = True
+    _can_compile_fullgraph = False
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": GlmMoeDsaDecoderLayer,
+    }
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+
+    @classmethod
+    def keep_in_fp32_for_weight_transfer(cls, name: str) -> bool:
+        return name.endswith("mlp.expert_bias")
+
+    @classmethod
+    def is_hf_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
+        return any("mlp.experts.1.up_proj" in name or "mlp.experts.gate_up_proj" in name for name in state_dict.keys())
+
+    @classmethod
+    def is_prime_state_dict(cls, state_dict: dict[str, Tensor]) -> bool:
+        return any("mlp.experts.w1" in module_name for module_name in state_dict.keys())
+
+    @classmethod
+    def conversion_chain(cls, config):
+        return conversion_chain(config)
+
+    @classmethod
+    def convert_adapter_to_hf(cls, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        for old_key in list(state_dict):
+            new_key = old_key.replace(".mlp.shared_expert.", ".mlp.shared_experts.")
+            if new_key != old_key:
+                state_dict[new_key] = state_dict.pop(old_key)
+        return state_dict
+
+    @classmethod
+    def convert_layer_to_vllm_kernel(
+        cls, state_dict: dict[str, Tensor], layer_idx: int, quantize_fp8: bool = False
+    ) -> dict[str, Tensor]:
+        return convert_tt_layer_to_vllm_kernel(state_dict, layer_idx, quantize_fp8=quantize_fp8)
+
+
+@auto_docstring
+class GlmMoeDsaModel(GlmMoeDsaPreTrainedModel):
+    def __init__(self, config: GlmMoeDsaConfig):
+        super().__init__(config)
+
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [GlmMoeDsaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = RMSNorm(RMSNormConfig(hidden_size=config.hidden_size, eps=config.rms_norm_eps))
+
+        rope_parameters = getattr(config, "rope_parameters", None) or {}
+        rope_type = rope_parameters.get("rope_type", "default") if isinstance(rope_parameters, dict) else "default"
+        rotary_config = RotaryEmbeddingConfig(
+            max_position_embeddings=config.max_position_embeddings,
+            rope_type=rope_type,
+            model_config=config,
+        )
+        self.rotary_emb = RotaryEmbedding(rotary_config)
+        self.gradient_checkpointing = False
+
+        self.post_init()
+
+    def _context_parallel_state(self) -> tuple[dist.ProcessGroup | None, int, int]:
+        if len(self.layers) == 0:
+            return None, 0, 1
+
+        # Under pipeline parallelism apply_pp_boundaries replaces this
+        # Pipeline stages store layers by their global index.
+        if isinstance(self.layers, nn.ModuleDict):
+            layer = next(iter(self.layers.values()))
+        else:
+            layer = self.layers[0]
+        return getattr(layer, "_cp_group", None), getattr(layer, "_cp_rank", 0), getattr(layer, "_cp_world_size", 1)
+
+    def _gather_position_ids_for_cp(
+        self,
+        position_ids: torch.LongTensor,
+        cp_group: dist.ProcessGroup,
+        cp_world_size: int,
+    ) -> torch.LongTensor:
+        gathered_position_ids = [torch.empty_like(position_ids) for _ in range(cp_world_size)]
+        dist.all_gather(gathered_position_ids, position_ids.contiguous(), group=cp_group)
+        return torch.cat(gathered_position_ids, dim=1)
+
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        routed_experts: Optional[torch.LongTensor] = None,
+        sparse_indices_cache: Optional[torch.LongTensor] = None,
+        *,
+        seq_lens: Optional[torch.LongTensor] = None,
+        seq_lens_are_pre_shard: bool = False,
+        pipeline_layer_indices: Optional[tuple[int, ...]] = None,
+        pipeline_apply_norm: bool = True,
+    ) -> BaseModelOutputWithPast:
+        """
+        routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
+            Routed experts for each token in the sequence. Only used for router replay.
+        sparse_indices_cache (`torch.LongTensor`, *optional*):
+            Sparse attention indices from the preceding pipeline stage.
+        seq_lens (`torch.LongTensor` of shape `(num_documents,)`, *optional*):
+            Per-document lengths of the packed row (PrimeRL packed-batch contract). Unused.
+        seq_lens_are_pre_shard (`bool`, *optional*, defaults to `False`):
+            Whether `seq_lens` holds pre-CP-shard (global) document boundaries. Unused.
+        pipeline_layer_indices (`tuple[int, ...]`, *optional*):
+            Global indices of the layers owned by this pipeline stage.
+        pipeline_apply_norm (`bool`, *optional*, defaults to `True`):
+            Whether to apply the final model normalization.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+
+        cp_group, cp_rank, cp_world_size = self._context_parallel_state()
+        if cp_group is not None and cp_world_size > 1:
+            position_ids_full = self._gather_position_ids_for_cp(position_ids, cp_group, cp_world_size)
+        else:
+            position_ids_full = position_ids
+
+        flat_position_ids = position_ids_full.view(-1)
+        S_full = flat_position_ids.shape[0]
+        ks_full = torch.arange(S_full, dtype=torch.int32, device=flat_position_ids.device) - flat_position_ids.to(
+            torch.int32
+        )
+        ke_full = torch.arange(1, S_full + 1, dtype=torch.int32, device=flat_position_ids.device)
+
+        # K uses the full sequence. Q uses the local context-parallel slice.
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids_full)
+
+        if cp_world_size > 1:
+            s_local = S_full // cp_world_size
+            ks = ks_full[cp_rank * s_local : (cp_rank + 1) * s_local].contiguous()
+            ke = ke_full[cp_rank * s_local : (cp_rank + 1) * s_local].contiguous()
+        else:
+            ks, ke = ks_full, ke_full
+
+        cached_indices = sparse_indices_cache
+        use_index_cache = getattr(self.config, "use_index_cache", False)
+        # Router replay uses global layer indices.
+        if pipeline_layer_indices is not None:
+            layer_items = [
+                (index, self.layers[str(index)]) for index in pipeline_layer_indices
+            ]
+        elif isinstance(self.layers, nn.ModuleDict):
+            layer_items = [(int(name), module) for name, module in self.layers.items()]
+        else:
+            layer_items = list(enumerate(self.layers[: self.config.num_hidden_layers]))
+        for layer_idx, decoder_layer in layer_items:
+            routed_experts_layer = routed_experts[:, :, layer_idx, :] if routed_experts is not None else None
+            hidden_states, next_cached_indices = decoder_layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                ks=ks,
+                ke=ke,
+                cached_indices=cached_indices,
+                routed_experts=routed_experts_layer,
+            )
+            cached_indices = next_cached_indices if use_index_cache else None
+
+        # Only the last pipeline stage owns the final normalization.
+        if pipeline_apply_norm and self.norm is not None:
+            hidden_states = self.norm(hidden_states)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=cached_indices,
+        )
+
+
+@auto_docstring
+class GlmMoeDsaForCausalLM(GlmMoeDsaPreTrainedModel, GenerationMixin):
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _tp_plan = {"lm_head": "colwise_rep"}
+    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = GlmMoeDsaModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        warnings.warn("GlmMoeDsaForCausalLM is experimental, higher trainer<->inference KL mismatch may be observed.")
+        warnings.warn("`model.attn` is ignored; GlmMoeDsa selects its model-specific attention path.")
+
+        self.post_init()
+
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        temperature: Optional[torch.Tensor] = None,
+        routed_experts: Optional[torch.LongTensor] = None,
+        sparse_indices_cache: Optional[torch.LongTensor] = None,
+        pipeline_layer_indices: Optional[tuple[int, ...]] = None,
+        pipeline_apply_norm: bool = True,
+        # Document boundaries derive from position_ids; seq_lens is accepted
+        # to satisfy the trainer's universal contract.
+        *,
+        seq_lens: torch.LongTensor,
+        seq_lens_are_pre_shard: bool = False,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> PrimeLmOutput:
+        r"""
+        seq_lens (`torch.LongTensor` of shape `(num_documents,)`):
+            Per-document lengths of the packed row (PrimeRL packed-batch contract).
+        seq_lens_are_pre_shard (`bool`, *optional*, defaults to `False`):
+            Whether `seq_lens` holds pre-CP-shard (global) document boundaries.
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices of input tokens in the KV cache. Accepted only for HuggingFace API
+            compatibility — prime-rl asserts `use_cache is None` since training does not
+            perform autoregressive decoding, so this argument is unused.
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels used by PrimeRL's wrapped LM head to optionally compute per-token logprobs/entropy.
+        temperature (`torch.Tensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Per-token temperatures for logprobs/entropy computation when `labels` are provided.
+        routed_experts (`torch.LongTensor` of shape `(batch_size, sequence_length, num_hidden_layers, num_experts_per_tok)`, *optional*):
+            Routed experts for each token in the sequence. Only used for router replay.
+        sparse_indices_cache (`torch.LongTensor` of shape `(batch_size, sequence_length, index_n_heads, index_topk)`, *optional*):
+            Sparse attention indices computed by an earlier pipeline stage.
+        pipeline_layer_indices (`tuple[int, ...]`, *optional*):
+            Global indices of the layers owned by this pipeline stage.
+        pipeline_apply_norm (`bool`, *optional*, defaults to `True`):
+            Whether the model applies its final normalization.
+        """
+        assert use_cache is None, "use_cache is not supported for custom glm_moe_dsa for now"
+        assert past_key_values is None, "past_key_values is not supported for custom glm_moe_dsa for now"
+
+        if position_ids is None:
+            if inputs_embeds is not None:
+                position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
+            else:
+                position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            routed_experts=routed_experts,
+            sparse_indices_cache=sparse_indices_cache,
+            pipeline_layer_indices=pipeline_layer_indices,
+            pipeline_apply_norm=pipeline_apply_norm,
+        )
+        hidden_states = outputs.last_hidden_state
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        output = self.lm_head(
+            hidden_states[:, slice_indices, :],
+            labels[:, slice_indices] if labels is not None else None,
+            temperature=temperature,
+        )
+        return output
+
+    def init_buffers_post_meta(self):
+        buffer_names = [name for name, _ in self.named_buffers()]
+        if "model.rotary_emb.inv_freq" in buffer_names:
+            rotary_emb = self.model.rotary_emb
+            inv_freq, rotary_emb.attention_scaling = rotary_emb.rope_init_fn(
+                rotary_emb.config, rotary_emb.inv_freq.device
+            )
+            rotary_emb.inv_freq.copy_(inv_freq)
+
+
+__all__ = ["GlmMoeDsaConfig", "GlmMoeDsaPreTrainedModel", "GlmMoeDsaModel", "GlmMoeDsaForCausalLM"]

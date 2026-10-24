@@ -1,0 +1,13 @@
+[project]
+name = "xiaomi-music"
+version = "0.1.0"
+description = "Native Verifiers tasks for Xiaomi Music"
+requires-python = ">=3.11"
+dependencies = ["verifiers>=0.3.2.dev206,<=0.3.2.dev208", "huggingface-hub>=0.24", "pyarrow>=18"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["xiaomi_music"]

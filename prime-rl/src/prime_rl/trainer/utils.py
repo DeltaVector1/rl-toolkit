@@ -1,0 +1,679 @@
+import gc
+import heapq
+import json
+import pickle
+import shutil
+import time
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import torch
+import torch.distributed as dist
+from rich import print as rich_print
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+from torch import Tensor, nn
+from torch.distributed.tensor import DTensor
+from transformers.tokenization_utils import PreTrainedTokenizer
+
+from prime_rl.trainer.world import get_world
+from prime_rl.utils.logger import get_logger
+from prime_rl.utils.pathing import get_ckpt_dir
+from prime_rl.utils.utils import format_num, format_time, get_step_path
+
+DEFAULT_TIMEOUT = timedelta(seconds=600)
+
+
+def _text_config(model_config: Any) -> Any:
+    """Unwrap a multimodal model's text config, else return the config unchanged."""
+    return getattr(model_config, "text_config", model_config)
+
+
+def _is_mla(config: Any) -> bool:
+    return bool(getattr(config, "multi_latent_attention", False) or hasattr(config, "q_lora_rank"))
+
+
+def _kv_channels(config: Any) -> int:
+    return getattr(config, "kv_channels", getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
+
+
+def _qkv_projection_flops_per_token(config: Any) -> int:
+    """Linear-in-seqlen FLOPs of the Q/K/V projections (per token)."""
+    hidden_size = config.hidden_size
+    num_attention_heads = config.num_attention_heads
+    kv_channels = _kv_channels(config)
+    is_mla = _is_mla(config)
+    qk_head_dim = getattr(config, "qk_head_dim", 0)
+    qk_pos_emb_head_dim = getattr(config, "qk_pos_emb_head_dim", 0)
+
+    if is_mla and getattr(config, "q_lora_rank", None) is not None:
+        q_flops = 2 * config.q_lora_rank * (hidden_size + num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim))
+    else:
+        q_head_dim = (qk_head_dim + qk_pos_emb_head_dim) if is_mla else kv_channels
+        q_flops = 2 * hidden_size * num_attention_heads * q_head_dim
+
+    if is_mla and getattr(config, "kv_lora_rank", None) is not None:
+        v_head_dim = getattr(config, "v_head_dim", 0)
+        kv_flops = 2 * (
+            config.kv_lora_rank * (hidden_size + num_attention_heads * (qk_head_dim + v_head_dim))
+            + hidden_size * qk_pos_emb_head_dim
+        )
+    else:
+        num_query_groups = getattr(
+            config, "num_query_groups", getattr(config, "num_key_value_heads", num_attention_heads)
+        )
+        kv_flops = 4 * hidden_size * num_query_groups * kv_channels
+    return q_flops + kv_flops
+
+
+def _attention_flops_per_token_squared(config: Any) -> int:
+    """Quadratic-in-seqlen FLOPs of the attention scores and values (per token^2)."""
+    num_attention_heads = config.num_attention_heads
+    kv_channels = _kv_channels(config)
+    if _is_mla(config):
+        qk_head_dim = getattr(config, "qk_head_dim", 0)
+        qk_pos_emb_head_dim = getattr(config, "qk_pos_emb_head_dim", 0)
+        v_head_dim = getattr(config, "v_head_dim", kv_channels)
+        return num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim) + num_attention_heads * v_head_dim
+    return 2 * num_attention_heads * kv_channels
+
+
+def _ffn_flops_per_token(hidden_size: int, ffn_hidden_size: int) -> int:
+    return 6 * hidden_size * ffn_hidden_size
+
+
+def _dense_ffn_hidden_size(config: Any) -> int:
+    return getattr(
+        config, "ffn_hidden_size", getattr(config, "intermediate_size", getattr(config, "moe_intermediate_size", 0))
+    )
+
+
+def _moe_ffn_hidden_size(config: Any) -> int:
+    """Effective FFN width of an MoE layer: routed experts (topk) plus shared experts."""
+    dense_ffn = _dense_ffn_hidden_size(config)
+    routed_topk = getattr(config, "moe_router_topk", getattr(config, "num_experts_per_tok", 1))
+    moe_ffn = getattr(config, "moe_ffn_hidden_size", getattr(config, "moe_intermediate_size", dense_ffn))
+    return moe_ffn * routed_topk + (getattr(config, "moe_shared_expert_intermediate_size", None) or 0)
+
+
+def _count_dense_and_moe_layers(config: Any) -> tuple[int, int]:
+    """Split the model's layers into (dense, moe) counts."""
+    num_experts = getattr(config, "num_experts", getattr(config, "n_routed_experts", None))
+    if num_experts is None:
+        return config.num_hidden_layers, 0
+
+    moe_layer_freq = getattr(config, "moe_layer_freq", None)
+    if isinstance(moe_layer_freq, list):
+        num_dense = sum(1 for freq in moe_layer_freq if freq == 0)
+        num_moe = sum(1 for freq in moe_layer_freq if freq > 0)
+    elif isinstance(moe_layer_freq, int):
+        num_dense = sum(1 for i in range(config.num_hidden_layers) if i % moe_layer_freq != 0)
+        num_moe = config.num_hidden_layers - num_dense
+    elif getattr(config, "first_k_dense_replace", None) is not None:
+        num_dense = config.first_k_dense_replace
+        num_moe = config.num_hidden_layers - num_dense
+    else:
+        num_dense = 0
+        num_moe = config.num_hidden_layers
+    return num_dense, num_moe
+
+
+def _packing_cost_coeffs(config: Any) -> tuple[int, int]:
+    """Return the (linear, quadratic) coefficients of the per-sequence forward FLOPs."""
+    hidden_size = config.hidden_size
+    num_dense_layers, num_moe_layers = _count_dense_and_moe_layers(config)
+    qkv_per_token = _qkv_projection_flops_per_token(config)
+    attn_per_token_squared = _attention_flops_per_token_squared(config)
+
+    def layer_linear(ffn_hidden_size: int) -> int:
+        return qkv_per_token + 2 * hidden_size * hidden_size + _ffn_flops_per_token(hidden_size, ffn_hidden_size)
+
+    linear = (
+        num_dense_layers * layer_linear(_dense_ffn_hidden_size(config))
+        + num_moe_layers * layer_linear(_moe_ffn_hidden_size(config))
+        + 2 * hidden_size * config.vocab_size
+    )
+    quadratic = (num_dense_layers + num_moe_layers) * attn_per_token_squared
+    return linear, quadratic
+
+
+def build_bin_cost(model_config: Any | None) -> Callable[[Sequence[int]], int]:
+    """Build a closure scoring a packed bin by estimated forward compute.
+
+    With ``model_config=None`` the linear/quadratic coefficients are ``(1, 0)``, so
+    the cost reduces to the token count and balancing falls back to sequence length.
+    """
+    if model_config is None:
+        linear, quadratic = 1, 0
+    else:
+        linear, quadratic = _packing_cost_coeffs(_text_config(model_config))
+
+    def bin_cost(seqlens: Sequence[int]) -> int:
+        return linear * sum(seqlens) + quadratic * sum(n * n for n in seqlens)
+
+    return bin_cost
+
+
+@dataclass
+class _WeightedSet:
+    total: int = 0
+    items: list[int] = field(default_factory=list)
+
+    def add(self, idx: int, weight: int) -> None:
+        self.items.append(idx)
+        self.total += weight
+
+    def merge(self, other: "_WeightedSet") -> None:
+        self.items.extend(other.items)
+        self.total += other.total
+
+    def __lt__(self, other: "_WeightedSet") -> bool:
+        if self.total != other.total:
+            return self.total < other.total
+        return self.items < other.items
+
+
+class _KKState:
+    def __init__(self, items: list[tuple[int, int]], k: int):
+        self.sets = [_WeightedSet() for _ in range(k)]
+        for set_idx, (idx, weight) in enumerate(items):
+            self.sets[set_idx].add(idx, weight)
+        self.sets.sort(reverse=True)
+
+    @property
+    def spread(self) -> int:
+        return self.sets[0].total - self.sets[-1].total
+
+    def merge(self, other: "_KKState") -> None:
+        k = len(self.sets)
+        for i in range(k):
+            self.sets[i].merge(other.sets[k - 1 - i])
+        self.sets.sort(reverse=True)
+
+    def partitions(self) -> list[list[int]]:
+        return [sorted(weighted_set.items) for weighted_set in self.sets]
+
+    def __lt__(self, other: "_KKState") -> bool:
+        if self.spread != other.spread:
+            return self.spread > other.spread
+        return self.sets[0] > other.sets[0]
+
+
+def _karmarkar_karp(weights: Sequence[int], num_partitions: int) -> list[list[int]]:
+    assert len(weights) >= num_partitions
+    assert len(weights) % num_partitions == 0
+    weighted_indices = sorted((weight, idx) for idx, weight in enumerate(weights))
+    states: list[_KKState] = []
+    for offset in range(0, len(weighted_indices), num_partitions):
+        items = [(idx, weight) for weight, idx in weighted_indices[offset : offset + num_partitions]]
+        heapq.heappush(states, _KKState(items, num_partitions))
+
+    while len(states) > 1:
+        state = heapq.heappop(states)
+        state.merge(heapq.heappop(states))
+        heapq.heappush(states, state)
+
+    return states[0].partitions()
+
+
+def _partition_loads(weights: Sequence[int], partitions: list[list[int]]) -> list[int]:
+    return [sum(weights[i] for i in partition) for partition in partitions]
+
+
+def _refine_by_swapping(weights: Sequence[int], partitions: list[list[int]]) -> list[list[int]]:
+    partitions = [list(partition) for partition in partitions]
+    loads = _partition_loads(weights, partitions)
+
+    while True:
+        best_swap = None
+        best_score = (max(loads), max(loads) - min(loads))
+        for left_rank in range(len(partitions)):
+            for right_rank in range(left_rank + 1, len(partitions)):
+                for left_pos, left_idx in enumerate(partitions[left_rank]):
+                    for right_pos, right_idx in enumerate(partitions[right_rank]):
+                        new_left = loads[left_rank] - weights[left_idx] + weights[right_idx]
+                        new_right = loads[right_rank] - weights[right_idx] + weights[left_idx]
+                        new_loads = list(loads)
+                        new_loads[left_rank] = new_left
+                        new_loads[right_rank] = new_right
+                        score = (max(new_loads), max(new_loads) - min(new_loads))
+                        if score < best_score:
+                            best_score = score
+                            best_swap = (left_rank, right_rank, left_pos, right_pos, new_loads)
+        if best_swap is None:
+            return partitions
+
+        left_rank, right_rank, left_pos, right_pos, loads = best_swap
+        partitions[left_rank][left_pos], partitions[right_rank][right_pos] = (
+            partitions[right_rank][right_pos],
+            partitions[left_rank][left_pos],
+        )
+
+
+def balanced_partition(weights: Sequence[int], num_partitions: int) -> list[list[int]]:
+    """Partition item indices into ``num_partitions`` groups of near-equal total weight.
+
+    Requires ``len(weights)`` to be a positive multiple of ``num_partitions``.
+    """
+    partitions = _karmarkar_karp(weights, num_partitions)
+    return _refine_by_swapping(weights, partitions)
+
+
+class GarbageCollection:
+    """Controls Python garbage collection to avoid stragglers in distributed training.
+
+    In multi-GPU training, Python's automatic GC can trigger unpredictably on one rank
+    while others wait at a synchronization point, stalling the entire step. This class
+    disables automatic GC and runs deterministic collections every `interval` steps so
+    all ranks collect simultaneously.
+
+    Based on the approach from torchtitan (https://arxiv.org/abs/2505.05713).
+    """
+
+    def __init__(self, interval: int = 50):
+        assert interval > 0, "gc interval must be a positive integer"
+        self.interval = interval
+        gc.disable()
+        self._collect()
+
+    def run(self, step: int):
+        if step > 0 and step % self.interval == 0:
+            self._collect()
+
+    def _collect(self, generation: int = 1):
+        begin = time.monotonic()
+        gc.collect(generation)
+        get_logger().info(f"[GC] collection took {time.monotonic() - begin:.2f}s")
+
+
+def _to_local_tensor(tensor: Tensor | DTensor) -> Tensor:
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
+
+
+def count_zero_gradient_elements(parameters: Iterable[nn.Parameter]) -> tuple[Tensor, Tensor]:
+    """Count zero-gradient parameter elements on the local distributed shards.
+
+    Parameters that require gradients but did not receive one in the current step
+    are counted as fully zero. This makes inactive MoE experts visible in the
+    metric instead of silently dropping them from the count.
+    """
+
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    num_zeros = torch.zeros((), dtype=torch.long, device=device)
+    num_tracked = torch.zeros((), dtype=torch.long, device=device)
+
+    for param in parameters:
+        if not param.requires_grad:
+            continue
+
+        local_param = _to_local_tensor(param.detach())
+        if local_param.numel() == 0:
+            continue
+
+        if local_param.device != num_zeros.device:
+            num_zeros = num_zeros.to(local_param.device)
+            num_tracked = num_tracked.to(local_param.device)
+
+        local_numel = torch.tensor(local_param.numel(), dtype=torch.long, device=local_param.device)
+        num_tracked += local_numel
+
+        if param.grad is None:
+            num_zeros += local_numel
+            continue
+
+        local_grad = _to_local_tensor(param.grad.detach())
+        if local_grad.numel() != local_param.numel():
+            raise ValueError("Local gradient shape does not match the local parameter shape")
+
+        num_zeros += local_numel - torch.count_nonzero(local_grad)
+
+    return num_zeros, num_tracked
+
+
+def get_zero_gradient_ratio(parameters: Iterable[nn.Parameter], dp_replicate: int = 1) -> float:
+    num_zero_grad, num_grad_elements = count_zero_gradient_elements(parameters)
+    dist.all_reduce(num_zero_grad, op=dist.ReduceOp.SUM)
+    dist.all_reduce(num_grad_elements, op=dist.ReduceOp.SUM)
+    if dp_replicate > 1:
+        num_zero_grad = torch.div(num_zero_grad, dp_replicate, rounding_mode="floor")
+        num_grad_elements = torch.div(num_grad_elements, dp_replicate, rounding_mode="floor")
+    return (num_zero_grad.float() / num_grad_elements.clamp_min(1).float()).item()
+
+
+def get_ckpt_disk_metrics(output_dir: Path) -> dict[str, float]:
+    """
+    Disk usage metrics for the checkpoint directory (<output_dir>/checkpoints).
+
+    Intended to be called by trainer(s) on rank 0 and included in an existing
+    monitor.log(...) call (once per step).
+    """
+    ckpt_dir = get_ckpt_dir(output_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(str(ckpt_dir))
+    total = float(usage.total) if usage.total else 0.0
+    return {
+        "system/ckpt_disk_free_gib": usage.free / 1024**3,
+        "system/ckpt_disk_used_gib": usage.used / 1024**3,
+        "system/ckpt_disk_total_gib": usage.total / 1024**3,
+        "system/ckpt_disk_free_ratio": (usage.free / total) if total else 0.0,
+    }
+
+
+def setup_torch_distributed(timeout: timedelta = DEFAULT_TIMEOUT, enable_gloo: bool = False):
+    device_id = get_world().local_rank
+    torch.cuda.set_device(device_id)
+    # Use Gloo backend for CPU and NCCL for GPU when CPU offloading is enabled
+    # Otherwise use NCCL for better GPU performance
+    backend = None  # by default nccl
+    if enable_gloo:
+        get_logger().info("Using Gloo backend for CPU and NCCL backend for GPU")
+        backend = "cpu:gloo,cuda:nccl"
+
+    dist.init_process_group(backend=backend, timeout=timeout, device_id=device_id)
+
+
+def print_sample(input_ids: list[int], loss_mask: list[bool], tokenizer: PreTrainedTokenizer):
+    """
+    Visualize the loss mask of a tokenized sample using rich.
+    Reference: https://huggingface.co/Qwen/Qwen3-8B/discussions/14
+    """
+    text = Text()
+    for token, mask in zip(tokenizer.convert_ids_to_tokens(input_ids), loss_mask):
+        text.append(token.replace("Ġ", " ").replace("Ċ", "\n"), style="cyan" if mask else "white")
+    rich_print(text)
+
+
+def print_benchmark(history: dict[str, list[Any]]) -> None:
+    """
+    Print benchmark results as rich table. Shows formatted values for the
+    training throughput and overall step time. First first N rows show the
+    per-step values, and the last row shows the mean, std, min, and max values.
+    """
+    history.pop("step")
+    assert all(len(v) for v in history.values()), "All metrics must have logged the same number of steps"
+
+    # Turn metric history into pd.DataFrame
+    df = pd.DataFrame(dict(history.items()))
+    columns = {
+        "perf/mfu": "MFU",
+        "perf/throughput": "Throughput",
+        "time/step": "Step Time",
+        "perf/peak_memory": "Peak Memory",
+    }
+    df = df[columns.keys()].rename(columns=columns)
+    df = df.iloc[1:]  # Exclude first row
+
+    # Setup console
+    console = Console()
+    table = Table(title="Benchmark")
+
+    # Add columns
+    table.add_column("Step", justify="right")
+    for col in df.columns:
+        table.add_column(col, justify="center", style="magenta")
+
+    # Add formatted rows
+    formatted_df = pd.DataFrame(columns=df.columns)
+    formatted_df["MFU"] = df["MFU"].apply(lambda x: f"{format_num(x, precision=2)}%")
+    formatted_df["Throughput"] = df["Throughput"].apply(lambda x: format_num(x, precision=2))
+    formatted_df["Step Time"] = df["Step Time"].apply(format_time)
+    formatted_df["Peak Memory"] = df["Peak Memory"].apply(lambda x: f"{format_num(x, precision=1)} GiB")
+    for step, row in formatted_df.iterrows():
+        table.add_row(*([str(step)] + [str(x) for x in row]))
+
+    # Separator
+    table.add_row(*([""] * len(formatted_df.columns)))
+
+    # Add row for formatted, aggregated statistics
+    mean_df = df.describe().loc[["mean", "std", "min", "max"], :]
+    formatted_mean_df = pd.DataFrame()
+    formatted_mean_df["MFU"] = mean_df["MFU"].apply(lambda x: f"{format_num(x, precision=2)}%")
+    formatted_mean_df["Throughput"] = mean_df["Throughput"].apply(format_num, precision=2)
+    formatted_mean_df["Step Time"] = mean_df["Step Time"].apply(format_time)
+    mean_row = (
+        ["Overall"]
+        + formatted_mean_df.T.apply(
+            lambda row: f"{row['mean']} ± {row['std']} [{row['min']}, {row['max']}]", axis=1
+        ).tolist()
+        + [
+            f"{format_num(mean_df['Peak Memory']['mean'], precision=1)} GiB ({mean_df['Peak Memory']['mean'] / (torch.cuda.mem_get_info()[1] / 1024**3) * 100:.1f}%)"
+        ]
+    )
+    table.add_row(*mean_row)
+
+    # Display table
+    console.print(table)
+
+
+def export_benchmark_json(history: dict[str, list[Any]], output_path: Path) -> None:
+    """
+    Export benchmark results to a JSON file.
+
+    The JSON contains aggregated statistics (mean, std, min, max) for each metric.
+    """
+    history = history.copy()
+    history.pop("step", None)
+
+    # Turn metric history into pd.DataFrame
+    df = pd.DataFrame(dict(history.items()))
+    columns = {
+        "perf/mfu": "mfu",
+        "perf/throughput": "throughput",
+        "time/step": "step_time",
+        "perf/peak_memory": "peak_memory",
+    }
+    df = df[columns.keys()].rename(columns=columns)
+    df = df.iloc[1:]  # Exclude first warmup row
+
+    # Calculate statistics
+    stats = df.describe().loc[["mean", "std", "min", "max"], :]
+
+    # Get peak memory percentage
+    total_memory_gib = torch.cuda.mem_get_info()[1] / 1024**3
+    peak_memory_pct = stats["peak_memory"]["mean"] / total_memory_gib * 100
+
+    result = {
+        "mfu": {
+            "mean": float(stats["mfu"]["mean"]),
+            "std": float(stats["mfu"]["std"]),
+            "min": float(stats["mfu"]["min"]),
+            "max": float(stats["mfu"]["max"]),
+        },
+        "throughput": {
+            "mean": float(stats["throughput"]["mean"]),
+            "std": float(stats["throughput"]["std"]),
+            "min": float(stats["throughput"]["min"]),
+            "max": float(stats["throughput"]["max"]),
+        },
+        "step_time": {
+            "mean": float(stats["step_time"]["mean"]),
+            "std": float(stats["step_time"]["std"]),
+            "min": float(stats["step_time"]["min"]),
+            "max": float(stats["step_time"]["max"]),
+        },
+        "peak_memory": {
+            "gib": float(stats["peak_memory"]["mean"]),
+            "pct": float(peak_memory_pct),
+        },
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json.dump(result, f, indent=2)
+
+
+def flexible_all_gather(tensor: Tensor) -> Tensor:
+    """
+    All-gather a 1D tensor between ranks with potentially different lengths.
+    Returns a tensor with the sum of all local lengths.
+    """
+
+    assert tensor.ndim == 1, "Can only flexibly all-gather 1D tensors"
+
+    if dist.get_world_size() == 1:
+        return tensor
+
+    # Find the tensor with the most elements
+    local_numel = tensor.numel()
+    local_numel_tensor = torch.tensor(local_numel, device=tensor.device)
+    all_numel_tensors = [torch.tensor(0, device=tensor.device) for _ in range(dist.get_world_size())]
+    dist.all_gather(all_numel_tensors, local_numel_tensor)
+    all_numels = [numel.item() for numel in all_numel_tensors]
+    if len(set(all_numels)) > 1 and dist.get_backend() == "nccl":
+        tensor = tensor.contiguous()
+        all_tensors = [tensor.new_empty(numel) for numel in all_numels]
+        dist.all_gather(all_tensors, tensor)
+        return torch.cat(all_tensors)
+    max_numel = int(max(all_numels))
+
+    # Pad the tensor with zeros if it has less elements than the maximum
+    if local_numel < max_numel:
+        tensor = torch.cat([tensor, torch.zeros(max_numel - local_numel, dtype=tensor.dtype, device=tensor.device)])
+
+    # All-gather the tensors
+    all_tensors = [
+        torch.zeros(max_numel, dtype=tensor.dtype, device=tensor.device) for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather(all_tensors, tensor)
+    all_tensors_unpadded = torch.cat([tensor[:numel] for tensor, numel in zip(all_tensors, all_numels)])
+
+    return all_tensors_unpadded
+
+
+class Tensors(defaultdict):
+    """A class to accumulate tensors and compute statistics (mean, median, std, min, max) across multiple steps and ranks."""
+
+    def __init__(self):
+        assert dist.is_initialized(), "Tensors requires a distributed environment"
+        super().__init__(list)
+
+    def compute_stats(self) -> dict[str, float | int]:
+        """Synchronize the tensor statistic across all ranks for each key and compute relevant statistics."""
+
+        local_keys = list(self.keys())
+        gathered_keys: list[list[str] | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered_keys, local_keys)
+        keys = sorted({key for rank_keys in gathered_keys if rank_keys is not None for key in rank_keys})
+
+        metrics = {}
+        for key in keys:
+            # All-gather tensors across steps and ranks (get global distribution)
+            values = self.pop(key, [])
+            # Use one dtype because empty pipeline ranks default to float32 while
+            # real values may be bfloat16; these are logging statistics.
+            tensors = (
+                torch.cat(values, dim=0).to("cuda").float() if values else torch.empty(0, device="cuda", dtype=torch.float32)
+            )
+            assert tensors.ndim == 1, "Can only aggregate 1D tensors"
+            tensors = flexible_all_gather(tensors)
+            assert tensors.ndim == 1, "Can only aggregate 1D tensors"
+
+            # Handle empty tensors (can happen when all rollouts in a batch fail)
+            if tensors.numel() == 0:
+                metrics[f"{key}/mean"] = float("nan")
+                metrics[f"{key}/median"] = float("nan")
+                metrics[f"{key}/std"] = float("nan")
+                metrics[f"{key}/min"] = float("nan")
+                metrics[f"{key}/max"] = float("nan")
+                continue
+
+            # Compute relevant tensor statistics
+            metrics[f"{key}/mean"] = tensors.mean().item()
+            metrics[f"{key}/median"] = torch.median(tensors).item()
+            metrics[f"{key}/std"] = tensors.std().item()
+            metrics[f"{key}/min"] = tensors.min().item()
+            metrics[f"{key}/max"] = tensors.max().item()
+
+        return metrics
+
+
+def _is_env_tensor_stat(key: str, allowed_stats: set[str]) -> bool:
+    parts = key.split("/")
+    return len(parts) >= 3 and parts[-1] in allowed_stats
+
+
+def filter_rl_trainer_tensor_stats_for_wandb(metrics: dict[str, float | int]) -> dict[str, float | int]:
+    """Drop noisy per-token distribution keys before sending RL trainer stats to W&B."""
+    skip_prefixes = ("trainer_probs/", "inference_probs/")
+    mean_max_only_prefixes = (
+        "is_masked/",
+        "is_masked_low/",
+        "is_masked_high/",
+        "masked_advantage_positive/",
+        "masked_advantage_negative/",
+        "mismatch_kl/",
+        "masked_mismatch_kl/",
+        "unmasked_mismatch_kl/",
+        "ref_kl/is_masked/",
+        "ref_kl/masked_mismatch_kl/",
+        "ref_kl/unmasked_mismatch_kl/",
+    )
+    out: dict[str, float | int] = {}
+    for k, v in metrics.items():
+        if k == "step":
+            out[k] = v
+            continue
+        if any(k.startswith(p) for p in skip_prefixes):
+            continue
+        if k.startswith("entropy/") and not _is_env_tensor_stat(k, {"mean", "std", "max"}):
+            continue
+        if any(k.startswith(p) for p in mean_max_only_prefixes):
+            if _is_env_tensor_stat(k, {"mean", "std", "max"}):
+                out[k] = v
+                continue
+            if not (k.endswith("/mean") or k.endswith("/max")):
+                continue
+        out[k] = v
+    return out
+
+
+MEMORY_SNAPSHOT_MAX_ENTRIES = 100000
+
+
+class MemoryProfiler:
+    def __init__(self, step_num: int, snapshot_path: Path):
+        torch.cuda.memory._record_memory_history(max_entries=MEMORY_SNAPSHOT_MAX_ENTRIES)
+        self.logger = get_logger()
+        snapshot_path.mkdir(parents=True, exist_ok=True)
+        self.snapshot_path = snapshot_path
+        self.step_num = step_num
+
+    def step(self):
+        self.logger.info(f"Dumping memory snapshot at step {self.step_num} at {self.snapshot_path}")
+        begin = time.monotonic()
+        step_folder = self.snapshot_path / f"step_{self.step_num}"
+        step_folder.mkdir(parents=True, exist_ok=True)
+        file_path = step_folder / f"rank_{get_world().rank}.pickle"
+        with open(file_path, "wb") as output:
+            pickle.dump(torch.cuda.memory._snapshot(), output)
+        self.logger.info(
+            f"Finished dumping memory snapshot in {time.monotonic() - begin:.2f} seconds, load {file_path} at https://docs.pytorch.org/memory_viz to visualize the memory usage"
+        )
+        self.step_num += 1
+
+
+def maybe_clean(path: Path, step: int, interval_to_keep: int | None) -> None:
+    """Delete the broadcast dir from 2 trainer steps ago.
+
+    With a 1-step async barrier, the orchestrator at trainer step ``step`` is still consuming the
+    ckpt from ``step - 1``; ``step - 2`` is therefore safe to remove unless it falls on a
+    checkpoint interval that we want to preserve.
+    """
+    if step < 2:
+        return
+    logger = get_logger()
+    candidate_step = step - 2
+    candidate_path = get_step_path(path, candidate_step)
+    if interval_to_keep and candidate_step % interval_to_keep == 0:
+        logger.debug(f"Keeping path {candidate_path} (on ckpt interval)")
+        return
+    logger.debug(f"Removing path {candidate_path}")
+    shutil.rmtree(candidate_path, ignore_errors=True)

@@ -124,7 +124,7 @@ def wake_codex(session_id: str, output_dir: Path, reason: str, event_log: Path) 
 
     prompt = (
         f"Automated Prime RL monitor event for {output_dir}: {reason}. "
-        "Use skills/training/monitor-run/SKILL.md, inspect the live logs and W&B metrics, "
+        "Use .agents/skills/training-ops/SKILL.md, inspect the live logs and W&B metrics, "
         "then continue the active training objective. Another Codex turn may still be active. "
         "Never interrupt, restart, or clean a healthy run, and never act on stale log failures."
     )

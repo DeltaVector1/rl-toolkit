@@ -30,7 +30,7 @@ CUDA_HOME=$(uv run scripts/prepare_cuda_wheel_home.py --nvcc-root /tmp/cuda-nvcc
 
 Because the orchestrator recycles the teacher after each log-probability phase,
 run that command under the restart loop described in
-`skills/training/start-run/SKILL.md`.
+`.agents/skills/training-ops/SKILL.md`.
 
 After `http://127.0.0.1:8001/v1/models` is healthy, start the bounded recovery
 run on physical GPUs 0-3. Prime assigns two GPUs to student inference and two

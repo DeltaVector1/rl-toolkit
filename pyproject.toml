@@ -1,0 +1,22 @@
+[project]
+name = "training-ops"
+version = "1.0.0"
+description = "Status, reward analysis, repair, and launch control for the training run"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+training-ops = "training_ops:cli"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["training_ops"]
+
+[tool.setuptools.package-data]
+training_ops = [
+    "runtime/**/*.py",
+    "runtime/**/*.sh",
+]

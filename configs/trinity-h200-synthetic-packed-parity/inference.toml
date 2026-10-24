@@ -1,0 +1,36 @@
+# Base-model H200 endpoint used to build the fresh synthetic reference.
+
+enable_lora = false
+router = "None"
+gpu_memory_utilization = 0.85
+enable_prefix_caching = false
+enable_expert_parallel = true
+enable_eplb = false
+enable_return_routed_experts = true
+api_server_count = 1
+
+[server]
+host = "0.0.0.0"
+port = 8000
+liveness_timeout_seconds = 120.0
+
+[log]
+level = "info"
+
+[model]
+name = "/data/trinity-thinking-fp8"
+dtype = "bfloat16"
+max_model_len = 32768
+enforce_eager = false
+reasoning_parser = "deepseek_r1"
+
+[parallel]
+tp = 8
+dp = 1
+
+[weight_broadcast]
+type = "filesystem"
+
+[env_vars]
+VLLM_WORKER_MULTIPROC_METHOD = "spawn"
+NCCL_SOCKET_IFNAME = "eth0"

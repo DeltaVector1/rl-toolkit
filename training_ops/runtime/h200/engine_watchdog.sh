@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Restart the local vLLM engine when a real completion fails.
+set -uo pipefail
+
+PORT=${PORT:-8000}
+MODEL=${MODEL:-/data/glm52-rl/model-fp8}
+INTERVAL=${INTERVAL:-60}
+TIMEOUT=${TIMEOUT:-15}
+FAILS_BEFORE_RESTART=${FAILS_BEFORE_RESTART:-2}
+# A deliberate engine replacement can leave the base-model endpoint absent
+# while the checkpoint loads. The repair command starts a fresh watchdog with
+# this grace so stale misses from the old engine cannot trigger a second
+# replacement during that load.
+STARTUP_GRACE=${STARTUP_GRACE:-0}
+# Give a busy engine more time during a LoRA load.
+BUSY_STALL_FAILS_BEFORE_RESTART=${BUSY_STALL_FAILS_BEFORE_RESTART:-5}
+# Treat a resident engine as busy even when it reports zero requests.
+RESIDENT_ENGINE_MIN_MIB=${RESIDENT_ENGINE_MIN_MIB:-65536}
+START=${START:-/data/glm52-rl/deployment/training_ops/runtime/h200/start_inference.sh}
+ENGINE_CONTAINER=${ENGINE_CONTAINER:-glm52-decensor-h200}
+RELOAD_TRIES=${RELOAD_TRIES:-40}
+RELOAD_WAIT=${RELOAD_WAIT:-30}
+STAGING_STATUS_TIMEOUT=${STAGING_STATUS_TIMEOUT:-5}
+STAGING_GRACE=${STAGING_GRACE:-330}
+STAGING_PROGRESS_TIMEOUT=${STAGING_PROGRESS_TIMEOUT:-300}
+# /liveness runs the vLLM collective RPC. It can prove that the workers are
+# responsive while a tiny generation is delayed by a paused or busy engine.
+LIVENESS_TIMEOUT=${LIVENESS_TIMEOUT:-15}
+LIVENESS_LOG_EVERY=${LIVENESS_LOG_EVERY:-10}
+misses=0
+liveness_deferrals=0
+last_generation_tokens=-1
+last_staging_bytes=-1
+last_staging_progress_at=0
+loading_container=
+
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+log "engine watchdog started (port=$PORT interval=${INTERVAL}s timeout=${TIMEOUT}s)"
+if [ "$STARTUP_GRACE" -gt 0 ]; then
+  log "engine startup grace ${STARTUP_GRACE}s"
+  sleep "$STARTUP_GRACE"
+fi
+
+while true; do
+  container_state=$(sudo docker inspect -f '{{.Id}} {{.State.StartedAt}}' "$ENGINE_CONTAINER" 2>/dev/null || true)
+  container_id=${container_state%% *}
+  container_started_at=${container_state#* }
+  container_started_epoch=$(date -u -d "$container_started_at" +%s 2>/dev/null || true)
+  now=$(date +%s)
+  if [ "$STARTUP_GRACE" -gt 0 ] && [ -n "$container_id" ] &&
+     [ -n "$container_started_epoch" ] && [ $((now - container_started_epoch)) -lt "$STARTUP_GRACE" ]; then
+    if [ "$loading_container" != "$container_id" ]; then
+      log "engine container is loading; probe deferred"
+      loading_container=$container_id
+    fi
+    misses=0
+    sleep "$INTERVAL"
+    continue
+  fi
+  loading_container=
+  # A tiny real generation. max_tokens=3 keeps it cheap; a hung EngineCore
+  # never answers it even though /v1/models still returns 200.
+  code=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
+    -X POST "http://127.0.0.1:$PORT/v1/completions" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
+  metrics=
+  running=0
+  generated=0
+  if [ "$code" = "200" ]; then
+    [ "$misses" -gt 0 ] && log "engine recovered (was $misses miss(es))"
+    misses=0
+  else
+    staging_response=$(curl -sS -m "$STAGING_STATUS_TIMEOUT" \
+      "http://127.0.0.1:$PORT/staging_status" 2>/dev/null || true)
+    staging_state=$(printf '%s\n' "$staging_response" | sed -n \
+      's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    staging_age=$(printf '%s\n' "$staging_response" | sed -n \
+      's/.*"age_seconds"[[:space:]]*:[[:space:]]*\([0-9][0-9.]*\).*/\1/p')
+    staging_bytes=$(printf '%s\n' "$staging_response" | sed -n \
+      's/.*"bytes_done"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    now=$(date +%s)
+    if [ "$staging_state" = "staging" ] && [ -n "$staging_bytes" ] &&
+       [ "$staging_bytes" -gt "$last_staging_bytes" ]; then
+      last_staging_bytes=$staging_bytes
+      last_staging_progress_at=$now
+      log "adapter staging progressing (bytes=$staging_bytes); probe deferred"
+      misses=0
+      sleep "$INTERVAL"
+      continue
+    fi
+    if [ "$staging_state" = "staging" ] && [ "$last_staging_progress_at" -gt 0 ] &&
+       [ $((now - last_staging_progress_at)) -lt "$STAGING_PROGRESS_TIMEOUT" ]; then
+      log "adapter staging has no new bytes yet; probe deferred"
+      misses=0
+      sleep "$INTERVAL"
+      continue
+    fi
+    if [ "$staging_state" = "staging" ] && [ -n "$staging_age" ] &&
+       awk -v age="$staging_age" -v grace="$STAGING_GRACE" \
+         'BEGIN {exit !(age >= 0 && age < grace)}'; then
+      log "adapter staging active (age=${staging_age}s); probe deferred"
+      misses=0
+      sleep "$INTERVAL"
+      continue
+    fi
+    if [ "$staging_state" != "staging" ]; then
+      last_staging_bytes=-1
+      last_staging_progress_at=0
+    fi
+    if [ "$staging_state" = "staging" ] && [ -n "$staging_age" ]; then
+      log "adapter staging exceeded grace (age=${staging_age}s limit=${STAGING_GRACE}s)"
+    fi
+    # A paused engine can reject completions while its workers still answer
+    # the collective liveness RPC. Do not replace a live engine in that case.
+    liveness_code=$(curl -s -o /dev/null -m "$LIVENESS_TIMEOUT" -w "%{http_code}" \
+      "http://127.0.0.1:$PORT/liveness" 2>/dev/null)
+    if [ "$liveness_code" = "200" ]; then
+      liveness_deferrals=$((liveness_deferrals + 1))
+      if [ "$liveness_deferrals" -eq 1 ] ||
+         [ $((liveness_deferrals % LIVENESS_LOG_EVERY)) -eq 0 ]; then
+        log "engine liveness passed (completion code=${code:-none}); restart deferred (consecutive=$liveness_deferrals)"
+      fi
+      # The counter is only for bounded reporting. A later liveness failure
+      # resumes the normal completion-miss restart policy.
+      [ "$liveness_deferrals" -gt "$LIVENESS_LOG_EVERY" ] && liveness_deferrals=$LIVENESS_LOG_EVERY
+      misses=0
+    else
+      if [ "$liveness_deferrals" -gt 0 ]; then
+        log "engine liveness failed (code=${liveness_code:-none}); completion-miss restart checks resumed"
+        liveness_deferrals=0
+      fi
+      metrics=$(curl -s -m 5 "http://127.0.0.1:$PORT/metrics" 2>/dev/null || true)
+      running=$(printf '%s\n' "$metrics" | awk '/^vllm:num_requests_running[{]/ {sum += $NF} END {print sum + 0}')
+      generated=$(printf '%s\n' "$metrics" | awk '/^vllm:generation_tokens_total[{]/ {sum += $NF} END {print sum + 0}')
+      if [ "$running" != 0 ] &&
+         { [ "$last_generation_tokens" = -1 ] || awk "BEGIN {exit !($generated > $last_generation_tokens)}"; }; then
+        # A tiny completion can wait behind a saturated production queue for more
+        # than TIMEOUT. A rising token counter proves the EngineCore is working;
+        # restarting here discards every live rollout.
+        log "engine busy but progressing (running=$running generated=$generated); probe deferred"
+        misses=0
+      else
+        misses=$((misses + 1))
+        gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null | head -1)
+        gpu_mib=$(printf '%s\n' "$gpu" | awk '{print $1 + 0}')
+        restart_after=$FAILS_BEFORE_RESTART
+        if [ "$running" != 0 ] || [ "$gpu_mib" -ge "$RESIDENT_ENGINE_MIN_MIB" ]; then
+          restart_after=$BUSY_STALL_FAILS_BEFORE_RESTART
+        fi
+        log "engine probe failed (code=${code:-none} running=$running generated=$generated gpu0=${gpu:-unknown}) miss=$misses/$restart_after"
+        if [ "$misses" -ge "$restart_after" ]; then
+          log "RESTARTING ENGINE (gpu0=${gpu:-unknown})"
+          sudo docker rm -f "$ENGINE_CONTAINER" >/dev/null 2>&1
+          if bash "$START" >/dev/null 2>&1; then
+            log "start_inference.sh returned ok; waiting for engine to load"
+          else
+            log "WARNING start_inference.sh returned non-zero"
+          fi
+          # Loading the 745B checkpoint takes minutes; do not thrash it.
+          for _ in $(seq 1 "$RELOAD_TRIES"); do
+            sleep "$RELOAD_WAIT"
+            c=$(curl -s -o /dev/null -m "$TIMEOUT" -w "%{http_code}" \
+              -X POST "http://127.0.0.1:$PORT/v1/completions" \
+              -H "Content-Type: application/json" \
+              -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"max_tokens\":3}" 2>/dev/null)
+            [ "$c" = "200" ] && { log "engine back up (generation verified)"; break; }
+          done
+          misses=0
+        fi
+      fi
+    fi
+  fi
+  [ -n "$metrics" ] && last_generation_tokens=$generated
+  sleep "$INTERVAL"
+done

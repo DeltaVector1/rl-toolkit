@@ -1,0 +1,1768 @@
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import types
+import unittest
+from unittest import mock
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_filesystem():
+    modules = {
+        "torch": types.ModuleType("torch"),
+        "torch.nn": types.ModuleType("torch.nn"),
+        "vllm": types.ModuleType("vllm"),
+        "vllm.model_executor": types.ModuleType("vllm.model_executor"),
+        "vllm.model_executor.model_loader": types.ModuleType("vllm.model_executor.model_loader"),
+        "prime_rl": types.ModuleType("prime_rl"),
+        "prime_rl.utils": types.ModuleType("prime_rl.utils"),
+        "prime_rl.utils.checkpoint_delta": types.ModuleType("prime_rl.utils.checkpoint_delta"),
+    }
+    modules["torch.nn"].Module = object
+    modules["vllm.model_executor.model_loader"].DefaultModelLoader = object
+    modules["vllm.model_executor.model_loader"].get_model_loader = lambda _config: None
+    checkpoint_delta = modules["prime_rl.utils.checkpoint_delta"]
+    checkpoint_delta.DELTA_MANIFEST = "checkpoint_manifest.json"
+    checkpoint_delta.adapter_stage_timeout_seconds = 600.0
+    checkpoint_delta.apply_xor_delta_file = lambda *args, **kwargs: None
+    checkpoint_delta.sha256_file = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    saved = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+    try:
+        path = ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py"
+        spec = importlib.util.spec_from_file_location("linear_receiver_test", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, previous in saved.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+
+class LinearAdapterReceiverTest(unittest.TestCase):
+    def test_empty_receipts_allow_a_cache_directory_that_does_not_exist(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "not-created"
+            with mock.patch.dict(os.environ, {"PRIME_LORA_CACHE_DIR": str(cache)}):
+                filesystem.write_loaded_adapter_receipts({})
+            self.assertFalse(cache.exists())
+
+    def test_receipt_write_fails_closed_without_process_identity(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+        ):
+            receipts = {"initial": {"source_url": "http://source/step_0"},
+                        "slot0": {"source_url": "http://source/step_2"}}
+            filesystem.write_loaded_adapter_receipts(receipts)
+            path = Path(temporary) / filesystem._ADAPTER_LOADED_RECEIPTS
+            old_bytes = path.read_bytes()
+            with mock.patch.object(filesystem, "_process_start_time", return_value=None):
+                with self.assertRaisesRegex(OSError, "start-time identity"):
+                    filesystem.write_loaded_adapter_receipts({"slot0": receipts["slot0"]})
+            self.assertEqual(path.read_bytes(), old_bytes)
+
+    def test_publish_sync_order_is_staging_then_parent(self):
+        source = (ROOT / "src/prime_rl/inference/vllm/worker/filesystem.py").read_text(
+            encoding="utf-8"
+        )
+        staging_syncs = [
+            match.start()
+            for match in re.finditer(r"_fsync_directory\(temporary\)", source)
+        ]
+        publishes = [
+            match.start()
+            for match in re.finditer(
+                r'_replace_paths\(temporary, destination, "adapter (?:publish|cache reuse)"\)',
+                source,
+            )
+        ]
+        retires = [
+            match.start()
+            for match in re.finditer(
+                r'_replace_paths\(destination, retired, "retired adapter"\)',
+                source,
+            )
+        ]
+        self.assertEqual(len(staging_syncs), 4)
+        self.assertEqual(len(publishes), 4)
+        self.assertEqual(len(retires), 4)
+        for staging_sync, retire, publish in zip(staging_syncs, retires, publishes):
+            self.assertLess(staging_sync, retire)
+            self.assertLess(retire, publish)
+            self.assertIn(
+                "_fsync_directory(destination.parent)",
+                source[publish : publish + 200],
+            )
+
+    def test_output_region_digest_detects_corruption(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "adapter_model.safetensors"
+            path.write_bytes(b"left-regionright-region")
+            expected = hashlib.sha256(b"right-region").hexdigest()
+            self.assertEqual(filesystem._sha256_region(path, 11, 12), expected)
+            path.write_bytes(b"left-regionwrong-region")
+            self.assertNotEqual(filesystem._sha256_region(path, 11, 12), expected)
+
+    def test_persistent_response_closes_on_header_failure(self):
+        filesystem = load_filesystem()
+        closed = []
+
+        class Response:
+            status = 206
+            reason = "partial"
+            headers = {}
+
+            def getheader(self, _name):
+                raise OSError("header read failed")
+
+            def read(self, _size):
+                return b""
+
+            def close(self):
+                closed.append("response")
+
+        response = Response()
+
+        class Connection:
+            sock = None
+
+            def request(self, *_args, **_kwargs):
+                return None
+
+            def getresponse(self):
+                return response
+
+            def close(self):
+                closed.append("connection")
+
+        connection = filesystem._PersistentAdapterLanePool(1)._lanes[0][1]
+        raw_connection = Connection()
+        connection._connection = raw_connection
+        connection._open = lambda *_args, **_kwargs: (
+            raw_connection,
+            types.SimpleNamespace(path="/adapter", query=""),
+        )
+        with self.assertRaisesRegex(OSError, "header read failed"):
+            connection.read_range(
+                "http://source/adapter",
+                start=0,
+                end=3,
+                total=4,
+                expected_sha256="a" * 64,
+                timeout=10,
+                consume=lambda _chunk: None,
+            )
+        self.assertEqual(closed, ["response", "connection"])
+
+    def test_persistent_read_allows_progress_within_attempt_bound(self):
+        filesystem = load_filesystem()
+        closed = []
+
+        class Response:
+            status = 206
+            reason = "partial"
+            headers = {}
+            pieces = iter(b"abcd")
+
+            def getheader(self, name):
+                return {"Content-Length": "4", "Content-Range": "bytes 0-3/4"}.get(name)
+
+            def read1(self, _size):
+                time.sleep(0.005)
+                try:
+                    return bytes((next(self.pieces),))
+                except StopIteration:
+                    return b""
+
+            def close(self):
+                closed.append("response")
+
+        response = Response()
+
+        class Connection:
+            sock = None
+
+            def request(self, *_args, **_kwargs):
+                return None
+
+            def getresponse(self):
+                return response
+
+            def close(self):
+                closed.append("connection")
+
+        connection = filesystem._PersistentAdapterLanePool(1)._lanes[0][1]
+        raw_connection = Connection()
+        connection._connection = raw_connection
+        connection._open = lambda *_args, **_kwargs: (
+            raw_connection,
+            types.SimpleNamespace(path="/adapter", query=""),
+        )
+        received = []
+        try:
+            connection.read_range(
+                "http://source/adapter",
+                start=0,
+                end=3,
+                total=4,
+                expected_sha256=None,
+                timeout=0.01,
+                attempt_deadline=time.monotonic() + 0.1,
+                consume=received.append,
+            )
+        finally:
+            connection.close()
+        self.assertEqual(b"".join(received), b"abcd")
+        self.assertEqual(closed.count("response"), 1)
+
+    def test_persistent_idle_read_closes_response_and_connection(self):
+        filesystem = load_filesystem()
+        closed = []
+
+        class Response:
+            status = 206
+            reason = "partial"
+            headers = {}
+
+            def getheader(self, name):
+                return {"Content-Length": "1", "Content-Range": "bytes 0-0/1"}.get(name)
+
+            def read1(self, _size):
+                raise TimeoutError("idle read")
+
+            def close(self):
+                closed.append("response")
+
+        response = Response()
+
+        class Connection:
+            sock = None
+
+            def request(self, *_args, **_kwargs):
+                return None
+
+            def getresponse(self):
+                return response
+
+            def close(self):
+                closed.append("connection")
+
+        connection = filesystem._PersistentAdapterLanePool(1)._lanes[0][1]
+        raw_connection = Connection()
+        connection._connection = raw_connection
+        connection._open = lambda *_args, **_kwargs: (
+            raw_connection,
+            types.SimpleNamespace(path="/adapter", query=""),
+        )
+        with self.assertRaises(filesystem._PersistentTransportError):
+            connection.read_range(
+                "http://source/adapter",
+                start=0,
+                end=0,
+                total=1,
+                expected_sha256=None,
+                timeout=1,
+                consume=lambda _chunk: None,
+            )
+        self.assertEqual(closed, ["response", "connection"])
+
+    def test_v1_manifest_rejects_empty_and_dot_chunk_names(self):
+        filesystem = load_filesystem()
+        manifest = {
+            "version": 1,
+            "kind": "lora-adapter",
+            "mode": "delta",
+            "transport": "chunked-shuffled-xor-zstd",
+            "target_step": 2,
+            "base_step": 1,
+            "base_sha256": "a" * 64,
+            "target_sha256": "b" * 64,
+            "full_sha256": "b" * 64,
+            "target_size": 8,
+            "full_size": 8,
+            "config_sha256": "c" * 64,
+            "config_size": 0,
+            "base_config_sha256": "d" * 64,
+            "chunks": [
+                {
+                    "file": "chunk-0",
+                    "offset": 0,
+                    "raw_size": 8,
+                    "wire_size": 8,
+                    "wire_sha256": "e" * 64,
+                    "raw_sha256": "f" * 64,
+                    "codec": "zstd",
+                }
+            ],
+        }
+        old_reader = filesystem._read_source_text
+        filesystem._read_source_text = lambda *_args, **_kwargs: json.dumps(manifest)
+        try:
+            for invalid_name in ("", ".", ".."):
+                manifest["chunks"][0]["file"] = invalid_name
+                with self.assertRaisesRegex(OSError, "identity is invalid"):
+                    filesystem._read_chunked_v1_manifest("http://source/step_2")
+        finally:
+            filesystem._read_source_text = old_reader
+
+    def test_manifest_requires_two_adjacent_bases_and_even_coverage(self):
+        filesystem = load_filesystem()
+        self.assertEqual(filesystem._PREDICTIVE_RECONSTRUCT_WORKERS, 32)
+        target = b"t" * 8
+        digest = hashlib.sha256(target).hexdigest()
+        config = b"{}\n"
+        config_digest = hashlib.sha256(config).hexdigest()
+        correction_digest = hashlib.sha256(b"correction").hexdigest()
+        manifest = {
+            "version": 2,
+            "kind": "lora-adapter",
+            "mode": "delta",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+            "target_step": 2,
+            "base_step": 1,
+            "base2_step": 0,
+            "target_url": "http://source/step_2",
+            "base_url": "http://source/step_1",
+            "base2_url": "http://source/step_0",
+            "target_size": len(target),
+            "target_sha256": digest,
+            "full_size": len(target),
+            "full_sha256": digest,
+            "config_size": len(config),
+            "config_sha256": config_digest,
+            "base_size": len(target),
+            "base_sha256": "a" * 64,
+            "base_config_size": len(config),
+            "base_config_sha256": "b" * 64,
+            "base2_size": len(target),
+            "base2_sha256": "c" * 64,
+            "base2_config_size": len(config),
+            "base2_config_sha256": "d" * 64,
+            "data_offset": 2,
+            "chunk_alignment": 2,
+            "chunk_coverage": {"offset": 0, "size": len(target)},
+            "predictor": "bf16-float32-second-order-rne",
+            "value_encoding": "sparse-zigzag-leb128",
+            "mask_encoding": "zstd-bit-mask-little-endian",
+            "chunk_count": 1,
+            "chunks": [
+                {
+                    "file": "chunk-0",
+                    "offset": 0,
+                    "data_offset": 2,
+                    "raw_size": len(target),
+                    "wire_size": 4,
+                    "wire_sha256": "e" * 64,
+                    "raw_sha256": correction_digest,
+                    "codec": "zstd",
+                }
+            ],
+            "files": [
+                {"name": "adapter_config.json", "size": len(config), "sha256": config_digest},
+                {"name": "adapter_model.safetensors", "size": len(target), "sha256": digest},
+            ],
+        }
+        old_reader = filesystem._read_source_text
+        filesystem._read_source_text = lambda *_args, **_kwargs: json.dumps(manifest)
+        try:
+            parsed = filesystem._read_chunked_linear_manifest("http://source/step_2")
+            self.assertEqual(parsed["base2_url"], "http://source/step_0")
+            self.assertEqual(parsed["base_config_size"], len(config))
+            self.assertEqual(parsed["base2_config_size"], len(config))
+            self.assertEqual(parsed["chunks"][0]["data_offset"], 2)
+            for invalid_name in ("", ".", ".."):
+                manifest["chunks"][0]["file"] = invalid_name
+                with self.assertRaisesRegex(OSError, "identity is invalid"):
+                    filesystem._read_chunked_linear_manifest("http://source/step_2")
+            manifest["chunks"][0]["file"] = "chunk-0"
+            manifest["chunks"][0]["data_offset"] = 0
+            with self.assertRaisesRegex(OSError, "identity is invalid"):
+                filesystem._read_chunked_linear_manifest("http://source/step_2")
+            manifest["chunks"][0]["data_offset"] = 2
+            manifest["chunks"][0]["raw_size"] = 7
+            with self.assertRaisesRegex(OSError, "identity is invalid"):
+                filesystem._read_chunked_linear_manifest("http://source/step_2")
+        finally:
+            filesystem._read_source_text = old_reader
+
+    def test_manifest_accepts_odd_safetensors_offset_and_file_size(self):
+        filesystem = load_filesystem()
+        target = b"t" * 9
+        config = b"{}\n"
+
+        def digest(value):
+            return hashlib.sha256(value).hexdigest()
+
+        manifest = {
+            "version": 2,
+            "kind": "lora-adapter",
+            "mode": "delta",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+            "target_step": 2,
+            "base_step": 1,
+            "base2_step": 0,
+            "target_url": "http://source/step_2",
+            "base_url": "http://source/step_1",
+            "base2_url": "http://source/step_0",
+            "target_size": len(target),
+            "target_sha256": digest(target),
+            "full_size": len(target),
+            "full_sha256": digest(target),
+            "config_size": len(config),
+            "config_sha256": digest(config),
+            "base_size": len(target),
+            "base_sha256": "a" * 64,
+            "base_config_size": len(config),
+            "base_config_sha256": "b" * 64,
+            "base2_size": len(target),
+            "base2_sha256": "c" * 64,
+            "base2_config_size": len(config),
+            "base2_config_sha256": "d" * 64,
+            "data_offset": 3,
+            "chunk_alignment": 2,
+            "chunk_coverage": {"offset": 0, "size": len(target)},
+            "predictor": "bf16-float32-second-order-rne",
+            "value_encoding": "sparse-zigzag-leb128",
+            "mask_encoding": "zstd-bit-mask-little-endian",
+            "chunk_count": 1,
+            "chunks": [
+                {
+                    "file": "chunk-0",
+                    "offset": 0,
+                    "data_offset": 3,
+                    "raw_size": len(target),
+                    "wire_size": 4,
+                    "wire_sha256": "e" * 64,
+                    "raw_sha256": "f" * 64,
+                    "codec": "zstd",
+                }
+            ],
+            "files": [
+                {"name": "adapter_config.json", "size": len(config), "sha256": digest(config)},
+                {"name": "adapter_model.safetensors", "size": len(target), "sha256": digest(target)},
+            ],
+        }
+        old_reader = filesystem._read_source_text
+        filesystem._read_source_text = lambda *_args, **_kwargs: json.dumps(manifest)
+        try:
+            parsed = filesystem._read_chunked_linear_manifest("http://source/step_2")
+            self.assertEqual(parsed["target_size"], len(target))
+            self.assertEqual(parsed["data_offset"], 3)
+            self.assertEqual(parsed["chunks"][0]["raw_size"], len(target))
+            manifest["chunks"][0]["raw_size"] = 8
+            with self.assertRaisesRegex(OSError, "identity is invalid"):
+                filesystem._read_chunked_linear_manifest("http://source/step_2")
+        finally:
+            filesystem._read_source_text = old_reader
+
+    def test_receiver_reconstructs_exact_target_with_zero_correction(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/step_2"
+        target = b"target!!"
+        base1 = b"base-one"
+        base2 = b"base-two"
+        correction = b""
+        config = b"{}\n"
+        wire = b"wire"
+        def digest(value):
+            return hashlib.sha256(value).hexdigest()
+        transport = {
+            "version": 2,
+            "mode": "delta",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+            "source_manifest": {
+                "version": 2,
+                "kind": "lora-adapter",
+                "mode": "delta",
+                "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+                "files": [],
+            },
+            "base_url": "http://source/step_1",
+            "base_sha256": digest(base1),
+            "base_size": len(base1),
+            "base_config_sha256": digest(config),
+            "base_config_size": len(config),
+            "base2_url": "http://source/step_0",
+            "base2_sha256": digest(base2),
+            "base2_size": len(base2),
+            "base2_config_sha256": digest(config),
+            "base2_config_size": len(config),
+            "target_sha256": digest(target),
+            "target_size": len(target),
+            "config_sha256": digest(config),
+            "config_size": len(config),
+            "chunks": [
+                {
+                    "file": "chunk-0",
+                    "offset": 0,
+                    "data_offset": 2,
+                    "raw_size": len(target),
+                    "wire_size": len(wire),
+                    "wire_sha256": digest(wire),
+                    "raw_sha256": digest(correction),
+                    "codec": "zstd",
+                }
+            ],
+        }
+        source_manifest = {
+            "version": 1,
+            "source_url": source_url,
+            "files": {
+                "adapter_config.json": {"size": len(config), "sha256": digest(config)},
+                "adapter_model.safetensors": {"size": len(target), "sha256": digest(target)},
+            },
+        }
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_persistent_file = filesystem._download_persistent_file
+        old_lanes = filesystem._adapter_source_urls
+        old_streams = filesystem._configured_download_streams
+        old_base = filesystem._verified_adapter_base
+        old_source = filesystem._source_manifest
+        old_decode = filesystem._decode_linear_transport_chunk
+        old_timeout = filesystem._delta_stage_timeout_s
+        old_pool = filesystem._PersistentAdapterLanePool
+        relaying_seen_before_chunk = False
+        wire_proof_seen_during_decode = False
+        decode_calls = 0
+        chunk_download_calls = 0
+        base_calls = []
+        pool_instances = []
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                base_paths = {
+                    "http://source/step_1": Path(temporary) / "base1",
+                    "http://source/step_0": Path(temporary) / "base2",
+                }
+                for url, path, model in (
+                    ("http://source/step_1", base_paths["http://source/step_1"], base1),
+                    ("http://source/step_0", base_paths["http://source/step_0"], base2),
+                ):
+                    path.mkdir()
+                    (path / "adapter_model.safetensors").write_bytes(model)
+                    (path / "adapter_config.json").write_bytes(config)
+                    (path / "READY").write_text("ready\n", encoding="utf-8")
+
+                def fake_download(_source, destination, **kwargs):
+                    nonlocal relaying_seen_before_chunk, chunk_download_calls
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if "chunk-" in destination.name:
+                        chunk_download_calls += 1
+                        relaying_seen_before_chunk = (
+                            destination.parent.parent / "RELAYING"
+                        ).is_file()
+                    destination.write_bytes(
+                        config if "adapter_config.json" in destination.name else wire
+                    )
+                    if kwargs.get("progress"):
+                        kwargs["progress"](0, destination.stat().st_size)
+
+                class FakePool:
+                    def __init__(self, source_urls, width):
+                        self.source_urls = list(source_urls)
+                        self.width = width
+                        self.closed = False
+                        pool_instances.append(self)
+
+                    def urls_for_lane(self, lane, name):
+                        primary = self.source_urls[lane % self.width]
+                        return [
+                            f"{primary.rstrip('/')}/{name}",
+                            *(
+                                f"{source.rstrip('/')}/{name}"
+                                for source in self.source_urls
+                                if source != primary
+                            ),
+                        ]
+
+                    def download(self, _urls, lane, destination, _parent_fd, **kwargs):
+                        fake_download(None, destination, progress=kwargs.get("progress"))
+
+                    def close(self):
+                        self.closed = True
+
+                def fake_base(url, *_args, **_kwargs):
+                    base_calls.append((url, _kwargs))
+                    return base_paths[url] / "adapter_model.safetensors", base_paths[url] / "adapter_config.json"
+
+                filesystem._download_persistent_file = fake_download
+                filesystem._PersistentAdapterLanePool = FakePool
+                filesystem._adapter_source_urls = lambda _source: ["http://lane"]
+                filesystem._configured_download_streams = lambda: 1
+                filesystem._verified_adapter_base = fake_base
+                filesystem._source_manifest = lambda *_args, **_kwargs: source_manifest
+                filesystem._delta_stage_timeout_s = lambda: 30.0
+
+                def fake_decode(*_args, **_kwargs):
+                    nonlocal decode_calls, wire_proof_seen_during_decode
+                    decode_calls += 1
+                    chunk_path = (
+                        filesystem.adapter_cache_path(source_url).with_name(
+                            f"{filesystem.adapter_cache_path(source_url).name}.partial"
+                        )
+                        / "transport-chunks"
+                        / "chunk-0"
+                    )
+                    wire_proof_seen_during_decode = chunk_path.with_name(
+                        f"{chunk_path.name}.wire-ready"
+                    ).is_file()
+                    if decode_calls == 1:
+                        raise OSError("test interruption after wire publication")
+                    return target, digest(correction)
+
+                filesystem._decode_linear_transport_chunk = fake_decode
+                with self.assertRaisesRegex(OSError, "test interruption"):
+                    filesystem._stage_chunked_linear_adapter(
+                        source_url,
+                        transport,
+                        source_manifest,
+                        deadline=None,
+                        status_metadata={
+                            "policy_step": 3,
+                            "stage_timeout_seconds": 300.0,
+                            "acceptance_target_seconds": 300.0,
+                        },
+                    )
+                partial = filesystem.adapter_cache_path(source_url).with_name(
+                    f"{filesystem.adapter_cache_path(source_url).name}.partial"
+                )
+                self.assertTrue(
+                    (partial / "transport-chunks" / "chunk-0.wire-ready").is_file()
+                )
+                result = filesystem._stage_chunked_linear_adapter(
+                    source_url,
+                    transport,
+                    source_manifest,
+                    deadline=None,
+                    status_metadata={
+                        "policy_step": 3,
+                        "stage_timeout_seconds": 300.0,
+                        "acceptance_target_seconds": 300.0,
+                    },
+                )
+                self.assertTrue((result / "READY").is_file())
+                self.assertEqual((result / "adapter_model.safetensors").read_bytes(), target)
+                self.assertTrue(wire_proof_seen_during_decode)
+                self.assertEqual(chunk_download_calls, 1)
+                self.assertTrue(all(pool.closed for pool in pool_instances))
+                self.assertFalse(
+                    (result / "transport-chunks" / "chunk-0.wire-ready").exists()
+                )
+                self.assertTrue(
+                    (result / "transport-chunks" / "chunk-0.done").is_file()
+                )
+                status = filesystem.adapter_stage_status()
+                self.assertEqual(status["status"], "ready")
+                self.assertGreaterEqual(status["reconstruct_seconds"], 0.0)
+                self.assertEqual(status["policy_step"], 3)
+                self.assertEqual(status["stage_timeout_seconds"], 300.0)
+                self.assertEqual(status["acceptance_target_seconds"], 300.0)
+                self.assertTrue(relaying_seen_before_chunk)
+                self.assertEqual(
+                    [call[1]["expected_config_size"] for call in base_calls],
+                    [len(config), len(config), len(config), len(config)],
+                )
+                destination = filesystem.adapter_cache_path(source_url)
+                partial = destination.with_name(f"{destination.name}.partial")
+                destination.rename(partial)
+                (partial / "READY").unlink()
+                (partial / "adapter_model.safetensors").write_bytes(b"damaged!")
+                (partial / "transport-chunks" / "chunk-0.done").unlink()
+                statuses = []
+                old_status = filesystem._write_stage_status
+
+                def record_status(cache_root, value, **kwargs):
+                    statuses.append(dict(value))
+                    return old_status(cache_root, value, **kwargs)
+
+                filesystem._write_stage_status = record_status
+                try:
+                    resumed = filesystem._stage_chunked_linear_adapter(
+                        source_url,
+                        transport,
+                        source_manifest,
+                        deadline=None,
+                        status_metadata={
+                            "policy_step": 3,
+                            "stage_timeout_seconds": 300.0,
+                            "acceptance_target_seconds": 300.0,
+                        },
+                    )
+                finally:
+                    filesystem._write_stage_status = old_status
+                self.assertEqual(statuses[0]["bytes_done"], len(wire))
+                self.assertEqual(
+                    max(value["bytes_done"] for value in statuses if value["status"] == "staging"),
+                    len(wire) + len(config),
+                )
+                self.assertTrue(all(0 <= value["bytes_done"] <= value["bytes_total"] for value in statuses))
+                self.assertEqual((resumed / "adapter_model.safetensors").read_bytes(), target)
+                self.assertEqual(chunk_download_calls, 1)
+                self.assertEqual(decode_calls, 3)
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._download_persistent_file = old_persistent_file
+            filesystem._adapter_source_urls = old_lanes
+            filesystem._configured_download_streams = old_streams
+            filesystem._verified_adapter_base = old_base
+            filesystem._source_manifest = old_source
+            filesystem._decode_linear_transport_chunk = old_decode
+            filesystem._delta_stage_timeout_s = old_timeout
+            filesystem._PersistentAdapterLanePool = old_pool
+
+    def test_linear_receiver_caps_download_workers_to_responsive_lanes(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/step_2"
+        target = b"target!!"
+        base = b"\x00" * len(target)
+        config = b"{}\n"
+        wires = (b"wire", b"data")
+
+        def digest(value):
+            return hashlib.sha256(value).hexdigest()
+
+        chunks = [
+            {
+                "file": f"chunk-{index}",
+                "offset": index * 4,
+                "data_offset": 2,
+                "raw_size": 4,
+                "wire_size": len(wire),
+                "wire_sha256": digest(wire),
+                "raw_sha256": digest(b""),
+                "codec": "zstd",
+            }
+            for index, wire in enumerate(wires)
+        ]
+        transport = {
+            "version": 2,
+            "mode": "delta",
+            "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+            "source_manifest": {
+                "version": 2,
+                "kind": "lora-adapter",
+                "mode": "delta",
+                "transport": "chunked-bf16-linear-zigzag-sparse-zstd",
+                "files": [],
+            },
+            "base_url": "http://source/step_1",
+            "base_sha256": digest(base),
+            "base_size": len(base),
+            "base_config_sha256": digest(config),
+            "base_config_size": len(config),
+            "base2_url": "http://source/step_0",
+            "base2_sha256": digest(base),
+            "base2_size": len(base),
+            "base2_config_sha256": digest(config),
+            "base2_config_size": len(config),
+            "target_sha256": digest(target),
+            "target_size": len(target),
+            "config_sha256": digest(config),
+            "config_size": len(config),
+            "chunks": chunks,
+        }
+        source_manifest = {
+            "version": 1,
+            "source_url": source_url,
+            "files": {
+                "adapter_config.json": {"size": len(config), "sha256": digest(config)},
+                "adapter_model.safetensors": {
+                    "size": len(target),
+                    "sha256": digest(target),
+                },
+            },
+        }
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_download = filesystem._download_persistent_file
+        old_lanes = filesystem._responsive_adapter_source_urls
+        old_streams = filesystem._configured_download_streams
+        old_base = filesystem._verified_adapter_base
+        old_decode = filesystem._decode_linear_transport_chunk
+        old_executor = filesystem.ThreadPoolExecutor
+        old_timeout = filesystem._delta_stage_timeout_s
+        old_pool = filesystem._PersistentAdapterLanePool
+        workers = []
+        pool_instances = []
+        real_executor = filesystem.ThreadPoolExecutor
+
+        class RecordingExecutor:
+            def __init__(self, max_workers):
+                workers.append(max_workers)
+                self.executor = real_executor(max_workers=max_workers)
+
+            def submit(self, *args, **kwargs):
+                return self.executor.submit(*args, **kwargs)
+
+            def shutdown(self, *args, **kwargs):
+                return self.executor.shutdown(*args, **kwargs)
+
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                base_paths = {
+                    "http://source/step_1": Path(temporary) / "base1",
+                    "http://source/step_0": Path(temporary) / "base2",
+                }
+                for path in base_paths.values():
+                    path.mkdir()
+                    (path / "adapter_model.safetensors").write_bytes(base)
+                    (path / "adapter_config.json").write_bytes(config)
+                    (path / "READY").write_text("ready\n", encoding="utf-8")
+
+                def fake_download(_source, destination, **kwargs):
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if "adapter_config.json" in destination.name:
+                        value = config
+                    else:
+                        index = int(destination.name.split("chunk-", 1)[1].split(".", 1)[0])
+                        value = wires[index]
+                    destination.write_bytes(value)
+                    if kwargs.get("progress"):
+                        kwargs["progress"](0, len(value))
+
+                class FakePool:
+                    def __init__(self, source_urls, width):
+                        self.source_urls = list(source_urls)
+                        self.width = width
+                        self.closed = False
+                        pool_instances.append(self)
+
+                    def urls_for_lane(self, lane, name):
+                        primary = self.source_urls[lane % self.width]
+                        return [
+                            f"{primary.rstrip('/')}/{name}",
+                            *(
+                                f"{source.rstrip('/')}/{name}"
+                                for source in self.source_urls
+                                if source != primary
+                            ),
+                        ]
+
+                    def download(self, _urls, _lane, destination, _parent_fd, **kwargs):
+                        fake_download(None, destination, progress=kwargs.get("progress"))
+
+                    def close(self):
+                        self.closed = True
+
+                filesystem._download_persistent_file = fake_download
+                filesystem._PersistentAdapterLanePool = FakePool
+                filesystem._responsive_adapter_source_urls = (
+                    lambda *_args, **_kwargs: (["http://lane"], 3)
+                )
+                filesystem._configured_download_streams = lambda: 8
+                filesystem._verified_adapter_base = (
+                    lambda url, *_args, **_kwargs: (
+                        base_paths[url] / "adapter_model.safetensors",
+                        base_paths[url] / "adapter_config.json",
+                    )
+                )
+                filesystem._decode_linear_transport_chunk = (
+                    lambda _base2, _base1, _payload, *, offset, **_kwargs: (
+                        target[offset : offset + 4],
+                        digest(b""),
+                    )
+                )
+                filesystem.ThreadPoolExecutor = RecordingExecutor
+                filesystem._delta_stage_timeout_s = lambda: 30.0
+                result = filesystem._stage_chunked_linear_adapter(
+                    source_url,
+                    transport,
+                    source_manifest,
+                    status_metadata={
+                        "policy_step": 3,
+                        "stage_timeout_seconds": 300.0,
+                        "acceptance_target_seconds": 300.0,
+                    },
+                )
+                self.assertTrue((result / "READY").is_file())
+                self.assertEqual((result / "adapter_model.safetensors").read_bytes(), target)
+                self.assertEqual(workers, [2, 1])
+                self.assertTrue(all(pool.closed for pool in pool_instances))
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._download_persistent_file = old_download
+            filesystem._responsive_adapter_source_urls = old_lanes
+            filesystem._configured_download_streams = old_streams
+            filesystem._verified_adapter_base = old_base
+            filesystem._decode_linear_transport_chunk = old_decode
+            filesystem.ThreadPoolExecutor = old_executor
+            filesystem._delta_stage_timeout_s = old_timeout
+            filesystem._PersistentAdapterLanePool = old_pool
+
+    def test_receiver_rejects_symlinked_partial_before_external_write(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/step_2"
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path(source_url)
+                partial = destination.with_name(f"{destination.name}.partial")
+                Path(external, "sentinel").write_text("do not change", encoding="utf-8")
+                partial.symlink_to(external, target_is_directory=True)
+                with self.assertRaisesRegex(OSError, "partial directory is a symbolic link"):
+                    filesystem._stage_chunked_linear_adapter(source_url, {}, {})
+                self.assertTrue(partial.is_symlink())
+                self.assertEqual(
+                    Path(external, "sentinel").read_text(encoding="utf-8"),
+                    "do not change",
+                )
+                self.assertEqual(list(Path(external).iterdir()), [Path(external, "sentinel")])
+
+                partial.unlink()
+                destination.symlink_to(external, target_is_directory=True)
+                with self.assertRaisesRegex(OSError, "destination is a symbolic link"):
+                    filesystem._stage_chunked_linear_adapter(source_url, {}, {})
+                self.assertTrue(destination.is_symlink())
+                self.assertEqual(list(Path(external).iterdir()), [Path(external, "sentinel")])
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_inner_adapter_files_reject_symlinks(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+            root = Path(temporary)
+            external_file = Path(external, "outside")
+            external_file.write_bytes(b"outside")
+
+            output = root / "output"
+            output.symlink_to(external_file)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem._preallocate(output, 8)
+
+            incoming = root / "incoming"
+            incoming.symlink_to(external_file)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem.download("http://source/file", incoming, expected_size=8)
+
+            proof = root / "chunk.done"
+            proof.symlink_to(external_file)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem._proof_identity_matches(proof, {}, completed=True)
+
+            manifest = root / "manifest.json"
+            manifest.symlink_to(external_file)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem._write_json(manifest, {"safe": True})
+
+            output_parent = root / "output-parent"
+            output_parent.symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem._preallocate(output_parent / "output", 8)
+
+    def test_receiver_rejects_symlinked_chunk_directory(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/step_2"
+        transport = {
+            "base_url": "http://source/step_1",
+            "base_sha256": "a" * 64,
+            "base_size": 8,
+            "base_config_size": 3,
+            "base_config_sha256": "b" * 64,
+            "base2_url": "http://source/step_0",
+            "base2_sha256": "c" * 64,
+            "base2_size": 8,
+            "base2_config_size": 3,
+            "base2_config_sha256": "d" * 64,
+            "target_sha256": "e" * 64,
+            "target_size": 8,
+            "config_sha256": "f" * 64,
+            "config_size": 3,
+            "chunks": [],
+        }
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        old_base = filesystem._verified_adapter_base
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path(source_url)
+                partial = destination.with_name(f"{destination.name}.partial")
+                partial.mkdir(parents=True)
+                (partial / "transport-manifest.json").write_text(
+                    filesystem._adapter_resume_identity(source_url, transport),
+                    encoding="utf-8",
+                )
+                (partial / "transport-chunks").symlink_to(external, target_is_directory=True)
+                filesystem._verified_adapter_base = lambda *_args, **_kwargs: (
+                    Path(temporary) / "base-model",
+                    Path(temporary) / "base-config",
+                )
+                with self.assertRaisesRegex(OSError, "chunk directory is a symbolic link"):
+                    filesystem._stage_chunked_linear_adapter(
+                        source_url,
+                        transport,
+                        {},
+                    )
+                self.assertTrue((partial / "transport-chunks").is_symlink())
+                self.assertEqual(list(Path(external).iterdir()), [])
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+            filesystem._verified_adapter_base = old_base
+
+    def test_partial_cleanup_does_not_remove_a_swapped_directory(self):
+        filesystem = load_filesystem()
+        original_read = filesystem._read_text_nofollow
+        original_open = filesystem._open_directory_nofollow
+        try:
+            for version in ("v1", "v2"):
+                identity_name = "transport-manifest.json"
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    cache = root / "cache"
+                    cache.mkdir()
+                    partial = cache / "adapter.partial"
+                    partial.mkdir()
+                    (partial / identity_name).write_text("old", encoding="utf-8")
+                    (partial / "private-marker").write_text("private", encoding="utf-8")
+                    external = root / "external"
+                    external.mkdir()
+                    marker = external / "must-survive"
+                    marker.write_text("keep", encoding="utf-8")
+                    swapped = False
+
+                    def swap_after_identity_read(path, *args, **kwargs):
+                        nonlocal swapped
+                        value = original_read(path, *args, **kwargs)
+                        if path == identity_name and not swapped:
+                            swapped = True
+                            original_partial = root / "original-partial"
+                            partial.rename(original_partial)
+                            external.rename(partial)
+                        return value
+
+                    filesystem._read_text_nofollow = swap_after_identity_read
+                    with self.assertRaisesRegex(OSError, "replaced during cleanup"):
+                        filesystem._reset_staging_directory_identity(
+                            partial,
+                            identity_name,
+                            "new",
+                            f"{version} adapter partial directory",
+                        )
+                    self.assertTrue(swapped)
+                    self.assertEqual(
+                        (partial / "must-survive").read_text(encoding="utf-8"),
+                        "keep",
+                    )
+        finally:
+            filesystem._read_text_nofollow = original_read
+            filesystem._open_directory_nofollow = original_open
+
+    def test_replace_paths_keeps_both_ends_in_the_held_directory(self):
+        filesystem = load_filesystem()
+        original_open = filesystem._open_directory_nofollow
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                cache = root / "cache"
+                cache.mkdir()
+                incoming = cache / "incoming"
+                incoming.write_bytes(b"private adapter")
+                external = root / "external"
+                external.mkdir()
+                (external / "must-survive").write_text("keep", encoding="utf-8")
+                swapped = False
+
+                def swap_after_parent_open(path, *args, **kwargs):
+                    nonlocal swapped
+                    descriptor = original_open(path, *args, **kwargs)
+                    if Path(path) == cache and not swapped:
+                        swapped = True
+                        cache.rename(root / "original-cache")
+                        external.rename(cache)
+                    return descriptor
+
+                filesystem._open_directory_nofollow = swap_after_parent_open
+                filesystem._replace_paths(
+                    incoming,
+                    cache / "published",
+                    "adapter publish",
+                )
+                self.assertTrue(swapped)
+                self.assertEqual(
+                    (root / "original-cache" / "published").read_bytes(),
+                    b"private adapter",
+                )
+                self.assertFalse((cache / "published").exists())
+                self.assertEqual(
+                    (cache / "must-survive").read_text(encoding="utf-8"),
+                    "keep",
+                )
+        finally:
+            filesystem._open_directory_nofollow = original_open
+
+    def test_status_reports_filesystem_failures(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                status_path = Path(temporary) / ".adapter-stage-status.json"
+                status_path.symlink_to(Path(external), target_is_directory=True)
+                status = filesystem.adapter_stage_status()
+                self.assertEqual(status["status"], "failed")
+                self.assertIn("symbolic link", status["error"])
+                status_path.unlink()
+                status_path.write_text("not json", encoding="utf-8")
+                self.assertEqual(filesystem.adapter_stage_status()["status"], "failed")
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_cache_cleanup_rejects_a_symlinked_cache_root(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+            cache_root = Path(temporary) / "cache"
+            cache_root.symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(OSError, "symbolic link"):
+                filesystem._cleanup_previous_adapter_caches(
+                    cache_root,
+                    cache_root / "active",
+                )
+
+    def test_cache_cleanup_keeps_a_newer_adapter_during_recovery(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                base_url = "http://source/run/broadcasts/step_0"
+                active_url = "http://source/run/broadcasts/step_1"
+                future_url = "http://source/run/broadcasts/step_3"
+                stale_url = "http://source/old/broadcasts/step_99"
+                loaded_url = "http://source/older/broadcasts/step_100"
+                leased_url = "http://source/oldest/broadcasts/step_101"
+
+                paths = {
+                    url: filesystem.adapter_cache_path(url)
+                    for url in (base_url, active_url, future_url, stale_url, loaded_url, leased_url)
+                }
+                for url, path in paths.items():
+                    path.mkdir(parents=True)
+                    (path / "READY").write_text("ready\n", encoding="ascii")
+                    transport = {"source_url": url}
+                    if url == active_url:
+                        transport["base_url"] = base_url
+                    (path / "transport.json").write_text(
+                        json.dumps(transport),
+                        encoding="utf-8",
+                    )
+
+                filesystem.write_loaded_adapter_receipts({"loaded": {"source_url": loaded_url}})
+                with filesystem.adapter_reader_lock(paths[leased_url]):
+                    filesystem._cleanup_previous_adapter_caches(
+                        Path(temporary),
+                        paths[active_url],
+                    )
+
+                self.assertTrue(paths[base_url].is_dir())
+                self.assertTrue(paths[active_url].is_dir())
+                self.assertTrue(paths[future_url].is_dir())
+                self.assertFalse(paths[stale_url].exists())
+                self.assertTrue(paths[loaded_url].is_dir())
+                self.assertTrue(paths[leased_url].is_dir())
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_cache_run_comparison_ignores_slashes_in_url_queries(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                urls = (
+                    "http://source/run/step_1?token=/first/query",
+                    "http://source/run/step_2?token=/other/query",
+                    "http://source/old/step_9?token=/first/query",
+                )
+                paths = [filesystem.adapter_cache_path(url) for url in urls]
+                for url, path in zip(urls, paths):
+                    path.mkdir()
+                    (path / "READY").write_text("ready\n")
+                    (path / "transport.json").write_text(json.dumps({"source_url": url}))
+                filesystem._cleanup_previous_adapter_caches(Path(temporary), paths[0])
+                self.assertTrue(paths[0].is_dir())
+                self.assertTrue(paths[1].is_dir())
+                self.assertFalse(paths[2].exists())
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_pre_stage_cleanup_preserves_loaded_policy_over_staged_status(self):
+        filesystem = load_filesystem()
+        for loaded_steps in ((19, 22), (22, 19)):
+            with self.subTest(loaded_steps=loaded_steps), tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+                os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+            ):
+                cache = Path(temporary)
+                urls = {step: f"http://source/run/broadcasts/step_{step}" for step in range(19, 27)}
+                paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+                for step, path in paths.items():
+                    if step != 23:
+                        path.mkdir()
+                        (path / "READY").write_text("ready\n")
+                        (path / "transport.json").write_text(json.dumps({"source_url": urls[step]}))
+                target_partial = paths[23].with_name(f"{paths[23].name}.partial")
+                target_partial.mkdir()
+                def write_partial(step, identity_url=None):
+                    partial = paths[step].with_name(f"{paths[step].name}.partial")
+                    partial.mkdir()
+                    identity_url = identity_url or urls[step]
+                    identity = filesystem._adapter_resume_identity(
+                        identity_url,
+                        {
+                            "version": 1,
+                            "mode": "delta",
+                            "transport": filesystem._ADAPTER_DELTA_TRANSPORT,
+                            "base_url": urls[step - 1],
+                            "base_sha256": "a" * 64,
+                            "base_size": 1,
+                            "base_config_sha256": "b" * 64,
+                            "base_config_size": 1,
+                            "target_sha256": "c" * 64,
+                            "target_size": 1,
+                            "config_sha256": "d" * 64,
+                            "config_size": 1,
+                            "chunks": [],
+                        },
+                    )
+                    (partial / "transport-manifest.json").write_text(identity)
+                    return partial
+
+                future_partial = write_partial(24)
+                future_inode = future_partial.stat().st_ino
+                future_content = (future_partial / "transport-manifest.json").read_text()
+                wrong_source_partial = write_partial(
+                    25, "http://other/run/broadcasts/step_24"
+                )
+                wrong_identity_partial = write_partial(26)
+                wrong_identity = json.loads(
+                    (wrong_identity_partial / "transport-manifest.json").read_text()
+                )
+                wrong_identity["resume_identity_version"] = 2
+                (wrong_identity_partial / "transport-manifest.json").write_text(
+                    json.dumps(wrong_identity, sort_keys=True, separators=(",", ":"))
+                )
+                filesystem.write_loaded_adapter_receipts(
+                    {f"adapter-slot{index}": {"source_url": urls[step]}
+                     for index, step in enumerate(loaded_steps)}
+                )
+                (cache / ".adapter-stage-status.json").write_text(
+                    json.dumps({"status": "staging", "source_url": urls[19]})
+                )
+                transport = {"mode": "delta", "base_url": urls[22], "base2_url": urls[21]}
+                with filesystem.adapter_reader_lock(paths[20]):
+                    lock_path = filesystem._adapter_reader_lock(paths[20])
+                    lock_inode = lock_path.stat().st_ino
+                    filesystem._cleanup_adapter_space_before_stage(
+                        cache, paths[23], transport, source_url=urls[23]
+                    )
+                    self.assertTrue(paths[20].is_dir())
+                    self.assertEqual(lock_path.stat().st_ino, lock_inode)
+                filesystem._cleanup_adapter_space_before_stage(
+                    cache, paths[23], transport, source_url=urls[23]
+                )
+                for step in (19, 21, 22, 24, 25):
+                    self.assertTrue(paths[step].is_dir())
+                self.assertTrue(target_partial.is_dir())
+                self.assertTrue(future_partial.is_dir())
+                self.assertEqual(future_partial.stat().st_ino, future_inode)
+                self.assertEqual(
+                    (future_partial / "transport-manifest.json").read_text(), future_content
+                )
+                self.assertFalse(wrong_source_partial.exists())
+                self.assertFalse(wrong_identity_partial.exists())
+                self.assertFalse(paths[20].exists())
+                self.assertEqual(lock_path.stat().st_ino, lock_inode)
+
+    def test_pre_stage_cleanup_prunes_before_repeated_low_space_stages(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+        ):
+            cache = Path(temporary)
+            urls = {step: f"http://source/run/step_{step}" for step in range(19, 31)}
+            paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+            cache_bytes = 4096
+            capacity = 4 * cache_bytes
+
+            def publish(step, transport):
+                paths[step].mkdir()
+                (paths[step] / "READY").write_text("ready\n")
+                (paths[step] / "transport.json").write_text(json.dumps({
+                    **transport, "source_url": urls[step],
+                }))
+
+            for step in range(19, 23):
+                publish(step, {})
+            for index in range(300):
+                (cache / f".{index:064x}.readers.lock").touch()
+            loaded = [19, 22]
+
+            def disk_usage(_path):
+                used = sum(path.is_dir() for path in paths.values()) * cache_bytes
+                return types.SimpleNamespace(free=capacity - used)
+
+            for target in range(23, 31):
+                filesystem.write_loaded_adapter_receipts({
+                    f"slot{index}": {"source_url": urls[step]}
+                    for index, step in enumerate(loaded)
+                })
+                transport = {
+                    "mode": "delta", "transport": filesystem._ADAPTER_LINEAR_TRANSPORT,
+                    "source_manifest": {"target_step": target},
+                    "base_url": urls[target - 1], "base2_url": urls[target - 2],
+                    "target_size": cache_bytes, "target_sha256": "a" * 64,
+                    "config_size": 0, "config_sha256": "b" * 64,
+                }
+                manifest = {"files": {
+                    filesystem._ADAPTER_FILES[0]: {"size": 0, "sha256": "b" * 64},
+                    filesystem._ADAPTER_FILES[1]: {"size": cache_bytes, "sha256": "a" * 64},
+                }}
+
+                def stage(source_url, validated_transport, _manifest, **_kwargs):
+                    self.assertEqual(source_url, urls[target])
+                    filesystem._preflight_adapter_space(
+                        cache, [(paths[target] / filesystem._ADAPTER_FILES[1], cache_bytes)]
+                    )
+                    for step in {*loaded, target - 1, target - 2}:
+                        self.assertTrue(paths[step].is_dir())
+                    publish(target, validated_transport)
+                    filesystem._cleanup_adapter_caches(cache, paths[target])
+                    return paths[target]
+
+                with self.subTest(target=target), mock.patch.object(
+                    filesystem, "_read_delta_manifest_with_visibility_wait", return_value=transport
+                ), mock.patch.object(filesystem, "_source_manifest", return_value=manifest), mock.patch.object(
+                    filesystem, "_stage_chunked_linear_adapter", side_effect=stage
+                ), mock.patch.object(filesystem.shutil, "disk_usage", side_effect=disk_usage):
+                    self.assertEqual(
+                        filesystem.stage_lora_adapter_files(urls[target], require_delta=True), paths[target]
+                    )
+                    self.assertLessEqual(sum(path.is_dir() for path in paths.values()), 4)
+                loaded = [target - 1, target]
+
+    def test_pre_stage_cleanup_rejects_missing_or_corrupt_receipts(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                urls = {
+                    name: f"http://source/run/broadcasts/step_{step}"
+                    for name, step in (("loaded", 0), ("base2", 1), ("base", 2), ("target", 3))
+                }
+                paths = {name: filesystem.adapter_cache_path(url) for name, url in urls.items()}
+                for name in ("loaded", "base2", "base"):
+                    paths[name].mkdir(parents=True)
+                    (paths[name] / "READY").write_text("ready\n", encoding="ascii")
+                    (paths[name] / "transport.json").write_text(
+                        json.dumps({"source_url": urls[name]}), encoding="utf-8"
+                    )
+                paths["target"].with_name(f"{paths['target'].name}.partial").mkdir()
+                start_time = filesystem._process_start_time(os.getpid())
+                self.assertIsNotNone(start_time)
+                (Path(temporary) / filesystem._ADAPTER_LOADED_RECEIPTS).write_text(
+                    json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "start_time": start_time + 1,
+                            "receipts": {"slot": {"source_url": urls["loaded"]}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                receipt_path = Path(temporary) / filesystem._ADAPTER_LOADED_RECEIPTS
+                for ownership in ("corrupt", "missing"):
+                    with self.subTest(ownership=ownership):
+                        if ownership == "corrupt":
+                            receipt_path.write_text("not json")
+                        elif ownership == "missing":
+                            receipt_path.unlink()
+                        filesystem._cleanup_adapter_space_before_stage(
+                            Path(temporary),
+                            paths["target"],
+                            {"mode": "delta", "base_url": urls["base"], "base2_url": urls["base2"]},
+                            source_url=urls["target"],
+                        )
+                        for name in ("loaded", "base2", "base"):
+                            self.assertTrue(paths[name].exists())
+                        self.assertTrue(paths["target"].with_name(f"{paths['target'].name}.partial").exists())
+                        self.assertEqual(receipt_path.exists(), ownership != "missing")
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_pre_stage_cleanup_uses_transport_bases_after_receipt_owner_exits(self):
+        filesystem = load_filesystem()
+        for owner in ("reused", "dead", "unreadable", "malformed"):
+            with self.subTest(owner=owner), tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+                os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+            ):
+                cache = Path(temporary)
+                urls = {step: f"http://source/run/step_{step}" for step in (19, 22, 23, 24, 25, 26)}
+                paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+                for step in (19, 22, 23, 24, 26):
+                    paths[step].mkdir()
+                    (paths[step] / "READY").touch()
+                    (paths[step] / "transport.json").write_text(json.dumps({"source_url": urls[step]}))
+                unknown = filesystem.adapter_cache_path("unknown")
+                unknown.mkdir()
+                (unknown / "READY").touch()
+                partial = paths[25].with_name(f"{paths[25].name}.partial")
+                partial.mkdir()
+                receipt = {"pid": os.getpid(), "start_time": 1, "receipts": {
+                    "slot0": {"source_url": urls[19]}, "slot1": {"source_url": urls[22]},
+                }}
+                if owner == "malformed":
+                    receipt["receipts"]["slot1"] = {}
+                receipt_path = cache / filesystem._ADAPTER_LOADED_RECEIPTS
+                receipt_path.write_text(json.dumps(receipt))
+                transport = {"base_url": urls[24], "base2_url": urls[23]}
+                with mock.patch.object(
+                    filesystem, "_process_start_time", return_value=2 if owner == "reused" else None
+                ), mock.patch.object(
+                    filesystem.os, "kill", side_effect=ProcessLookupError() if owner in ("dead", "malformed") else None
+                ):
+                    with filesystem.adapter_reader_lock(paths[19]):
+                        filesystem._cleanup_adapter_space_before_stage(
+                            cache, paths[25], transport, source_url=urls[25]
+                        )
+                        self.assertTrue(paths[19].is_dir())
+                    filesystem._cleanup_adapter_space_before_stage(
+                        cache, paths[25], transport, source_url=urls[25]
+                    )
+                for step in (19, 22):
+                    self.assertEqual(paths[step].exists(), owner in ("reused", "unreadable", "malformed"))
+                for step in (23, 24, 26):
+                    self.assertTrue(paths[step].is_dir())
+                self.assertTrue(unknown.is_dir())
+                self.assertTrue(partial.is_dir())
+                self.assertEqual(json.loads(receipt_path.read_text()), receipt)
+
+    def test_pre_stage_cleanup_rejects_malformed_dead_owner_sources(self):
+        filesystem = load_filesystem()
+        invalid_receipts = [
+            {}, [], {"slot": None}, {"slot": {}},
+            *({"slot": {"source_url": value}} for value in (
+                "not a URL", "ftp://source/step_19", "http:///step_19",
+                "http://[invalid/step_19", "", None, 19, "http://source/\ud800",
+            )),
+            {"slot0": {"source_url": "http://source/step_19"}, "slot1": {"source_url": "bad"}},
+        ]
+        for receipts in invalid_receipts:
+            with self.subTest(receipts=receipts), tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+                os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+            ):
+                cache = Path(temporary)
+                urls = {step: f"http://source/run/step_{step}" for step in (19, 23, 24, 25)}
+                paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+                for step in (19, 23, 24):
+                    paths[step].mkdir()
+                    (paths[step] / "READY").touch()
+                    (paths[step] / "transport.json").write_text(json.dumps({"source_url": urls[step]}))
+                (cache / filesystem._ADAPTER_LOADED_RECEIPTS).write_text(json.dumps({
+                    "pid": os.getpid(), "start_time": 1, "receipts": receipts,
+                }))
+                with mock.patch.object(
+                    filesystem, "_process_start_time", return_value=None
+                ), mock.patch.object(filesystem.os, "kill", side_effect=ProcessLookupError()):
+                    self.assertEqual(filesystem._loaded_adapter_receipt_state(cache), ("unknown", []))
+                    filesystem._cleanup_adapter_space_before_stage(
+                        cache, paths[25], {"base_url": urls[24], "base2_url": urls[23]}, source_url=urls[25]
+                    )
+                for step in (19, 23, 24):
+                    self.assertTrue(paths[step].is_dir())
+
+    def test_stale_receipt_stage_frees_space_before_target_allocation(self):
+        filesystem = load_filesystem()
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
+            os.environ, {"PRIME_LORA_CACHE_DIR": temporary}
+        ):
+            cache = Path(temporary)
+            urls = {step: f"http://source/run/step_{step}" for step in (19, 22, 23, 24, 25)}
+            paths = {step: filesystem.adapter_cache_path(url) for step, url in urls.items()}
+            cache_bytes = 4096
+            for step in (19, 22, 23, 24):
+                paths[step].mkdir()
+                (paths[step] / "READY").touch()
+                (paths[step] / "transport.json").write_text(json.dumps({"source_url": urls[step]}))
+            (cache / filesystem._ADAPTER_LOADED_RECEIPTS).write_text(json.dumps({
+                "pid": os.getpid(), "start_time": 1,
+                "receipts": {"slot0": {"source_url": urls[19]}, "slot1": {"source_url": urls[22]}},
+            }))
+            transport = {
+                "mode": "delta", "transport": filesystem._ADAPTER_LINEAR_TRANSPORT,
+                "source_manifest": {"target_step": 25},
+                "base_url": urls[24], "base2_url": urls[23],
+                "target_size": cache_bytes, "target_sha256": "a" * 64,
+                "config_size": 0, "config_sha256": "b" * 64,
+            }
+            manifest = {"files": {
+                filesystem._ADAPTER_FILES[0]: {"size": 0, "sha256": "b" * 64},
+                filesystem._ADAPTER_FILES[1]: {"size": cache_bytes, "sha256": "a" * 64},
+            }}
+
+            def disk_usage(_path):
+                return types.SimpleNamespace(free=(4 - sum(path.is_dir() for path in paths.values())) * cache_bytes)
+
+            def stage(source_url, _transport, _manifest, **_kwargs):
+                self.assertEqual(source_url, urls[25])
+                self.assertFalse(paths[19].exists())
+                self.assertFalse(paths[22].exists())
+                self.assertTrue(paths[23].is_dir())
+                self.assertTrue(paths[24].is_dir())
+                self.assertEqual(disk_usage(cache).free, 2 * cache_bytes)
+                filesystem._preflight_adapter_space(
+                    cache, [(paths[25] / filesystem._ADAPTER_FILES[1], cache_bytes)]
+                )
+                paths[25].mkdir()
+                filesystem._preallocate(paths[25] / filesystem._ADAPTER_FILES[1], cache_bytes)
+                (paths[25] / "READY").touch()
+                return paths[25]
+
+            self.assertEqual(disk_usage(cache).free, 0)
+            with mock.patch.object(
+                filesystem, "_process_start_time", return_value=None
+            ), mock.patch.object(
+                filesystem.os, "kill", side_effect=ProcessLookupError()
+            ), mock.patch.object(
+                filesystem, "_read_delta_manifest_with_visibility_wait", return_value=transport
+            ), mock.patch.object(filesystem, "_source_manifest", return_value=manifest), mock.patch.object(
+                filesystem, "_stage_chunked_linear_adapter", side_effect=stage
+            ) as stage_call, mock.patch.object(filesystem.shutil, "disk_usage", side_effect=disk_usage):
+                self.assertEqual(filesystem.stage_lora_adapter_files(urls[25], require_delta=True), paths[25])
+                stage_call.assert_called_once()
+            self.assertEqual((paths[25] / filesystem._ADAPTER_FILES[1]).stat().st_size, cache_bytes)
+
+    def test_delta_cleanup_rejects_a_symlinked_candidate(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path("http://source/step_1")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                candidate = destination.with_name(f"{destination.name}.partial")
+                sentinel = Path(external) / "sentinel"
+                sentinel.write_text("keep", encoding="utf-8")
+                candidate.symlink_to(external, target_is_directory=True)
+                with self.assertRaisesRegex(OSError, "symbolic link"):
+                    filesystem._cleanup_delta_stage_artifacts(destination)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_delta_cleanup_removes_a_regular_assembling_file(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path("http://source/step_1")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                assembling = destination.with_name(f"{destination.name}.assembling")
+                assembling.write_bytes(b"private partial output")
+                self.assertTrue(filesystem._cleanup_delta_stage_artifacts(destination))
+                self.assertFalse(assembling.exists())
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_delta_cleanup_accepts_a_normal_chunk_directory(self):
+        filesystem = load_filesystem()
+        old_cache = os.environ.get("PRIME_LORA_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_LORA_CACHE_DIR"] = temporary
+                destination = filesystem.adapter_cache_path("http://source/step_1")
+                chunk_root = destination.with_name(f"{destination.name}.partial") / "transport-chunks"
+                chunk_root.mkdir(parents=True)
+                for index in range(300):
+                    (chunk_root / f"chunk-{index:04d}").touch()
+                self.assertTrue(filesystem._cleanup_delta_stage_artifacts(destination))
+                self.assertFalse(chunk_root.parent.exists())
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_LORA_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_LORA_CACHE_DIR"] = old_cache
+
+    def test_full_checkpoint_ready_requires_index_and_shard_hashes(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/checkpoint"
+        old_cache = os.environ.get("PRIME_FULL_CHECKPOINT_CACHE_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+                os.environ["PRIME_FULL_CHECKPOINT_CACHE_DIR"] = temporary
+                destination = filesystem.full_checkpoint_cache_path(source_url)
+                destination.mkdir(parents=True)
+                index = {"weight_map": {"x": "model-00001.safetensors"}}
+                index_bytes = json.dumps(index, separators=(",", ":")).encode("utf-8")
+                shard_bytes = b"checkpoint shard"
+                (destination / "READY").write_bytes(b"ready\n")
+                (destination / "model.safetensors.index.json").write_bytes(index_bytes)
+                shard = destination / "model-00001.safetensors"
+                shard.write_bytes(shard_bytes)
+                parent_fd = filesystem._open_directory_nofollow(
+                    destination.parent,
+                    create=False,
+                    label="test checkpoint parent",
+                )
+                try:
+                    self.assertFalse(
+                        filesystem._full_checkpoint_cache_is_valid(
+                            parent_fd,
+                            destination.name,
+                            source_url,
+                        )
+                    )
+                    manifest = {
+                        "version": 1,
+                        "source_url": source_url,
+                        "index_sha256": hashlib.sha256(index_bytes).hexdigest(),
+                        "files": {
+                            shard.name: {
+                                "size": len(shard_bytes),
+                                "sha256": hashlib.sha256(shard_bytes).hexdigest(),
+                            }
+                        },
+                    }
+                    (destination / "checkpoint-cache.json").write_text(
+                        json.dumps(manifest),
+                        encoding="utf-8",
+                    )
+                    self.assertTrue(
+                        filesystem._full_checkpoint_cache_is_valid(
+                            parent_fd,
+                            destination.name,
+                            source_url,
+                        )
+                    )
+                    shard.write_bytes(b"tampered")
+                    self.assertFalse(
+                        filesystem._full_checkpoint_cache_is_valid(
+                            parent_fd,
+                            destination.name,
+                            source_url,
+                        )
+                    )
+                    shard.unlink()
+                    shard.symlink_to(Path(external) / "outside")
+                    with self.assertRaisesRegex(OSError, "symbolic link"):
+                        filesystem._full_checkpoint_cache_is_valid(
+                            parent_fd,
+                            destination.name,
+                            source_url,
+                        )
+                finally:
+                    os.close(parent_fd)
+        finally:
+            if old_cache is None:
+                os.environ.pop("PRIME_FULL_CHECKPOINT_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_FULL_CHECKPOINT_CACHE_DIR"] = old_cache
+
+    def test_full_checkpoint_staging_does_not_return_an_incomplete_ready_cache(self):
+        filesystem = load_filesystem()
+        source_url = "http://source/checkpoint"
+        old_cache = os.environ.get("PRIME_FULL_CHECKPOINT_CACHE_DIR")
+        old_urlopen = filesystem._adapter_http_open
+        old_download = filesystem.download
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                os.environ["PRIME_FULL_CHECKPOINT_CACHE_DIR"] = temporary
+                destination = filesystem.full_checkpoint_cache_path(source_url)
+                destination.mkdir(parents=True)
+                (destination / "READY").write_bytes(b"ready\n")
+                calls: list[str] = []
+                index_bytes = json.dumps(
+                    {"weight_map": {"x": "model-00001.safetensors"}},
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                shard_bytes = b"new checkpoint shard"
+
+                def no_delta_manifest(url: str, **_kwargs):
+                    raise filesystem.HTTPError(url, 404, "not found", {}, None)
+
+                def fake_download(_url, path, **_kwargs):
+                    calls.append(path.name)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(index_bytes if path.name.endswith(".json") else shard_bytes)
+
+                filesystem._adapter_http_open = no_delta_manifest
+                filesystem.download = fake_download
+                result = filesystem.stage_full_checkpoint_files(
+                    source_url,
+                    download_fn=filesystem.download,
+                )
+                self.assertEqual(result, destination)
+                self.assertIn("model.safetensors.index.json", calls)
+                self.assertIn("model-00001.safetensors", calls)
+                parent_fd = filesystem._open_directory_nofollow(
+                    destination.parent,
+                    create=False,
+                    label="test checkpoint parent",
+                )
+                try:
+                    self.assertTrue(
+                        filesystem._full_checkpoint_cache_is_valid(
+                            parent_fd,
+                            destination.name,
+                            source_url,
+                        )
+                    )
+                finally:
+                    os.close(parent_fd)
+        finally:
+            filesystem._adapter_http_open = old_urlopen
+            filesystem.download = old_download
+            if old_cache is None:
+                os.environ.pop("PRIME_FULL_CHECKPOINT_CACHE_DIR", None)
+            else:
+                os.environ["PRIME_FULL_CHECKPOINT_CACHE_DIR"] = old_cache
+
+
+if __name__ == "__main__":
+    unittest.main()

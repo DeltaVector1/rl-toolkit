@@ -1,103 +1,87 @@
-# Trinity RL Kit
+# RL Toolkit
 
-Our RL environments, configs, patches, and skills for training Trinity-Mini on
-[prime-rl](https://github.com/PrimeIntellect-ai/prime-rl). This repo is **not** a
-fork — it holds only our stuff, so we can pull upstream prime-rl updates freely and
-drop this on top.
+This repository holds RL environments, training configurations, evaluation code,
+training tools, and related PRIME-RL changes.
 
 ## Layout
 
-| Folder | What's in it |
-|---|---|
-| `environments-v1/` | **Current.** The verifiers **v1** ports — `decensor_v1`, `nemotron_guard_v1` (shared guard + subtask blending), and the four `nemotron-*_v1` envs, plus `tests/` (reward parity suites). Each has its own `pyproject.toml`. |
-| `environments/` | **Legacy v0.** `decensor-env`, `decensor-env-multiturn`, the four `nemotron-*` envs, and bench envs (`mmlu`, `arcee-ifeval`). Kept as the parity reference the v1 suites grade against. |
-| `docs/` | `PORTING_GUIDE.md` (v0 → v1 API notes and the reward formulas) and `AUDIT_2026-07-24.md` (plain-English audit of every reward bug found against a real 50-step run, and what was changed). |
-| `patches/submodules/` | Patches against prime-rl's `deps/` submodules — Trinity tokenizer (`renderers`) and multiturn error handling (`verifiers`). Both load-bearing for Trinity. |
-| `patches/prime-rl/` | Our load-bearing edits to prime-rl `src/`, as a git patch. |
-| `configs/` | Working RL configs. `trinity_mini_modern/` is the current one (v1 envs, `arcee-ai/Trinity-Mini`); the others are v0-era. |
-| `skills/` | Our edited Claude Code skills (`configs`, `training/*`). |
-| `other/` | Helper tooling — `rollout_viewer.py`, monitoring/GPU scripts, and the archived OPD distillation experiment. |
+- `environments/` holds the active projects. It includes the experimental
+  `decensor`, `decensor-experimental`, `general-agent`, and `ornith`
+  projects; five Nemotron v1 projects; and the retained `arcee-ifeval` and
+  `mmlu` projects.
+- `environments/pyproject.toml` defines the workspace for the five Nemotron
+  v1 projects. Run their workspace commands from `environments/`.
+- `environments/xiaomi-envs/` holds the complete Xiaomi environment repository
+  at the recorded source commit. Run its workspace commands from that directory.
+- `environments/PORTING_GUIDE.md` preserves the v1 porting guide.
+- `environments/tests/` keeps four Nemotron v1/v0 parity scripts. Run a script
+  with `--legacy-root` pointing to the old Nemotron projects. Run the scripts
+  with `uv run --project environments --all-packages python
+  environments/tests/parity_nemotron_knowledge.py --legacy-root <old-projects>`.
+  Pytest reports `PARITY NOT RUN` when that baseline is not available.
+- `configs/` holds 43 configurations. The three main branch `trinity_mini_*`
+  configurations remain as historical examples. The two `*_rl` files refer to
+  retired v0 IDs. `trinity_mini_modern` refers to the removed `decensor-v1`
+  project. Update these IDs before you run those configurations.
+- `evals/refusals-classification/` holds the refusal classifier evaluator.
+- `training_ops/` holds the local training status and runtime tools.
+- `agents/` holds repository instructions, training expectations, and the
+  experiment notes. Codex skills are under `.agents/skills/`.
+- `docs/`, `other/`, and the existing `patches/` files retain the main
+  branch's guides, tools, and historical patches.
 
-## Pinned base
+## PRIME-RL files
 
-These patches are cut against a specific prime-rl commit. Apply them onto that
-commit (or expect to resolve conflicts on a newer one):
+The root `prime-rl/` directory is a 79-file overlay from experimental commit
+`67e53862aca11fd65de80b4694f44c398ee922b1`. The Dockerfile copies these files
+into the `prime-rl:glm52-decensor` image. The source tree does not record the
+upstream commit used to build that image.
+
+The two files under `patches/prime-rl/` are separate historical patch sets:
+
+- `prime-rl.patch` is the main branch patch, documented against PRIME-RL
+  commit `38494ccb`.
+- `glm52-decensor.patch` is the experimental branch patch. Its exact upstream
+  base is not recorded.
+
+Do not apply both patches together. Do not use a wildcard to select a patch.
+Check the target tree before you apply either file.
+
+Read `agents/AGENTS.md` before repository work. Read
+`agents/TRAINING_EXPECTATIONS.md` before a live training test or run.
+
+## Historical Trinity-Mini notes
+
+These pins and renderer notes describe the older Trinity-Mini setup. They do
+not identify the upstream base for the GLM-5.2 Docker image.
+
+The legacy `prime-rl.patch` was cut against these revisions:
 
 ```
-prime-rl            38494ccb   (v0.6.0)
-deps/pydantic-config 896ade4e
-deps/renderers       19332933
+prime-rl             38494ccb   (v0.6.0)
+deps/pydantic-config  896ade4e
+deps/renderers        19332933
 deps/research-environments 841f9a54
-deps/verifiers       78c1b3c5
+deps/verifiers        78c1b3c5
 ```
 
-## Bootstrap
+Trinity's tokenizer has no `<tool_call>` special token. It encodes this text as
+four ordinary tokens. Renderers that search by token ID therefore miss every
+tool call. The historical
+`patches/submodules/renderers-hermes-tool-parser.patch` adds a text parser named
+`hermes`, as specified by Trinity's model card. `<think>` is a real token, so
+`reasoning_parser = "think"` works. The parser must live in `renderers`: each
+environment server imports that package without importing `prime_rl`.
 
-```bash
-# 1. clone prime-rl at the pinned base
-git clone https://github.com/PrimeIntellect-ai/prime-rl.git
-cd prime-rl && git checkout 38494ccb && git submodule update --init --recursive
+The legacy subtask blend also needs an explicit mix. The outer `ratio` setting
+balances environments and does not set the blend inside one environment. A
+taskset that loads several subtasks can concatenate them, which weights them
+by source size. The historical `nemotron-reasoning` data had 83% science and
+2% math under that default. Its `taskset.mix` used `weight`, `max_examples`,
+`repeat`, and `enabled` so smaller sources could cycle instead of being starved.
 
-# 2. clone this kit next to it
-git clone https://github.com/<you>/trinity-rl-kit.git ../trinity-rl-kit
-KIT=../trinity-rl-kit
-
-# 3. apply submodule patches (Trinity tokenizer + verifiers multiturn fix)
-git -C deps/renderers apply "$KIT"/patches/submodules/renderers-trinity-tokenizer.patch
-git -C deps/verifiers apply "$KIT"/patches/submodules/verifiers-trinity-cleanblend.patch
-
-# 4. apply our prime-rl src patch
-git apply "$KIT"/patches/prime-rl/*.patch
-
-# 5. drop in envs, configs, skills
-cp -r "$KIT"/environments/* rl_environments/
-cp -r "$KIT"/configs/*      configs/
-cp -r "$KIT"/skills/*       skills/
-
-# 6. install
-uv sync --all-extras
-```
-
-### Grabbing just one env
-
-```bash
-git clone --filter=blob:none --sparse https://github.com/<you>/trinity-rl-kit.git
-cd trinity-rl-kit && git sparse-checkout set environments/decensor-env
-```
-
-## Trinity tool calling — read this before changing the renderer
-
-Trinity's tokenizer has **no `<tool_call>` special token** (it encodes as four ordinary
-tokens). Every tool parser shipped in `renderers` locates `<tool_call>` by token id, so all
-of them return "no tool calls" for every completion, silently. Confirmed on both
-`arcee-ai/Trinity-Mini` and the NewEden fine-tune.
-
-`patches/submodules/renderers-hermes-tool-parser.patch` adds a text-level `"hermes"` parser
-to the `renderers` package — matching the `--tool-call-parser hermes` on Trinity's own model
-card — and the config selects it with `[orchestrator.renderer] tool_parser = "hermes"`.
-`<think>` **is** a real token, so `reasoning_parser = "think"` is fine as-is.
-
-It has to live in the `renderers` package itself, not in prime-rl: every env-server
-subprocess builds its own renderer and imports `renderers` without importing `prime_rl`.
-Registering from prime-rl leaves those processes with a stock registry, and every rollout
-fails with `Unknown tool_parser 'hermes'`.
-
-## Subtask blending
-
-`ratio` balances envs against each other and does not reach inside an env. A taskset that
-loads several subtasks concatenates them by default, so the blend follows raw source file
-size — `nemotron-reasoning` ran 83% science / 2% math that way. Use `taskset.mix` (see
-`nemotron_guard_v1/mixing.py` and the `configs/trinity_mini_modern/rl.toml` blocks):
-`weight`, `max_examples`, `repeat`, `enabled` per subtask, with small sources cycled rather
-than starved.
-
-## Notes
-
-- Envs pull their datasets from Hugging Face at runtime — no data is vendored here.
-- The v1 envs depend on `verifiable-instructions` (pinned `f46a5ac`) for the IFEval checkers —
-  the same package NVIDIA's own instruction-following server uses. Don't re-hand-write them.
-- Reward parity suites run under pytest (`python_files = ["test_*.py", "parity_*.py"]`). They
-  assert v1 == v0 *except* where a case declares `expect_v1`, which is how an intentional bug
-  fix is recorded instead of showing up as a failure.
-- `patches/prime-rl/` is the piece that rots when upstream moves; regenerate it
-  against a newer base with `git diff <base> -- src/ > patches/prime-rl/prime-rl.patch`.
+The old bootstrap instructions no longer match this repository layout. When
+using that legacy PRIME-RL patch, select `patches/prime-rl/prime-rl.patch`
+explicitly and apply it to the pinned base above. Do not apply it together with
+`patches/prime-rl/glm52-decensor.patch`; the GLM-5.2 image base for that overlay
+is unknown.
