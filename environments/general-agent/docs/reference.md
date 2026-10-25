@@ -2,10 +2,10 @@
 
 A two-phase environment for training LLM agents on tool-use tasks over structured databases.
 
-**Phase 1 — Synthesize**: an agent creates new tasks (the "game designer").
-**Phase 2 — Solve**: an agent solves those tasks (the "player").
+In phase 1, an agent creates tasks. In phase 2, an agent solves them.
 
-Synthesis and solving form a 2-player loop: the synthesizer creates a task, then immediately solves it (via the local solver) to verify difficulty. Only tasks that pass gating are kept.
+The synthesizer checks each new task with the local solver to measure difficulty.
+Only tasks that pass gating are kept.
 
 Further docs: [CLI](cli.md) | [Tests](tests.md)
 
@@ -16,7 +16,7 @@ The synthesizer spawns an OpenCode agent in a sandbox. The agent follows the `sy
 1. **Gold validation** — `general-agent validate` replays the gold solution and checks DB hashes + `verify(db)`.
 2. **Pass-rate gating** — `vf-eval general-agent-solver-local` runs the local solver N times; the tier's pass rate must fall in its target band (t0: >=80%, t1: 60-80%, ..., t4: 0-20%).
 
-The second check is what makes this a 2-player game: the synthesizer creates a task, the local solver tries to solve it, and the synthesizer adjusts difficulty based on the result.
+The synthesizer uses the measured pass rate to adjust task difficulty.
 
 ```bash
 # Single synthesis job (agent picks a novel task)
@@ -37,7 +37,9 @@ Three solver backends, each with a `general-agent-solver-*` entry point:
 
 ### Local solver (`general-agent` / `general-agent-solver-local`) — default, for synthesis gating + fast iteration
 
-The default. Calls tools directly as Python functions — no sandbox, no MCP server, no external agent binary. Used by the synthesizer for pass-rate gating and for fast local iteration.
+The default solver calls tools directly as Python functions. It needs no sandbox,
+MCP server, or external agent binary. The synthesizer uses it for pass-rate gating;
+it also supports local iteration.
 
 ```bash
 uv run vf-eval general-agent

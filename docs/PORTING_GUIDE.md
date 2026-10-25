@@ -1,13 +1,13 @@
-# Porting our v0 envs → modern verifiers v1
+# Porting v0 environments to Verifiers v1
 
 Reference for porting `/root/prime/rl_environments/*` to the v1 API in modern prime-rl.
-All code grounded in `/root/prime-modern/deps/verifiers/verifiers/v1/` and the example envs
+The API reference is `/root/prime-modern/deps/verifiers/verifiers/v1/`; example environments are
 in `/root/prime-modern/deps/research-environments/environments/`.
 
-## Constraints (non-negotiable)
-- Humane, plain code. No hardcodes, no SCREAMING_CONSTANT spam, no cute/opaque function names.
-- Every ported env must be **parity-tested** against the v0 env: same inputs → same reward.
-- Fix the audited bugs *in the port* (don't reproduce them). See "Audit fixes" below.
+## Requirements
+- Use plain code and clear function names. Do not hardcode values or add unnecessary all-caps constants.
+- Test every port against the v0 environment: the same inputs must give the same reward.
+- Fix the audited bugs in the port. See "Audit fixes" below.
 
 ## Core v1 model (verbatim from the API)
 - `vf.TaskData` (frozen row: `idx`, `prompt`, + typed gold fields).
@@ -20,14 +20,14 @@ in `/root/prime-modern/deps/research-environments/environments/`.
 - `vf.Trace` — `last_reply` (final assistant text), `transcript` (full branch), `rewards`, `metrics`,
   `info`, `assistant_messages[i].tool_calls`, `record_metrics({...})`, `record_reward(...)`.
 
-## THE combine rule (critical)
-Rewards are combined by **weighted SUM**: `trace.reward == sum(record_reward(name, value*weight))`.
-There is NO built-in product. So a **multiplicative** reward (decensor) must be computed inside
-**ONE** `@vf.reward` returning the scalar product; log each factor via `trace.record_metrics`.
+## Reward combination
+Rewards use a weighted sum: `trace.reward == sum(record_reward(name, value*weight))`.
+There is no built-in product. For a multiplicative reward such as decensor, compute and return
+the scalar product in one `@vf.reward` method. Log each factor via `trace.record_metrics`.
 
-## Gate semantics (critical)
-A gate that should hard-zero the reward must **return 0.0** from Python. Do NOT `raise` — a raising
-judge/grader *fails the rollout for retry*, it does not score 0 (`judge.py:160-165`).
+## Gates that give zero reward
+A gate that must give zero reward must return 0.0 from Python. Do not `raise`: a judge/grader
+exception fails the rollout for retry instead of scoring 0 (`judge.py:160-165`).
 
 ## Judges
 `vf.Judge` subclass: set `prompt` (name-substitution, literal braces survive) + `schema=PydanticModel`
@@ -40,14 +40,14 @@ field or slice in `load()`; prime-rl train/eval are separate config blocks (eval
 
 ## Multi-turn / simulated user (decensor)
 Subclass `vf.User[UserConfig, StateT].respond(message)->Messages`; share `vf.State`; terminate with a
-`@vf.stop` reading `trace.state`. Run under the **`null`** harness (chat, no code exec). If the user sim
+`@vf.stop` reading `trace.state`. Run under the `null` harness (chat, no code exec). If the user sim
 needs an LLM it calls the model itself in `respond()` (no built-in LLM-user; see tau2_bench_v1/harness.py).
 Turn/token caps on `env.agent`: `max_turns`, `max_output_tokens`.
 
 ## Tool-calling
 `vf.Toolset[Config,State]` with `@vf.tool` methods; wire on Task via `tools = (MyToolset,)` + a
 type-matched config field. Grade by reading `trace.assistant_messages[...].tool_calls` (see bfcl_v3_v1).
-`trace.state` is NOT in the serialized trace — persist anything a reward needs into `trace.info`.
+`trace.state` is absent from the serialized trace. Save anything a reward needs in `trace.info`.
 
 ## Packaging + config
 Hatchling package; `__init__.py` re-exports one Taskset in `__all__` (no entry points).
@@ -61,14 +61,14 @@ Config: `env.taskset = { id = "<pkg>", <TasksetConfig fields>, task = { <TaskCon
 - tool-calling → `tool_use/bfcl_v3_v1` (Toolset + @vf.stop + tool-call grading).
 - decensor → multi-turn `vf.User` + judge + multiplicative reward (hardest).
 
-## Audit fixes to bake into the ports
+## Audit fixes
 1. IF: `JUDGE_MAX_TOKENS` was used but not imported → 5 subtasks scored constant 0.0. In the port,
-   the judge max-tokens must be a real config value, actually applied.
+   configure and apply the judge max-tokens value.
 2. Decensor: "Be verbose" word band [1900,2100] is unreachable → word_multiplier=0 zeros the product on
    ~94% of those rollouts. Floor the length multiplier (e.g. >=0.1) or retarget to an achievable band.
-3. nemotron format_reward was dead (weight 0). Either omit it or give it a real, discriminating range.
-4. decensor reasoning_coherency judge was dead (always 1.0) — drop it.
-5. decide judge fail-open vs fail-closed deliberately and document it.
+3. nemotron format_reward had weight 0. Either omit it or give it a range that distinguishes answers.
+4. decensor reasoning_coherency judge always returned 1.0; remove it.
+5. Choose and document the judge failure policy: fail open or fail closed.
 
 ## v0 reward formulas (parity targets)
 - decensor: `final = base(=1-refusal/10 ∈[.1,.9]) × word_mult × coherent × md_pres × md_corr × reasoning × meta`.

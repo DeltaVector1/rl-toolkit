@@ -64,9 +64,8 @@ Reports:
 - 5-bucket pass-rate distribution per tier (right-aligned grid)
 - difficulty-method frequency
 
-Useful as a quick "is the corpus actually getting harder per tier" check after a synth
-run, and to see at a glance which tiers are saturated vs. genuinely hard for the
-configured solver.
+After a synthesis run, use these results to check whether difficulty increases by tier
+and which tiers the configured solver can solve reliably.
 
 ## `serve`
 
