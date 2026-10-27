@@ -8,7 +8,9 @@ import math
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
+import socket
 import sys
 import time
 
@@ -171,6 +173,85 @@ def shown(value):
     return f"{value:.5g}" if finite(value) else "unknown"
 
 
+def probe_health(ports, seconds=2):
+    """Read local HTTP status lines with one deadline shared by all ports."""
+    deadline = time.monotonic() + seconds
+    results = {port: "deadline exceeded" for port in ports}
+    pending = {}
+    with selectors.DefaultSelector() as selector:
+        try:
+            for port in ports:
+                connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    connection.setblocking(False)
+                    connection.connect_ex(("127.0.0.1", port))
+                    request = f"GET /health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode()
+                    pending[connection] = {"port": port, "request": request, "response": b""}
+                    selector.register(connection, selectors.EVENT_WRITE)
+                except OSError as error:
+                    results[port] = str(error)
+                    pending.pop(connection, None)
+                    connection.close()
+            while pending and time.monotonic() < deadline:
+                for key, events in selector.select(max(0, deadline - time.monotonic())):
+                    connection = key.fileobj
+                    state = pending[connection]
+                    done = False
+                    try:
+                        if events & selectors.EVENT_WRITE:
+                            error = connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                            if error:
+                                raise OSError(error, os.strerror(error))
+                            sent = connection.send(state["request"])
+                            state["request"] = state["request"][sent:]
+                            if not state["request"]:
+                                selector.modify(connection, selectors.EVENT_READ)
+                        else:
+                            data = connection.recv(4096 - len(state["response"]))
+                            state["response"] += data
+                            if b"\n" in state["response"] or not data or len(state["response"]) >= 4096:
+                                line = state["response"].split(b"\n", 1)[0]
+                                match = re.match(rb"HTTP/1\.[01] ([0-9]{3})(?: |\r|$)", line)
+                                code = int(match[1]) if match else None
+                                results[state["port"]] = None if code is not None and 200 <= code < 300 else (
+                                    f"HTTP {code}" if code is not None else "invalid HTTP response")
+                                done = True
+                    except BlockingIOError:
+                        continue
+                    except OSError as error:
+                        results[state["port"]] = str(error)
+                        done = True
+                    if done:
+                        selector.unregister(connection)
+                        pending.pop(connection)
+                        connection.close()
+        finally:
+            for connection in pending:
+                connection.close()
+    return results
+
+
+def service_health(settings):
+    configured = {}
+    for role in ("policy", "judge"):
+        ports = settings.get(role)
+        if isinstance(ports, list) and 0 < len(ports) <= 32 and all(type(port) is int and 1 <= port <= 65535 for port in ports):
+            configured[role] = list(dict.fromkeys(ports))
+    ports = list(dict.fromkeys(port for values in configured.values() for port in values))
+    results = probe_health(ports) if ports else {}
+    print("Service health (local HTTP /health, 2 second total deadline):")
+    for role in ("policy", "judge"):
+        if role not in configured:
+            print(f"  {role}: unknown (health ports are missing or invalid)")
+            continue
+        selected = configured[role]
+        responding = sum(results[port] is None for port in selected)
+        print(f"  {role}: {responding}/{len(selected)} responding")
+        for port in selected:
+            if results[port] is not None:
+                print(f"    failed http://127.0.0.1:{port}/health ({results[port]})")
+
+
 def reward_report(root):
     path = root / "monitors/file/traces/stream.index.jsonl"
     data, size, truncated = tail(path, 2 * 1024 * 1024)
@@ -206,7 +287,7 @@ def reward_report(root):
           f"older records omitted {'yes' if truncated else 'no'}.")
 
 
-def status_report(root, state):
+def status_report(root, state, health_ports=None):
     metrics_path = root / "monitors/file/metrics.jsonl"
     data, size, truncated = tail(metrics_path, 4 * 1024 * 1024)
     grouped = {"trainer": {}, "orch": {}}
@@ -226,6 +307,7 @@ def status_report(root, state):
                        and not row.get("diagnostic/parity_guard_rejected"))
     latest = {actor: rows[max(rows)] if rows else {} for actor, rows in grouped.items()}
     print(f"Run {root.name}\nProcess {'running' if alive(state) else 'stopped'} (PID {state['pid']})")
+    service_health(health_ports or {})
     if size is None:
         count = "unknown (metrics file is absent)"
     elif not completed:
@@ -303,11 +385,12 @@ def main():
     parser.add_argument("--seconds", type=float, default=600)
     parser.add_argument("--role", choices=("trainer", "orchestrator"), default="orchestrator")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--health-ports", type=json.loads, default={})
     args = parser.parse_args()
     try:
         root, state = select_run(args.root, args.run)
         if args.status:
-            return status_report(root, state)
+            return status_report(root, state, args.health_ports)
         return watch(root, state, args.lines, not args.no_follow, args.seconds, args.role)
     except (OSError, ValueError, KeyError) as error:
         print(str(error), file=sys.stderr)

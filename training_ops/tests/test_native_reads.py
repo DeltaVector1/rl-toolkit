@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import json
 import os
@@ -7,6 +8,8 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -172,6 +175,11 @@ class NativeRoutingTest(unittest.TestCase):
                 self.assertIn("ConnectTimeout=5", argv)
                 self.assertNotIn("ConnectTimeout=25", argv)
                 self.assertIn("--root", shlex.split(argv[-1]))
+                if action == "status":
+                    remote = shlex.split(argv[-1])
+                    settings = json.loads(remote[remote.index("--health-ports") + 1])
+                    self.assertEqual(settings["policy"], training_ops.nodes["single_node"]["h100"]["policy_health_ports"])
+                    self.assertEqual(settings["judge"], [18001])
                 legacy.assert_not_called()
                 self.assertEqual(call.kwargs["timeout"], 610 if action == "watch-rollouts" else 15)
 
@@ -186,6 +194,75 @@ class NativeRoutingTest(unittest.TestCase):
                 with self.assertRaises(training_ops.Refused):
                     training_ops._native_read_action(args, "status")
                 run.assert_not_called()
+
+
+class ServiceHealthTest(unittest.TestCase):
+    def local_socket(self, response=None, error=0):
+        connection = mock.Mock()
+        connection.connect_ex.return_value = 0
+        connection.getsockopt.return_value = error
+        connection.send.side_effect = len
+        connection.recv.return_value = response
+        connection.probe_response = response
+        return connection
+
+    def setUp(self):
+        class LocalSelector:
+            def __init__(self):
+                self.pending = {}
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                pass
+            def register(self, connection, events):
+                self.pending[connection] = events
+            modify = register
+            def unregister(self, connection):
+                self.pending.pop(connection)
+            def select(self, timeout):
+                ready = [(SimpleNamespace(fileobj=connection), event) for connection, event in self.pending.items()
+                         if event == viewer.selectors.EVENT_WRITE or connection.probe_response is not None]
+                if not ready:
+                    time.sleep(timeout)
+                return ready
+        patcher = mock.patch.object(viewer.selectors, "DefaultSelector", LocalSelector)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_missing_health_configuration_is_unknown_and_does_not_probe(self):
+        output = io.StringIO()
+        with mock.patch.object(viewer, "probe_health") as probe, contextlib.redirect_stdout(output):
+            viewer.service_health({})
+        probe.assert_not_called()
+        self.assertIn("policy: unknown", output.getvalue())
+        self.assertIn("judge: unknown", output.getvalue())
+
+    def test_eight_missing_policy_forwards_are_visible(self):
+        policy = [8100, *range(18100, 18108), *range(18200, 18208)]
+        connections = [self.local_socket(b"HTTP/1.1 200 OK\r\n\r\n", errno.ECONNREFUSED if 18100 <= port <= 18107 else 0)
+                       for port in policy + [18001]]
+        output = io.StringIO()
+        with mock.patch.object(viewer.socket, "socket", side_effect=connections), contextlib.redirect_stdout(output):
+            viewer.service_health({"policy": policy, "judge": [18001]})
+        self.assertIn("policy: 9/17 responding", output.getvalue())
+        self.assertIn("judge: 1/1 responding", output.getvalue())
+        for port, connection in zip(policy + [18001], connections):
+            connection.connect_ex.assert_called_once_with(("127.0.0.1", port))
+        for port in range(18100, 18108):
+            self.assertIn(f"failed http://127.0.0.1:{port}/health", output.getvalue())
+
+    def test_http_failure_is_not_counted_as_healthy(self):
+        connection = self.local_socket(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+        with mock.patch.object(viewer.socket, "socket", return_value=connection):
+            self.assertEqual(viewer.probe_health([18001]), {18001: "HTTP 503"})
+
+    def test_silent_endpoint_obeys_total_deadline(self):
+        connection = self.local_socket()
+        started = time.monotonic()
+        with mock.patch.object(viewer.socket, "socket", return_value=connection):
+            result = viewer.probe_health([18001], seconds=0.02)
+        self.assertEqual(result, {18001: "deadline exceeded"})
+        self.assertLess(time.monotonic() - started, 0.5)
 
 
 if __name__ == "__main__":

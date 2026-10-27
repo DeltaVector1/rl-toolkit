@@ -12967,6 +12967,9 @@ def _native_read_action(arguments: list[str], action: str):
             remote.extend(["--run", args.run])
         if action == "status":
             remote.append("--status")
+            remote.extend(["--health-ports", json.dumps({
+                role: settings.get(f"{role}_health_ports") for role in ("policy", "judge")
+            })])
         if action == "logs":
             remote.extend(["--role", args.role])
         if args.no_follow or action == "logs":
