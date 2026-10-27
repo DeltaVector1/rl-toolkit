@@ -12994,10 +12994,7 @@ def _watch_rollouts_action(arguments: list[str]):
 
 def _node_action(arguments: list[str]):
     from training_ops.runtime.node_registry import cli as node_cli
-    code = node_cli(arguments)
-    if code:
-        raise SystemExit(code)
-    return code
+    return node_cli(arguments)
 
 
 actions = {
@@ -13084,13 +13081,14 @@ Read {repo_root / '.agents/skills/training-ops/SKILL.md'} first.
 """
 
 
-def cli() -> None:
+def cli() -> int | None:
     args = sys.argv[1:]
     if not args or args[0] in ("-h", "--help", "help"):
         print(usage)
         sys.exit(0)
     try:
-        run(shlex.join(args))
+        result = run(shlex.join(args))
+        return result if type(result) is int else None
     except (Refused, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)
         sys.exit(2)

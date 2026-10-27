@@ -1,15 +1,43 @@
 import contextlib
+from copy import deepcopy
 import io
 import shlex
 import sys
+import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import training_ops
+from training_ops.runtime import node_registry
 
 
 class CliTest(unittest.TestCase):
+    def test_node_registration_preserves_paths_with_spaces(self):
+        original = deepcopy(training_ops.nodes)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "nodes.toml"
+                path.write_text(training_ops.nodes_path.read_text())
+                arguments = ["training-ops", "nodes", "add", "fixture", "--host", "fixture.invalid",
+                             "--port", "2222", "--user", "root", "--identity", "/tmp/key with spaces",
+                             "--runs", "/tmp/runs with spaces", "--python", "/usr/bin/python3"]
+                with mock.patch.object(node_registry, "default_path", path), mock.patch.object(
+                    sys, "argv", arguments
+                ), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(training_ops.cli(), 0)
+                profile = tomllib.loads(path.read_text())["single_node"]["fixture"]
+                self.assertEqual(profile["ssh_identity_file"], "/tmp/key with spaces")
+                self.assertEqual(profile["runs"], "/tmp/runs with spaces")
+        finally:
+            training_ops.nodes.clear()
+            training_ops.nodes.update(original)
+
+    def test_invalid_node_selection_returns_error_exit_code(self):
+        with mock.patch.object(sys, "argv", ["training-ops", "nodes", "use", "missing-fixture"]), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(training_ops.cli(), 2)
+
     def test_stop_rejects_extra_arguments_without_stopping(self):
         for argument in ("--help", "unexpected"):
             with self.subTest(argument=argument), mock.patch.object(training_ops, "stop") as stop:
