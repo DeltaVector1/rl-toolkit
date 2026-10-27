@@ -121,9 +121,9 @@ trainer_gpus = [0, 1, 2, 3]
 policy_gpus = [4, 5, 6, 7]
 judge_gpus = []
 policy_api_port = 8100
-# Local worker forwards from qwen38-xiaomi-decensor-h100/router-r3.json.
-policy_health_ports = [8100, 18100, 18101, 18102, 18103, 18104, 18105, 18106, 18107, 18200, 18201, 18202, 18203, 18204, 18205, 18206, 18207]
-# Local judge forward from qwen38-xiaomi-decensor-h100/rl-r12.toml.
+# Local worker forwards from qwen38-xiaomi-decensor-h100/router-r13-healthy.json.
+policy_health_ports = [8100, 18200, 18201, 18202, 18203, 18204, 18205, 18206, 18207]
+# Local judge forward from qwen38-xiaomi-decensor-h100/rl-r13-healthy.toml.
 judge_health_ports = [18001]
 storage_root = "/root/glm52-rl"
 remote_repository = "/root/glm52-rl/deployment"
