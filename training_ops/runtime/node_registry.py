@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -103,6 +104,19 @@ def _table_bounds(lines: list[str], header: str) -> tuple[int, int] | None:
 
 def _replace_table_values(text: str, header: str, values: dict[str, str | int]) -> str:
     """Replace selected keys in one table and keep all other source text."""
+    try:
+        expected = deepcopy(tomllib.loads(text))
+    except tomllib.TOMLDecodeError as error:
+        raise NodeRegistryError(f"cannot update invalid nodes TOML: {error}") from error
+    target = expected
+    for component in header.split("."):
+        if component not in target:
+            target[component] = {}
+        if not isinstance(target[component], dict):
+            raise NodeRegistryError(f"TOML table {header} cannot be updated")
+        target = target[component]
+    target.update(values)
+
     lines = text.splitlines(keepends=True)
     bounds = _table_bounds(lines, header)
     if bounds is None:
@@ -131,9 +145,11 @@ def _replace_table_values(text: str, header: str, values: dict[str, str | int]) 
 
     result = "".join(lines)
     try:
-        tomllib.loads(result)
+        actual = tomllib.loads(result)
     except tomllib.TOMLDecodeError as error:
         raise NodeRegistryError(f"node config update would make invalid TOML: {error}") from error
+    if actual != expected:
+        raise NodeRegistryError("node config update changed values outside the requested table fields")
     return result
 
 

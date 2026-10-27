@@ -116,6 +116,24 @@ keep = true
         self.assertEqual(profile["role"], "trainer")
         self.assertEqual(profile["custom_value"], "keep this too")
 
+    def test_add_rejects_key_like_text_inside_multiline_string(self):
+        text = self.path.read_text(encoding="utf-8")
+        text = text.replace(
+            'ssh_host = "old.example"',
+            'description = """\nssh_host = "decoy.example"\n"""\n'
+            'ssh_host = "old.example"',
+        )
+        self.path.write_text(text, encoding="utf-8")
+        before = self.path.read_bytes()
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            result = node_registry.cli(
+                ["add", "old", "--ssh-host", "new.example"], path=self.path
+            )
+        self.assertEqual(result, 2)
+        self.assertIn("outside the requested table fields", error.getvalue())
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_use_updates_active_node_and_preserves_selection_fields(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
