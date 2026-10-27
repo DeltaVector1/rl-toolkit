@@ -273,7 +273,8 @@ def status_report(root, state):
         if key.startswith("train/agg/") and "/timing/" in key and key.endswith("/mean"):
             print(f"  {key.removeprefix('train/agg/')}: {shown(value)}")
     print("Stability (latest trainer metric step):")
-    for label, key in (("Gradient norm", "optim/grad_norm"), ("Masked KL", "mismatch_kl/all/mean"),
+    for label, key in (("Gradient norm", "optim/grad_norm"), ("Masked KL", "masked_mismatch_kl/mean"),
+                       ("All-token KL", "mismatch_kl/all/mean"),
                        ("Unmasked KL", "unmasked_mismatch_kl/mean"), ("Masked fraction", "is_masked/mean"),
                        ("Loss", "loss/mean")):
         print(f"  {label}: {shown(latest['trainer'].get(key))}")

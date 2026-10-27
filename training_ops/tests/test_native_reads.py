@@ -127,6 +127,17 @@ class NativeReadsTest(unittest.TestCase):
         self.assertIn("Completed optimizer updates: unknown", report)
         self.assertIn("Gradient norm: unknown", report)
 
+    def test_kl_labels_use_distinct_step25_metric_fields(self):
+        root, state = self.fixture()
+        self.metrics(root, [{"producer": "trainer", "step": 25,
+                            "masked_mismatch_kl/mean": 0.007590143010020256,
+                            "mismatch_kl/all/mean": 0.0007629550527781248,
+                            "unmasked_mismatch_kl/mean": 0.0007671326166018844}])
+        report = self.report(root, state)
+        self.assertIn("Masked KL: 0.0075901", report)
+        self.assertIn("All-token KL: 0.00076296", report)
+        self.assertIn("Unmasked KL: 0.00076713", report)
+
     def test_failed_episodes_are_excluded_and_group_failures_are_separate(self):
         root, state = self.fixture()
         index = root / "monitors/file/traces/stream.index.jsonl"
