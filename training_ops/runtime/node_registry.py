@@ -12,9 +12,9 @@ import tempfile
 import tomllib
 
 
-DEFAULT_PATH = Path(__file__).resolve().parents[2] / "configs" / "nodes.toml"
-_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-_REQUIRED_FIELDS = (
+default_path = Path(__file__).resolve().parents[2] / "configs" / "nodes.toml"
+name_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+required_fields = (
     "ssh_host",
     "ssh_port",
     "ssh_user",
@@ -51,7 +51,7 @@ def profile(nodes: dict, host: str) -> dict | None:
 
 
 def _validate_name(name: str) -> str:
-    if not _NAME.fullmatch(name):
+    if not name_pattern.fullmatch(name):
         raise NodeRegistryError(
             "node name must start with a letter or digit and contain only letters, digits, _ or -"
         )
@@ -172,7 +172,7 @@ def _write_atomic(path: Path, text: str) -> None:
 
 def _reload_training_ops(path: Path) -> None:
     """Refresh the package's parsed node config after a default-file update."""
-    if path.resolve() != DEFAULT_PATH.resolve():
+    if path.resolve() != default_path.resolve():
         return
     import training_ops
 
@@ -260,7 +260,7 @@ def _add(path: Path, text: str, nodes: dict, args: argparse.Namespace) -> int:
     existing = profile(nodes, name)
     values = {
         key: getattr(args, key)
-        for key in (*_REQUIRED_FIELDS, "role")
+        for key in (*required_fields, "role")
         if getattr(args, key) is not None
     }
     for key in ("ssh_host", "ssh_user", "ssh_identity_file", "runs", "python", "role"):
@@ -272,7 +272,7 @@ def _add(path: Path, text: str, nodes: dict, args: argparse.Namespace) -> int:
     _check_not_blocked(nodes, name, values.get("ssh_host", old_host))
     merged = dict(existing or {})
     merged.update(values)
-    missing = [key for key in _REQUIRED_FIELDS if key not in merged]
+    missing = [key for key in required_fields if key not in merged]
     if missing:
         required = ", ".join(missing)
         raise NodeRegistryError(f"profile {name} needs these fields: {required}")
@@ -309,7 +309,7 @@ def cli(arguments: list[str] | tuple[str, ...], path: str | Path | None = None) 
         parser.print_help()
         return 0
     parsed = parser.parse_args(args)
-    config_path = Path(path) if path is not None else DEFAULT_PATH
+    config_path = Path(path) if path is not None else default_path
     try:
         text, nodes = _read_validate(config_path)
         if parsed.command == "list":

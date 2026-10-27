@@ -111,3 +111,25 @@ tensor_parallel_size = 8
 data_parallel_size = 1
 mtp_tokens = 0
 ports = [8000]
+
+[single_node.h100]
+ssh_host = "192.222.55.85"
+ssh_port = 40301
+ssh_user = "root"
+ssh_identity_file = "/home/mango/.ssh/h200_rollout_ed25519"
+trainer_gpus = [0, 1, 2, 3]
+policy_gpus = [4, 5, 6, 7]
+judge_gpus = []
+policy_api_port = 8100
+storage_root = "/root/glm52-rl"
+remote_repository = "/root/glm52-rl/deployment"
+runs = "/root/glm52-rl/runs"
+python = "/usr/bin/python3"
+model_cache = "/root/.cache/huggingface/hub"
+trinity_model = "arcee-ai/Trinity-Mini"
+trinity_revision = "cdb81e8130815fec299cccc8f8700004b8366e1e"
+trinity_path = "/root/.cache/huggingface/hub/models--arcee-ai--Trinity-Mini/snapshots/cdb81e8130815fec299cccc8f8700004b8366e1e"
+trinity_bytes = 52249446248
+
+[selection]
+active_node = "h100"

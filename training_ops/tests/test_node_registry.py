@@ -160,7 +160,7 @@ keep = true
     def test_default_file_change_refreshes_training_ops_nodes(self):
         original_nodes = dict(training_ops.nodes)
         try:
-            with mock.patch.object(node_registry, "DEFAULT_PATH", self.path):
+            with mock.patch.object(node_registry, "default_path", self.path):
                 with contextlib.redirect_stdout(io.StringIO()):
                     result = node_registry.cli(["use", "old"], path=self.path)
             self.assertEqual(result, 0)

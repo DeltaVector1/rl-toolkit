@@ -564,7 +564,7 @@ def _check_host(host: str) -> str:
 def _ssh_destination(host: str) -> tuple[list[str], list[str], str]:
     """Return SSH options, SCP options, and the configured destination."""
     _check_host(host)
-    settings = inference_settings.get(host, {})
+    settings = nodes.get("single_node", {}).get(host, inference_settings.get(host, {}))
     address = settings.get("ssh_host")
     if address is None:
         return [], [], host
@@ -12911,33 +12911,102 @@ def _stop_action(arguments: list[str]):
     return stop()
 
 
-def _watch_rollouts_action(arguments: list[str]):
-    if arguments:
-        raise Refused("watch-rollouts does not accept arguments")
-    ssh_options, _, destination = _ssh_destination(orchestrator_host)
-    remote_script = shlex.join(
-        [
-            "bash",
-            f"{runtime_root}/h200/watch_rollouts.sh",
-            orchestrator_container,
+def _native_read_action(arguments: list[str], action: str):
+    import argparse
+    from training_ops.runtime.node_registry import active_host, profile
+
+    parser = argparse.ArgumentParser(prog=f"training-ops {action}")
+    parser.add_argument("--host")
+    parser.add_argument("--run")
+    parser.add_argument("--lines", type=int, default=30)
+    parser.add_argument("--no-follow", action="store_true")
+    parser.add_argument("--seconds", type=float, default=600)
+    if action == "status":
+        parser.add_argument("run_name", nargs="?")
+    if action == "logs":
+        parser.add_argument("role", nargs="?", choices=("trainer", "orchestrator"), default="trainer")
+        parser.add_argument("line_count", nargs="?", type=int)
+    args = parser.parse_args(arguments)
+    if getattr(args, "run_name", None):
+        if args.run:
+            raise Refused("run was supplied twice")
+        args.run = args.run_name
+    if getattr(args, "line_count", None) is not None:
+        args.lines = args.line_count
+    if not 1 <= args.lines <= 10000:
+        raise Refused("--lines must be between 1 and 10000")
+    if not 0 < args.seconds <= 600:
+        raise Refused("--seconds must be greater than zero and at most 600")
+    if args.run and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", args.run):
+        raise Refused("--run must be a single run name")
+    host = args.host or active_host(nodes)
+    if not host:
+        raise Refused("No active node. Use nodes use NAME or --host NAME.")
+    host = orchestrator_host if host == "h200" else host
+    if host == orchestrator_host:
+        if action == "status":
+            return status(args.run or "")
+        if action == "logs":
+            return logs(args.role, args.lines)
+        if args.run or args.no_follow or args.lines != 30:
+            raise Refused("H200 watch supports only --host and --seconds")
+        remote_script = shlex.join([
+            "bash", f"{runtime_root}/h200/watch_rollouts.sh", orchestrator_container,
             f"{runtime_root}/h200/watch_rollouts_tqdm.py",
-        ]
-    )
-    command = ssh_command + ssh_options + ["-tt", destination, remote_script]
-    result = subprocess.run(command, check=False)
+        ])
+    else:
+        settings = profile(nodes, host)
+        if settings is None:
+            raise Refused(f"node profile {host} is not registered")
+        _check_host(settings["ssh_host"])
+        source = (repo_root / "training_ops/runtime/watch_native_rollouts.py").read_text()
+        remote = [settings.get("python", "python3"), "-u", "-c", source,
+                  "--root", settings["runs"], "--lines", str(args.lines),
+                  "--seconds", str(args.seconds)]
+        if args.run:
+            remote.extend(["--run", args.run])
+        if action == "status":
+            remote.append("--status")
+        if action == "logs":
+            remote.extend(["--role", args.role])
+        if args.no_follow or action == "logs":
+            remote.append("--no-follow")
+        remote_script = shlex.join(remote)
+    ssh_options, _, destination = _ssh_destination(host)
+    options = {"ConnectTimeout=25": "ConnectTimeout=5", "ServerAliveInterval=15": "ServerAliveInterval=2",
+               "ServerAliveCountMax=4": "ServerAliveCountMax=2"}
+    command = [options.get(value, value) for value in ssh_command] + ssh_options
+    command += ["-tt" if action == "watch-rollouts" else "-T", destination, remote_script]
+    timeout = args.seconds + 10 if action == "watch-rollouts" and not args.no_follow else 15
+    print(f"Node {host}", flush=True)
+    try:
+        result = subprocess.run(command, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"{action} on {host} exceeded its {timeout:g} second deadline") from error
     if result.returncode:
-        raise RuntimeError(
-            f"watch-rollouts failed on {orchestrator_host} with exit code {result.returncode}"
-        )
+        raise RuntimeError(f"{action} failed on {host} with exit code {result.returncode}")
     return result.returncode
 
 
+def _watch_rollouts_action(arguments: list[str]):
+    return _native_read_action(arguments, "watch-rollouts")
+
+
+def _node_action(arguments: list[str]):
+    from training_ops.runtime.node_registry import cli as node_cli
+    code = node_cli(arguments)
+    if code:
+        raise SystemExit(code)
+    return code
+
+
 actions = {
-    "status": lambda a: status(*a),
+    "status": lambda a: _native_read_action(a, "status"),
     "acceptance": lambda a: acceptance(*a),
     "reward": lambda a: reward(a[0] if a else "", host=a[1] if len(a) > 1 else ""),
     "engines": lambda a: engines(*a),
-    "logs": lambda a: logs(a[0] if a else "trainer", int(a[1]) if len(a) > 1 else 200),
+    "logs": lambda a: _native_read_action(a, "logs"),
+    "nodes": _node_action,
     "parity": lambda a: parity(*a),
     "steps": lambda a: steps(a[0] if a else "", int(a[1]) if len(a) > 1 else 10),
     "remote": _remote_action,
@@ -12970,17 +13039,19 @@ def run(argstr: str = "status"):
 
 usage = f"""training-ops <action> [args]
 
-  status [run]                  show the complete run state
+  status [run] [--host NAME]    show the active node and training measurements
   acceptance [run]              check training requirements
   reward [run] [host]           show reward and its measured trend
   steps [run] [count]           show recent trainer times
   engines                       test every configured inference endpoint
-  logs [role] [lines]           read one service log
+  logs [role] [lines] [--host NAME] [--run RUN]  read the active node log
+  nodes list|add|use          list, register, or select a node
   parity [run]                  read the trainer parity record
   remote <group> <command>      run on trainer, inference, or all hosts
   versions [package ...]        show installed package versions
   watch [hours] [seconds]       monitor in the foreground
-  watch-rollouts                 stream H200 rollout progress in the foreground
+  watch-rollouts [--host h100|h200] [--run RUN] [--lines N] [--no-follow]
+                                follow the active node training run; --seconds defaults to 600
   repair <name>                 repair an engine, adapter server, orchestrator, supervisors, rollout-puller, or microbatch sync
   deploy <path>                 copy one repository file
   start <run> [cold|fresh|restart] [config-dir]  start one run config directory
@@ -13019,7 +13090,7 @@ def cli() -> None:
         print(usage)
         sys.exit(0)
     try:
-        run(" ".join(args))
+        run(shlex.join(args))
     except (Refused, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)
         sys.exit(2)

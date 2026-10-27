@@ -95,7 +95,7 @@ class CliTest(unittest.TestCase):
             "run",
             return_value=mock.Mock(returncode=0),
         ) as run_process:
-            self.assertEqual(training_ops._watch_rollouts_action([]), 0)
+            self.assertEqual(training_ops._watch_rollouts_action(["--host", "h200"]), 0)
 
         ssh_destination.assert_called_once_with(training_ops.orchestrator_host)
         remote_script = shlex.join(
@@ -107,12 +107,15 @@ class CliTest(unittest.TestCase):
             ]
         )
         run_process.assert_called_once_with(
-            training_ops.ssh_command + options + ["-tt", destination, remote_script],
+            [{"ConnectTimeout=25": "ConnectTimeout=5", "ServerAliveInterval=15": "ServerAliveInterval=2",
+              "ServerAliveCountMax=4": "ServerAliveCountMax=2"}.get(value, value)
+             for value in training_ops.ssh_command] + options + ["-tt", destination, remote_script],
             check=False,
+            timeout=610,
         )
 
     def test_watch_rollouts_rejects_arguments(self):
-        with self.assertRaisesRegex(training_ops.Refused, "does not accept arguments"):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             training_ops._watch_rollouts_action(["10m"])
 
     def test_watch_rollouts_propagates_remote_failure(self):
@@ -122,7 +125,7 @@ class CliTest(unittest.TestCase):
             return_value=mock.Mock(returncode=17),
         ):
             with self.assertRaisesRegex(RuntimeError, "exit code 17"):
-                training_ops._watch_rollouts_action([])
+                training_ops._watch_rollouts_action(["--host", "h200"])
 
     def test_watch_rollouts_propagates_keyboard_interrupt(self):
         with mock.patch.object(
@@ -131,7 +134,7 @@ class CliTest(unittest.TestCase):
             side_effect=KeyboardInterrupt,
         ) as run_process:
             with self.assertRaises(KeyboardInterrupt):
-                training_ops._watch_rollouts_action([])
+                training_ops._watch_rollouts_action(["--host", "h200"])
         run_process.assert_called_once()
 
     def test_watch_rollouts_fallback_uses_deployed_repository_root(self):
