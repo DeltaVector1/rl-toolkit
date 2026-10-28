@@ -160,6 +160,23 @@ class NativeReadsTest(unittest.TestCase):
 
 
 class NativeRoutingTest(unittest.TestCase):
+    def inventory_fixture(self):
+        return {
+            "selection": {"active_node": "fixture_node"},
+            "single_node": {
+                "fixture_node": {
+                    "ssh_host": "192.0.2.81",
+                    "ssh_port": 20299,
+                    "ssh_user": "root",
+                    "ssh_identity_file": "/tmp/fixture-key",
+                    "runs": "/tmp/fixture-runs",
+                    "python": "/usr/bin/python3",
+                    "policy_health_ports": [8100, *range(18200, 18208)],
+                    "judge_health_ports": [18001],
+                }
+            },
+        }
+
     def invoke(self, action, arguments=None):
         with mock.patch.object(training_ops.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
             with contextlib.redirect_stdout(io.StringIO()):
@@ -167,21 +184,51 @@ class NativeRoutingTest(unittest.TestCase):
         return run.call_args
 
     def test_status_logs_and_watch_share_active_node_without_legacy_probes(self):
-        for action in ("status", "logs", "watch-rollouts"):
-            with self.subTest(action=action), mock.patch.object(training_ops, "status") as legacy:
-                call = self.invoke(action)
-                argv = call.args[0]
-                self.assertIn("root@192.222.55.85", argv)
-                self.assertIn("ConnectTimeout=5", argv)
-                self.assertNotIn("ConnectTimeout=25", argv)
-                self.assertIn("--root", shlex.split(argv[-1]))
-                if action == "status":
+        inventory = self.inventory_fixture()
+        profile = inventory["single_node"]["fixture_node"]
+        with mock.patch.object(training_ops, "nodes", inventory):
+            for action in ("status", "logs", "watch-rollouts"):
+                with self.subTest(action=action), mock.patch.object(
+                    training_ops, "status"
+                ) as legacy:
+                    call = self.invoke(action)
+                    argv = call.args[0]
+                    self.assertIn(f"{profile['ssh_user']}@{profile['ssh_host']}", argv)
+                    self.assertEqual(argv[argv.index("-p") + 1], str(profile["ssh_port"]))
+                    self.assertEqual(argv[argv.index("-i") + 1], profile["ssh_identity_file"])
+                    self.assertIn("ConnectTimeout=5", argv)
+                    self.assertNotIn("ConnectTimeout=25", argv)
                     remote = shlex.split(argv[-1])
-                    settings = json.loads(remote[remote.index("--health-ports") + 1])
-                    self.assertEqual(settings["policy"], training_ops.nodes["single_node"]["h100"]["policy_health_ports"])
-                    self.assertEqual(settings["judge"], [18001])
-                legacy.assert_not_called()
-                self.assertEqual(call.kwargs["timeout"], 610 if action == "watch-rollouts" else 15)
+                    self.assertEqual(remote[:3], [profile["python"], "-u", "-c"])
+                    self.assertEqual(remote[remote.index("--root") + 1], profile["runs"])
+                    self.assertNotIn("--run", remote)
+                    source = remote[3]
+                    self.assertIn("select_run", source)
+                    self.assertNotIn("h100", source.lower())
+                    self.assertNotIn("docker", source.lower())
+                    self.assertNotIn("container", source.lower())
+                    if action == "status":
+                        settings = json.loads(remote[remote.index("--health-ports") + 1])
+                        self.assertEqual(settings["policy"], profile["policy_health_ports"])
+                        self.assertEqual(settings["judge"], profile["judge_health_ports"])
+                    legacy.assert_not_called()
+                    self.assertEqual(call.kwargs["timeout"], 610 if action == "watch-rollouts" else 15)
+
+    def test_explicit_r14_run_uses_disposable_profile(self):
+        inventory = self.inventory_fixture()
+        run_name = "qwen38-xiaomi-decensor-h200-fresh-20261027-r14"
+        with mock.patch.object(training_ops, "nodes", inventory):
+            call = self.invoke("status", ["--run", run_name])
+        remote = shlex.split(call.args[0][-1])
+        self.assertEqual(remote[remote.index("--run") + 1], run_name)
+        self.assertEqual(call.kwargs["timeout"], 15)
+
+    def test_help_lists_configured_nodes_and_default_selection(self):
+        names = ", ".join(sorted(training_ops.nodes["single_node"]))
+        default = training_ops.nodes["selection"]["active_node"]
+        self.assertIn(f"node profiles: {names}", training_ops.usage)
+        self.assertIn(f"default selected node: {default}", training_ops.usage)
+        self.assertNotIn("--host h100|h200", training_ops.usage)
 
     def test_command_timeout_has_readable_failure(self):
         with mock.patch.object(training_ops.subprocess, "run", side_effect=subprocess.TimeoutExpired("ssh", 15)):

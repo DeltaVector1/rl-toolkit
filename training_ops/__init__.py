@@ -13037,21 +13037,33 @@ def run(argstr: str = "status"):
     return actions[parts[0]](parts[1:])
 
 
+node_profiles = nodes.get("single_node", {})
+node_profile_names = (
+    ", ".join(sorted(node_profiles)) if isinstance(node_profiles, dict) else "none"
+)
+selection = nodes.get("selection", {})
+selected_node = selection.get("active_node") if isinstance(selection, dict) else None
+default_node_name = (
+    selected_node if isinstance(selected_node, str) and selected_node else "none"
+)
+
 usage = f"""training-ops <action> [args]
 
-  status [run] [--host NAME]    show the active node and training measurements
+  status [run] [--host NODE]    show the active node and training measurements
   acceptance [run]              check training requirements
   reward [run] [host]           show reward and its measured trend
   steps [run] [count]           show recent trainer times
   engines                       test every configured inference endpoint
-  logs [role] [lines] [--host NAME] [--run RUN]  read the active node log
+  logs [role] [lines] [--host NODE] [--run RUN]  read the active node log
   nodes list|add|use          list, register, or select a node
   parity [run]                  read the trainer parity record
   remote <group> <command>      run on trainer, inference, or all hosts
   versions [package ...]        show installed package versions
   watch [hours] [seconds]       monitor in the foreground
-  watch-rollouts [--host h100|h200] [--run RUN] [--lines N] [--no-follow]
-                                follow the active node training run; --seconds defaults to 600
+  watch-rollouts [--host NODE] [--run RUN] [--lines N] [--no-follow]
+                                follow the selected node run; --seconds defaults to 600
+  node profiles: {node_profile_names}
+  default selected node: {default_node_name}
   repair <name>                 repair an engine, adapter server, orchestrator, supervisors, rollout-puller, or microbatch sync
   deploy <path>                 copy one repository file
   start <run> [cold|fresh|restart] [config-dir]  start one run config directory
