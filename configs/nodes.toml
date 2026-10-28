@@ -148,6 +148,18 @@ policy_api_port = 8100
 policy_health_ports = [8100, 18200, 18201, 18202, 18203, 18204, 18205, 18206, 18207]
 # Local judge forward from qwen38-xiaomi-decensor-h200/rl-r14.toml.
 judge_health_ports = [18001]
+policy_health_urls = [
+  "http://127.0.0.1:8100/health",
+  "http://103.175.197.41:30005/r0/health",
+  "http://103.175.197.41:30005/r1/health",
+  "http://103.175.197.41:30005/r2/health",
+  "http://103.175.197.41:30005/r3/health",
+  "http://103.175.197.41:30005/r4/health",
+  "http://103.175.197.41:30005/r5/health",
+  "http://103.175.197.41:30005/r6/health",
+  "http://103.175.197.41:30005/r7/health",
+]
+judge_health_urls = ["http://103.175.197.21:30005/health"]
 storage_root = "/root/glm52-rl"
 remote_repository = "/root/glm52-rl/deployment"
 runs = "/root/glm52-rl/runs"

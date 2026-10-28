@@ -3,6 +3,7 @@
 import argparse
 from collections import deque
 from datetime import datetime, timezone
+import ipaddress
 import json
 import math
 import os
@@ -13,6 +14,7 @@ import shlex
 import socket
 import sys
 import time
+from urllib.parse import urlsplit
 
 
 def read_json(path):
@@ -173,23 +175,69 @@ def shown(value):
     return f"{value:.5g}" if finite(value) else "unknown"
 
 
-def probe_health(ports, seconds=2):
-    """Read local HTTP status lines with one deadline shared by all ports."""
+def health_target(endpoint):
+    if type(endpoint) is int:
+        if not 1 <= endpoint <= 65535:
+            raise ValueError("invalid local health port")
+        host = "127.0.0.1"
+        port = endpoint
+        path = "/health"
+        authority = f"{host}:{port}"
+        family = socket.AF_INET
+    elif isinstance(endpoint, str):
+        try:
+            parts = urlsplit(endpoint)
+            if (any(character.isspace() for character in endpoint) or parts.scheme.lower() != "http"
+                    or not parts.hostname or parts.username or parts.password or parts.fragment):
+                raise ValueError
+            host = str(ipaddress.ip_address(parts.hostname))
+            port = parts.port if parts.port is not None else 80
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError as error:
+            raise ValueError("invalid HTTP health URL") from error
+        path = parts.path or "/"
+        if not path.startswith("/"):
+            raise ValueError("invalid HTTP health URL")
+        if parts.query:
+            path += f"?{parts.query}"
+        authority = parts.netloc
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    else:
+        raise ValueError("invalid health endpoint")
+    request = f"GET {path} HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n".encode()
+    address = (host, port, 0, 0) if family == socket.AF_INET6 else (host, port)
+    return address, family, request
+
+
+def probe_health(endpoints, seconds=2):
+    """Read HTTP status lines with one deadline shared by all endpoints."""
     deadline = time.monotonic() + seconds
-    results = {port: "deadline exceeded" for port in ports}
+    endpoints = list(dict.fromkeys(endpoints))
+    results = {endpoint: "deadline exceeded" for endpoint in endpoints}
     pending = {}
     with selectors.DefaultSelector() as selector:
         try:
-            for port in ports:
-                connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            for endpoint in endpoints:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    address, family, request = health_target(endpoint)
+                except ValueError as error:
+                    results[endpoint] = str(error)
+                    continue
+                try:
+                    connection = socket.socket(family, socket.SOCK_STREAM)
+                except OSError as error:
+                    results[endpoint] = str(error)
+                    continue
                 try:
                     connection.setblocking(False)
-                    connection.connect_ex(("127.0.0.1", port))
-                    request = f"GET /health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode()
-                    pending[connection] = {"port": port, "request": request, "response": b""}
+                    connection.connect_ex(address)
+                    pending[connection] = {"endpoint": endpoint, "request": request, "response": b""}
                     selector.register(connection, selectors.EVENT_WRITE)
                 except OSError as error:
-                    results[port] = str(error)
+                    results[endpoint] = str(error)
                     pending.pop(connection, None)
                     connection.close()
             while pending and time.monotonic() < deadline:
@@ -213,13 +261,13 @@ def probe_health(ports, seconds=2):
                                 line = state["response"].split(b"\n", 1)[0]
                                 match = re.match(rb"HTTP/1\.[01] ([0-9]{3})(?: |\r|$)", line)
                                 code = int(match[1]) if match else None
-                                results[state["port"]] = None if code is not None and 200 <= code < 300 else (
+                                results[state["endpoint"]] = None if code is not None and 200 <= code < 300 else (
                                     f"HTTP {code}" if code is not None else "invalid HTTP response")
                                 done = True
                     except BlockingIOError:
                         continue
                     except OSError as error:
-                        results[state["port"]] = str(error)
+                        results[state["endpoint"]] = str(error)
                         done = True
                     if done:
                         selector.unregister(connection)
@@ -231,25 +279,57 @@ def probe_health(ports, seconds=2):
     return results
 
 
-def service_health(settings):
+def valid_health_urls(value):
+    if not isinstance(value, list) or not 0 < len(value) <= 32:
+        return None
+    if not all(isinstance(url, str) for url in value):
+        return None
+    try:
+        for url in value:
+            health_target(url)
+    except ValueError:
+        return None
+    return list(dict.fromkeys(value))
+
+
+def valid_health_ports(value):
+    if isinstance(value, list) and 0 < len(value) <= 32 and all(
+        type(port) is int and 1 <= port <= 65535 for port in value
+    ):
+        return list(dict.fromkeys(value))
+    return None
+
+
+def health_url(endpoint):
+    return endpoint if isinstance(endpoint, str) else f"http://127.0.0.1:{endpoint}/health"
+
+
+def service_health(settings, urls=None):
+    urls = urls or {}
     configured = {}
     for role in ("policy", "judge"):
-        ports = settings.get(role)
-        if isinstance(ports, list) and 0 < len(ports) <= 32 and all(type(port) is int and 1 <= port <= 65535 for port in ports):
-            configured[role] = list(dict.fromkeys(ports))
-    ports = list(dict.fromkeys(port for values in configured.values() for port in values))
-    results = probe_health(ports) if ports else {}
-    print("Service health (local HTTP /health, 2 second total deadline):")
+        if role in urls and urls[role] is not None:
+            selected = valid_health_urls(urls[role])
+        else:
+            selected = valid_health_ports(settings.get(role))
+        if selected is not None:
+            configured[role] = selected
+    endpoints = list(dict.fromkeys(endpoint for values in configured.values() for endpoint in values))
+    results = probe_health(endpoints) if endpoints else {}
+    print("Service health (configured HTTP endpoints, 2 second total deadline):")
     for role in ("policy", "judge"):
         if role not in configured:
-            print(f"  {role}: unknown (health ports are missing or invalid)")
+            print(f"  {role}: unknown (health URLs or ports are missing or invalid)")
             continue
         selected = configured[role]
-        responding = sum(results[port] is None for port in selected)
+        responding = sum(results[endpoint] is None for endpoint in selected)
         print(f"  {role}: {responding}/{len(selected)} responding")
-        for port in selected:
-            if results[port] is not None:
-                print(f"    failed http://127.0.0.1:{port}/health ({results[port]})")
+        for endpoint in selected:
+            url = health_url(endpoint)
+            if results[endpoint] is None:
+                print(f"    responding {url}")
+            else:
+                print(f"    failed {url} ({results[endpoint]})")
 
 
 def reward_report(root):
@@ -287,7 +367,7 @@ def reward_report(root):
           f"older records omitted {'yes' if truncated else 'no'}.")
 
 
-def status_report(root, state, health_ports=None):
+def status_report(root, state, health_ports=None, health_urls=None):
     metrics_path = root / "monitors/file/metrics.jsonl"
     data, size, truncated = tail(metrics_path, 4 * 1024 * 1024)
     grouped = {"trainer": {}, "orch": {}}
@@ -307,7 +387,7 @@ def status_report(root, state, health_ports=None):
                        and not row.get("diagnostic/parity_guard_rejected"))
     latest = {actor: rows[max(rows)] if rows else {} for actor, rows in grouped.items()}
     print(f"Run {root.name}\nProcess {'running' if alive(state) else 'stopped'} (PID {state['pid']})")
-    service_health(health_ports or {})
+    service_health(health_ports or {}, health_urls or {})
     if size is None:
         count = "unknown (metrics file is absent)"
     elif not completed:
@@ -386,11 +466,12 @@ def main():
     parser.add_argument("--role", choices=("trainer", "orchestrator"), default="orchestrator")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--health-ports", type=json.loads, default={})
+    parser.add_argument("--health-urls", type=json.loads, default={})
     args = parser.parse_args()
     try:
         root, state = select_run(args.root, args.run)
         if args.status:
-            return status_report(root, state, args.health_ports)
+            return status_report(root, state, args.health_ports, args.health_urls)
         return watch(root, state, args.lines, not args.no_follow, args.seconds, args.role)
     except (OSError, ValueError, KeyError) as error:
         print(str(error), file=sys.stderr)

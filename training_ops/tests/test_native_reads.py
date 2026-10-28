@@ -173,6 +173,8 @@ class NativeRoutingTest(unittest.TestCase):
                     "python": "/usr/bin/python3",
                     "policy_health_ports": [8100, *range(18200, 18208)],
                     "judge_health_ports": [18001],
+                    "policy_health_urls": ["http://203.0.113.20:30000/r0/health"],
+                    "judge_health_urls": ["http://203.0.113.20:30005/health"],
                 }
             },
         }
@@ -211,6 +213,9 @@ class NativeRoutingTest(unittest.TestCase):
                         settings = json.loads(remote[remote.index("--health-ports") + 1])
                         self.assertEqual(settings["policy"], profile["policy_health_ports"])
                         self.assertEqual(settings["judge"], profile["judge_health_ports"])
+                        urls = json.loads(remote[remote.index("--health-urls") + 1])
+                        self.assertEqual(urls["policy"], profile["policy_health_urls"])
+                        self.assertEqual(urls["judge"], profile["judge_health_urls"])
                     legacy.assert_not_called()
                     self.assertEqual(call.kwargs["timeout"], 610 if action == "watch-rollouts" else 15)
 
@@ -241,6 +246,14 @@ class NativeRoutingTest(unittest.TestCase):
                 with self.assertRaises(training_ops.Refused):
                     training_ops._native_read_action(args, "status")
                 run.assert_not_called()
+
+    def test_h200_replacement_uses_public_health_urls(self):
+        profile = training_ops.nodes["single_node"]["h200_replacement"]
+        self.assertEqual(profile["policy_health_urls"], [
+            "http://127.0.0.1:8100/health",
+            *[f"http://103.175.197.41:30005/r{index}/health" for index in range(8)],
+        ])
+        self.assertEqual(profile["judge_health_urls"], ["http://103.175.197.21:30005/health"])
 
 
 class ServiceHealthTest(unittest.TestCase):
@@ -303,12 +316,54 @@ class ServiceHealthTest(unittest.TestCase):
         with mock.patch.object(viewer.socket, "socket", return_value=connection):
             self.assertEqual(viewer.probe_health([18001]), {18001: "HTTP 503"})
 
-    def test_silent_endpoint_obeys_total_deadline(self):
-        connection = self.local_socket()
+    def test_public_url_failure_reports_the_exact_url(self):
+        url = "http://103.175.197.21:30005/health"
+        connection = self.local_socket(b"HTTP/1.1 503 Service Unavailable\r\n\r\n")
+        output = io.StringIO()
+        with mock.patch.object(viewer.socket, "socket", return_value=connection), contextlib.redirect_stdout(output):
+            viewer.service_health({}, {"judge": [url]})
+        self.assertIn("judge: 0/1 responding", output.getvalue())
+        self.assertIn(f"failed {url} (HTTP 503)", output.getvalue())
+
+    def test_public_health_url_uses_its_path_and_reports_exact_url(self):
+        url = "http://103.175.197.41:30005/r4/health"
+        connection = self.local_socket(b"HTTP/1.1 200 OK\r\n\r\n")
+        requests = []
+        connection.send.side_effect = lambda data: (requests.append(data), len(data))[1]
+        output = io.StringIO()
+        with mock.patch.object(viewer.socket, "socket", return_value=connection), contextlib.redirect_stdout(output):
+            viewer.service_health({}, {"policy": [url]})
+        connection.connect_ex.assert_called_once_with(("103.175.197.41", 30005))
+        self.assertEqual(requests, [b"GET /r4/health HTTP/1.0\r\nHost: 103.175.197.41:30005\r\nConnection: close\r\n\r\n"])
+        self.assertIn(f"responding {url}", output.getvalue())
+
+    def test_shared_public_port_keeps_each_policy_path(self):
+        urls = [f"http://103.175.197.41:30005/r{index}/health" for index in (0, 1)]
+        connections = [self.local_socket(b"HTTP/1.1 200 OK\r\n\r\n") for _ in urls]
+        requests = []
+        for connection in connections:
+            connection.send.side_effect = lambda data: (requests.append(data), len(data))[1]
+        output = io.StringIO()
+        with mock.patch.object(viewer.socket, "socket", side_effect=connections), contextlib.redirect_stdout(output):
+            viewer.service_health({}, {"policy": urls})
+        self.assertIn("policy: 2/2 responding", output.getvalue())
+        for connection in connections:
+            connection.connect_ex.assert_called_once_with(("103.175.197.41", 30005))
+        self.assertEqual([request.split(b" ", 2)[1] for request in requests], [b"/r0/health", b"/r1/health"])
+
+    def test_invalid_configured_url_stays_unknown(self):
+        output = io.StringIO()
+        with mock.patch.object(viewer, "probe_health") as probe, contextlib.redirect_stdout(output):
+            viewer.service_health({"policy": [8100]}, {"policy": ["https://example.org/health"]})
+        probe.assert_not_called()
+        self.assertIn("policy: unknown", output.getvalue())
+
+    def test_silent_endpoints_share_one_total_deadline(self):
+        connections = [self.local_socket(), self.local_socket()]
         started = time.monotonic()
-        with mock.patch.object(viewer.socket, "socket", return_value=connection):
-            result = viewer.probe_health([18001], seconds=0.02)
-        self.assertEqual(result, {18001: "deadline exceeded"})
+        with mock.patch.object(viewer.socket, "socket", side_effect=connections):
+            result = viewer.probe_health([18001, 18002], seconds=0.02)
+        self.assertEqual(result, {18001: "deadline exceeded", 18002: "deadline exceeded"})
         self.assertLess(time.monotonic() - started, 0.5)
 
 
