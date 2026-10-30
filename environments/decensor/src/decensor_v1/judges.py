@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pydantic import Field
 from verifiers.v1.judge import JudgeConfig
-from verifiers.v1.types import SamplingConfig as JudgeSamplingConfig
+
+try:
+    from verifiers.v1.configs.sampling import SamplingConfig as JudgeSamplingConfig
+except ImportError:
+    from verifiers.v1.types import SamplingConfig as JudgeSamplingConfig
 
 
 class DecensorJudgeSampling(JudgeSamplingConfig):

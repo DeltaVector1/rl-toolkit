@@ -1,0 +1,104 @@
+# Prime RL a566e5d8e2a903f44d901e114d5d510888b93303.
+# Hub revision df919e1e2cf077a22204c78b6c826bf3db18bc08 contains BF16 weights.
+output_dir = "outputs/nanbeige-decensor"
+max_steps = 100
+seq_len = 32768
+
+[run]
+name = "nanbeige43-33b-decensor-bf16-lora"
+
+[model]
+name = "Nanbeige/Nanbeige4.3-33B"
+
+[deployment]
+type = "single_node"
+num_train_gpus = 4
+num_infer_gpus = 4
+
+[monitors.wandb]
+project = "nanbeige-decensor"
+
+[monitors.file]
+
+[ckpt]
+interval = 10
+keep_last = 3
+keep_interval = 50
+
+[weight_broadcast]
+type = "filesystem"
+
+[trainer.model]
+attn = "auto"
+ep = 1
+cp = 1
+
+[trainer.model.lora]
+rank = 16
+alpha = 32
+dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[trainer.optim]
+type = "adamw"
+lr = 1e-5
+weight_decay = 0.0
+max_norm = 1.0
+
+[trainer.scheduler]
+type = "linear"
+warmup_steps = 5
+decay_steps = 0
+
+[orchestrator]
+batch_size = 128
+max_staleness = 2
+
+[orchestrator.concurrency]
+initial_inflight = 32
+max_inflight = 128
+
+[orchestrator.renderer]
+name = "default"
+reasoning_parser = "think"
+enable_thinking = true
+preserve_thinking = false
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.train.sampling]
+temperature = 0.6
+top_p = 1.0
+max_completion_tokens = 8192
+
+[[orchestrator.train.source]]
+name = "decensor"
+env.taskset.id = "decensor-v1"
+env.assistant.harness.id = "null"
+env.assistant.runtime.type = "subprocess"
+env.assistant.max_turns = 6
+env.assistant.max_output_tokens = 24576
+env.assistant.max_total_tokens = 32768
+
+[orchestrator.train.source.env.taskset.task.judge]
+base_url = "http://103.175.197.21:30005/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+
+[orchestrator.train.source.env.taskset.task.user]
+base_url = "http://103.175.197.21:30005/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
+api_key_var = "VLLM_API_KEY"
+
+[inference.vllm]
+dtype = "bfloat16"
+tensor_parallel_size = 4
+data_parallel_size = 1
+max_model_len = 32768
+gpu_memory_utilization = 0.8
+enable_lora = true
+max_lora_rank = 16
+max_num_seqs = 128
+reasoning_parser = "qwen3"
+tool_call_parser = "qwen3_coder"
