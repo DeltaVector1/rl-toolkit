@@ -19,6 +19,7 @@ from ._data import (
     resolve_image,
 )
 from ._runtime import checked_run, run_shell
+from ._judge_format import prepare_verifier
 
 from .servers.tool import GeneralTools
 
@@ -404,10 +405,21 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
         if verifier.get("container", "sidecar") == "main":
             raise ValueError("Verifier must remain privileged")
         for item in verifier.get("uploads", []):
+            source = self.task_dir() / item["source"]
+            target = f"/work/_verifier/{PurePosixPath(item['target']).name}"
+            if PurePosixPath(item["target"]).name == "verify.py":
+                content, changed = prepare_verifier(source.read_bytes())
+                if changed:
+                    await runtime.write(
+                        "/work/_verifier/_judge_format.py",
+                        Path(__file__).with_name("_judge_format.py").read_bytes(),
+                    )
+                    await runtime.write(target, content)
+                    continue
             await upload(
                 runtime,
-                self.task_dir() / item["source"],
-                f"/work/_verifier/{PurePosixPath(item['target']).name}",
+                source,
+                target,
             )
         env = {"VERIFY_DETERMINISTIC": "1", "VERIFY_AGENT_JUDGE": "1"}
         env.update(
