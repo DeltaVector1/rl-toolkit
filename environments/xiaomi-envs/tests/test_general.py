@@ -736,13 +736,102 @@ async def test_general_grading_exception_trace_does_not_retain_judge_key(monkeyp
     trace = SimpleNamespace(info={"general_submission_validated": True})
     with pytest.raises(RuntimeError) as caught:
         await task.verifier_reward(trace, Runtime())
-    saved = "".join(traceback.format_exception(caught.value))
+    saved = "".join(traceback.format_exception(caught.value)) + json.dumps(trace.info)
     assert key not in saved and "fake-private" not in saved
     assert str(caught.value) == (
         "RuntimeError: missing_or_invalid_reward_json" if failure in ("read", "reward")
         else "ValueError: HTTPError: rejected <redacted> key=<redacted>"
     )
-    assert "verifier" not in trace.info
+    info = trace.info["verifier"]
+    assert key not in info["error"]
+    if failure != "run":
+        assert info["verifier_returncode"] == 1
+    if failure == "reward":
+        assert info["reward_output"] == {"reward": "<redacted>"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", [False, True])
+async def test_general_invalid_reward_keeps_redacted_grader_diagnostics(monkeypatch, malformed):
+    import xiaomi_general.taskset as module
+
+    key = "fake-private-credential"
+    monkeypatch.setenv("GA_JUDGE_KEY", key)
+    monkeypatch.setattr(GeneralTask, "manifest", lambda _: {})
+    message = "no usable verdict " + key + " key=fake-private..."
+    clean_message = "no usable verdict <redacted> key=<redacted>"
+    output = {"reward_error": "judge_crashed", "judge_error": message}
+    raw = (json.dumps(output) + " invalid " + "x" * 2100 if malformed else json.dumps(output))
+    detail = {"reward_error": "judge_crashed", "detail": {"judge_error": message}}
+
+    async def run_shell(*args, **kwargs):
+        return ProgramResult(1, message + "\n" + "x" * 9997, message + "\n" + "y" * 3997)
+
+    monkeypatch.setattr(module, "run_shell", run_shell)
+
+    class Runtime:
+        async def run(self, argv, env):
+            return ProgramResult(0, json.dumps(detail) if argv[0] == "cat" else "", "")
+
+        async def read(self, path):
+            return raw.encode()
+
+    task = GeneralTask(GeneralData(instance={"dataset_type": "general_agent"}))
+    trace = SimpleNamespace(info={"general_submission_validated": True})
+    with pytest.raises(RuntimeError, match="missing_or_invalid_reward_json"):
+        await task.verifier_reward(trace, Runtime())
+    info = trace.info["verifier"]
+    assert info["verifier_returncode"] == 1
+    assert info["stdout"] == (clean_message + "\n" + "x" * 9997)[-10000:]
+    assert info["stderr"] == (clean_message + "\n" + "y" * 3997)[-4000:]
+    assert info["reward_detail"] == {
+        "reward_error": "judge_crashed", "detail": {"judge_error": clean_message},
+    }
+    if malformed:
+        assert info["reward_output_raw"].startswith('{"reward_error": "judge_crashed"')
+        assert len(info["reward_output_raw"]) == 2000
+        assert "reward_output" not in info
+    else:
+        assert info["reward_output"] == {
+            "reward_error": "judge_crashed", "judge_error": clean_message,
+        }
+    assert info["error"] == "RuntimeError: missing_or_invalid_reward_json"
+    saved = json.dumps(trace.info)
+    assert key not in saved and "fake-private" not in saved
+
+
+@pytest.mark.asyncio
+async def test_general_failed_reward_bounds_json_diagnostics_after_redaction(monkeypatch):
+    import xiaomi_general.taskset as module
+
+    key = "fake-private-credential"
+    monkeypatch.setenv("GA_JUDGE_KEY", key)
+    monkeypatch.setattr(GeneralTask, "manifest", lambda _: {})
+    raw = json.dumps({"reward_error": "judge_crashed", "error": "x" * 19940 + key + "y" * 100})
+    clean = raw.replace(key, "<redacted>")
+
+    async def run_shell(*args, **kwargs):
+        return ProgramResult(1, "", "")
+
+    monkeypatch.setattr(module, "run_shell", run_shell)
+
+    class Runtime:
+        async def run(self, argv, env):
+            return ProgramResult(0, raw if argv[0] == "cat" else "", "")
+
+        async def read(self, path):
+            return raw.encode()
+
+    task = GeneralTask(GeneralData(instance={"dataset_type": "general_agent"}))
+    trace = SimpleNamespace(info={"general_submission_validated": True})
+    with pytest.raises(RuntimeError, match="missing_or_invalid_reward_json"):
+        await task.verifier_reward(trace, Runtime())
+    info = trace.info["verifier"]
+    for name in ("reward_output", "reward_detail"):
+        assert info[name + "_raw"] == clean[:20000]
+        assert info[name + "_truncated"] is True
+        assert name not in info
+    assert "fake-private" not in json.dumps(trace.info)
 
 
 @pytest.mark.asyncio

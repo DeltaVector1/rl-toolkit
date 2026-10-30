@@ -467,6 +467,22 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
                 return [redact(item) for item in value]
             return value
 
+        info = {}
+        trace.info["verifier"] = info
+
+        def record_json(name, raw):
+            try:
+                value = redact(json.loads(raw))
+            except ValueError:
+                info[name + "_raw"] = redact(raw)[:2000]
+            else:
+                text = json.dumps(value, ensure_ascii=False)
+                if len(text) > 20000:
+                    info[name + "_raw"] = text[:20000]
+                    info[name + "_truncated"] = True
+                else:
+                    info[name] = value
+
         try:
             result = await run_shell(
                 runtime,
@@ -477,13 +493,6 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
                 or 900,
                 env=env,
             )
-            try:
-                raw = (await runtime.read(reward_path)).decode()
-            except RolloutError:
-                raise
-            except Exception as exc:
-                raise RuntimeError("missing_or_invalid_reward_json") from exc
-            reward, info = parse_reward(raw, bool(instance.get("reward_binary_fullscore")))
             info.update(
                 verifier_returncode=result.exit_code,
                 stdout=redact(result.stdout)[-10000:],
@@ -492,13 +501,19 @@ class GeneralTask(vf.Task[GeneralData, vf.State, GeneralTaskConfig]):
             if detail_path:
                 detail = await runtime.run(["cat", detail_path], {})
                 if detail.exit_code == 0:
-                    try:
-                        info["reward_detail"] = redact(json.loads(detail.stdout))
-                    except ValueError:
-                        info["reward_detail_raw"] = redact(detail.stdout)[:2000]
-            trace.info["verifier"] = info
+                    record_json("reward_detail", detail.stdout)
+            try:
+                raw = (await runtime.read(reward_path)).decode()
+            except RolloutError:
+                raise
+            except Exception as exc:
+                raise RuntimeError("missing_or_invalid_reward_json") from exc
+            record_json("reward_output", raw)
+            reward, reward_info = parse_reward(raw, bool(instance.get("reward_binary_fullscore")))
+            info.update(reward_info)
             return reward
         except Exception as exc:
+            info["error"] = f"{type(exc).__name__}: {redact(str(exc))}"[:2000]
             # Keep native retry classification while removing secret-bearing chains.
             if isinstance(exc, RolloutError):
                 exc.args = (redact(str(exc)),)
