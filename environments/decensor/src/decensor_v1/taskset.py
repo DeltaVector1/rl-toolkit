@@ -37,9 +37,6 @@ from decensor_v1.text import (
 from decensor_v1.user import DecensorUser, DecensorUserConfig
 
 
-_review_slots = asyncio.Semaphore(2)
-
-
 class DecensorData(vf.TaskData):
     word_requirement: str = ""
     word_target: int = 0
@@ -236,9 +233,11 @@ class DecensorTask(vf.Task[DecensorData, DecensorState, DecensorTaskConfig]):
         review_names = [
             f"turn_{source.turns[0].turn}_review" for source in review_sources
         ]
+        # Limit turn reviews per rollout; service.py caps judge requests across workers.
+        review_slots = asyncio.Semaphore(2)
 
         async def review_one(name: str, source: Any):
-            async with _review_slots:
+            async with review_slots:
                 return await request_judge_score(
                     name,
                     lambda: run_agentic_review(task_config.judge, source),
