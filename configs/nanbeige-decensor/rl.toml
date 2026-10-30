@@ -51,7 +51,7 @@ warmup_steps = 25
 decay_steps = 0
 
 [orchestrator]
-batch_size = 128
+batch_size = 1024
 max_staleness = 2
 
 [orchestrator.concurrency]
