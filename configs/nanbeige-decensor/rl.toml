@@ -1,8 +1,8 @@
 # Prime RL a566e5d8e2a903f44d901e114d5d510888b93303.
 # Hub revision df919e1e2cf077a22204c78b6c826bf3db18bc08 contains BF16 weights.
 output_dir = "outputs/nanbeige-decensor"
-max_steps = 100
-seq_len = 32768
+max_steps = 500
+seq_len = 65536
 
 [run]
 name = "nanbeige43-33b-decensor-bf16-lora"
@@ -34,8 +34,8 @@ ep = 1
 cp = 1
 
 [trainer.model.lora]
-rank = 16
-alpha = 32
+rank = 128
+alpha = 256
 dropout = 0.0
 target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
@@ -47,7 +47,7 @@ max_norm = 1.0
 
 [trainer.scheduler]
 type = "linear"
-warmup_steps = 5
+warmup_steps = 25
 decay_steps = 0
 
 [orchestrator]
@@ -55,22 +55,23 @@ batch_size = 128
 max_staleness = 2
 
 [orchestrator.concurrency]
-initial_inflight = 32
-max_inflight = 128
+initial_inflight = 128
+min_inflight = 32
+max_inflight = 512
 
 [orchestrator.renderer]
 name = "default"
+tool_parser = "qwen3.5"
 reasoning_parser = "think"
 enable_thinking = true
 preserve_thinking = false
 
 [orchestrator.train]
-group_size = 8
+group_size = 16
 
 [orchestrator.train.sampling]
-temperature = 0.6
-top_p = 1.0
-max_completion_tokens = 8192
+temperature = 1.0
+max_completion_tokens = 32768
 
 [[orchestrator.train.source]]
 name = "decensor"
@@ -78,8 +79,8 @@ env.taskset.id = "decensor-v1"
 env.assistant.harness.id = "null"
 env.assistant.runtime.type = "subprocess"
 env.assistant.max_turns = 6
-env.assistant.max_output_tokens = 24576
-env.assistant.max_total_tokens = 32768
+env.assistant.max_output_tokens = 32768
+env.assistant.max_total_tokens = 65536
 
 [orchestrator.train.source.env.taskset.task.judge]
 base_url = "http://103.175.197.21:30005/v1"
@@ -93,12 +94,12 @@ api_key_var = "VLLM_API_KEY"
 
 [inference.vllm]
 dtype = "bfloat16"
-tensor_parallel_size = 4
-data_parallel_size = 1
-max_model_len = 32768
-gpu_memory_utilization = 0.8
+tensor_parallel_size = 1
+data_parallel_size = 4
+max_model_len = 65536
+gpu_memory_utilization = 0.90
 enable_lora = true
-max_lora_rank = 16
-max_num_seqs = 128
+max_lora_rank = 128
+max_num_seqs = 256
 reasoning_parser = "qwen3"
 tool_call_parser = "qwen3_coder"
