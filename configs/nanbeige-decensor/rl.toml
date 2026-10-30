@@ -54,6 +54,9 @@ decay_steps = 0
 batch_size = 1024
 max_staleness = 2
 
+[orchestrator.monitors]
+prime = "None"
+
 [orchestrator.concurrency]
 initial_inflight = 128
 min_inflight = 32
