@@ -19,7 +19,7 @@ training tools, and related PRIME-RL changes.
   with `uv run --project environments --all-packages python
   environments/tests/parity_nemotron_knowledge.py --legacy-root <old-projects>`.
   Pytest reports `PARITY NOT RUN` when that baseline is not available.
-- `configs/` holds 43 configurations. The three main branch `trinity_mini_*`
+- `configs/` holds 42 TOML files, including `nodes.toml`. The three main branch `trinity_mini_*`
   configurations remain as historical examples. The two `*_rl` files refer to
   retired v0 IDs. `trinity_mini_modern` refers to the removed `decensor-v1`
   project. Update these IDs before you run those configurations.
