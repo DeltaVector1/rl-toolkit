@@ -14,6 +14,7 @@ from pydantic import PositiveInt
 import verifiers.v1 as vf
 from ._data import XiaomiTasksetConfig, load_instance, load_rows, resolve_image
 from ._runtime import checked_run, run_shell
+from ._repairs import repair_test_patch
 
 ERROR_CATEGORY = "reward/testbed_corrupted"
 PATCH_PATH = "/tmp/_opensource_code_test.patch"
@@ -258,7 +259,7 @@ class XiaomiCodeTaskset(vf.Taskset[XiaomiCodeTask, XiaomiTasksetConfig]):
                 prompt=instance["problem_statement"],
                 image=resolve_image(instance["docker_image"], self.config.revision),
                 workdir=instance["cwd"],
-                test_patch=instance["test_patch"],
+                test_patch=repair_test_patch(instance["instance_id"], instance["test_patch"]),
                 test_command=instance["test_command"],
                 verifier_timeout_sec=instance["verifier_timeout_sec"],
                 timeout=vf.TaskTimeout(setup=600, scoring=instance["verifier_timeout_sec"] + 120),

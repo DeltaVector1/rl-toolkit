@@ -5,6 +5,8 @@ import py_compile
 import shlex
 import subprocess
 import sys
+from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,8 @@ from xiaomi_code.taskset import (
     BASH_ENV_PATH, BASH_ENV_SCRIPT, CACHE_CLEANUP, CodeData, CodeState,
     XiaomiCodeTask, reset_command, strip_history_command, touched_files,
 )
+
+from xiaomi_code._repairs import repair_test_patch
 
 PATCH = """diff --git a/check.txt b/check.txt
 new file mode 100644
@@ -207,6 +211,39 @@ async def test_broken_testbed_is_error_and_cleanup_runs(runtime):
     assert "git cat-file" in runtime.calls[-1][1][-1]
 
 
+def test_published_hcl_repair_restores_protected_upstream_fixtures(repo):
+    # This patch comes unchanged from the pinned dataset revision.
+    original = (Path(__file__).parent / "fixtures" / "code-001441.patch").read_text()
+    assert sha256(original.encode()).hexdigest() == "f50c33e070080c593b60017eaf7ae4e10999f839f7ee1062894898b95621d87f"
+    patch = repair_test_patch("format-code-task-001441", original)
+    assert patch.startswith(original.rstrip("\n") + "\n")
+    fixture_dir = repo / "hcl/printer/testdata"
+    fixture_dir.mkdir(parents=True)
+    # Source: hashicorp/hcl@78101eb3cb45bc983bceeb78993f6a263406c54e/hcl/printer/printer_test.go.
+    before = (Path(__file__).parent / "fixtures" / "hcl-printer-before.go").read_bytes()
+    (repo / "hcl/printer/printer_test.go").write_bytes(before)
+    git(repo, "add", "hcl/printer/printer_test.go")
+    git(repo, "commit", "-qm", "upstream printer test before fixture addition")
+    base = git(repo, "rev-parse", "HEAD")
+    for name in ("empty_block.input", "empty_block.golden"):
+        (fixture_dir / name).write_text("model changed fixture\n")
+    subprocess.run(["bash", "-c", reset_command(patch, base)], cwd=repo, check=True)
+    subprocess.run(["git", "apply", "-"],
+                   input=patch, text=True, cwd=repo, check=True)
+    assert sha256((fixture_dir / "empty_block.input").read_bytes()).hexdigest() == "4a2b73a9a03a96f3e409d8b97ecaea0307a7e520295235873eae55184487e561"
+    assert sha256((fixture_dir / "empty_block.golden").read_bytes()).hexdigest() == "ac0ab6cfb3ebc4236a0dd6658e6856e0335e516a6b62700e715026a26263fe01"
+    subprocess.run(["bash", "-c", reset_command(patch, base)], cwd=repo, check=True)
+    assert not (fixture_dir / "empty_block.input").exists()
+    assert not (fixture_dir / "empty_block.golden").exists()
+    assert (repo / "solution.txt").read_text() == "before\n"
+
+
+def test_hcl_repair_rejects_a_different_published_patch():
+    with pytest.raises(ValueError, match="Unknown test patch"):
+        repair_test_patch("format-code-task-001441", PATCH)
+    assert repair_test_patch("another-task", PATCH) == PATCH
+
+
 @pytest.mark.parametrize("history", ["clean", "remaining_ref", "git_failure"])
 async def test_history_check_ignores_profile_output_and_fails_closed(repo, history):
     task, trace = task_and_trace()
@@ -255,20 +292,25 @@ async def test_setup_captures_original_head_before_agent_moves_it():
     assert runtime.calls == [('write', BASH_ENV_PATH, BASH_ENV_SCRIPT.encode())]
 
 
-def test_taskset_load_and_default_agent_tools(monkeypatch):
+@pytest.mark.parametrize("task_id", ["example", "format-code-task-001441"])
+def test_taskset_load_and_default_agent_tools(monkeypatch, task_id):
     from xiaomi_code import taskset
     from xiaomi_code._data import XiaomiTasksetConfig
     from verifiers.v1.configs.env import default_agent_harness
     from verifiers.v1.utils.loaders import load_taskset
     import json
+    patch = PATCH if task_id == "example" else (
+        Path(__file__).parent / "fixtures" / "code-001441.patch"
+    ).read_text()
     instance = dict(dataset_type='opensource-code', cwd='/testbed', docker_image='original',
-                    instance_id='example', problem_statement='Original task\n', test_patch=PATCH,
+                    instance_id=task_id, problem_statement='Original task\n', test_patch=patch,
                     test_command='bash /testbed/check.sh', verifier_timeout_sec=1800)
     monkeypatch.setattr(taskset, 'load_rows', lambda domain, config: [
         {'extra_info': {'instance_json': json.dumps(instance)}}])
     monkeypatch.setattr(taskset, 'resolve_image', lambda image, revision: 'docker.io/xiaomimimo/mimo-v2.6-rl-oss:example')
     task = next(iter(load_taskset(XiaomiTasksetConfig(id='xiaomi-code'))))
-    assert task.data.id == 'example'
+    assert task.data.id == task_id
+    assert task.data.test_patch == repair_test_patch(task_id, patch)
     assert task.data.prompt == instance['problem_statement']
     assert task.data.timeout.scoring == 1920
     assert task.data.timeout.setup == 600
