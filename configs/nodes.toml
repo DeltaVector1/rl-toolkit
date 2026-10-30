@@ -172,3 +172,36 @@ hourly_cost_usd = 28
 
 [selection]
 active_node = "h200_replacement"
+
+[single_node.nanbeige]
+ssh_host = "204.12.180.252"
+ssh_port = 20301
+ssh_user = "root"
+ssh_identity_file = "/home/mango/.ssh/id_ed25519"
+python = "/usr/bin/python3"
+storage_root = "/root/nanbeige-rl"
+remote_repository = "/root/nanbeige-rl/prime-rl"
+runs = "/root/nanbeige-rl/prime-rl/outputs"
+model_cache = "/workspace/hf/hub"
+model = "Nanbeige/Nanbeige4.3-33B"
+model_revision = "df919e1e2cf077a22204c78b6c826bf3db18bc08"
+model_path = "/workspace/hf/hub/models--Nanbeige--Nanbeige4.3-33B/snapshots/df919e1e2cf077a22204c78b6c826bf3db18bc08"
+trainer_gpus = [4, 5, 6, 7]
+policy_gpus = [0, 1, 2, 3]
+judge_gpus = []
+policy_health_urls = ["http://127.0.0.1:8000/health"]
+judge_health_urls = ["http://103.175.197.21:30005/health"]
+
+[single_node.nanbeige_judge]
+ssh_host = "103.175.197.21"
+ssh_port = 30300
+ssh_user = "root"
+ssh_identity_file = "/home/mango/.ssh/h200_rollout_ed25519"
+python = "/usr/bin/python3"
+runs = "/root/glm52-rl/runs"
+
+[judges.nanbeige]
+host = "103.175.197.21"
+ssh_node = "nanbeige_judge"
+api_url = "http://103.175.197.21:30005/v1"
+model = "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic"
